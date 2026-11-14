@@ -3982,7 +3982,8 @@ def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveRe
   prints the readback: `offset 5000 PFSOffset units`. A readback that
   differs from the value asked says so, `reached` false (FM-155).
   *Amended by #349*: `--floor` read back above the floor says what to
-  change (§12.12 D16).
+  change (§12.12 D16). *Amended by #487*: on a declared stand `--floor` read
+  back on either side of the floor says so, and only there (§12.12 D16).
 - `--floor` with no soft limits exits 1 before anything is sent: `no floor:
   [safety] autofocus_offset_soft_limits is not set (m2 §12.10)`.
 - Reading the floor (`offset_limits_native()`) is a read, so
@@ -4329,7 +4330,11 @@ this section decides it**: it answers the nine items left by the review
 of #348 (#349; #364 asked three of them first), with the options not
 chosen. No Protocol and no signature changes. On the Ti2-E's profile as it
 stands only the texts change: it declares every condition below, and its
-factors agree with its direction (D12).
+factors agree with its direction (D12). *Amended by #487* (the first-lock
+texts that the review of #485 found wrong or incomplete): D12's closing
+clause and its case of no objective turret, D14's loop on a floor the device
+does not hold (closed in D16), and D16 on both sides of the floor and off a
+declared stand.
 
 #### 12.12.1 What is known
 
@@ -4359,7 +4364,13 @@ factors agree with its direction (D12).
   itself, and `engage()` then takes a first lock at that offset (D4: at or
   below). Only a device that rounds up would land above the floor, where
   `engage()` refuses with "set the offset to its floor": the circle of
-  #349's item 7.
+  #349's item 7. *Amended by #487*: the same circle exists below the
+  floor. Measured on the Ti2-E fake (`main` 471cf45, planning #487), with
+  the floor 7927.5 and `hold_whole_units("PFSOffset")`: setting the floor
+  read back 7927; a first lock from there that dropped Z to 3614.94 µm,
+  past the 4000 µm soft limit, said D14's "set the offset to its floor and
+  engage again"; setting the floor again read back 7927. Nothing in that
+  advice changes what the device holds.
 
 #### 12.12.2 Decisions
 
@@ -4395,9 +4406,37 @@ every attempt would rise toward the sample by R and trip.
   [autofocus.offset_per_um] for objective '10x' (5.9) says a larger offset
   gives a larger Z and [safety] z_away_from_sample is "increasing", so the
   floor's plane lies toward the sample (m2 §12.12 D12). One of the two is
-  wrong for this stand: check both at the stand; until then smc engages
-  only at an offset it has read locked ``. With a negative factor, "a
+  wrong for this stand: check both at the stand; until then smc takes no
+  first lock from the offset's floor ``. With a negative factor, "a
   smaller Z".
+- *Amended by #487*: **the closing clause.** It read "until then smc engages
+  only at an offset it has read locked", which says the opposite of what the
+  refusal does when the floor *was* read locked: it is in `seen`, the
+  autofocus is off, and D9 makes the engage a first lock whether or not the
+  floor was seen, so D12 refuses it (measured on the Ti2-E fake, `main`
+  471cf45: a lock at the floor read by `is_locked()`, `disengage()`, a
+  factor of -6 on a `"decreasing"` stand: refused with that clause, nothing
+  sent). The new clause is true whether or not the floor was seen, and says
+  what is refused and nothing of what is allowed. Not chosen: *the clause
+  only when the floor was not seen*: two texts for one refusal, and the
+  state read that tells them apart is D9's, not D12's. Not chosen: *no
+  closing clause*: the operator would not learn that nothing smc does
+  changes the refusal until the profile is fixed.
+- **No objective turret** (*amended by #487*, its item 4). The objective's
+  label then reads `None`, no factor can be chosen (the profile keys them by
+  the turret's labels), and D12 does not apply: this is "no factor" above.
+  The first lock runs under R (else E, §12.11 D8) and logs its usual line;
+  **nothing more is logged**, since nothing is unknown: the stand has no
+  objective, and the bound that holds is the one the line names. Measured
+  on the Ti2-E fake with no turret and a factor of -6 on a `"decreasing"`
+  stand: `engage()` returned `True`, the log was `[ON]`, and the one INFO
+  line was the first lock's. **A turret that cannot be read is not this case**: the
+  read raises `HardwareError` (`objective_turret: getStateLabel('Nosepiece')
+  failed (turret does not answer); check the device: power, cable, another
+  program holding it`) before D12 is reached, with nothing sent (measured).
+  Not chosen: *a DEBUG or INFO line "no objective turret, the factor's sign
+  was not checked"*: it would be written on every first lock of a stand
+  that can never have a factor, and no one would act on it.
 - Not chosen: *a key of its own for the sign*. One more thing to declare
   from the stand, where the factors already record the sign once measured.
 - Not chosen: *the floor at the upper bound when the sign is negative*. No
@@ -4440,6 +4479,20 @@ At the floor, "raise the floor" stays. The text names no CLI command: the
 page shows it too. The offset is the one the guard engaged at (the `seen`
 pair); the floor is the profile's.
 
+*Amended by #487*: **a floor the device does not hold sends this advice in
+a circle** (§12.12.1: the fractional floor of a device that truncates reads
+back below itself, the trip says "set the offset to its floor", and the
+floor lands there again). The text is unchanged; the circle is closed one
+step later, where the operator sets the floor: D16 now says on that
+readback that the floor is not held, before any engage and so before any Z
+motion. Not chosen: *D14 also naming "raise the floor"*. Below the floor
+the usual cause is the stand's own (a turn restored an offset, the knob
+moved it), where setting the floor is the whole advice; a second remedy in
+every such trip would lengthen a text for a cause that is a defect of the
+profile, which D16 reports earlier and in its own words. Not chosen: *the
+advice depending on the offset being within one unit of the floor*: the
+device's step is not known (unknown beats guessed).
+
 **D15. A trip's words follow the direction** (item 6). D10's text takes
 three words from `z_away_from_sample`: `"decreasing"`, "is not below where
 Z started", "lies above the focus", "names a lower one" (the Ti2-E's text,
@@ -4460,6 +4513,57 @@ D16) ``
 A readback below the floor keeps today's text: `engage()` takes a first
 lock there (D14). `profiles/README.md` says that the floor is a value the
 device holds as written (the Ti2-E: a whole number).
+
+*Amended by #487*: **both sides of the floor, a declared stand only, and
+both causes.** The review of #485 found three faults in the text above.
+- **Below the floor** (§12.12.1, D14): a first lock from there that trips
+  sends the operator to `--floor`, which landed at the same offset and said
+  nothing. A readback below the floor now says so too. Reversed: "keeps
+  today's text" held while nothing sent the operator back to the floor.
+- **A stand that does not declare `engage_drives_z_to_offset`** takes no
+  first lock at any offset, so the floor has no such role there, and the
+  clause "where engage() takes no first lock; set the floor …" advised a
+  change to a profile value that matters for nothing. Neither side gets a
+  clause there: the text is the readback's, as before D16. The drive reads
+  the flag as `read_autofocus_offset` does,
+  `microscope.profile.autofocus.engage_drives_z_to_offset`, at the call.
+- **A readback far from the floor because the device did not take the
+  write** was blamed on the floor's value. Whether a readback is a rounding
+  or an ignored write cannot be told from one readback: the device's step
+  is unknown. The text names both causes, the one the profile can fix
+  first.
+
+On a declared stand, `smc autofocus offset --floor` whose readback differs
+from the floor says one of the two texts, `reached` false. Above the
+floor:
+
+`` offset 7928 PFSOffset units, although 7927.5 was asked: above the floor,
+where engage() takes no first lock; either this device does not hold the
+floor as written (set the floor, [safety] autofocus_offset_soft_limits, to
+a value it holds) or it did not take the write (read the offset again and
+check the stand) (m2 §12.12 D16) ``
+
+Below the floor:
+
+`` offset 7927 PFSOffset units, although 7927.5 was asked: below the floor,
+so setting the floor again may change nothing; either this device does not
+hold the floor as written (set the floor, [safety]
+autofocus_offset_soft_limits, to a value it holds) or it did not take the
+write (read the offset again and check the stand) (m2 §12.12 D16) ``
+
+Not a declared stand, or `--to VALUE`, or a readback that is not finite
+(it lies on no side, as in §12.10.6): `offset 7927 PFSOffset units,
+although 7927.5 was asked`, as today; a readback equal to the floor says
+only the offset; the dry-run text is unchanged. The `profiles/README.md`
+row of `autofocus_offset_soft_limits` says that the command says so on a
+declared stand.
+- Not chosen: *a check of the floor's value in `profile.py`*: as in the
+  text above, whether a device holds whole units is the device's, and the
+  profile does not know it.
+- Not chosen: *one more read after the write to tell the two causes*: an
+  extra hardware read in a command, for a text. `set_offset_native` already
+  waits and returns the readback, and a second read of the same value
+  tells a rounding from an ignored write no better than the first.
 
 **Seen offsets at a sample change (item 5): settled by D9.** With the
 autofocus off, `engage()` at or below the floor is a first lock whether or
@@ -4482,6 +4586,10 @@ change no text and no outcome.
   one offset lens, §12.10.1); D12 reads the factor of the objective in
   place only.
 - D12 at a stand: no profile contradicts itself today.
+- *Added by #487*: D16's texts at a stand. The Ti2-E's floor is 0, a whole
+  number, so no readback differs from it; the texts are built on the fake
+  (`hold_whole_units` for below the floor, a device that rounds up for
+  above it, which no stand is known to be).
 
 #### 12.12.4 Limits of the design, named
 
