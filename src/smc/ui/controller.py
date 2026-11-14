@@ -64,6 +64,7 @@ from smc.plugins import (
     PluginEntry,
     PluginError,
     PluginParams,
+    PluginRunError,
     Progress,
     Registry,
     check_ready,
@@ -74,8 +75,10 @@ from smc.plugins import (
     run_plugin,
 )
 from smc.plugins.api import ShownFrame
+from smc.plugins.camera_calibration.plugin import calibration_from
 from smc.plugins.frames import stage_side_of_image_side
 from smc.plugins.geometry import Matrix2
+from smc.plugins.objective_offsets.algorithm import MAX_TARGETS
 from smc.plugins.presets import (
     NOT_IN_PARAMS,
     Preset,
@@ -126,6 +129,10 @@ from smc.ui.guide import (
     NO_CALIBRATION_FOR_SIDES,
     NOT_CONNECTED,
     OFFSETS_DRY_RUN,
+    OFFSETS_NO_DOCUMENT,
+    OFFSETS_NOTHING_ARMED,
+    OFFSETS_TOO_MANY,
+    OFFSETS_TURRET_UNREAD,
     PLATE_NOT_CHOSEN,
     RUN_ALL_LABEL,
     SCAN_CHECKPOINT_KEPT,
@@ -138,10 +145,17 @@ from smc.ui.guide import (
     GotoAnswer,
     NextStep,
     a1_corner,
+    busy_note,
+    calibration_paths,
     command_line,
     local_time,
     next_slot,
     offsets_card_lines,
+    offsets_changed,
+    offsets_in_two_documents,
+    offsets_is_the_plates,
+    offsets_no_objective,
+    offsets_not_on_turret,
     offsets_plate_refusal,
     register_objective_refusal,
     replace_note,
@@ -167,11 +181,13 @@ __all__ = [
     "NOT_CONNECTED",
     "PAGE_PARAMS",
     "STAGES",
+    "CalibrationRead",
     "ChainEnd",
     "ChainStatus",
     "CheckItem",
     "LoadedPreset",
     "OffsetsOffer",
+    "OffsetsStep",
     "PageServerError",
     "PageStatus",
     "PlanLayer",
@@ -551,6 +567,41 @@ class OffsetsOffer:
     """
 
     plate_objective: str
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationRead:
+    """One line of the block's field, read: the document the typed path names (m5 §18.3).
+
+    ``path`` is as typed, never resolved (FM-24, FM-50). ``objective`` and ``measured`` are the
+    document's camera calibration's (``calibration_from``: the objective it was done with and
+    the record's time to the second, or ``at an unknown time``); ``problem`` is why the
+    document cannot be used, in the tool's words, and then ``objective`` is ``None`` and
+    ``measured`` is empty.
+    """
+
+    path: str
+    objective: str | None
+    measured: str
+    problem: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OffsetsStep:
+    """What the block's *Measure the offsets* would run, and what it waits for (m5 §18.3).
+
+    ``reads`` has one entry for each typed path (at most ``MAX_TARGETS``) and ``targets`` are
+    the objectives of those documents, in line order: the objectives the turret would turn to.
+    ``wait`` is the first reason there is nothing to run (the stand, the plate, a document, a
+    refusal of the page's own); with one, ``pairs`` is empty, else it is the ``targets`` and
+    ``calibrations`` pairs of ``smc run objective-offsets``, JSON so that a Windows path's
+    backslashes are doubled by the encoder and not by the operator.
+    """
+
+    pairs: tuple[str, ...]
+    targets: tuple[str, ...]
+    reads: tuple[CalibrationRead, ...]
+    wait: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1119,6 +1170,31 @@ def _offsets_of(record: StageRecord) -> ObjectiveOffsetsResult | None:
         return ObjectiveOffsetsResult.model_validate(record.result)
     except ValidationError:
         return None
+
+
+def _read_calibration(path: str, *, profile: str, dry_run: bool) -> CalibrationRead:
+    """The calibration document ``path`` names, read as the tool reads it, or why it cannot be (m5 §18.3).
+
+    A typed path is data, and so is the file it names (FM-125, FM-98): ``calibration_from``
+    raises ``PluginRunError`` with the tool's words for a missing file, one that is not JSON, a
+    document with no usable calibration; any other error of reading it (a folder is refused by
+    the document, but a name the OS refuses, a permission, a file too large) is a text for the
+    line, never an exception in a Panel callback, and the error itself is not kept.
+    """
+    problem = ""
+    try:
+        found, measured = calibration_from(
+            "objective-offsets", Path(path), profile=profile, dry_run=dry_run
+        )
+    except PluginRunError as exc:
+        problem = exc.reason
+    except Exception as exc:
+        problem = f"{path}: {type(exc).__name__}: {_one_line(exc)}"
+    if problem:
+        return CalibrationRead(path, None, "", _flat(problem))
+    if found.objective is None:
+        return CalibrationRead(path, None, "", offsets_no_objective(path))
+    return CalibrationRead(path, found.objective, measured, None)
 
 
 def _offsets_offer_of(registered: PlateResult | None) -> OffsetsOffer | None:
@@ -5096,6 +5172,131 @@ class PlatePage:
         """
         pairs, wait = self._registration_step([])
         return tuple(pairs), wait
+
+    # --- the offsets block (m5 §18) -----------------------------------------------------
+
+    def offsets_step(self, calibrations_text: str) -> OffsetsStep:
+        """Read the typed calibration documents and say what *Measure the offsets* would run, or what it waits for (m5 §18.2 D3, D8).
+
+        The objectives to measure are **the documents'**: each line is a run document holding a
+        ``camera-calibration``, read with the tool's own ``calibration_from``, and the objective
+        it was done with is the one to turn to, so a document with no target and a target with
+        no document cannot be typed. A line the tool refuses is that line's ``problem``, its
+        words; a path is data (FM-125, FM-98): any other error of reading it (a folder, a
+        permission, a name the OS refuses) is a text for the line and never an exception in a
+        Panel callback. A relative path is read from where ``smc ui`` was started, as the tool
+        reads it, and is shown as typed.
+
+        ``wait`` is the first of: the stand is closed, ``_offsets_refusal``, a run document that
+        cannot be read (FM-229: not an empty one), a plate the tool cannot read, an activity
+        going, no document typed, the first line with a problem, then the page's own three
+        refusals in line order (the plate's own objective, an objective not on the turret, one
+        in two documents: foresight, FM-206; the tool checks every one again) and last the
+        sixth line, which is not read. Never called from the tick or from ``refresh()``: it
+        reads files (FM-145).
+        """
+        paths = calibration_paths(calibrations_text)
+        profile = self._profile.microscope.name
+        reads = tuple(
+            _read_calibration(path, profile=profile, dry_run=self._dry_run)
+            for path in paths[:MAX_TARGETS]
+        )
+        targets = tuple(
+            read.objective
+            for read in reads
+            if read.objective is not None and read.problem is None
+        )
+        wait = self._offsets_wait(paths, reads)
+        pairs: tuple[str, ...] = ()
+        if wait is None:
+            pairs = (
+                f"targets={json.dumps(list(targets))}",
+                f"calibrations={json.dumps([read.path for read in reads])}",
+            )
+        return OffsetsStep(pairs, targets, reads, wait)
+
+    def _offsets_wait(
+        self, paths: Sequence[str], reads: Sequence[CalibrationRead]
+    ) -> str | None:
+        """The first reason ``offsets_step`` has nothing to run, in the order its docstring gives, or ``None``."""
+        if self._microscope is None:
+            return NOT_CONNECTED
+        doc, unreadable = self._document()
+        refusal = self._offsets_refusal(doc)
+        if refusal is not None:
+            return refusal
+        if unreadable is not None:
+            return f"run document: {_flat(unreadable)}"
+        unusable = self._unusable(doc, "plate", "objective-offsets")
+        if unusable is not None:
+            return unusable
+        current = self._current_run
+        if current is not None:
+            return busy_note(current[0], live=current[0] == "live")
+        if not paths:
+            return OFFSETS_NO_DOCUMENT
+        for read in reads:
+            if read.problem is not None:
+                return read.problem
+        plate = self._slot(doc, "plate", PlateResult, [])
+        labels = self.objective_labels()
+        if not labels:
+            return OFFSETS_TURRET_UNREAD
+        first_path: dict[str, str] = {}
+        for read in reads:
+            objective = read.objective
+            if objective is None:
+                continue  # unreachable: a document with no objective is a problem above
+            if plate is not None and objective == plate.objective:
+                return offsets_is_the_plates(objective)
+            if objective not in labels:
+                return offsets_not_on_turret(objective, labels)
+            if objective in first_path:
+                return offsets_in_two_documents(
+                    objective, first_path[objective], read.path
+                )
+            first_path[objective] = read.path
+        if len(paths) > MAX_TARGETS:
+            return OFFSETS_TOO_MANY
+        return None
+
+    def measure_offsets(self, armed: Sequence[str], calibrations_text: str) -> None:
+        """Turn the turret to each objective of the documents and measure the offsets, if they are still the objectives the operator confirmed (m5 §18.2 D4, FM-14).
+
+        The block's *Turn and measure*, the second of two clicks, and **the only place in the
+        page that writes ``confirm_turns=true``**: the first click armed the objectives the
+        documents named and asked the question (``offsets_confirm_text``). Here the documents
+        are read again, and nothing turns unless every one is usable and their objectives are
+        the armed ones: a path edited, a file replaced or an activity started since the
+        question was asked changes what the turret would be driven to, and the operator
+        confirmed a different turn (FM-169: the controller refuses on its own, whatever the
+        button says, and a stale tab or a script sends the click all the same). The refusal is
+        the outcome, ``Objective offsets: <why>``, and nothing is written or started. The run
+        that follows is ``run``'s, with its checks; the tool checks everything again before it
+        turns.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page is closed.
+        """
+        self._refuse_if_busy()
+        why = self._offsets_confirm_refusal(armed, calibrations_text)
+        if isinstance(why, str):
+            self._set_outcome(f"{tool_title('objective-offsets')}: {why}")
+            return
+        self.run("objective-offsets", [*why.pairs, "confirm_turns=true"])
+
+    def _offsets_confirm_refusal(
+        self, armed: Sequence[str], calibrations_text: str
+    ) -> OffsetsStep | str:
+        """The step to run when the armed objectives are the documents' now, else the text that says why not."""
+        if not armed:
+            return OFFSETS_NOTHING_ARMED
+        step = self.offsets_step(calibrations_text)
+        if step.wait is not None:
+            return step.wait
+        if step.targets != tuple(armed):
+            return offsets_changed(armed, step.targets)
+        return step
 
     def _registration_step(self, why: list[str]) -> tuple[list[str], str | None]:
         """The pairs of ``plate-registration`` and what it waits for, with a line of ``why`` for them.

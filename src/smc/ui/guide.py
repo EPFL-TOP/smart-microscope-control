@@ -94,6 +94,7 @@ __all__ = [
     "OFFSETS_STALE",
     "OFFSETS_TITLE",
     "OFFSETS_TOO_MANY",
+    "OFFSETS_TURRET_UNREAD",
     "ORIENTATION_IN_STAGE_TERMS",
     "OTHER_WAYS_TO_REGISTER",
     "PLATE_NOT_CHOSEN",
@@ -2499,6 +2500,12 @@ OFFSETS_NO_FILE = "this stand's profile is built into smc, with no file to write
 
 #: Under a result whose inputs were produced again since (D6).
 OFFSETS_STALE = "out of date: the plate was registered again since"
+
+#: The turret's labels could not be read (no turret, or the read failed), so no objective of a
+#: document can be checked against it: the page does not guess that one is there.
+OFFSETS_TURRET_UNREAD = (
+    "the turret's objectives could not be read: check the stand, then try again"
+)
 
 #: ``PluginRunError: objective-offsets: <words>``: the type, then the tool's own name.
 _ERROR_TYPE = re.compile(r"^[A-Za-z_][\w.]*Error: ")

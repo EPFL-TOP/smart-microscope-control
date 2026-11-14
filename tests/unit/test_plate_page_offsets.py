@@ -11,18 +11,26 @@ refuse (FM-43, FM-169).
 
 from __future__ import annotations
 
+import json
+import os
+import threading
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 from pymmcore_plus import CMMCorePlus
 
+import smc.ui.controller as controller_module
 from smc.hardware import Microscope
+from smc.hardware.capabilities import ObjectiveTurret
 from smc.hardware.profile import Profile
+from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.errors import PluginRunError
 from smc.plugins.objective_offsets.plugin import _refuse_wells_that_disagree
+from smc.plugins.params import parse_params
 from smc.plugins.registry import GROUP
 from smc.plugins.slots import (
     MeasuredOffset,
@@ -35,8 +43,14 @@ from smc.plugins.slots import (
 )
 from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
-from smc.ui.controller import NOT_CONNECTED, PlatePage
-from smc.ui.guide import OFFSETS_DRY_RUN, offsets_plate_refusal
+from smc.ui.controller import NOT_CONNECTED, CalibrationRead, PlatePage
+from smc.ui.guide import (
+    OFFSETS_DRY_RUN,
+    OFFSETS_NO_DOCUMENT,
+    OFFSETS_TOO_MANY,
+    busy_note,
+    offsets_plate_refusal,
+)
 
 T0 = datetime(2026, 11, 14, 9, 0, tzinfo=timezone.utc)
 TEN = "Nikon 10X S Fluor"
@@ -559,3 +573,522 @@ def test_objective_offsets_is_blocked_by_the_dry_run_before_what_it_reads_and_by
         assert closed.view().blocked["objective-offsets"] == NOT_CONNECTED
     finally:
         closed.close()
+
+
+# --- the step (D3, D8) and the confirmed run (D4) -----------------------------------
+
+
+class StubOffsetsParams(PluginParams):
+    """The tool's three parameters the block fills, as the real ones are."""
+
+    targets: tuple[str, ...]
+    calibrations: tuple[Path, ...]
+    confirm_turns: bool = False
+
+
+class StubOffsets:
+    """``objective-offsets`` without a stage: it keeps what it was given and returns a result of the targets."""
+
+    name = provides = "objective-offsets"
+    summary = "A test tool."
+    Params = StubOffsetsParams
+    Result = ObjectiveOffsetsResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ("plate",)
+    reads_optional: tuple[str, ...] = ()
+    seen: ClassVar[list[StubOffsetsParams]] = []
+
+    def run(
+        self, microscope: Any, params: StubOffsetsParams, ctx: RunContext
+    ) -> ObjectiveOffsetsResult:
+        StubOffsets.seen.append(params)
+        return _result(*((label, (1.0, 2.0)) for label in params.targets))
+
+
+class StubSlow(PluginParams):
+    pass
+
+
+class SlowResult(PluginResult):
+    pass
+
+
+class Slow:
+    """A tool that waits until the test lets it go: an activity that is going."""
+
+    name = provides = "slow"
+    summary = "A test tool that waits."
+    Params = StubSlow
+    Result = SlowResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+    started: ClassVar[threading.Event] = threading.Event()
+    release: ClassVar[threading.Event] = threading.Event()
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> SlowResult:
+        Slow.started.set()
+        Slow.release.wait(10.0)
+        return SlowResult()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_state() -> Iterator[None]:
+    StubOffsets.seen = []
+    Slow.started = threading.Event()
+    Slow.release = threading.Event()
+    try:
+        yield
+    finally:
+        Slow.release.set()  # a worker a failed test left behind ends
+
+
+def _stub_page(microscope: Microscope, run_doc: Path) -> PlatePage:
+    return PlatePage(
+        microscope,
+        run_doc,
+        entry_points=[
+            EntryPoint(name=c.name, value=f"{__name__}:{c.__name__}", group=GROUP)
+            for c in (StubOffsets, Slow)
+        ],
+    )
+
+
+def _document(
+    folder: Path,
+    objective: str,
+    seed: Callable[..., Any],
+    *,
+    name: str | None = None,
+    profile: str = "demo",
+) -> Path:
+    """A run document holding the camera calibration of ``objective``, in a file of its own."""
+    path = folder / (name or f"cal-{objective.split()[1].lower()}.json")
+    seed(path, objective=objective, profile=profile)
+    return path
+
+
+def _typed(*paths: Path | str) -> str:
+    """What an operator typed: one path per line, as they are."""
+    return "\n".join(str(path) for path in paths)
+
+
+def _turret_labels(microscope: Microscope) -> tuple[str, ...]:
+    return tuple(
+        label for label in microscope.require(ObjectiveTurret).labels() if label
+    )
+
+
+def test_offsets_step_reads_each_document_and_derives_the_objectives_in_line_order(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed_plate(run_doc)
+    forty = _document(tmp_path, FORTY, seed_camera_calibration)
+    twenty = _document(tmp_path, TWENTY, seed_camera_calibration)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        # 40X first, then 20X: the order the turret turns in, the documents' and not the
+        # turret's (the 20X is the turret's fourth position, the 40X its first).
+        step = page.offsets_step(_typed(twenty, forty))
+        backwards = page.offsets_step(_typed(forty, twenty))
+    finally:
+        page.close()
+
+    assert step.wait is None
+    assert step.targets == (TWENTY, FORTY)
+    assert backwards.targets == (FORTY, TWENTY)
+    when = "2026-11-09T09:30:00+00:00"
+    assert step.reads == (
+        CalibrationRead(str(twenty), TWENTY, when, None),
+        CalibrationRead(str(forty), FORTY, when, None),
+    )
+    # The pairs are what `smc run objective-offsets` is given, read back by the parameters'
+    # own parser, never compared as strings (FM-45).
+    parsed = parse_params(StubOffsetsParams, [*step.pairs, "confirm_turns=true"])
+    assert parsed.targets == (TWENTY, FORTY)  # type: ignore[attr-defined]
+    assert parsed.calibrations == (twenty, forty)  # type: ignore[attr-defined]
+    assert parsed.confirm_turns is True  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "case", ["missing", "not-json", "no-calibration", "other-profile", "folder"]
+)
+def test_offsets_step_waits_on_the_first_document_the_tool_refuses_and_says_its_words(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+    case: str,
+) -> None:
+    _seed_plate(run_doc)
+    good = _document(tmp_path, FORTY, seed_camera_calibration)
+    bad = tmp_path / "bad.json"
+    where = bad.as_posix()
+    expected: dict[str, str] = {
+        "missing": f"{where}: does not exist",
+        "no-calibration": (
+            f"in {where}: the run document has no camera-calibration; smc run --list "
+            "shows which plugin provides it"
+        ),
+        "other-profile": (
+            f"in {where}: camera-calibration was run on lightsheet, this is demo; run "
+            "camera-calibration again on this profile"
+        ),
+        "folder": f"{where}: is a folder, not a run document; name a file",
+    }
+    if case == "not-json":
+        bad.write_text("{not json", encoding="utf-8")
+    elif case == "no-calibration":
+        _seed(bad, "plate-walls", "plate", _walls_plate().model_dump(mode="json"))
+    elif case == "other-profile":
+        seed_camera_calibration(bad, objective=TWENTY, profile="lightsheet")
+    elif case == "folder":
+        bad.mkdir()
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        # The good document first and another one after: the first with a problem is the wait.
+        step = page.offsets_step(_typed(good, bad, tmp_path / "also-missing.json"))
+    finally:
+        page.close()
+
+    assert step.pairs == ()
+    assert step.wait is not None
+    if case == "not-json":
+        assert step.wait.startswith(f"{where}: is not valid JSON: ")
+    else:
+        assert step.wait == expected[case]
+    assert step.reads[0].problem is None
+    assert step.reads[1].problem == step.wait
+    assert step.targets == (FORTY,)
+
+
+def test_offsets_step_waits_for_what_the_page_holds_in_its_order(
+    fake_microscope: Microscope,
+    fake_core: FakeCore,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    forty = _document(tmp_path, FORTY, seed_camera_calibration)
+    text = _typed(forty)
+    # No plate at all: what the tool reads is missing (the reads' own reason).
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        no_plate = page.offsets_step(text).wait
+        _seed_plate(run_doc)
+        assert page.offsets_step("").wait == OFFSETS_NO_DOCUMENT
+        assert page.offsets_step(" \n\n").wait == OFFSETS_NO_DOCUMENT
+        # A run going: the activity's name, said as the tools' own waits say it.
+        page.run("slow", [])
+        assert Slow.started.wait(10.0)
+        going = page.offsets_step(text).wait
+        Slow.release.set()
+        assert page.join(10.0)
+        # The run document cannot be read: not an empty one (FM-229).
+        run_doc.write_text("{not json", encoding="utf-8")
+        unreadable = page.offsets_step(text).wait
+    finally:
+        page.close()
+    dry = _dry_microscope(fake_core)
+    dry_page = _stub_page(dry, run_doc)
+    try:
+        run_doc.unlink()
+        # A dry run: its words come first, before the plate the page cannot read.
+        dry_wait = dry_page.offsets_step(text).wait
+    finally:
+        dry_page.close()
+        dry.close()
+    closed = PlatePage.closed(
+        fake_microscope.profile,
+        run_doc,
+        entry_points=[EntryPoint(name="objective-offsets", value=OFFSETS, group=GROUP)],
+    )
+    try:
+        closed_wait = closed.offsets_step(text).wait
+    finally:
+        closed.close()
+
+    assert no_plate is not None
+    assert no_plate.startswith("the run document has no plate")
+    assert going == busy_note("slow", live=False)
+    assert unreadable is not None
+    assert unreadable.startswith("run document: ")
+    assert dry_wait == OFFSETS_DRY_RUN
+    assert closed_wait == NOT_CONNECTED
+
+
+def test_offsets_step_refuses_the_plates_own_objective_one_not_on_the_turret_and_one_given_twice(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed_plate(run_doc)
+    labels = _turret_labels(fake_microscope)
+    ten = _document(tmp_path, TEN, seed_camera_calibration)
+    sixty = _document(tmp_path, "Nikon 60X Plan Apo", seed_camera_calibration)
+    forty = _document(tmp_path, FORTY, seed_camera_calibration)
+    forty_again = _document(
+        tmp_path, FORTY, seed_camera_calibration, name="cal-40x-again.json"
+    )
+    twenty = _document(tmp_path, TWENTY, seed_camera_calibration)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        own = page.offsets_step(_typed(forty, ten)).wait
+        off_turret = page.offsets_step(_typed(forty, sixty)).wait
+        twice = page.offsets_step(_typed(forty, twenty, forty_again)).wait
+        # The first that holds in line order: the 60X comes before the plate's own 10X.
+        first = page.offsets_step(_typed(sixty, ten)).wait
+        fine = page.offsets_step(_typed(forty, twenty)).wait
+    finally:
+        page.close()
+
+    assert own == (
+        f"{TEN} is the objective the plate was registered with: its offset from "
+        "itself is zero; leave its document out"
+    )
+    assert off_turret == f"Nikon 60X Plan Apo is not on the turret: {', '.join(labels)}"
+    assert twice == f"{FORTY} is in two documents: {forty} and {forty_again}"
+    assert first == f"Nikon 60X Plan Apo is not on the turret: {', '.join(labels)}"
+    assert fine is None
+
+
+def test_offsets_step_reads_no_sixth_line(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed_plate(run_doc)
+    # The demo turret has exactly five objectives besides the plate's 10X.
+    others = [label for label in _turret_labels(fake_microscope) if label != TEN]
+    assert len(others) == 5
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    documents = [
+        _document(folder, label, seed_camera_calibration, name=f"cal-{n}.json")
+        for n, label in enumerate(others)
+    ]
+    sixth = tmp_path / "sixth.json"  # not there: read, it would say so
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step(_typed(*documents, sixth))
+        five = page.offsets_step(_typed(*documents))
+    finally:
+        page.close()
+
+    assert len(step.reads) == 5
+    assert len(step.targets) == 5
+    assert step.pairs == ()
+    assert step.wait == OFFSETS_TOO_MANY
+    assert five.wait is None
+    assert len(five.pairs) == 2
+
+
+def test_offsets_step_encodes_the_paths_as_json_so_a_windows_path_survives(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed_plate(run_doc)
+    # Backslashes in the typed text: a Windows path as Copy as path gives it (in quotes),
+    # or, on another OS, a file name that holds backslashes. Either way the file is there.
+    typed = f"{tmp_path}{os.sep}docs\\cal-40x.json"
+    Path(typed).parent.mkdir(parents=True, exist_ok=True)
+    seed_camera_calibration(Path(typed), objective=FORTY)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step(f'"{typed}"')
+    finally:
+        page.close()
+
+    assert step.wait is None
+    assert step.reads[0].path == typed
+    # The quotes were dropped and the path is as typed, doubled by the encoder only.
+    calibrations = step.pairs[1]
+    assert calibrations.startswith("calibrations=[")
+    assert json.loads(calibrations.partition("=")[2]) == [typed]
+    assert "docs\\\\cal-40x.json" in calibrations
+    assert parse_params(StubOffsetsParams, list(step.pairs)).calibrations == (  # type: ignore[attr-defined]
+        Path(typed),
+    )
+
+
+def _documents_for(tmp_path: Path, seed: Callable[..., Any]) -> tuple[Path, Path]:
+    return (
+        _document(tmp_path, FORTY, seed),
+        _document(tmp_path, TWENTY, seed),
+    )
+
+
+def test_measure_offsets_sends_confirm_turns_only_when_the_armed_objectives_are_still_the_documents(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed_plate(run_doc)
+    forty, twenty = _documents_for(tmp_path, seed_camera_calibration)
+    text = _typed(forty, twenty)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        armed = page.offsets_step(text).targets
+        assert armed == (FORTY, TWENTY)
+        page.measure_offsets(armed, text)
+        assert page.join(10.0)
+        outcome = page.status().outcome
+        record = RunDocument.load_or_new(run_doc).provider("objective-offsets")
+    finally:
+        page.close()
+
+    assert [(p.targets, p.calibrations, p.confirm_turns) for p in StubOffsets.seen] == [
+        ((FORTY, TWENTY), (forty, twenty), True)
+    ]
+    assert record is not None
+    assert record.status is StageStatus.done
+    assert record.params["confirm_turns"] is True
+    assert outcome is not None
+    assert outcome.startswith("Objective offsets done in ")
+
+
+@pytest.mark.parametrize(
+    "armed",
+    [(TWENTY, FORTY), (FORTY,), (FORTY, TWENTY, "Objective-2"), (TEN,)],
+    ids=["reordered", "one-short", "one-more", "another"],
+)
+def test_measure_offsets_with_other_armed_objectives_turns_nothing_and_says_what_changed(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+    armed: tuple[str, ...],
+) -> None:
+    _seed_plate(run_doc)
+    forty, twenty = _documents_for(tmp_path, seed_camera_calibration)
+    text = _typed(forty, twenty)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        page.measure_offsets(armed, text)
+        running = page.status().running
+        outcome = page.status().outcome
+        after = run_doc.read_bytes()
+    finally:
+        page.close()
+
+    assert StubOffsets.seen == []
+    assert running is None
+    assert after == before
+    assert outcome == (
+        "Objective offsets: the objectives changed since you confirmed them "
+        f"({', '.join(armed)} → {FORTY}, {TWENTY}): measure again"
+    )
+
+
+def test_measure_offsets_with_changed_documents_turns_nothing_and_says_what_changed(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed_plate(run_doc)
+    forty, twenty = _documents_for(tmp_path, seed_camera_calibration)
+    text = _typed(forty, twenty)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        armed = page.offsets_step(text).targets
+        # Between the question and the click the second file is replaced by the calibration of
+        # another objective: the turret would go to an objective the operator did not confirm.
+        seed_camera_calibration(twenty, objective="Objective-2")
+        before = run_doc.read_bytes()
+        page.measure_offsets(armed, text)
+        running = page.status().running
+        outcome = page.status().outcome
+        after = run_doc.read_bytes()
+        # Or the file is taken away: the document's own words, nothing turns.
+        twenty.unlink()
+        page.measure_offsets(armed, text)
+        gone = page.status().outcome
+    finally:
+        page.close()
+
+    assert StubOffsets.seen == []
+    assert running is None
+    assert after == before
+    assert outcome == (
+        "Objective offsets: the objectives changed since you confirmed them "
+        f"({FORTY}, {TWENTY} → {FORTY}, Objective-2): measure again"
+    )
+    assert gone == f"Objective offsets: {twenty.as_posix()}: does not exist"
+
+
+def test_a_click_on_turn_and_measure_with_nothing_armed_turns_nothing_in_the_controller(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed_plate(run_doc)
+    forty, _ = _documents_for(tmp_path, seed_camera_calibration)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        page.measure_offsets((), _typed(forty))
+        outcome = page.status().outcome
+        running = page.status().running
+        after = run_doc.read_bytes()
+    finally:
+        page.close()
+
+    assert StubOffsets.seen == []
+    assert running is None
+    assert after == before
+    assert outcome == (
+        "Objective offsets: choose the documents and press Measure the offsets again"
+    )
+
+
+def test_measure_offsets_is_refused_while_an_activity_goes(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed_plate(run_doc)
+    forty, _ = _documents_for(tmp_path, seed_camera_calibration)
+    text = _typed(forty)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        page.run("slow", [])
+        assert Slow.started.wait(10.0)
+        with pytest.raises(RuntimeError, match=r"^slow is running$"):
+            page.measure_offsets((FORTY,), text)
+    finally:
+        Slow.release.set()
+        assert page.join(10.0)
+        page.close()
+
+    assert StubOffsets.seen == []
+
+
+def test_nothing_else_in_the_page_writes_confirm_turns() -> None:
+    # The turn is confirmed by one click on a question that names what turns (FM-14): the
+    # block's second click is the only code that sends the pair. The accordion's own form has
+    # its checkbox, which `describe_params` draws from the tool's parameters, not from a literal.
+    ui = Path(controller_module.__file__).parent
+    found = {
+        path.name: path.read_text(encoding="utf-8").count('"confirm_turns=true"')
+        for path in sorted(ui.glob("*.py"))
+    }
+
+    assert found == {
+        "__init__.py": 0,
+        "controller.py": 1,
+        "frames.py": 0,
+        "guide.py": 0,
+        "plate_page.py": 0,
+    }
