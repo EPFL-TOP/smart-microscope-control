@@ -998,8 +998,8 @@ _DECLARED_EMERGENCY_STOP = (
             "(-6) says a larger offset gives a smaller Z and [safety] "
             'z_away_from_sample is "decreasing", so the floor\'s plane lies toward '
             "the sample (m2 §12.12 D12). One of the two is wrong for this stand: "
-            "check both at the stand; until then smc engages only at an offset it "
-            "has read locked",
+            "check both at the stand; until then smc takes no first lock from the "
+            "offset's floor",
             id="first-lock-factor-contradicts",
         ),
         pytest.param(
