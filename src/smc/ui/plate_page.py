@@ -1438,8 +1438,12 @@ class PlatePageView:
         )
         self.offsets_run_text = _wrapped_text()
         self.offsets_result_text = _wrapped_text()
+        # Shown with the first result: before a run it asks for the session of numbers that do
+        # not exist yet (the browser session of #382 found it).
         self.offsets_session_input = pn.widgets.TextInput(
-            label=_OFFSETS_SESSION_LABEL, placeholder=_OFFSETS_SESSION_PLACEHOLDER
+            label=_OFFSETS_SESSION_LABEL,
+            placeholder=_OFFSETS_SESSION_PLACEHOLDER,
+            visible=False,
         )
         self.offsets_plan_text = _wrapped_text()
         self.offsets_write_button = pn.widgets.Button(
@@ -3902,6 +3906,7 @@ class PlatePageView:
         card = view.cards.get("objective-offsets")
         self._offsets_card_status = None if card is None else card.status
         self._say(self.offsets_result_text, self._offsets_result(card))
+        self.offsets_session_input.visible = card is not None
         self._draw_offsets_plan()
         command = f"smc run camera-calibration -p {shlex.quote(self.page.profile_argument)} --run-doc cal-<objective>.json"
         note = posix_quoting_note(self._windows)
