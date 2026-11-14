@@ -3908,6 +3908,9 @@ class PlatePageView:
         self.calibration_how_text.object = "\n".join(
             [calibration_how_text(command), *([note] if note else [])]
         )
+        # The card's status decides the line after a run, and the tick that ended the run drew
+        # the line before this redraw: say it now, from the status already read.
+        self._draw_offsets(self._status)
 
     @staticmethod
     def _offsets_result(card: ResultCard | None) -> str:
