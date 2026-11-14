@@ -6335,9 +6335,9 @@ plate was registered with and make `plate` stale (§1.7), so each target's
 calibration comes from a document of its own, loaded by the rule
 `camera-calibration` reuses one with (§4.2, `from_run_doc`).
 
-**Not here**: the plate page (its next step after a registration, the
-objective in place at each step and the turns' confirmation; a follow-up
-issue, after #373); a Z offset (m2 §13.2: the layer applies none; a focused Z
+**Not here**: the plate page (its block after a registration, the objective
+in place at each step and the turns' confirmation: m5 §18, #382, which reads
+the write of §20.7 as a library, §20.11); a Z offset (m2 §13.2: the layer applies none; a focused Z
 needs the operator, which a plugin cannot ask, §5.1, or a declared PFS lock
 of #349); a plate registered by `plate-registration` or `plate-finding` (their
 positions are centred by eye or fitted, not measured centres); turning back to
@@ -6999,6 +6999,63 @@ FM-190, FM-195, FM-203.
 - Whether a turn at the plate's working height (Z about 4195 µm at 10×)
   settles within the turret's wait (m2 §8.11.3); the tool refuses a Z that
   still moves and says so.
+
+### 20.11 The preview and the write, as a library (#382)
+
+`smc objective offset --from-run-doc` (§20.7) keeps its logic in `cli.py`
+(`_offsets_from_run_doc`, `_say_offsets_to_write`), and the plate page (m5 §18)
+needs the same preview and the same write. The logic moves into
+`smc/plugins/objective_offsets/profile_offsets.py`, **unchanged in behaviour**: the
+command's output, its exit codes and every text of §20.7 stay character for
+character what they are, and `tests/test_cli_objective_offsets.py`, untouched,
+proves the move. The command becomes a shell: it loads the profile and the run
+document, calls the two functions, prints `lines` through `_say`, and prints
+`✗` for an `OffsetsWriteError`.
+
+```python
+class OffsetsWriteError(Exception):
+    """str(exc) is the text of a ✗ line, with no prefix."""
+
+
+@dataclass(frozen=True, slots=True)
+class OffsetsPlan:
+    profile: str
+    source: Path
+    section: ObjectivesSection
+    lines: tuple[str, ...]
+    new_reference: bool
+
+
+def plan_offsets(
+    profile: Profile, document: RunDocument, run_doc: Path, *, session: str | None
+) -> OffsetsPlan: ...
+def write_offsets(plan: OffsetsPlan) -> None: ...
+```
+
+- `plan_offsets` is §20.7's steps 1 to 5 for a profile and a document already
+  loaded; it opens no file and no stand. `run_doc` is only the name its texts
+  use (`run_doc.as_posix()` in `in <where>: …`, `run_doc.name` in `measured`:
+  FM-50). A profile with no `source`: `<name> is not loaded from a file: give
+  the path of its .toml to -p` (the command's words; the page checks first and
+  says its own). A `session` with a character below `U+0020`: `OffsetsWriteError`
+  `the session is one line of text: no tab, no line break` (the command's usage
+  error, exit 2, stays in the command and comes first). `lines` is step 5's, in
+  its order, plain (FM-36); `new_reference` is `reference now is blank`.
+- `write_offsets` is step 6's write: the missing `tomli-w` text, `profile_text`,
+  `with_objectives`, `write_atomically(..., make_parents=False)` and the
+  `AtomicWriteError` text with the kept copy, each an `OffsetsWriteError`
+  carrying §20.7's words. It writes nothing when `with_objectives` refuses
+  (`ProfileError` becomes an `OffsetsWriteError` of its text).
+- **Tests**: `tests/unit/test_profile_offsets.py` (new, pure, a record put into a
+  document by `write_stage`, a copy of `profiles/nikon-ti2.toml` in `tmp_path`):
+  `test_the_plan_says_each_target_each_label_the_reference_and_the_text`,
+  `test_the_plan_replaces_a_label_says_what_it_held_and_drops_a_z`,
+  `test_the_plan_refuses_a_reference_changed_since_the_run`,
+  `test_the_plan_refuses_a_result_of_another_profile`,
+  `test_the_plan_refuses_a_session_with_a_line_break`,
+  `test_the_write_replaces_the_block_and_keeps_every_other_byte`,
+  `test_a_write_that_cannot_replace_the_file_says_where_the_new_text_is`.
+  **Failure modes**: FM-36, FM-38, FM-50, FM-98, FM-99, FM-107, FM-156, FM-172.
 
 ## 21. The focus on the cells (#341)
 
