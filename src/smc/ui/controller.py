@@ -4449,11 +4449,17 @@ class PlatePage:
         ``_STAND_READ_LATE_S`` ago or more, that the stand has not answered (D5).
         With nothing stored (an activity that began before the first status) every
         field is unknown, and ``connected`` is whether the page holds a facade (D4):
-        never a direct read, which is what this method exists to avoid. When no read
-        is in flight, the start of the new one is set here, in the same critical
-        section as the check, so that two tabs never start two.
+        never a direct read, which is what this method exists to avoid. A stored
+        read of a stand the page no longer holds, or does not hold yet (the closed
+        read kept before a Connect, the connected one kept before a Disconnect), is
+        no read either: serving it would say ``not connected`` of a page that holds a
+        stand, until the first background read lands. When no read is in flight, the
+        start of the new one is set here, in the same critical section as the check,
+        so that two tabs never start two.
         """
         stored = self._stand_read
+        if stored is not None and stored.connected != (self._microscope is not None):
+            stored = None
         in_flight = self._stand_read_in_flight
         start = in_flight is None
         if start:
@@ -4484,15 +4490,19 @@ class PlatePage:
         return read, start
 
     def _keep_stand_read(self, read: _StandRead) -> None:
-        """Keep ``read`` when it began after the one kept, and forget the text of a read that raised (m3 §15.4 D3).
+        """Keep ``read`` unless it began before the one kept, and forget the text of a read that raised (m3 §15.4 D3).
 
         Both paths store: a background read that began before a direct one and ends
-        after it never replaces it. A read that did not raise clears the text of
-        the one that did. ``_lock`` is taken here and never held across a read.
+        after it never replaces it. Two reads that began at the same clock value
+        keep the one that ends last: ``time.monotonic()`` ticks every 15.6 ms on
+        Windows before Python 3.13 (FM-197), and a tie must never keep the older
+        read of a stage that has moved since. A read that did not raise clears the
+        text of the one that did. ``_lock`` is taken here and never held across a
+        read.
         """
         with self._lock:
             kept = self._stand_read
-            if kept is None or read.began_s > kept.began_s:
+            if kept is None or read.began_s >= kept.began_s:
                 self._stand_read = read
             self._stand_read_error = None
 

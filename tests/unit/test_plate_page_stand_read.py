@@ -22,6 +22,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from importlib.metadata import EntryPoint
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -36,7 +37,7 @@ from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.registry import GROUP
 from smc.testing import FakeCore
-from smc.ui.controller import PlatePage
+from smc.ui.controller import PlatePage, _StandRead
 
 READ_THREAD = "smc-stand-read"
 LATE_TEXT = re.compile(
@@ -283,6 +284,10 @@ def test_one_stand_read_in_flight_whatever_the_number_of_status_calls(
             for _ in range(10):
                 page.status()
             assert len(held.threads) == 1
+            # A daemon, so that a camera that never answers cannot hold the process
+            # at its exit.
+            readers = [t for t in threading.enumerate() if t.name == READ_THREAD]
+            assert [t.daemon for t in readers] == [True]
             held.go.set()
             # Once the read is released the next call starts a second one.
             assert _eventually(
@@ -357,6 +362,9 @@ def test_status_during_an_activity_before_any_read_says_the_stand_is_unknown(
             assert status.connected is True
             assert held.inside.wait(5)
             assert threading.current_thread().name not in held.threads
+            # The read is in flight and has not been going for the bound: nothing is
+            # said yet (D5). A read said late at once would put a line on every strip.
+            assert page.status().problems == ()
         finally:
             held.go.set()
             _end_the_run(page)
@@ -375,7 +383,8 @@ def test_a_stand_read_late_by_the_bound_is_said_in_problems(
     with _replaced(fake_microscope, "state", held):
         _hold_a_run(page)
         try:
-            assert held.inside.wait(5) or page.status() is not None
+            page.status()  # starts the read, which the test then holds
+            assert held.inside.wait(5)
             assert _eventually(told_late)
             held.go.set()
             # The read is stored and the next one is new: nothing is late any more.
@@ -462,3 +471,135 @@ def test_a_disconnect_waits_for_a_background_stand_read(
         del stand.close
         page.close()
         stand.close()
+
+
+def test_the_problems_of_the_stored_read_stay_on_the_strip_during_an_activity(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # A device fault the last read found must not disappear when a scan starts: the
+    # strip is then the only thing in view. Order: the stored read's own problems,
+    # then the text of the background read that raised.
+    real = fake_microscope.state
+    fault = "z: RuntimeError: the focus did not answer"
+    error = "stand read: RuntimeError: the camera did not answer"
+    go = threading.Event()
+    calls: list[int] = []
+
+    def state() -> Any:
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("the camera did not answer")
+        if len(calls) == 3:
+            assert go.wait(10), "the test never let the read go"
+        found = real()
+        found.errors.append(fault)
+        return found
+
+    with _replaced(fake_microscope, "state", state):
+        assert page.status().problems == (fault,)
+        _hold_a_run(page)
+        try:
+            assert page.status().problems == (fault,)
+            assert _eventually(lambda: page.status().problems == (fault, error))
+            go.set()
+            assert _eventually(lambda: page.status().problems == (fault,))
+        finally:
+            go.set()
+            _end_the_run(page)
+        assert _eventually(_no_read_thread_left)
+
+
+def test_a_thread_that_cannot_start_is_a_read_that_raised_and_the_next_status_tries_again(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_start = threading.Thread.start
+    refused: list[str] = []
+
+    def start(self: threading.Thread) -> None:
+        if self.name == READ_THREAD and not refused:
+            refused.append(self.name)
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    _hold_a_run(page)
+    try:
+        assert page.status().problems == ()
+        assert refused == [READ_THREAD]
+        # The failure is said, and the in-flight mark was cleared: this status starts
+        # the read again, and when it lands the strip knows the stand.
+        assert page.status().problems == (
+            "stand read: RuntimeError: can't start new thread",
+        )
+        assert _eventually(lambda: page.status().xy_um is not None)
+        assert _eventually(lambda: page.status().problems == ())
+    finally:
+        _end_the_run(page)
+    assert _eventually(_no_read_thread_left)
+
+
+def test_a_closed_read_kept_before_a_connect_is_not_served_as_the_stand(
+    tmp_path: Path,
+) -> None:
+    # The Connect is an activity, and the activity after it must not say ``not
+    # connected`` of a page that holds a stand, from the read kept before it, until
+    # the first background read lands (adversarial review of #333).
+    stands: list[Microscope] = []
+
+    def opener() -> Microscope:
+        stand = Microscope.from_core(
+            cast("CMMCorePlus", FakeCore.demo_like()), Profile.demo()
+        )
+        stands.append(stand)
+        return stand
+
+    page = PlatePage.closed(
+        Profile.demo(), tmp_path / "run.json", opener=opener, entry_points=ENTRY_POINTS
+    )
+    try:
+        assert page.status().connected is False
+        page.connect()
+        assert page.join(5)
+        assert page.connected
+        _hold_a_run(page)
+        status = page.status()
+        assert status.running == "slow"
+        assert status.connected is True
+        assert status.xy_um is None
+        assert status.autofocus == "?"
+        # And it is the page's stand that the background read finds.
+        assert _eventually(lambda: page.status().xy_um is not None)
+    finally:
+        Slow.release.set()
+        page.close()
+        page.release()
+        for stand in stands:
+            stand.close()
+    assert _eventually(_no_read_thread_left)
+
+
+def test_two_reads_that_began_at_the_same_clock_value_keep_the_one_stored_last(
+    page: PlatePage,
+) -> None:
+    # ``time.monotonic()`` ticks every 15.6 ms on Windows before Python 3.13 (FM-197):
+    # a read that began in the same tick as the one kept, after the stage moved, is
+    # the newer one. One that began before the kept one is not.
+    first = _StandRead(
+        began_s=100.0,
+        connected=True,
+        xy_um=(0.0, 0.0),
+        z_um=0.0,
+        objective=None,
+        autofocus="no autofocus",
+        light_on=None,
+        moving=(),
+        halted=False,
+        problems=(),
+    )
+    same_tick = replace(first, xy_um=(400.0, 300.0))
+    earlier = replace(first, began_s=99.0, xy_um=(-5.0, -5.0))
+    page._keep_stand_read(first)
+    page._keep_stand_read(same_tick)
+    assert page._stand_read is same_tick
+    page._keep_stand_read(earlier)
+    assert page._stand_read is same_tick

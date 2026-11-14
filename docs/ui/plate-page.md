@@ -155,7 +155,7 @@ read failed), the light, `DRY RUN` when it is one, and `HALTED` with **Resume** 
 stand is halted. `?` is an unknown, never a zero. With the stand closed it is
 `<stand> | not connected` and nothing else. It is read once a second, and no
 faster: a scan must not be slowed by a status poll. During a run or Live the strip
-can be about a second old: the page reads no device on the loop that takes the click on
+can be about a second old: the strip's read is not made on the loop that takes the click on
 STOP (a read waits on the camera for as long as a snap, 133 ms median and 464 ms at
 most at the Ti2-E), so a background read refreshes it and the strip shows its latest
 answer ([m3 §15.4](../design/m3-plugins.md)). A stand that has not answered for 10 s is

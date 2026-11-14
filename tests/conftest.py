@@ -24,6 +24,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import threading
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,25 @@ def no_cyclic_gc() -> Iterator[None]:
         yield
     finally:
         gc.enable()
+
+
+@pytest.fixture(autouse=True)
+def no_stand_read_outlives_its_test() -> Iterator[None]:
+    """A background stand read ends before the next test starts (m3 §15.4, #333).
+
+    ``PlatePage.status()`` during an activity starts a daemon thread
+    (``smc-stand-read``) that reads the stand, and a test that ends while it is
+    still reading leaves it to run in the next test, against the core the first
+    test's fixture closed: its ``state: ... read failed`` DEBUG lines then fall
+    inside the window a log-counting test measures, whenever a loaded runner starts
+    the thread late (FM-44). The wait is bounded and the thread is asserted gone, so
+    a read that a test forgot to release is a named error, not a hang.
+    """
+    yield
+    for thread in threading.enumerate():
+        if thread.name == "smc-stand-read":
+            thread.join(10)
+            assert not thread.is_alive(), "a stand read outlived its test"
 
 
 @pytest.fixture

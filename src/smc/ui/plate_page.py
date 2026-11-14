@@ -190,10 +190,12 @@ NAMES_UP_TO_WELLS = 96
 #: How often the page reads the stand and the run, in milliseconds. A scan must not
 #: be slowed by a status poll: ``Microscope.state()`` costs 0.4 ms idle and, while
 #: another thread snaps, 133 ms median and 464 ms at most at the Ti2-E (#334, m3
-#: §15.3). So during an activity the tick reads no device: ``PlatePage.status()``
-#: serves the latest stand read, which a daemon thread refreshes, and the loop that
-#: takes the click on STOP never waits on the camera (m3 §15.4). A click or a button
-#: acts at once through its own handler.
+#: §15.3). So during an activity the tick's ``PlatePage.status()`` reads no device:
+#: it serves the latest stand read, which a daemon thread refreshes, and the status
+#: read no longer holds the loop that takes the click on STOP (m3 §15.4). The tick's
+#: other reads (the turret's labels while none were read, the light's capability) are
+#: not guarded and touch no camera. A click or a button acts at once through its own
+#: handler.
 TICK_MS = 1000
 
 #: How often the page looks for a new frame, in milliseconds. It matches
