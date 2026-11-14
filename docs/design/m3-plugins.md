@@ -4826,7 +4826,9 @@ Python 3.10.10 (what `panel>=1.4` resolves to on each today), macOS,
   it on Bokeh's server loop, the loop that also handles a click on STOP: a
   device read that hangs in a vendor SDK would delay the STOP click, whatever
   the lock (`state()` takes none, FM-16). The first hardware session times the
-  tick on the Ti2-E.
+  tick on the Ti2-E. **Measured since** (Ti2-E session 2, #334): 0.4 ms idle,
+  133 ms median and 464 ms at most while another thread snaps; §15.4 takes the
+  read off the loop while an activity goes.
 
 **The types** (`smc/ui/controller.py`, no Panel import):
 
@@ -5095,10 +5097,10 @@ class PlatePage:
     `test_the_run_button_of_a_stopped_stage_is_disabled_with_the_resume_command`
     (the page), and `reachable_checkpoint`'s own cases in `test_plugin_runner.py`.
 - **`status()`** drains the progress queue (the latest `Progress` is kept, so
-  two sessions see the same) and reads the stand now; the page's periodic
-  callback calls it once a second (`period=1000`) and no faster: a scan must
-  not be slowed by a status poll, and the poll's cost on a real stand is not
-  measured. **`view()`** runs on an event (a click, a typed range, a capture, the
+  two sessions see the same) and reads the stand now, or, while an activity
+  goes, serves the latest stand read and reads the stand off the loop (§15.4);
+  the page's periodic callback calls it once a second (`period=1000`) and no
+  faster: a scan must not be slowed by a status poll. **`view()`** runs on an event (a click, a typed range, a capture, the
   end of a run) and on a *Refresh* button, never on the tick.
 - **`stop()`** sets the run's stop event (a plain attribute read, then
   `Event.set()`; no lock of the controller, FM-70), then `microscope.stop()`,
@@ -5208,6 +5210,126 @@ adds for what this section measured: a server that swallows the operator's
 Ctrl-C, a port taken that no one is told of, a refresh that rebuilds an O(wells)
 structure on every tick, and a view lifetime that is not the work's lifetime
 (a closed tab must not stop a scan).
+
+### 15.4 The tick reads no device while an activity goes (#333)
+
+**Measured** at the Ti2-E, session 2 (#334, `state-cost.json`, Prime 95B at
+10 ms): `Microscope.state()` takes 0.4 ms idle (0.3 to 0.9, n = 30) and
+**133 ms median, 464 ms at most** (130 minimum, n = 25) while another thread
+snaps, a snap taking 166 ms. Each read of the stand alone (XY, Z, the offset,
+the lock, `PFS Status`, busy) takes 0.00 to 0.05 ms. So the cost is a wait, and
+the tick, on the loop that also takes the click on STOP, held that click up to
+half a second during Live or a scan. On a stand whose stages refuse `stop()`
+(#204), STOP keeps the next move from being sent, and that came half a second
+later.
+
+**The cause, not measured**: `state()` reads the camera's exposure, image shape
+and pixel size, and MMCore takes the camera's module lock for each of them, which
+`snapImage` holds for the whole snap (MMCore's source; not measured at the stand).
+The fix below does not rest on it: it keeps every device read off the loop while
+the camera may be busy, whichever read waits.
+
+**Decided** (controller only; `PageStatus`, `plate_page.py` and the facade do not
+change):
+
+- **D1 Read now, or serve the latest read.** `PlatePage.status()` reads the stand
+  on the caller's thread only when no activity goes (`_current_run is None`), as
+  before: the camera is then idle, the read costs 0.4 ms, and the tests that read
+  a change at once keep reading it. While an activity goes (a run, a chain, Live,
+  a snap, a drive action, connect, disconnect), `status()` calls **no device**: the
+  stand's fields are those of the latest stand read, and it starts one read on a
+  daemon thread named `smc-stand-read` when none is in flight. One read is in
+  flight at most, whatever the number of tabs; the run's fields (`running`,
+  `progress`, `outcome`, `stop_note`, `goto`, `clock`, `chain`, `goto_answer`) are
+  read now on every call, as before.
+- **D2 One read, two callers.** The part of `status()` that reads the facade (from
+  `with self._reading() as microscope:` to the stand's fields: `state()`, the
+  light's `is_on()` and `_note_light_read`, the autofocus's words, and the closed
+  stand's fields when `_reading()` gives `None` or a disconnect dropped the facade
+  during the read) becomes `_read_stand(self) -> _StandRead`, which both paths
+  call. The background read is registered through `_reading()` like every read,
+  so a Disconnect waits for it (m5 §7.2, *Reads in flight*). `_StandRead` is a
+  private frozen, slotted dataclass:
+
+  ```python
+  @dataclass(frozen=True, slots=True)
+  class _StandRead:
+      began_s: float
+      connected: bool
+      xy_um: tuple[float, float] | None
+      z_um: float | None
+      objective: str | None
+      autofocus: str
+      light_on: bool | None
+      moving: tuple[str, ...]
+      halted: bool
+      problems: tuple[str, ...]
+  ```
+
+  `began_s` is `time.monotonic()` taken before the read's first device call.
+- **D3 The newer read is kept.** A read is stored (under `_lock`, which is never
+  held across a device call) only when its `began_s` is later than the stored
+  one's; both paths store. A background read that began before a direct one and
+  ends after it never replaces it.
+- **D4 No read yet.** While an activity goes and no read was ever stored (an
+  activity started before the first `status()`: the page's first tick comes before
+  any click), the stand's fields are unknown: `xy_um=None`, `z_um=None`,
+  `objective=None`, `autofocus="?"`, `light_on=None`, `moving=()`, `halted=False`,
+  `problems=()`, and `connected` is whether the page holds a facade
+  (`self._microscope is not None`). Never a direct read in that case.
+- **D5 A read that does not answer is said.** While an activity goes and the read
+  in flight began `_STAND_READ_LATE_S` (10.0 s) ago or more, `problems` gains
+  `the stand has not answered a read for <n:.0f> s; the strip shows its last
+  answer`. 10 s is far above a snap (166 to 198 ms measured) and the exposures M3
+  uses; before #333 a read that hung froze the whole page, and a strip that stays
+  still without a word would be a regression of what the operator sees.
+- **D6 A background read that raises.** The thread catches `Exception` (a facade
+  released under it, m5 §7.2; anything else): nothing is stored, the text
+  `stand read: <Type>: <one line>` is kept as a string (FM-98: never the
+  exception) and added to `problems` of every status served from the store until a
+  read is stored, which clears it. It is logged at WARNING once, the first time it
+  differs from the text kept, and after the text is kept (FM-62). The in-flight
+  flag is cleared in a `finally`, so the next `status()` starts a read again. The
+  direct read raises as before.
+- **D7 STOP and the handlers.** `stop()` touches stages and the autofocus only
+  (`Microscope.stop`), never the camera, and does not change. `on_stop` and every
+  handler keep calling `tick()`, which calls `status()`: while an activity goes
+  that call no longer waits on a device, so a click on STOP waits at most for the
+  drawing of a tick already under way. Between activities a device that hangs
+  still holds the loop, as before (FM-15); that is not this section's case.
+- **D8 What the strip shows during an activity** is at most one tick and one read
+  old (about 1.1 to 1.5 s at the Ti2-E's measured cost). During Live the cross
+  follows the frames anyway (m5 §15 D1).
+
+**Not chosen**: Live's own per-frame `state()` as the source during Live (one path
+serves every activity, and that read has no `light_on`); an async periodic
+callback awaiting a thread (Panel's async callbacks and Bokeh's document lock are
+not measured without a browser, and every handler's `tick()` would still read on
+the loop); a bounded wait for the read (a timing the tests would race, FM-96);
+`Microscope.state()` without its camera reads (the cause is not measured, and any
+other read that waits would still hold the loop).
+
+**Measured on a prototype** of D1 to D4, not committed (`main` 17e6b75, macOS,
+Python 3.13, Panel 1.10.0): the whole default suite passed (8315 passed) and the
+UI modules passed three times in a row under `pytest -n auto`, so no existing
+test reads a stand's change during an activity; a test whose fake's `state()`
+blocks for as long as a held snap runs saw `tick()` then `on_stop()` return at
+once during Live with the prototype, and hang until the snap was released without
+it.
+
+**Tests** (`tests/unit/test_plate_page_stand_read.py`, new):
+`test_stop_during_live_is_not_held_by_a_status_read_that_waits_on_the_snap`,
+`test_status_during_an_activity_calls_no_device_on_the_callers_thread`,
+`test_one_stand_read_in_flight_whatever_the_number_of_status_calls`,
+`test_a_read_that_began_before_a_newer_one_is_not_kept`,
+`test_status_during_an_activity_before_any_read_says_the_stand_is_unknown`,
+`test_a_stand_read_late_by_the_bound_is_said_in_problems`,
+`test_a_background_read_that_raises_is_said_and_the_next_one_clears_it`,
+`test_a_disconnect_waits_for_a_background_stand_read`.
+
+**Failure modes**: FM-16, FM-15, FM-70, FM-98, FM-62, FM-96, FM-44, FM-145,
+FM-148, FM-238, and the entry the develop session adds: *a device read on the loop
+that handles STOP while an activity holds the device it reads*.
 
 ## 16. Sequencing
 
