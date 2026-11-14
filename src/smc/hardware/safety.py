@@ -1238,18 +1238,34 @@ class Executor:
                     timeout_s=timeout_s,
                 )
             k = 1
+            # Up once the last segment's command is being sent: until then a
+            # segment is left unsent, even with ``k == n`` (its INFO line, or a
+            # stop that refuses it before it starts).
+            last_sent = False
+
+            def sending_last() -> None:
+                nonlocal last_sent
+                last_sent = True
+
             try:
                 while True:
-                    landed = self._segment(description, built, k, motion, timeout_s)
+                    landed = self._segment(
+                        description,
+                        built,
+                        k,
+                        motion,
+                        timeout_s,
+                        sending=sending_last if k == n else None,
+                    )
                     if k == n:
                         return landed
                     self._check_landing(description, built, k, motion, landed)
                     k += 1
             except BaseException as exc:
-                # Only once a segment is left unsent: after the last, or with
-                # one segment, the move was sent whole (m2 §11.12 D4). The note
-                # takes no lock and does no I/O (FM-70).
-                if k < n:
+                # Only while a segment is left unsent: once the last is sent, or
+                # with one segment, the move was sent whole (m2 §11.12 D4). The
+                # note takes no lock and does no I/O (FM-70).
+                if not last_sent:
                     note_stop(exc, StopNote(motion.name, StopOutcome.rest_not_sent))
                 raise
 
@@ -1262,15 +1278,28 @@ class Executor:
         k: int,
         motion: Motion,
         timeout_s: float | Callable[[], float],
+        *,
+        sending: Callable[[], None] | None = None,
     ) -> T:
-        """Segment ``k`` of ``plan`` as one nested ``do()``; a stop names the segment (D5)."""
+        """Segment ``k`` of ``plan`` as one nested ``do()``; a stop names the segment (D5).
+
+        ``sending`` is called right before the segment's command is sent, so
+        that the caller knows whether it was left unsent.
+        """
         n = len(plan.targets)
         target = plan.targets[k - 1]
         line = f"{plan.log}, segment {k} of {n} to {_coords(target)} µm"
+        step = plan.step(line, target)
+        if sending is not None:
+            command = step.send
+
+            def send() -> object:
+                sending()
+                return command()
+
+            step = replace(step, send=send)
         try:
-            return self.do(
-                description, plan.step(line, target), motion=motion, timeout_s=timeout_s
-            )
+            return self.do(description, step, motion=motion, timeout_s=timeout_s)
         except MotionStoppedError as exc:
             rest = (
                 f"; the profile cuts a move into segments of at most "

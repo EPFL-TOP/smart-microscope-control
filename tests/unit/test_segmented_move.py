@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Iterator
+import threading
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import cast
 
@@ -47,6 +49,7 @@ from smc.hardware.safety import (
 from smc.testing import FakeCore, FakeDevice
 
 LOGGER = "smc.hardware.microscope"
+JOIN_S = 5.0
 #: The first of three segments of a move from (0, 0) to (2500, 0) at 1000 µm.
 FIRST = 2500.0 / 3
 SECOND = 5000.0 / 3
@@ -244,6 +247,106 @@ def test_a_start_that_is_not_a_number_sends_nothing() -> None:
     )
 
 
+def test_a_segmented_xy_move_still_meets_the_soft_limits() -> None:
+    # Never forceable (CLAUDE.md): the cut must not take the limit off a jog.
+    demo = _segmented_profile()
+    safety = demo.safety.model_copy(
+        update={"xy_soft_limits_um": ((-3000.0, 3000.0), (-3000.0, 3000.0))}
+    )
+    with _stand(demo.model_copy(update={"safety": safety})) as (core, microscope):
+        stage = microscope.require(XYStage)
+        with pytest.raises(SafetyRefusedError, match="outside the soft limits"):
+            stage.move_by_um(4000.0, 0.0, force=True)
+        with pytest.raises(SafetyRefusedError, match="outside the soft limits"):
+            stage.move_to_um(4000.0, 0.0)
+        assert core.log == []
+        assert stage.move_by_um(2500.0, 0.0) == XY(2500.0, 0.0)
+        assert len(_xy_sends(core)) == 3
+
+
+def _queued_behind_a_snap(
+    microscope: Microscope, move: Callable[[], object], moved: Callable[[], None]
+) -> None:
+    """Run ``move`` while a hung snap holds the lock; ``moved()`` while it waits.
+
+    The stage moving meanwhile is what a start read before the lock would miss
+    (FM-43): only a read inside the move's lock section sees it.
+    """
+    executor = microscope._executor
+    entered, release = threading.Event(), threading.Event()
+    failures: list[str] = []
+
+    def hung_snap() -> None:
+        entered.set()
+        release.wait(JOIN_S)
+
+    def run_move() -> None:
+        try:
+            move()
+        except Exception as exc:
+            failures.append(repr(exc))
+
+    holder = threading.Thread(
+        target=lambda: executor.acquire("camera: snap", hung_snap)
+    )
+    holder.start()
+    assert entered.wait(JOIN_S)
+    mover = threading.Thread(target=run_move)
+    mover.start()
+    # Queued: the mover reaches the lock the snap holds, and waits for it.
+    time.sleep(0.2)
+    moved()
+    release.set()
+    holder.join(JOIN_S)
+    mover.join(JOIN_S)
+    assert not mover.is_alive()
+    assert failures == []
+
+
+def test_a_segmented_move_by_reads_its_start_inside_the_lock() -> None:
+    with _stand() as (core, microscope):
+        stage = microscope.require(XYStage)
+
+        def moved() -> None:
+            core._xy["XY"] = (100.0, -40.0)
+
+        _queued_behind_a_snap(microscope, lambda: stage.move_by_um(2500.0, 0.0), moved)
+        assert _xy_sends(core) == [
+            f"setXYPosition('XY', {100.0 + FIRST!r}, -40.0)",
+            f"setXYPosition('XY', {100.0 + SECOND!r}, -40.0)",
+            "setXYPosition('XY', 2600.0, -40.0)",
+        ]
+
+
+def test_a_segmented_move_to_cuts_from_the_start_read_inside_the_lock() -> None:
+    with _stand() as (core, microscope):
+        stage = microscope.require(XYStage)
+
+        def moved() -> None:
+            core._xy["XY"] = (1000.0, 0.0)
+
+        _queued_behind_a_snap(microscope, lambda: stage.move_to_um(2500.0, 0.0), moved)
+        # 1500 µm from where the stage is: two segments, not three from (0, 0).
+        assert _xy_sends(core) == [
+            "setXYPosition('XY', 1750.0, 0.0)",
+            "setXYPosition('XY', 2500.0, 0.0)",
+        ]
+
+
+def test_a_segmented_z_move_to_cuts_from_the_start_read_inside_the_lock() -> None:
+    with _stand() as (core, microscope):
+        z = microscope.require(ZStage)
+
+        def moved() -> None:
+            core._z["Z"] = 100.0
+
+        _queued_behind_a_snap(microscope, lambda: z.move_to_um(250.0), moved)
+        assert [line for line in core.log if line.startswith("setPosition")] == [
+            "setPosition('Z', 175.0)",
+            "setPosition('Z', 250.0)",
+        ]
+
+
 def test_a_stop_during_a_segment_ends_the_move_after_it_and_sends_no_more() -> None:
     with _stand() as (core, microscope):
         stage = microscope.require(XYStage)
@@ -435,6 +538,63 @@ def test_ctrl_c_in_the_last_segment_notes_no_rest() -> None:
     )
 
 
+class _InterruptOn(logging.Handler):
+    """Raise ``KeyboardInterrupt`` from the line holding ``text``: a Ctrl-C as it is written."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(logging.INFO)
+        self.text = text
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self.text in record.getMessage():
+            raise KeyboardInterrupt
+
+
+def test_ctrl_c_before_the_last_segment_is_sent_notes_rest_not_sent() -> None:
+    # The window between the landing check of segment n-1 and the send of the
+    # last: the last segment is unsent, and the line must not say "no move".
+    logger = logging.getLogger(LOGGER)
+    handler = _InterruptOn("segment 3 of 3")
+    level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        with _stand() as (core, microscope):
+            with pytest.raises(KeyboardInterrupt) as interrupted:
+                microscope.require(XYStage).move_to_um(2500.0, 0.0)
+            assert len(_xy_sends(core)) == 2
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(level)
+    assert stop_notes(interrupted.value) == (
+        StopNote("xy_stage XY", StopOutcome.rest_not_sent),
+    )
+
+
+def test_a_stop_that_refuses_the_last_segment_notes_rest_not_sent() -> None:
+    with _stand() as (core, microscope):
+        stage = microscope.require(XYStage)
+        read = core.getXPosition
+
+        def stop_at_the_second_readback(label: str | None = None) -> float:
+            if len(_xy_sends(core)) == 2 and "stop('XY')" not in core.log:
+                with pytest.raises(StopRefusedError):
+                    stage.stop()
+            return read(label)
+
+        core.getXPosition = stop_at_the_second_readback  # type: ignore[method-assign]
+        try:
+            with pytest.raises(MotionStoppedError) as stopped:
+                stage.move_to_um(2500.0, 0.0)
+        finally:
+            del core.getXPosition
+        assert len(_xy_sends(core)) == 2
+    assert stopped.value.detail == "segment 3 of 3: it was stopped before it started"
+    assert stop_notes(stopped.value) == (
+        StopNote("xy_stage XY", StopOutcome.rest_not_sent),
+    )
+
+
 def _landing_off_by(core: FakeCore, segment: int, off_um: float) -> None:
     """Segment ``segment`` stores ``off_um`` short of its target in x: an early return."""
     send = core.setXYPosition
@@ -558,15 +718,80 @@ def test_a_segmented_move_in_dry_run_logs_each_segment_and_sends_nothing(
 # --- Z, without and under an autofocus -------------------------------------------
 
 
-def test_a_long_z_move_without_an_autofocus_is_sent_in_segments() -> None:
+def test_a_long_z_move_without_an_autofocus_is_sent_in_segments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     with _stand() as (core, microscope):
-        landed = microscope.require(ZStage).move_to_um(250.0)
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            landed = microscope.require(ZStage).move_to_um(250.0)
         assert [line for line in core.log if line.startswith("setPosition")] == [
             f"setPosition('Z', {250.0 / 3!r})",
             f"setPosition('Z', {500.0 / 3!r})",
             "setPosition('Z', 250.0)",
         ]
     assert landed == 250.0
+    # A Z point is one number, not a 1-tuple.
+    assert _segment_lines(caplog.messages) == [
+        f"z: move_to 250.0 µm, segment 1 of 3 to {250.0 / 3!r} µm",
+        f"z: move_to 250.0 µm, segment 2 of 3 to {500.0 / 3!r} µm",
+        "z: move_to 250.0 µm, segment 3 of 3 to 250.0 µm",
+    ]
+
+
+def test_a_z_segment_that_does_not_land_says_so_in_single_numbers() -> None:
+    with _stand() as (core, microscope):
+        send = core.setPosition
+
+        def short(label: str, z_um: float) -> None:
+            send(label, z_um)
+            core._z[label] = z_um - 2.0
+
+        core.setPosition = short  # type: ignore[method-assign]
+        try:
+            with pytest.raises(HardwareError) as failed:
+                microscope.require(ZStage).move_to_um(250.0)
+        finally:
+            del core.setPosition
+    assert str(failed.value).startswith(
+        f"`z: move_to 250.0 µm`: segment 1 of 3 read {250.0 / 3 - 2.0!r} µm once "
+        f"its call had returned and z Z read idle, 2 µm from its target "
+        f"{250.0 / 3!r} µm, beyond 1 µm; "
+    )
+    assert "([safety] max_z_segment_um)" in str(failed.value)
+
+
+def test_a_stop_during_a_segmented_z_move_names_its_segment_and_key() -> None:
+    with _stand() as (core, microscope):
+        z = microscope.require(ZStage)
+        send = core.setPosition
+
+        def stopped_on_the_way(label: str, z_um: float) -> None:
+            send(label, z_um)
+            with pytest.raises(StopRefusedError):
+                z.stop()
+
+        core.setPosition = stopped_on_the_way  # type: ignore[method-assign]
+        try:
+            with pytest.raises(MotionStoppedError) as stopped:
+                z.move_to_um(250.0)
+        finally:
+            del core.setPosition
+    assert stopped.value.detail.endswith(
+        "; the profile cuts a move into segments of at most 100 µm ([safety] "
+        "max_z_segment_um), and the segments after it were not sent"
+    )
+
+
+def test_a_z_start_that_is_not_a_number_sends_nothing() -> None:
+    with _stand() as (core, microscope):
+        core._z["Z"] = math.nan
+        with pytest.raises(HardwareError) as failed:
+            microscope.require(ZStage).move_to_um(250.0)
+        assert core.log == []
+    assert str(failed.value).startswith(
+        "z Z read its position as nan µm, not a finite position, so the move cannot "
+        "be cut into segments; nothing was sent."
+    )
 
 
 def test_a_z_move_by_cuts_from_the_position_read_inside_the_move() -> None:

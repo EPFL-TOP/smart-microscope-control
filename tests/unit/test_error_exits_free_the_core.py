@@ -26,6 +26,7 @@ goes in here. Hazards, measured on #148:
 
 from __future__ import annotations
 
+import functools
 import logging
 import socket
 import sys
@@ -1402,4 +1403,109 @@ def test_smc_ui_plate_that_ends_frees_its_core(
     args = ["ui", "plate", "--run-doc", str(tmp_path / "run.json"), "--port", str(port)]
     exit_code, watched = _run_cli(monkeypatch, FakeCore, args)
     assert exit_code == code
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+# --- a move cut into segments (m2 §11.12, #221) ------------------------------------
+
+
+def _segmented_stand() -> tuple[FakeCore, Microscope]:
+    """A fake demo stand refusing its XY and Z stops, cutting at 1000 / 100 µm."""
+    core = FakeCore.demo_like()
+    core.stop_refused = {"XY", "Z"}
+    demo = Profile.demo()
+    safety = demo.safety.model_copy(
+        update={
+            "stop_refused_by": (Role.xy_stage, Role.focus),
+            "max_segment_um": 1000.0,
+            "max_z_segment_um": 100.0,
+        }
+    )
+    profile = demo.model_copy(update={"safety": safety})
+    return core, Microscope.from_core(cast("CMMCorePlus", core), profile)
+
+
+def _stop_in_a_segment(core: FakeCore, microscope: Microscope) -> None:
+    send, stage = core.setXYPosition, microscope.require(XYStage)
+
+    def stopped(label: str, x_um: float, y_um: float) -> None:
+        send(label, x_um, y_um)
+        _outcome(stage.stop)
+
+    core.setXYPosition = stopped  # type: ignore[method-assign]
+
+
+def _halt_in_a_segment(core: FakeCore, microscope: Microscope) -> None:
+    send = core.setXYPosition
+
+    def halted(label: str, x_um: float, y_um: float) -> None:
+        send(label, x_um, y_um)
+        _outcome(microscope.stop)
+
+    core.setXYPosition = halted  # type: ignore[method-assign]
+
+
+def _segment_short_of_its_target(core: FakeCore, microscope: Microscope) -> None:
+    send = core.setXYPosition
+
+    def short(label: str, x_um: float, y_um: float) -> None:
+        send(label, x_um, y_um)
+        core._xy[label] = (x_um / 2, y_um)
+
+    core.setXYPosition = short  # type: ignore[method-assign]
+
+
+def _ctrl_c_in_a_segments_call(core: FakeCore, microscope: Microscope) -> None:
+    send = core.setXYPosition
+
+    def interrupted(label: str, x_um: float, y_um: float) -> None:
+        send(label, x_um, y_um)
+        raise KeyboardInterrupt
+
+    core.setXYPosition = interrupted  # type: ignore[method-assign]
+
+
+def _ctrl_c_between_segments(core: FakeCore, microscope: Microscope) -> None:
+    read = core.getXPosition
+
+    def interrupted(label: str | None = None) -> float:
+        if any(line.startswith("setXYPosition") for line in core.log):
+            raise KeyboardInterrupt
+        return read(label)
+
+    core.getXPosition = interrupted  # type: ignore[method-assign]
+
+
+@pytest.mark.parametrize(
+    ("hook", "kind"),
+    [
+        pytest.param(_stop_in_a_segment, "MotionStoppedError", id="stop"),
+        pytest.param(_halt_in_a_segment, "MotionStoppedError", id="emergency-stop"),
+        pytest.param(_segment_short_of_its_target, "HardwareError", id="landing"),
+        pytest.param(_ctrl_c_in_a_segments_call, "KeyboardInterrupt", id="ctrl-c"),
+        pytest.param(
+            _ctrl_c_between_segments, "KeyboardInterrupt", id="ctrl-c-between"
+        ),
+    ],
+)
+def test_a_segmented_move_that_ends_in_an_error_frees_the_core(
+    no_cyclic_gc: None, hook: Callable[[FakeCore, Microscope], None], kind: str
+) -> None:
+    # `_segment` re-raises a stop's error naming the segment, and `segmented`
+    # notes the rest: neither may keep what it raises in a frame on its own
+    # traceback (FM-98). The hooks are instance attributes, removed with `del`.
+    core, microscope = _segmented_stand()
+    hook(core, microscope)
+    stage = microscope.require(XYStage)
+    try:
+        raised, _ = _outcome(functools.partial(stage.move_to_um, 2500.0, 0.0))
+    finally:
+        for name in ("setXYPosition", "getXPosition"):
+            if name in vars(core):
+                delattr(core, name)
+    assert raised == kind
+    microscope.resume()
+    microscope.close()
+    watched = _watch(microscope, core)
+    del microscope, core, stage
     assert _alive(watched) == _FACADE_AND_CORE_FREED

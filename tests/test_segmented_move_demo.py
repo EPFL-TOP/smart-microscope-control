@@ -41,20 +41,26 @@ def test_a_segmented_move_on_the_demo_stage_lands_at_its_target(
     demo_core: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
     microscope = Microscope.from_core(demo_core, _segmented_demo())
+    xy = microscope.require(XYStage)
+    z = microscope.require(ZStage)
     try:
-        xy = microscope.require(XYStage)
-        z = microscope.require(ZStage)
         start = xy.move_to_um(0.0, 0.0)
         z.move_to_um(0.0)
         with caplog.at_level(logging.INFO, logger=LOGGER):
             landed = xy.move_to_um(start.x_um + 3000.0, start.y_um)
             z_landed = z.move_to_um(250.0)
+        segments = [m for m in caplog.messages if ", segment " in m]
     finally:
-        microscope.close()
+        # The demo camera's frames follow Z across the cores of one process: a
+        # later demo test that snaps must find Z where it starts (#221 review).
+        try:
+            z.move_to_um(0.0)
+            xy.move_to_um(0.0, 0.0)
+        finally:
+            microscope.close()
     assert landed.x_um == pytest.approx(3000.0, abs=0.05)
     assert landed.y_um == pytest.approx(0.0, abs=0.05)
     assert z_landed == pytest.approx(250.0, abs=0.05)
-    segments = [m for m in caplog.messages if ", segment " in m]
     assert [m.split(", segment ")[1].split(" to ")[0] for m in segments] == [
         "1 of 3",
         "2 of 3",

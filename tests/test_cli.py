@@ -992,6 +992,15 @@ def test_say_stop_refused_reads_the_profile_section_and_filters_by_roles(
         "5000 µm ([safety] max_segment_um), so Ctrl-C ends it at the end of the "
         "current segment"
     ]
+    z_cut = cut.model_copy(update={"max_z_segment_um": 100.0})
+    cli._say_stop_refused(z_cut, [Role.focus])
+    assert capsys.readouterr().out.splitlines() == [
+        "! the profile declares that this stand refuses stop() on focus ([safety] "
+        "stop_refused_by): once sent, a move runs to its target, and Ctrl-C ends "
+        "smc, not the move; but a focus move is sent in segments of at most 100 µm "
+        "([safety] max_z_segment_um), so Ctrl-C ends it at the end of the current "
+        "segment"
+    ]
 
 
 def test_the_stop_refused_line_names_the_segments_of_each_role_with_a_key() -> None:
