@@ -80,6 +80,23 @@ and never committed: `demo-sample` served **without** `--dry-run` (a simulated s
 *Live mode* below for the check of the profile) on a scratch run folder, driven by Playwright
 through the Plate, Wells and Scan screens, with PNGs taken while the scan runs (#445).
 
+**The offsets block** (*Measure the offsets between objectives*, m5 §18, #382) is not one of the
+states above and must not appear in them: the script serves `demo-sample` always with `--dry-run`,
+the tool refuses a dry run, and the dry-run page's plate is registered from the sample's centres,
+not from walls, so the block is **hidden** there (the regression to read in `summary.txt`). It is
+checked in a **one-off browser session** of the same kind: a scratch copy of `demo-sample.toml`
+with `[sample]` turned as m3 §20.1 (`rotation_deg`, `camera_rotation_deg`, `mirrored`) and
+`objective_shift_um` set for the 10X, 20X and 40X (m3 §20.8); a scratch run folder holding the
+documents of m5 §18.1 (the 40X's and the 20X's calibration, one document each, and the 10X's
+calibration with `plate-walls` on A1, H12 and A12 in `run.json`, built through `run_plugin`);
+the page served **without** `--dry-run` on that profile and folder, on a free port; and
+Playwright at 1280 x 800 through the Plate screen: the block offered with its lead, the two
+paths typed and the lines under them, the confirmation, the block while it measures (twice, so
+that `Objective in place` shows two turns; at the demo's default 10 mm/s a run takes about a
+minute), the card and the preview, the session typed, the write, the written line and the
+profile file read. One more with a missing path and one with the plate's own document, for the
+waits. The PNGs are cited in the develop session's Report and never committed.
+
 **A chain in motion** (*Run all that are left* with a step running and the others waiting:
 `Running now`, `after <step>`, the chain's line `Running <step> (k of 5).`) is the same kind
 of session, through the Plate, Wells, Scan and Results screens, with PNGs of Results before the
