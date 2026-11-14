@@ -6,7 +6,7 @@
   for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206
   (2026-10-28), §11.11 for #224 (2026-10-30); §12 for #205 (2026-10-28);
   §13 for #340 (2026-11-05); §8.11 D8 and §12.10's amendments for #407
-  (2026-11-10).
+  (2026-11-10); §11.12 for #221 (2026-11-14).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -2855,7 +2855,7 @@ for it.
 Extends M1 §13 (*Stop and halt*), §3.3.1 and §3.11. **Merging this section
 decides it**: §11.2 puts the four questions of #204 with the options not
 chosen and why. #206 (the Ctrl-C line) is built with it, since both change
-the same stop paths. Segmenting a long move is #221.
+the same stop paths. Segmenting a long move is §11.12 (#221).
 
 ### 11.1 What is known
 
@@ -2912,7 +2912,8 @@ it, and a hardware contract checks it at each later session (§11.7).
   the one that matters, is already running, and nothing could be said
   before it.
 
-**D2. Long moves: not segmented for now** (#221). Every message says that
+**D2. Long moves: not segmented for now** (#221; superseded by §11.12,
+which cuts them on a stand whose profile asks for it). Every message says that
 a sent move runs to its target. Only today's guards bound such a move:
 - the jog limits;
 - the soft limits;
@@ -3185,9 +3186,9 @@ about where the move goes, not how it is stopped.
 
 ### 11.10 Not verified
 
-- Whether `deviceBusy("XYStage")` reads True for the whole of a move, and
-  whether `setXYPosition` blocks (#221, session 2). Until then, a Ctrl-C
-  during an XY move on the Ti2-E may arrive only once the move has ended.
+- ~~Whether `deviceBusy("XYStage")` reads True for the whole of a move, and
+  whether `setXYPosition` blocks~~: read at session 2 (#334): the call
+  returns once the move has ended, and busy never reads True (§11.12.1).
 - What `unloadAllDevices()` does to a Ti2-E stage that is still moving.
   Drill 2 suggests no harm, but its console was not kept.
 - B5's "PFS off stops Z at once" rests on one trial.
@@ -3315,6 +3316,251 @@ it prints says what that stop did; a stand may refuse it. Three texts said
 
 **Tests** (`tests/unit/test_refused_stop.py`, `test_errors_and_roles.py`,
 `test_cli.py`): one per decision, each on a `FakeCore`; the plan names them.
+
+### 11.12 A long move cut into segments (#221)
+
+Extends §11.2 D2, which deferred it until the Ti2-E's two reads came back;
+they came back at session 2 (#334). **Merging this section decides it.**
+
+#### 11.12.1 What is known
+
+- **On the Ti2-E, a move call returns once the move has ended** (session 2,
+  #334; `nikon-ti2.md`, *Session 2*), PFS off, the 10×, busy and the position
+  polled every 50 ms after the call returned:
+
+  | move | call returned after | first read | `deviceBusy` True | landing error |
+  |---|---|---|---|---|
+  | XY ±10 mm | 0.591 s, 0.673 s | at target | 0 of 32 reads | 0.1 µm |
+  | XY ±1 mm | 0.248 s, 0.216 s | at target | 0 of 48 | ≤ 0.1 µm |
+  | Z ∓50 µm | 0.232 s, 0.346 s | at target | 0 of 22 | ≤ 0.08 µm |
+
+  A Ctrl-C during the call takes effect when the call returns: pymmcore holds
+  the main thread in it. In the drill, a Ctrl-C 0.5 s into a 20 mm jog let the
+  whole move run. From the XY times, a call costs about 0.19 s plus 0.044 s per
+  mm (two distances, two trials each: a fit, not a law).
+- **The demo stand** (measured 2026-11-14, `open_core(None)`, pymmcore-plus
+  0.18.1): `DXYStage`'s `setXYPosition` returns at once, the stage reads busy
+  until it arrives (0.04-0.40 s for 0.3-3.9 mm), and lands within 0.007 µm of
+  the target; `DStage` (Z) lands exactly and never reads busy. So the demo is
+  the other kind of stand: the call does not block, and busy says when the move
+  ends.
+- **Segments as nested actions** (prototype on a Ti2-E `FakeCore`,
+  2026-11-14, `main` 8b8ac17): three `do()`s inside one `Executor.compound`.
+  A `stop()` sent from inside the first segment's command raised
+  `MotionStoppedError` after it, and the second segment was not sent; so did a
+  `Microscope.stop()`; a `KeyboardInterrupt` raised as the first call returned
+  gave up on the motion (the refused stop was sent, noted `refused`), and the
+  second segment was not sent.
+
+#### 11.12.2 Decisions
+
+**D1. A stand asks for segments in its profile, per axis, on a declared
+role.** `[safety] max_segment_um` cuts an XY move, `[safety]
+max_z_segment_um` a Z move. Each is accepted only when `stop_refused_by`
+names its role (`xy_stage`, `focus`). Omitted (the default), a move is sent
+whole, as today, with no extra read. `profiles/nikon-ti2.toml` sets
+`max_segment_um = 5000.0` and `max_z_segment_um = 100.0`, chosen equal to
+its jog limits: a Ctrl-C, a stop or a halt then lets a move run at most as far
+as a jog may move without `--force`.
+- What it buys. On a declared stand a sent move runs to its target (§11.1).
+  A typo past the jog guard with `--force`, or an absolute move, `smc z move`
+  above all, which no jog guard bounds, then runs at most one segment past a
+  Ctrl-C or a STOP. Z is the axis that crashes on an inverted stand (D2).
+- What it costs, from the fit above: a 9 mm well step goes in two calls,
+  about 0.78 s instead of 0.59 s; a 90 mm traverse in 18, about 7.4 s instead
+  of 4.2 s. A Z move of 3700 µm goes in 37 calls; at 0.23-0.35 s each that is
+  9-13 s, and how long the same move takes in one call was not measured. A
+  scan's field steps are shorter than a segment, and cost nothing.
+- Not chosen: *segments by default*, or on a stand whose stop works. There a
+  stop ends the move at once, and the segments only cost time; the profile
+  refuses the key without the declaration.
+- Not chosen: *one key for both axes*. A sensible XY segment is millimetres,
+  a Z one tens of micrometres.
+- Not chosen: *segmenting the autofocus offset*. With PFS off an offset move
+  moves no Z (§4.5), and with PFS on, switching PFS off stops the Z it drives
+  (§11.9).
+
+**D2. How a move is cut.** Along the straight line from where the stage is
+to the target, in `n = ceil(d / cap)` equal segments, `d` the Euclidean
+distance (XY) or `|dz|` (Z); the last segment's target is the move's own,
+exactly as given, never recomputed. `d ≤ cap` is one segment, sent with the
+same INFO line as a move without the key. The start is read inside the move's
+lock section, as a relative move reads its anchor today (M1 §13), so no other
+caller moves the stage between the read and the first segment.
+
+**D3. A segment has ended when its call has returned, the device reads idle,
+and its readback lies within `SEGMENT_END_TOLERANCE_UM` (1.0 µm, Euclidean) of
+the segment's target.** The first two are the `Executor`'s wait, unchanged
+(`_move`). The third is new, and it is checked before the next segment is sent,
+for every segment but the last (a move without segments has no landing check
+either, and the key must not make one fail).
+- On the Ti2-E all three hold at the first read: the call blocks, busy never
+  reads True, and the readback is the target within 0.1 µm.
+- The readback is the guard against the stand §11.2 D2 feared: a call that
+  returns early with busy reading idle. Its readback would lie on the way, far
+  from the segment's target; the layer then raises and sends nothing more,
+  rather than assume the segment ended (FM-195).
+- 1.0 µm is chosen: ten times the Ti2-E's largest landing error, and more than
+  a stage that holds whole units of 1 µm can miss by (the fake's
+  `hold_whole_units`).
+- Not chosen: *polling the position until it reaches the segment's target*.
+  A stage that stops 2 µm short would then be waited for until the timeout,
+  and on the Ti2-E the first read is already there. *A tolerance key in the
+  profile*: one stand, one measurement; a stand that needs another value
+  makes it a key then.
+
+**D4. Stop, halt and Ctrl-C between segments.** All the segments of a move
+run in one `Executor.compound`, each a nested `do()` with the move's motion and
+the core timeout (each segment has its own deadline). The compound records the
+stop generations and the halt mark when the move is called (m2 §3.7), so:
+
+| What happens | During segment k | Between segment k and k+1 |
+|---|---|---|
+| `stop()` of the stage (CLI, a tool, the page's STOP through `Microscope.stop()`) | the stop is sent and refused; segment k runs to its end; `MotionStoppedError` | segment k+1 is refused before it is sent: `MotionStoppedError` |
+| A halt (`Microscope.stop()`) | as the stop, which it also sends | `MicroscopeHaltedError`, nothing sent |
+| Ctrl-C | arrives when the call returns (Ti2-E); the give-up sends the refused stop and notes `refused` (§11.4); the rest is not sent | no stop is sent; the rest is not sent |
+| The core timeout | per segment, as for one move today | — |
+
+In every row the segments after the current one are not sent, and any
+exception that leaves a segmented move while a segment is left unsent carries
+the note `StopNote(<motion>, StopOutcome.rest_not_sent)` (D5).
+- **Z under an engaged autofocus**: the suspend, every segment, then the relock
+  once, after the last, as §3.4 does for one move; a stop or a Ctrl-C at any
+  segment leaves the autofocus off and says so (FM-88).
+- **The lock** is held for the whole move, as by the Z interlock's compound.
+  During a segment, another caller is refused at once (`MotionInProgressError`);
+  between two segments, for a few milliseconds, it waits for the lock.
+- **Dry-run**: the start is read, and each segment logs its `[dry-run]` line.
+
+**D5. The words.** A sent segment still "runs to its target", the target it
+was sent: the `StopRefusedError` default text, the give-up's text and
+`close()`'s line are unchanged. What changes is what the operator is told
+about the rest of the move:
+- **A stop or a halt during a segmented move** (`n > 1`): the
+  `MotionStoppedError` a segment raised is re-raised, from it, with the detail
+  `segment <k> of <n>: <its detail>`, followed, when `k < n`, by `; the profile
+  cuts a move into segments of at most <cap:g> µm ([safety] <key>), and the
+  segments after it were not sent`.
+- **A segment that did not land** (D3): `HardwareError`, `` `<description>`:
+  segment <k> of <n> read (<x>, <y>) µm once its call had returned and <name>
+  read idle, <d:.3g> µm from its target (<tx>, <ty>) µm, beyond 1 µm; the stand
+  may report a move as ended before it has, so segments cannot bound its moves
+  ([safety] <key>), and the rest of the move was not sent. Read the position
+  before the next move, and report it: <key> may have to go (m2 §11.12) ``. For
+  Z the positions are single numbers.
+- **The Ctrl-C line** (§11.6). `rest_not_sent`'s clause: `the rest of <name>'s
+  move was not sent: the profile cuts it into segments`. When a motion has a
+  `rest_not_sent` note, its `refused` clause ends `so it runs to the end of its
+  current segment` instead of `so it runs to its target`. The tail `let it
+  finish or stop it with the stand's own controls, then …` is written when any
+  note is neither `accepted` nor `rest_not_sent`.
+- **The `!` line before a move** (§11.6) gains, for each named role whose key
+  is set, `; but an <role> move is sent in segments of at most <cap:g> µm
+  ([safety] <key>), so Ctrl-C ends it at the end of the current segment`
+  (`an xy_stage move`, `a focus move`).
+- **The emergency stop** (§11.5): when a refused role has its key set, the
+  `StopRefusedError` text, and the `HardwareError` text's refusal clause, add
+  after `a move under way runs to its target` the clause `; a move cut into
+  segments ([safety] <keys>) ends with its current segment, since the halt
+  refuses the next`.
+
+#### 11.12.3 Profile — `profile.py`, `profiles/`
+
+```toml
+[safety]
+# max_segment_um = 5000.0   # cut an XY move into segments of at most this; only with "xy_stage" in stop_refused_by (m2 §11.12)
+# max_z_segment_um = 100.0  # the same for a Z move; only with "focus" in stop_refused_by (m2 §11.12)
+```
+
+`SafetySection` gains `max_segment_um: float | None = None` and
+`max_z_segment_um: float | None = None`. Each, when set, is not a boolean
+(`_no_boolean`), finite and `> 0`; a `ProfileError` names the key. A model
+validator refuses a key whose role `stop_refused_by` does not name:
+`max_segment_um cuts a move on a stand that refuses its stop, but
+stop_refused_by does not name xy_stage, so a stop already ends its moves:
+remove max_segment_um, or declare the refusal the stand showed` (and the same
+with `max_z_segment_um` and `focus`). The demo declares neither, and the two
+commented lines go into `demo.toml`; `Profile.demo()` and `demo.toml` stay
+equal. `profiles/README.md` documents both keys.
+
+#### 11.12.4 Safety and the Executor — `safety.py`
+
+```python
+#: How far a segment's readback may lie from its target before the next
+#: segment is sent (m2 §11.12 D3). Chosen: ten times the Ti2-E's largest
+#: landing error (0.1 µm XY, 0.08 µm Z, session 2, #334).
+SEGMENT_END_TOLERANCE_UM = 1.0
+
+
+def segment_targets_um(
+    start: tuple[float, ...], target: tuple[float, ...], max_segment_um: float
+) -> tuple[tuple[float, ...], ...]:
+    """The end of each segment of a straight move, the last being ``target`` itself (D2)."""
+
+
+@dataclass(frozen=True)
+class SegmentPlan(Generic[T]):
+    """A move cut into segments, built inside the move's lock section (m2 §11.12)."""
+
+    log: str  # the move's INFO line, as a Step's: used alone when n == 1
+    targets: tuple[tuple[float, ...], ...]  # from segment_targets_um
+    # One segment's Step, from its INFO line and its target.
+    step: Callable[[str, tuple[float, ...]], Step[T]]
+    position: Callable[[T], tuple[float, ...]]  # a readback as coordinates (D3)
+    key: str  # "max_segment_um" or "max_z_segment_um", for the messages
+    max_segment_um: float
+```
+
+- `Safety(..., max_segment_um: float | None = None, max_z_segment_um: float |
+  None = None)`: each finite and `> 0` or `ValueError`, and a `ValueError` when
+  its role is not in `stop_refused_by`, as the profile validates (code that
+  builds a `Safety` directly gets the same rule). Attributes of the same names.
+- `Executor.segmented(description: str, plan: Callable[[], SegmentPlan[T]], *,
+  motion: Motion, timeout_s: float | Callable[[], float]) -> T`: runs as one
+  `compound(description, …)`; inside it, builds the plan, then, for `n == 1`,
+  one nested `do(description, plan.step(plan.log, target), motion=…,
+  timeout_s=…)`; for `n > 1`, segment `k` is `do(description, plan.step(f"{log},
+  segment {k} of {n} to {target} µm", target_k), …)`, the landing check of D3
+  after each but the last, and the messages and the note of D4-D5. A compound
+  nested in another (the Z interlock's) keeps the outer one's record, so a
+  stop since the outer call cancels a segment too.
+
+#### 11.12.5 Backends — `backends/mm.py`
+
+- **`MMXYStage`.** With `safety.max_segment_um` unset, `move_to_um` and
+  `move_by_um` are unchanged. With it set, both call `executor.segmented`. The
+  plan reads the position (`_read_position`), takes the target (`move_to_um`'s
+  own, or the position plus the offset for `move_by_um`, checked against the
+  soft limits there, as today), and cuts with `segment_targets_um`.
+  `move_by_um`'s jog guard runs on the whole offset before anything, as today.
+- **`MMZStage`.** The same with `safety.max_z_segment_um`. Under an autofocus,
+  the plan is built where the `Step` is built today, before the suspend, so a
+  target the soft limits refuse never touches the autofocus; then
+  `executor.segmented` takes the place of the one `_move` between the suspend
+  and the relock, inside `_interlocked`'s compound. The relock gets the last
+  segment's readback.
+
+#### 11.12.6 Notes and the CLI — `errors.py`, `microscope.py`, `cli.py`
+
+- `StopOutcome.rest_not_sent = "rest_not_sent"`: a segmented move, the
+  segments after the current one not sent (D4). `_note_clause` gets its branch
+  (and the twin test its member); `_interrupted_line` passes each note whether
+  its motion also has a `rest_not_sent` note, for the `refused` clause of D5.
+- `_stop_refused_line(roles, segments_um: Mapping[Role, float] = {})` and
+  `_say_stop_refused` read the two keys from the safety section.
+- `Microscope.stop()` adds D5's clause from `self.profile.safety`.
+
+#### 11.12.7 Not verified
+
+- A segmented move on the Ti2-E: the owner runs it at the next visit (#198):
+  `smc stage jog 12000 0 --force` lands in three calls of 4000 µm (the log
+  shows three `segment k of 3` lines); a Ctrl-C during the first stops after
+  it, and the Ctrl-C line says the rest was not sent; the same with an `smc z
+  move` to a target 250 µm away from the sample (three segments of at most
+  100 µm).
+- The time a long Z move takes in one call on the Ti2-E, against segments.
+- Whether the 1.0 µm of D3 holds at the 40× and with a plate: session 2 read
+  it at the 10× with no sample.
 
 ## 12. Engaging an autofocus that drives Z to its offset's plane (#205)
 
