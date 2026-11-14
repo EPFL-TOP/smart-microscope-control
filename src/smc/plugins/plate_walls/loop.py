@@ -26,8 +26,13 @@ from pathlib import Path
 import numpy as np
 import numpy.typing as npt
 
-from smc.hardware.capabilities import XY, Camera, XYStage
-from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.capabilities import XY, Autofocus, Camera, XYStage
+from smc.hardware.errors import (
+    HardwareError,
+    MicroscopeHaltedError,
+    MotionStoppedError,
+    SafetyRefusedError,
+)
 from smc.plugins.api import RunContext
 from smc.plugins.errors import PluginRunError
 from smc.plugins.geometry import Matrix2, fov_of
@@ -54,6 +59,7 @@ from smc.plugins.slots import (
 from smc.run.files import write_atomically
 
 __all__ = [
+    "AUTOFOCUS_OFF_LINE",
     "WallWalk",
     "Where",
     "check_calibration",
@@ -63,6 +69,7 @@ __all__ = [
     "checked_search",
     "measure_well",
     "move",
+    "switch_off_autofocus",
     "warn_left",
 ]
 
@@ -73,6 +80,13 @@ _NO_OBJECTIVE = "an unknown objective"
 _NO_LIMITS_LINE = (
     "the stage reports no soft limits, so the frames' moves were not checked "
     "against any travel"
+)
+#: The first ``assumed`` line of a run that switched the autofocus off (m3 §5.7
+#: D1), first so that the page's strip shows it. The record is where it is kept:
+#: ``plate`` is read by every later tool, so it gets no field of its own.
+AUTOFOCUS_OFF_LINE = (
+    "the autofocus was switched off before anything moved, so that no lock crossed "
+    "a well's wall: engage it again on the sample"
 )
 
 
@@ -256,6 +270,79 @@ def check_soft_limits(
                         f"({x + 0.0:.1f}, {y + 0.0:.1f}) µm, outside the stage's soft limits",
                     )
     return []
+
+
+def switch_off_autofocus(
+    stage: str, autofocus: Autofocus | None, ctx: RunContext
+) -> bool:
+    """Switch an engaged autofocus off and read it back, once, before anything moves; whether this switched it off (m3 §5.7 D1).
+
+    A walk moves the stage from well to well, and PFS locked in one well follows
+    its reference over the wall into the next, whose plane lies at least 104 µm
+    away at the 40x (F11), with no action holding the microscope and no guard
+    (m2 §12.2 D2, FM-223). Switched off once here, every wall and every well of
+    the run is walked with PFS off and Z where PFS held it. Nothing engages it
+    again (FM-88): a lock in a new well at the 40x is the operator's first lock
+    from below, which a tool cannot ask for. ``is_engaged()`` decides, not
+    ``is_locked()``: PFS on and searching drives Z the moment it finds its
+    reference. One that is off is left off, and nothing is said. No branch for a
+    dry run: both tools refuse one before they get here.
+
+    Called after every refusal that can happen before the first move and after
+    the stop check, outside the ``try`` that says where the stage was left:
+    nothing has moved, and a refusal later would have switched PFS off for a run
+    that never moves.
+
+    Args:
+        stage: The plugin whose run it is, for the texts.
+        autofocus: The stand's autofocus, ``None`` when it has none.
+        ctx: For the logger.
+
+    Raises:
+        PluginRunError: A read or the switch-off raised, or it still reads on:
+            PFS may be on, so nothing may move (FM-19). Raised outside the
+            handler, with the error's text only (FM-98).
+        MicroscopeHaltedError, MotionStoppedError: Passed first (FM-64). On a
+            halted stand the switch-off is made and the first move raises.
+    """
+    if autofocus is None:
+        return False
+    cause: str | None = None
+    still_on = False
+    try:
+        if not autofocus.is_engaged():
+            return False
+        autofocus.disengage()
+        still_on = autofocus.is_engaged()
+    except (MicroscopeHaltedError, MotionStoppedError):
+        raise
+    except HardwareError as exc:
+        cause = _one_line(exc)
+    if cause is not None:
+        raise PluginRunError(
+            stage,
+            f"the autofocus could not be switched off before anything moved "
+            f"({cause}): nothing moved, and PFS may still be on: switch it off at "
+            f"the stand, then run {stage} again",
+        )
+    if still_on:
+        raise PluginRunError(
+            stage,
+            "the autofocus still reads on after it was switched off: nothing "
+            f"moved: switch it off at the stand, then run {stage} again",
+        )
+    ctx.logger.warning(
+        "%s: the autofocus was switched off before anything moved, so that no lock "
+        "crosses a well's wall (m2 §12.2 D2): engage it again after the run",
+        stage,
+    )
+    return True
+
+
+def _one_line(exc: BaseException) -> str:
+    """``<Type>: <first line of the message>``: a device's error, for the run's text."""
+    lines = str(exc).splitlines()
+    return f"{type(exc).__name__}: {lines[0] if lines else ''}".rstrip()
 
 
 def move(

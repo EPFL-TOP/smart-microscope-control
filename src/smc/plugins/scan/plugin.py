@@ -43,7 +43,12 @@ keep a night's scan from producing frames nobody can trust:
 * **The autofocus is used only as the operator left it.** One the operator
   left off is never engaged, and one that is on must have locked on this
   sample: engaging drives Z to the plane of whatever offset is stored (#205),
-  which only a lock on this sample shows is the operator's.
+  which only a lock on this sample shows is the operator's. ``autofocus=off``
+  never uses it either, and refuses one that is on, searching or unreadable
+  before anything moves, in a dry run too (m3 §5.7 D2): a lock left on would
+  carry over every well's wall with no guard (m2 §12.2 D2, FM-223), and the
+  scan does not switch it off for an operator who may have meant
+  ``if-engaged``. That one read is all ``off`` makes of it.
 * **Nothing moves to put something back** (FM-88): no Z move, no turret turn,
   no return to a start position, no ``finally`` that moves.
 """
@@ -160,8 +165,9 @@ class ScanParams(PluginParams):
         "if-engaged",
         description=(
             "if-engaged: use it when it is on and locked; required: refuse to "
-            "start unless it is; off: never touch it. It is never switched on "
-            "by the scan."
+            "start unless it is; off: never used, and refused when it is on (a "
+            "lock would cross every well's wall). It is never switched on by "
+            "the scan."
         ),
     )
     max_failed_in_row: int = Field(
@@ -557,17 +563,6 @@ class ScanPlugin:
                 params.focus_range_um,
                 params.focus_step_um,
             )
-            if params.autofocus == "off" and af is not None and af.is_engaged():
-                # The sweep's Z moves go through the layer's interlock, which
-                # switches an engaged autofocus off and leaves it off: with
-                # autofocus=off nothing would say so, or lock it again. The
-                # one read of an autofocus that "off" otherwise never reads.
-                raise PluginRunError(
-                    _NAME,
-                    "cell_focus moves Z, which switches the autofocus off, and it "
-                    "is on: run with autofocus=if-engaged to use it, or switch it "
-                    "off first",
-                )
         # The autofocus the focus step switches off: the one the scan uses.
         focus_af = af if stand.used else None
         unused_af_line: str | None = None
@@ -1184,13 +1179,27 @@ def _check_autofocus(
 ) -> tuple[Autofocus | None, bool]:
     """The autofocus and whether the scan uses it; refused when it cannot be used as asked.
 
-    ``off`` reads nothing from it. Otherwise it is used only when it is on and
+    ``off`` never uses it, and reads **one thing**: whether it is on, and an
+    autofocus that is on is refused (m3 §5.7 D2). A lock the operator left on
+    would follow its reference over every well's wall with no guard (m2 §12.2 D2,
+    FM-223), which ``off``'s promise not to touch it does nothing about. The scan
+    does not switch it off for the operator: ``off`` is what they asked, and they
+    may have meant ``if-engaged``. A state that cannot be read counts as on
+    (FM-19). Searching counts as on: ``is_engaged()``, not ``is_locked()``. Same
+    in a dry run, which only reads. Otherwise it is used only when it is on and
     locked now: engaging it would drive Z to the plane of whatever offset is
     stored, and only a lock on this sample shows that offset is the
     operator's (#205).
+
+    Raises:
+        PluginRunError: ``off`` and the autofocus is on or cannot be read; or
+            ``required`` and it is not locked; or on and not locked.
+        MicroscopeHaltedError, MotionStoppedError: Passed (FM-64).
     """
     af = microscope.get(Autofocus)
     if params.autofocus == "off":
+        if af is not None:
+            _refuse_autofocus_on(af)
         return af, False
     engaged = af is not None and af.is_engaged()
     locked = engaged and af is not None and af.is_locked()
@@ -1208,6 +1217,39 @@ def _check_autofocus(
             "it off and run with autofocus=off",
         )
     return af, locked
+
+
+def _refuse_autofocus_on(af: Autofocus) -> None:
+    """Refuse ``autofocus=off`` while the autofocus is on or its state cannot be read (m3 §5.7 D2).
+
+    Raises:
+        PluginRunError: It reads on (locked or searching), or the read raised:
+            PFS may be on (FM-19). Raised outside the handler, with the error's
+            text only (FM-98).
+        MicroscopeHaltedError, MotionStoppedError: Passed (FM-64).
+    """
+    cause: str | None = None
+    on = False
+    try:
+        on = af.is_engaged()
+    except (MicroscopeHaltedError, MotionStoppedError):
+        raise
+    except HardwareError as exc:
+        cause = _one_line(exc)
+    if cause is not None:
+        raise PluginRunError(
+            _NAME,
+            f"autofocus=off, and whether the autofocus is on could not be read "
+            f"({cause}): a lock would cross every well's wall: switch it off at the "
+            "stand, then run the scan again",
+        )
+    if on:
+        raise PluginRunError(
+            _NAME,
+            "autofocus=off, and the autofocus is on: the scan would carry its lock "
+            "over every well's wall with no guard (m2 §12.2 D2): run with "
+            "autofocus=if-engaged to use it, or switch it off first",
+        )
 
 
 def _switch_off_at_wall(af: Autofocus, well: str) -> bool:

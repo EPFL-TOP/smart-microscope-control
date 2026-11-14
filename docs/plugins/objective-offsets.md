@@ -98,6 +98,19 @@ and frame; the profile's reference (if it names one, it must be the plate's obje
 a target); and each target's walk (its size and the stage's soft limits). A refusal at
 this point turns and moves nothing.
 
+**It switches the PFS off before anything turns or moves, and leaves it off.** After
+those checks and a stop check, an autofocus that is on (or still searching) is switched
+off once and read back off, with `plate-walls`' own function: a lock taken in one well
+follows its reference over the wall into the next. The turret switches it off before a
+turn too, but not when it already reads the first target (the 40× left in place by a
+calibration, say), and then the first move to a wall would be made with the PFS engaged.
+Nothing engages it again: lock it yourself on the sample afterwards. One that is already
+off is left alone. If the switch-off fails, or the PFS still reads on after it, the run
+ends before anything turns or moves: `the autofocus could not be switched off before
+anything moved (<error>): nothing moved, and PFS may still be on: switch it off at the
+stand, then run objective-offsets again`, or `the autofocus still reads on after it was
+switched off: nothing moved: …`.
+
 Then, for each target in order:
 
 1. **The turn**, with the layer's own confirmation. The turret must **read the target
@@ -132,7 +145,8 @@ profile cannot key (FM-103); that Z after a turn is where the stand left it, not
 Z; that the plate has not moved since `plate-walls` registered it (a plate that moved as a
 whole is taken for an offset between objectives, and the wells agreeing does not show
 otherwise); and, when the profile names no reference, that `--write` makes the plate's
-objective the reference.
+objective the reference. When the PFS was on, **the first line** says it was switched off
+before anything moved (a WARNING says it too).
 
 **Frames.** With `save_frames` the centred frame of each wall is a TIFF under
 `objective-offsets/<token>/<n>/<well>_<side>.tif` beside the run document, `n` the target's
