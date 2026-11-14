@@ -69,12 +69,16 @@ from smc.hardware.errors import (
 __all__ = [
     "DEFAULT_MAX_Z_JOG_UM",
     "POLL_INTERVAL_S",
+    "SEGMENT_END_TOLERANCE_UM",
     "Executor",
     "Motion",
     "SafeCall",
     "Safety",
+    "SegmentPlan",
     "Step",
     "StopLink",
+    "segment_targets_um",
+    "segment_without_refusal",
 ]
 
 T = TypeVar("T")
@@ -83,6 +87,59 @@ T = TypeVar("T")
 #: measurement: no travel range or objective tells a sensible focus jog, so
 #: the guard says whenever it shows that the number is assumed (design §12).
 DEFAULT_MAX_Z_JOG_UM = 100.0
+
+#: How far a segment's readback may lie from its target before the next
+#: segment is sent (m2 §11.12 D3). Chosen: ten times the Ti2-E's largest
+#: landing error (0.1 µm XY, 0.08 µm Z, session 2, #334).
+SEGMENT_END_TOLERANCE_UM = 1.0
+
+
+def segment_without_refusal(key: str, role: str) -> str:
+    """Why a segment key is refused without its role's declared refusal (m2 §11.12.3).
+
+    One text for the profile's validator and for ``Safety``, which code may
+    build directly.
+    """
+    return (
+        f"{key} cuts a move on a stand that refuses its stop, but stop_refused_by "
+        f"does not name {role}, so a stop already ends its moves: remove {key}, or "
+        f"declare the refusal the stand showed"
+    )
+
+
+def segment_targets_um(
+    start: tuple[float, ...], target: tuple[float, ...], max_segment_um: float
+) -> tuple[tuple[float, ...], ...]:
+    """The end of each segment of a straight move, the last being ``target`` itself (D2).
+
+    ``n = ceil(d / max_segment_um)`` equal segments along the line, ``d`` the
+    Euclidean distance (``|dz|`` for one coordinate). The last end is the
+    move's own target as given, never recomputed: ``start + (target - start)``
+    in floating point may miss it by a rounding, and the move must land where
+    it was asked to.
+
+    Raises:
+        ValueError: The two points differ in length, a coordinate is not
+            finite, or ``max_segment_um`` is not finite and > 0.
+    """
+    if len(start) != len(target):
+        raise ValueError(
+            f"start {start!r} and target {target!r} have different dimensions"
+        )
+    if not all(math.isfinite(value) for value in (*start, *target)):
+        raise ValueError(
+            f"a move is cut only between finite points, got {start!r} -> {target!r}"
+        )
+    if not math.isfinite(max_segment_um) or max_segment_um <= 0:
+        raise ValueError(
+            f"max_segment_um must be finite and > 0, got {max_segment_um!r}"
+        )
+    n = max(1, math.ceil(math.dist(start, target) / max_segment_um))
+    ends = [
+        tuple(a + (b - a) * k / n for a, b in zip(start, target, strict=True))
+        for k in range(1, n)
+    ]
+    return (*ends, tuple(target))
 
 
 def _check_range(name: str, bounds: tuple[float, float]) -> tuple[float, float]:
@@ -114,10 +171,30 @@ class Safety:
         max_engage_excursion_um: float | None = None,
         z_away_from_sample: Literal["decreasing", "increasing"] | None = None,
         first_lock_max_rise_um: float | None = None,
+        max_segment_um: float | None = None,
+        max_z_segment_um: float | None = None,
     ) -> None:
         #: The roles' values whose device refuses ``stop()`` (``"xy_stage"``):
         #: the backends set ``Motion.stop_refused`` from it (m2 §11.3).
         self.stop_refused_by = frozenset(stop_refused_by)
+        # As the profile validates them, for code that builds this (m2 §11.12.4).
+        for key, cap, role in (
+            ("max_segment_um", max_segment_um, "xy_stage"),
+            ("max_z_segment_um", max_z_segment_um, "focus"),
+        ):
+            if cap is None:
+                continue
+            if isinstance(cap, bool) or not math.isfinite(cap) or cap <= 0:
+                raise ValueError(f"{key} must be finite and > 0, got {cap!r}")
+            if role not in self.stop_refused_by:
+                raise ValueError(segment_without_refusal(key, role))
+        #: Cut an XY move into segments of at most this; ``None``: sent whole
+        #: (m2 §11.12 D1).
+        self.max_segment_um = None if max_segment_um is None else float(max_segment_um)
+        #: The same for a Z move.
+        self.max_z_segment_um = (
+            None if max_z_segment_um is None else float(max_z_segment_um)
+        )
         # As the profile validates it, for code that builds this: any other
         # value would read as "unknown" and silently refuse every first lock,
         # or worse, as a direction (m2 §12.10.4).
@@ -414,6 +491,30 @@ class Step(Generic[T]):
     send: Callable[[], object]
     readback: Callable[[], T]
     dry_result: T  # returned in dry-run instead of sending
+
+
+@dataclass(frozen=True)
+class SegmentPlan(Generic[T]):
+    """A move cut into segments, built inside the move's lock section (m2 §11.12).
+
+    Built there, as a relative move's ``Step`` is, so that the start it is cut
+    from is where the stage is when the first segment is sent (D2).
+    """
+
+    log: str  # the move's INFO line, as a Step's: used alone when n == 1
+    targets: tuple[tuple[float, ...], ...]  # from segment_targets_um
+    # One segment's Step, from its INFO line and its target.
+    step: Callable[[str, tuple[float, ...]], Step[T]]
+    position: Callable[[T], tuple[float, ...]]  # a readback as coordinates (D3)
+    key: str  # "max_segment_um" or "max_z_segment_um", for the messages
+    max_segment_um: float
+
+
+def _coords(point: tuple[float, ...]) -> str:
+    """A point as the move lines write it: ``12.0`` for Z, ``(1.0, 2.0)`` for XY."""
+    if len(point) == 1:
+        return str(point[0])
+    return f"({', '.join(str(value) for value in point)})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1084,6 +1185,166 @@ class Executor:
                 self._leave_compound(previous)
 
         return self._exclusive(description, run_inside, called.halt_mark)
+
+    def segmented(
+        self,
+        description: str,
+        plan: Callable[[], SegmentPlan[T]],
+        *,
+        motion: Motion,
+        timeout_s: float | Callable[[], float],
+    ) -> T:
+        """A move sent in segments, on a stand whose stop the device refuses (m2 §11.12).
+
+        On such a stand a sent move runs to its target (m2 §11.1), so a long
+        one is cut: each segment is a nested ``do()`` of one ``compound``, and a
+        stop, a halt or a Ctrl-C leaves the segments after the current one
+        unsent (D4). The compound records the stop generations and the halt
+        mark when it is called, so a stop at any time since cancels the next
+        segment before it is sent; nested in another compound (the Z
+        interlock's), it keeps the outer one's record.
+
+        ``plan`` is built inside the lock section, so the start it reads is
+        where the stage is when the first segment goes (D2). One segment is
+        one ``do()`` with the plan's own line, as a move without segments. With
+        more, each segment's readback must lie within
+        ``SEGMENT_END_TOLERANCE_UM`` of its target before the next is sent
+        (D3): the call returning and the device reading idle do not prove that
+        a move has ended on every stand (FM-195). The last segment has no such
+        check, as a move without segments has none.
+
+        Every exception that leaves while a segment is unsent carries the note
+        ``rest_not_sent`` (D4): the Ctrl-C line then says that the rest of the
+        move was not sent. Nothing here sends a stop: a segment's own ``_move``
+        gave up on it, once, if it had to (FM-70, FM-168).
+
+        Raises:
+            MotionStoppedError: A stop or a halt during a segment; with more
+                than one, its detail names the segment and whether the rest
+                was sent (D5).
+            HardwareError: A segment did not land within the tolerance; the
+                rest was not sent.
+            Exception: Whatever a segment's ``do()`` raises, as for one move.
+        """
+
+        def run() -> T:
+            built = plan()
+            n = len(built.targets)
+            if n == 1:
+                return self.do(
+                    description,
+                    built.step(built.log, built.targets[0]),
+                    motion=motion,
+                    timeout_s=timeout_s,
+                )
+            k = 1
+            # Up once the last segment's command is being sent: until then a
+            # segment is left unsent, even with ``k == n`` (its INFO line, or a
+            # stop that refuses it before it starts).
+            last_sent = False
+
+            def sending_last() -> None:
+                nonlocal last_sent
+                last_sent = True
+
+            try:
+                while True:
+                    landed = self._segment(
+                        description,
+                        built,
+                        k,
+                        motion,
+                        timeout_s,
+                        sending=sending_last if k == n else None,
+                    )
+                    if k == n:
+                        return landed
+                    self._check_landing(description, built, k, motion, landed)
+                    k += 1
+            except BaseException as exc:
+                # Only while a segment is left unsent: once the last is sent, or
+                # with one segment, the move was sent whole (m2 §11.12 D4). The
+                # note takes no lock and does no I/O (FM-70).
+                if not last_sent:
+                    note_stop(exc, StopNote(motion.name, StopOutcome.rest_not_sent))
+                raise
+
+        return self.compound(description, run)
+
+    def _segment(
+        self,
+        description: str,
+        plan: SegmentPlan[T],
+        k: int,
+        motion: Motion,
+        timeout_s: float | Callable[[], float],
+        *,
+        sending: Callable[[], None] | None = None,
+    ) -> T:
+        """Segment ``k`` of ``plan`` as one nested ``do()``; a stop names the segment (D5).
+
+        ``sending`` is called right before the segment's command is sent, so
+        that the caller knows whether it was left unsent.
+        """
+        n = len(plan.targets)
+        target = plan.targets[k - 1]
+        line = f"{plan.log}, segment {k} of {n} to {_coords(target)} µm"
+        step = plan.step(line, target)
+        if sending is not None:
+            command = step.send
+
+            def send() -> object:
+                sending()
+                return command()
+
+            step = replace(step, send=send)
+        try:
+            return self.do(description, step, motion=motion, timeout_s=timeout_s)
+        except MotionStoppedError as exc:
+            rest = (
+                f"; the profile cuts a move into segments of at most "
+                f"{plan.max_segment_um:g} µm ([safety] {plan.key}), and the "
+                f"segments after it were not sent"
+                if k < n
+                else ""
+            )
+            # No local holds the new error: `exc` is cleared as the clause ends,
+            # so no frame on its traceback keeps it (FM-98).
+            raise MotionStoppedError(
+                exc.device, f"segment {k} of {n}: {exc.detail}{rest}"
+            ) from exc
+
+    def _check_landing(
+        self,
+        description: str,
+        plan: SegmentPlan[T],
+        k: int,
+        motion: Motion,
+        landed: T,
+    ) -> None:
+        """Refuse to go on when segment ``k``'s readback is not at its target (D3).
+
+        A stand whose call returns early with the device reading idle would
+        otherwise have its next segment sent during the previous one, and a
+        stop would bound nothing (FM-195). A readback that is not a number
+        fails the check too: ``nan`` compares false against every bound.
+        """
+        n = len(plan.targets)
+        target = plan.targets[k - 1]
+        read = plan.position(landed)
+        distance = math.dist(read, target)
+        if distance <= SEGMENT_END_TOLERANCE_UM:
+            return
+        raise HardwareError(
+            f"`{description}`: segment {k} of {n} read {_coords(read)} µm once its "
+            f"call had returned and {motion.name} read idle, {distance:.3g} µm from "
+            f"its target {_coords(target)} µm, beyond "
+            f"{SEGMENT_END_TOLERANCE_UM:g} µm; the stand may report a move as ended "
+            f"before it has, so segments cannot bound its moves ([safety] "
+            f"{plan.key}), and the rest of the move was not sent. Read the position "
+            f"before the next move, and report it: {plan.key} may have to go (m2 "
+            f"§11.12)"
+        )
 
     def refuse_if_stopped(self, device: str, cancelled: HardwareError) -> None:
         """Inside a compound: refuse what comes next if ``device`` was stopped since it was called.

@@ -92,7 +92,15 @@ from smc.hardware.errors import (
     SafetyRefusedError,
 )
 from smc.hardware.roles import Role, device_type_name
-from smc.hardware.safety import POLL_INTERVAL_S, Motion, SafeCall, Step, StopLink
+from smc.hardware.safety import (
+    POLL_INTERVAL_S,
+    Motion,
+    SafeCall,
+    SegmentPlan,
+    Step,
+    StopLink,
+    segment_targets_um,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -283,6 +291,24 @@ def _core_timeout(core: CMMCorePlus) -> Callable[[], float]:
     return lambda: core.getTimeoutMs() / 1000.0
 
 
+def _finite_start(name: str, start: tuple[float, ...]) -> tuple[float, ...]:
+    """The position a move is cut from, or a ``HardwareError`` before anything is sent.
+
+    A stage that reads ``nan`` gives no line to cut along, and a guess would
+    send segments nobody planned (m2 §11.12 D2: the start is read, never
+    assumed).
+    """
+    if not all(math.isfinite(value) for value in start):
+        shown = start[0] if len(start) == 1 else start
+        raise HardwareError(
+            f"{name} read its position as {shown} µm, not a finite position, so the "
+            f"move cannot be cut into segments; nothing was sent. Read the "
+            f"position, and check the device: power, cable, another program "
+            f"holding it"
+        )
+    return start
+
+
 #: How long a readback that is not what was set is read again before it is
 #: believed (m2 §8.11 D1). Assumed: the Ti2-E's DiaLamp read the previous
 #: value 9 ms after a set and the new one 0.3 s after, and nothing longer
@@ -388,39 +414,79 @@ class MMXYStage:
             description, step, motion=self._motion, timeout_s=_core_timeout(self._core)
         )
 
+    def _segmented(self, description: str, plan: Callable[[], SegmentPlan[XY]]) -> XY:
+        return self._executor.segmented(
+            description, plan, motion=self._motion, timeout_s=_core_timeout(self._core)
+        )
+
+    def _plan(
+        self, log: str, start: XY, x_um: float, y_um: float, cap: float
+    ) -> SegmentPlan[XY]:
+        """The move from ``start`` to ``(x_um, y_um)``, cut at ``cap`` (m2 §11.12.5)."""
+        here = _finite_start(self._motion.name, (start.x_um, start.y_um))
+        return SegmentPlan(
+            log=log,
+            targets=segment_targets_um(here, (x_um, y_um), cap),
+            step=lambda line, end: self._step(line, end[0], end[1]),
+            position=lambda xy: (xy.x_um, xy.y_um),
+            key="max_segment_um",
+            max_segment_um=cap,
+        )
+
     def move_to_um(self, x_um: float, y_um: float) -> XY:
         """Move to an absolute position (soft limits apply, no jog guard).
 
         Returns where the stage landed, once it reports idle (§13). A UI that
         must stay responsive moves from a worker thread: reads and ``stop()``
-        never wait for the microscope lock.
+        never wait for the microscope lock. With ``[safety] max_segment_um``
+        set, a longer move is sent in segments, cut from the position read
+        inside the action (m2 §11.12).
         """
         x_um, y_um = float(x_um), float(y_um)
         self._safety.check_xy_target_um(x_um, y_um)
         description = f"xy_stage: move_to ({x_um}, {y_um}) µm"
-        return self._move(description, lambda: self._step(description, x_um, y_um))
+        cap = self._safety.max_segment_um
+        if cap is None:
+            return self._move(description, lambda: self._step(description, x_um, y_um))
+        return self._segmented(
+            description,
+            lambda: self._plan(description, self._read_position(), x_um, y_um, cap),
+        )
 
     def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
         """Move relative to the live position; jog-guarded unless ``force``.
 
         The target is computed from a position read inside the action, after
         the guard, and moved to absolutely: the soft-limit check sees the real
-        destination, and no other caller can move the stage in between.
+        destination, and no other caller can move the stage in between. With
+        ``[safety] max_segment_um`` set, the jog guard still sees the whole
+        offset, and a longer move is cut from that same read (m2 §11.12).
         """
         dx_um, dy_um = float(dx_um), float(dy_um)
         self._safety.check_jog_um(dx_um, dy_um, force=force)
+        description = f"xy_stage: move_by ({dx_um}, {dy_um}) µm"
 
-        def relative() -> Step[XY]:
+        def target() -> tuple[XY, str, float, float]:
             here = self._read_position()
             x_um, y_um = here.x_um + dx_um, here.y_um + dy_um
             self._safety.check_xy_target_um(x_um, y_um)
-            return self._step(
-                f"xy_stage: move_by ({dx_um}, {dy_um}) µm to ({x_um}, {y_um}) µm",
-                x_um,
-                y_um,
-            )
+            log = f"xy_stage: move_by ({dx_um}, {dy_um}) µm to ({x_um}, {y_um}) µm"
+            return here, log, x_um, y_um
 
-        return self._move(f"xy_stage: move_by ({dx_um}, {dy_um}) µm", relative)
+        cap = self._safety.max_segment_um
+        if cap is None:
+
+            def relative() -> Step[XY]:
+                _, log, x_um, y_um = target()
+                return self._step(log, x_um, y_um)
+
+            return self._move(description, relative)
+
+        def plan() -> SegmentPlan[XY]:
+            here, log, x_um, y_um = target()
+            return self._plan(log, here, x_um, y_um, cap)
+
+        return self._segmented(description, plan)
 
     def wait(self, timeout_s: float | None = None) -> None:
         """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout).
@@ -533,7 +599,10 @@ class MMZStage:
         self._safety.check_z_target_um(z_um)
         description = f"z: move_to {z_um} µm"
         return self._interlocked(
-            description, lambda: self._step(description, z_um), keep_autofocus
+            description,
+            lambda: self._step(description, z_um),
+            lambda cap: self._plan(description, self._read_position(), z_um, cap),
+            keep_autofocus,
         )
 
     def move_by_um(
@@ -550,17 +619,50 @@ class MMZStage:
         dz_um = float(dz_um)
         self._safety.check_z_jog_um(dz_um, force=force)
 
-        def relative() -> Step[float]:
-            z_um = self._read_position() + dz_um
+        def target() -> tuple[float, str, float]:
+            here = self._read_position()
+            z_um = here + dz_um
             self._safety.check_z_target_um(z_um)
-            return self._step(f"z: move_by {dz_um} µm to {z_um} µm", z_um)
+            return here, f"z: move_by {dz_um} µm to {z_um} µm", z_um
 
-        return self._interlocked(f"z: move_by {dz_um} µm", relative, keep_autofocus)
+        def relative() -> Step[float]:
+            _, log, z_um = target()
+            return self._step(log, z_um)
+
+        def plan(cap: float) -> SegmentPlan[float]:
+            here, log, z_um = target()
+            return self._plan(log, here, z_um, cap)
+
+        return self._interlocked(
+            f"z: move_by {dz_um} µm", relative, plan, keep_autofocus
+        )
+
+    def _plan(
+        self, log: str, start: float, z_um: float, cap: float
+    ) -> SegmentPlan[float]:
+        """The move from ``start`` to ``z_um``, cut at ``cap`` (m2 §11.12.5)."""
+        here = _finite_start(self._motion.name, (start,))
+        return SegmentPlan(
+            log=log,
+            targets=segment_targets_um(here, (z_um,), cap),
+            step=lambda line, end: self._step(line, end[0]),
+            position=lambda z: (z,),
+            key="max_z_segment_um",
+            max_segment_um=cap,
+        )
+
+    def _segmented(
+        self, description: str, plan: Callable[[], SegmentPlan[float]]
+    ) -> float:
+        return self._executor.segmented(
+            description, plan, motion=self._motion, timeout_s=_core_timeout(self._core)
+        )
 
     def _interlocked(
         self,
         description: str,
         step: Callable[[], Step[float]],
+        plan: Callable[[float], SegmentPlan[float]],
         keep_autofocus: bool,
     ) -> float:
         """The move, inside the autofocus's suspend and relock when there is one (m2 §3.4).
@@ -571,13 +673,26 @@ class MMZStage:
         only when the move returned: after a stop, a halt, a timeout, a fault
         or a Ctrl-C, engaging PFS would move Z after the operator's stop
         (FM-88), so it stays off and a WARNING says so.
+
+        With ``[safety] max_z_segment_um`` set, ``plan`` takes ``step``'s place
+        and the move is sent in segments (m2 §11.12.5): under an autofocus, the
+        plan is built where the step was, before the suspend, and the relock
+        runs once, after the last segment, with its readback.
         """
+        cap = self._safety.max_z_segment_um
         interlock = self._autofocus()
         if interlock is None:
-            return self._move(description, step)
+            if cap is None:
+                return self._move(description, step)
+            return self._segmented(description, lambda: plan(cap))
 
         def run() -> float:
-            prepared = step()
+            move: Callable[[], float]
+            if cap is None:
+                move = functools.partial(self._move, description, step())
+            else:
+                built = plan(cap)
+                move = functools.partial(self._segmented, description, lambda: built)
             # A Z stop pressed while this move waited for the lock cancels it
             # before the autofocus is touched (design §13, m2 §3.7).
             self._executor.refuse_if_stopped(
@@ -588,7 +703,7 @@ class MMZStage:
             )
             was_on = interlock.suspend(description)
             try:
-                landed = self._move(description, prepared)
+                landed = move()
             except BaseException as exc:
                 if was_on:
                     logger.warning(

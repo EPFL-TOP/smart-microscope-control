@@ -31,6 +31,7 @@ from pydantic import (
 from smc.hardware.capabilities import ObjectiveOffset
 from smc.hardware.errors import ProfileError
 from smc.hardware.roles import Role
+from smc.hardware.safety import segment_without_refusal as _segment_without_refusal
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -205,6 +206,13 @@ def _check_ordered(limits: tuple[float, float], axis: str) -> None:
 #: stop_refused_by`` may name (m2 §11.3).
 ROLES_WITH_A_STOP: tuple[Role, ...] = (Role.xy_stage, Role.focus, Role.autofocus_offset)
 
+#: The ``[safety]`` keys that cut a move into segments, and the role each needs in
+#: ``stop_refused_by`` (m2 §11.12.3).
+_SEGMENT_KEYS: tuple[tuple[str, Role], ...] = (
+    ("max_segment_um", Role.xy_stage),
+    ("max_z_segment_um", Role.focus),
+)
+
 
 class SafetySection(_Section):
     """Limits the facade enforces; ``None`` means no soft limit on that axis.
@@ -236,6 +244,40 @@ class SafetySection(_Section):
     #: How far Z may move toward the sample during a first lock from the floor;
     #: None: max_engage_excursion_um (m2 §12.11 D8)
     first_lock_max_rise_um: float | None = None
+    #: Cut an XY move into segments of at most this, so that a stop, a halt or a
+    #: Ctrl-C leaves the rest unsent on a stand that refuses its stop; only with
+    #: ``xy_stage`` in ``stop_refused_by``; ``None``: sent whole (m2 §11.12 D1).
+    max_segment_um: float | None = None
+    #: The same for a Z move; only with ``focus`` in ``stop_refused_by``.
+    max_z_segment_um: float | None = None
+
+    @field_validator("max_segment_um", "max_z_segment_um", mode="before")
+    @classmethod
+    def _segment_not_boolean(cls, value: Any, info: ValidationInfo) -> Any:
+        # pydantic's lax mode would read `true` as a 1 µm segment (#106).
+        return _no_boolean(str(info.field_name), value)
+
+    @field_validator("max_segment_um", "max_z_segment_um")
+    @classmethod
+    def _segment_positive_finite(
+        cls, value: float | None, info: ValidationInfo
+    ) -> float | None:
+        # As for the jog limits: an infinite segment is not "no segment".
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(
+                f"{info.field_name} must be a positive, finite number of µm, got "
+                f"{value}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _segments_only_on_a_declared_refusal(self) -> SafetySection:
+        # A stand whose stop works ends a move at once: segments there only cost
+        # time, so the key without the declaration is a mistake (m2 §11.12 D1).
+        for key, role in _SEGMENT_KEYS:
+            if getattr(self, key) is not None and role not in self.stop_refused_by:
+                raise ValueError(_segment_without_refusal(key, role.value))
+        return self
 
     @field_validator("stop_refused_by", mode="before")
     @classmethod

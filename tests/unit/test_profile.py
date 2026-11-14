@@ -1418,6 +1418,75 @@ def test_first_lock_max_rise_um_above_max_engage_excursion_um_is_refused(
     assert Profile.load(alone).safety.first_lock_max_rise_um == 80.0
 
 
+# -- a long move cut into segments (m2 §11.12.3) -------------------------------------
+
+_DECLARED_BOTH = 'stop_refused_by = ["xy_stage", "focus"]\n'
+
+
+def test_max_segment_um_defaults_to_none(tmp_path: Path) -> None:
+    # Unset, a move is sent whole, as before #221.
+    profile = Profile.load(write_profile(tmp_path / "p.toml", ""))
+    assert profile.safety.max_segment_um is None
+    assert profile.safety.max_z_segment_um is None
+    assert Profile.demo().safety.max_segment_um is None
+    assert Profile.demo().safety.max_z_segment_um is None
+
+
+def test_max_segment_um_loads_on_a_declared_stand(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        f"[safety]\n{_DECLARED_BOTH}max_segment_um = 5000\nmax_z_segment_um = 100.0\n",
+    )
+    safety = Profile.load(path).safety
+    assert (safety.max_segment_um, safety.max_z_segment_um) == (5000.0, 100.0)
+
+
+@pytest.mark.parametrize("key", ["max_segment_um", "max_z_segment_um"])
+@pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])
+def test_max_segment_um_must_be_positive_and_finite(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    msg = _load_error(tmp_path, f"[safety]\n{_DECLARED_BOTH}{key} = {value}\n")
+    assert f"safety.{key}" in msg
+    assert f"{key} must be a positive, finite number of µm, got {value}" in msg
+
+
+@pytest.mark.parametrize("key", ["max_segment_um", "max_z_segment_um"])
+def test_max_segment_um_refuses_a_boolean(tmp_path: Path, key: str) -> None:
+    # pydantic's lax mode would read `true` as a 1 µm segment (#106).
+    msg = _load_error(tmp_path, f"[safety]\n{_DECLARED_BOTH}{key} = true\n")
+    assert f"safety.{key}" in msg
+    assert f"{key} must be a number, not a boolean (got true)" in msg
+
+
+def test_max_segment_um_needs_xy_stage_in_stop_refused_by(tmp_path: Path) -> None:
+    msg = _load_error(
+        tmp_path, '[safety]\nstop_refused_by = ["focus"]\nmax_segment_um = 5000.0\n'
+    )
+    assert (
+        "max_segment_um cuts a move on a stand that refuses its stop, but "
+        "stop_refused_by does not name xy_stage, so a stop already ends its moves: "
+        "remove max_segment_um, or declare the refusal the stand showed"
+    ) in msg
+    assert "safety" in msg
+
+
+def test_max_z_segment_um_needs_focus_in_stop_refused_by(tmp_path: Path) -> None:
+    msg = _load_error(tmp_path, "[safety]\nmax_z_segment_um = 100.0\n")
+    assert (
+        "max_z_segment_um cuts a move on a stand that refuses its stop, but "
+        "stop_refused_by does not name focus, so a stop already ends its moves: "
+        "remove max_z_segment_um, or declare the refusal the stand showed"
+    ) in msg
+
+
+def test_the_ti2_profile_cuts_its_moves_at_its_jog_limits() -> None:
+    # Chosen (m2 §11.12 D1): a stop lets a move run at most as far as a jog may.
+    loaded = Profile.load(PROFILES_DIR / "nikon-ti2.toml")
+    assert loaded.safety.max_segment_um == loaded.safety.max_jog_um == 5000.0
+    assert loaded.safety.max_z_segment_um == loaded.safety.max_z_jog_um == 100.0
+
+
 # -- a first lock from below (m2 §12.10.3) ------------------------------------------
 
 

@@ -34,6 +34,8 @@ max_autofocus_offset_jog = 50.0                  # in [autofocus] offset_unit
 # the 40x (17794) lie inside.
 autofocus_offset_soft_limits = [0.0, 20000.0]    # in [autofocus] offset_unit; not forceable
 stop_refused_by = ["xy_stage", "focus", "autofocus_offset"]  # measured, session 1 (#208): "Unsupported device command (11)", still and moving
+max_segment_um = 5000.0    # chosen (m2 §11.12 D1, #221): equal to max_jog_um; not measured
+max_z_segment_um = 100.0   # chosen (m2 §11.12 D1, #221): equal to max_z_jog_um; not measured
 # Chosen (m2 §12.2 D2), for the owner to confirm: how far Z may move while PFS engages,
 # beyond where it started or held. Session 1 jumped +235 µm (#205), and the stand's button
 # +206.6 µm in session 2 (#334); at an offset seen locked, an engage moved Z 0.00 µm (#334).

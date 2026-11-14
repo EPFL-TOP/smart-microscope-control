@@ -23,11 +23,11 @@ import socket
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from types import TracebackType
+from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TextIO
 
 import typer
@@ -378,14 +378,24 @@ def _interrupted_line(notes: Sequence[StopNote]) -> str:
     read = "read the position (smc stage get, smc z get) before the next move"
     if not notes:
         return f"interrupted — no move was under way; {read}"
-    clauses = "; ".join(_note_clause(note) for note in notes)
-    if any(note.outcome is not StopOutcome.accepted for note in notes):
+    # A motion cut into segments runs to the end of its current one, not to the
+    # move's target (m2 §11.12 D5).
+    cut = {note.motion for note in notes if note.outcome is StopOutcome.rest_not_sent}
+    clauses = "; ".join(_note_clause(note, cut=note.motion in cut) for note in notes)
+    if any(
+        note.outcome not in (StopOutcome.accepted, StopOutcome.rest_not_sent)
+        for note in notes
+    ):
         read = f"let it finish or stop it with the stand's own controls, then {read}"
     return f"interrupted — {clauses}; {read}"
 
 
-def _note_clause(note: StopNote) -> str:
-    """One stop of the Ctrl-C line, in the words of m2 §11.6."""
+def _note_clause(note: StopNote, *, cut: bool = False) -> str:
+    """One stop of the Ctrl-C line, in the words of m2 §11.6 and §11.12 D5.
+
+    ``cut``: the same motion has a ``rest_not_sent`` note, so a refused stop
+    lets it run to the end of its current segment, not to its target.
+    """
     name = note.motion
     outcome = note.outcome
     # One branch per outcome, so that a member added later fails here and never
@@ -395,9 +405,14 @@ def _note_clause(note: StopNote) -> str:
     if outcome is StopOutcome.accepted:
         return f"{name} was stopped"
     if outcome is StopOutcome.refused:
+        runs_to = "the end of its current segment" if cut else "its target"
         return (
             f"{name} refuses a stop on this stand ([safety] stop_refused_by), "
-            f"so it runs to its target"
+            f"so it runs to {runs_to}"
+        )
+    if outcome is StopOutcome.rest_not_sent:
+        return (
+            f"the rest of {name}'s move was not sent: the profile cuts it into segments"
         )
     if outcome is StopOutcome.failed:
         return f"the stop of {name} failed, so it may still be moving"
@@ -413,21 +428,46 @@ def _note_clause(note: StopNote) -> str:
     assert_never(outcome)
 
 
-def _stop_refused_line(roles: Iterable[Role]) -> str | None:
+#: Per role whose moves a ``[safety]`` key cuts into segments: how the ``!`` line
+#: names its move, and the key (m2 §11.12 D5).
+_SEGMENTED_MOVE: Mapping[Role, tuple[str, str]] = MappingProxyType(
+    {
+        Role.xy_stage: ("an xy_stage move", "max_segment_um"),
+        Role.focus: ("a focus move", "max_z_segment_um"),
+    }
+)
+_NO_SEGMENTS: Mapping[Role, float] = MappingProxyType({})
+
+
+def _stop_refused_line(
+    roles: Iterable[Role], segments_um: Mapping[Role, float] = _NO_SEGMENTS
+) -> str | None:
     """The ``!`` line before a move on a role whose stop the stand refuses; ``None`` if none.
 
     Printed once the stand is open and before anything is sent, never in
     dry-run (m2 §11.6): on such a stand, Ctrl-C ends smc and not the move,
     and the operator must know it before the move, not after it.
+    ``segments_um`` holds the segment of each role whose key is set: such a
+    move ends at the end of its current segment (m2 §11.12 D5).
     """
     declared = set(roles)
-    named = [role.value for role in ROLES_WITH_A_STOP if role in declared]
+    named = [role for role in ROLES_WITH_A_STOP if role in declared]
     if not named:
         return None
+    # A role whose moves the profile cuts into segments: Ctrl-C ends the move
+    # at the end of the current segment (m2 §11.12 D5).
+    segments = "".join(
+        f"; but {_SEGMENTED_MOVE[role][0]} is sent in segments of at most "
+        f"{segments_um[role]:g} µm ([safety] {_SEGMENTED_MOVE[role][1]}), so Ctrl-C "
+        f"ends it at the end of the current segment"
+        for role in named
+        if role in _SEGMENTED_MOVE and role in segments_um
+    )
     return (
         f"! the profile declares that this stand refuses stop() on "
-        f"{join_names(named)} ([safety] stop_refused_by): once sent, a move runs "
-        f"to its target, and Ctrl-C ends smc, not the move"
+        f"{join_names([role.value for role in named])} ([safety] stop_refused_by): "
+        f"once sent, a move runs to its target, and Ctrl-C ends smc, not the move"
+        f"{segments}"
     )
 
 
@@ -441,8 +481,10 @@ def _say_stop_refused(
     and ``smc ui`` the profile it has loaded, before any stand is open (m5 §7.1).
     """
     declared = safety.stop_refused_by
+    caps = {Role.xy_stage: safety.max_segment_um, Role.focus: safety.max_z_segment_um}
     line = _stop_refused_line(
-        declared if roles is None else [r for r in roles if r in declared]
+        declared if roles is None else [r for r in roles if r in declared],
+        {role: cap for role, cap in caps.items() if cap is not None},
     )
     if line is not None:
         _say(line)

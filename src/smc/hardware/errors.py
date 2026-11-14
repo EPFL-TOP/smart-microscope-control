@@ -198,6 +198,8 @@ class StopOutcome(str, Enum):
     impossible = "impossible"  # no stop from smc (a State device)
     interrupted = "interrupted"  # a Ctrl-C cut the stop: it may not have got through
     still_moving = "still_moving"  # tracked as moving when the stand was released
+    # a segmented move: the segments after the current one were not sent (m2 §11.12)
+    rest_not_sent = "rest_not_sent"
 
 
 @dataclass(frozen=True, slots=True)
