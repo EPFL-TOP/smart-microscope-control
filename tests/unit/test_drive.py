@@ -1370,46 +1370,113 @@ class LandsAt(NeverLocks):
         return (7927.5, 20000.0)
 
 
-def test_set_autofocus_offset_floor_read_back_above_the_floor_says_to_set_a_floor_the_device_holds(
-    fake_microscope: Microscope,
-) -> None:
-    # A device that rounds up lands above the floor, where engage() takes no first
-    # lock and refuses with "set the offset to its floor": the circle of #349's item 7
-    # (m2 §12.12 D16).
-    fake_microscope.override(Autofocus, LandsAt(7928.0))
+def _offset_set(declared: bool, landed: float, value: float | None) -> DriveResult:
+    """``set_autofocus_offset`` of a demo stand whose offset device lands at ``landed``, floor 7927.5.
 
-    result = drive.set_autofocus_offset(fake_microscope, None)
+    ``declared`` is ``[autofocus] engage_drives_z_to_offset``, which the drive
+    reads at the call (m2 §12.12 D16); ``value`` ``None`` is ``--floor``.
+    """
+    profile = Profile.demo().model_copy(deep=True)
+    profile.autofocus.engage_drives_z_to_offset = declared
+    core = FakeCore.demo_like()
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), profile)
+    try:
+        microscope.override(Autofocus, LandsAt(landed))
+        return drive.set_autofocus_offset(microscope, value)
+    finally:
+        microscope.close()
+
+
+def _floor_set(declared: bool, landed: float) -> DriveResult:
+    """``smc autofocus offset --floor`` of a stand whose device lands at ``landed``."""
+    return _offset_set(declared, landed, None)
+
+
+def test_set_autofocus_offset_floor_read_back_above_the_floor_on_a_declared_stand_names_both_causes() -> (
+    None
+):
+    # A device that rounds up lands above the floor, where engage() takes no first
+    # lock and refuses with "set the offset to its floor": the circle of #349's item 7.
+    # A readback far above the floor may as well be a write the device ignored, which
+    # one readback cannot tell (m2 §12.12 D16, amended by #487).
+    result = _floor_set(declared=True, landed=7928.0)
 
     assert result == DriveResult(
         "offset 7928 PFSOffset units, although 7927.5 was asked: above the floor, "
-        "where engage() takes no first lock; set the floor ([safety] "
-        "autofocus_offset_soft_limits) to a value this device holds (m2 §12.12 D16)",
+        "where engage() takes no first lock; either this device does not hold the "
+        "floor as written (set the floor, [safety] autofocus_offset_soft_limits, to a "
+        "value it holds) or it did not take the write (read the offset again and "
+        "check the stand) (m2 §12.12 D16)",
         reached=False,
     )
 
 
-def test_set_autofocus_offset_floor_read_back_below_the_floor_keeps_the_readback_text(
-    fake_microscope: Microscope,
-) -> None:
-    # The Ti2-E truncates: engage() takes a first lock below the floor (D14), so the
-    # text says only what the readback is.
-    fake_microscope.override(Autofocus, LandsAt(7927.0))
-
-    result = drive.set_autofocus_offset(fake_microscope, None)
+def test_set_autofocus_offset_floor_read_back_below_the_floor_on_a_declared_stand_names_both_causes() -> (
+    None
+):
+    # The Ti2-E truncates: a floor of 7927.5 reads 7927, a first lock from there that
+    # drops past the Z soft limit says "set the offset to its floor" (D14), and the
+    # floor lands at 7927 again. The text says so before any engage (FM-173's sibling:
+    # an advice that changes nothing).
+    result = _floor_set(declared=True, landed=7927.0)
 
     assert result == DriveResult(
-        "offset 7927 PFSOffset units, although 7927.5 was asked", reached=False
+        "offset 7927 PFSOffset units, although 7927.5 was asked: below the floor, so "
+        "setting the floor again may change nothing; either this device does not hold "
+        "the floor as written (set the floor, [safety] autofocus_offset_soft_limits, "
+        "to a value it holds) or it did not take the write (read the offset again and "
+        "check the stand) (m2 §12.12 D16)",
+        reached=False,
     )
 
 
-def test_set_autofocus_offset_to_a_value_read_back_higher_says_nothing_of_the_floor(
-    fake_microscope: Microscope,
+@pytest.mark.parametrize(
+    ("landed", "text"),
+    [
+        (7928.0, "offset 7928 PFSOffset units, although 7927.5 was asked"),
+        (7927.0, "offset 7927 PFSOffset units, although 7927.5 was asked"),
+    ],
+    ids=["above", "below"],
+)
+def test_set_autofocus_offset_floor_read_back_off_the_floor_on_an_undeclared_stand_says_only_the_readback(
+    landed: float, text: str
 ) -> None:
-    # `--to` names a value, not the floor: the clause is for the floor alone, even
-    # where the readback lies above it.
-    fake_microscope.override(Autofocus, LandsAt(7928.0))
+    # engage() takes no first lock at any offset there, so the floor has no such role
+    # and neither side names it (m2 §12.12 D16, amended by #487).
+    result = _floor_set(declared=False, landed=landed)
 
-    result = drive.set_autofocus_offset(fake_microscope, 7927.5)
+    assert result == DriveResult(text, reached=False)
+
+
+def test_set_autofocus_offset_floor_read_back_at_the_floor_on_a_declared_stand_says_only_the_offset() -> (
+    None
+):
+    result = _floor_set(declared=True, landed=7927.5)
+
+    assert result == DriveResult("offset 7927.5 PFSOffset units")
+
+
+@pytest.mark.parametrize("landed", [float("nan"), float("inf"), float("-inf")])
+def test_set_autofocus_offset_floor_read_back_not_finite_gets_no_clause(
+    landed: float,
+) -> None:
+    # A readback that is not finite lies on no side of the floor: NaN compares false
+    # with everything, so a bare above-else-below would call it "below" and infinity
+    # "above" (as in read_autofocus_offset, m2 §12.10.6).
+    result = _floor_set(declared=True, landed=landed)
+
+    assert result == DriveResult(
+        f"offset {landed:g} PFSOffset units, although 7927.5 was asked", reached=False
+    )
+
+
+def test_set_autofocus_offset_to_a_value_read_back_higher_says_nothing_of_the_floor() -> (
+    None
+):
+    # `--to` names a value, not the floor: the clause is for the floor alone, even
+    # where the readback lies above it. The stand is declared, so that this is not
+    # the undeclared stand's silence by luck.
+    result = _offset_set(declared=True, landed=7928.0, value=7927.5)
 
     assert result == DriveResult(
         "offset 7928 PFSOffset units, although 7927.5 was asked", reached=False

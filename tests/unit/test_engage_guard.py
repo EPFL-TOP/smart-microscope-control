@@ -44,6 +44,7 @@ from test_mm_autofocus import (
 )
 
 import smc.hardware.backends.mm as mm
+from smc.drive import DriveResult, set_autofocus_offset
 from smc.hardware.capabilities import ObjectiveTurret, XYStage
 from smc.hardware.errors import (
     AutofocusExcursionError,
@@ -1535,8 +1536,8 @@ CONTRADICTS = (
     "[autofocus.offset_per_um] for objective '10x' ({factor}) says a larger offset "
     'gives a {larger} Z and [safety] z_away_from_sample is "{direction}", so the '
     "floor's plane lies toward the sample (m2 §12.12 D12). One of the two is wrong "
-    "for this stand: check both at the stand; until then smc engages only at an "
-    "offset it has read locked"
+    "for this stand: check both at the stand; until then smc takes no first lock "
+    "from the offset's floor"
 )
 
 
@@ -1603,6 +1604,72 @@ def test_dry_run_first_lock_with_a_contradicting_factor_is_refused_too() -> None
             stand.af.engage()
         assert str(refused.value) == CONTRADICTS.format(
             factor="-6", larger="smaller", direction="decreasing"
+        )
+        assert stand.core.log == []
+
+
+def test_a_contradicting_factor_refuses_the_first_lock_at_a_floor_that_was_read_locked() -> (
+    None
+):
+    # The closing clause used to say "smc engages only at an offset it has read
+    # locked" here, where the floor was read locked and D12 still refuses (m2
+    # §12.12 D12, amended by #487): the clause is true whether or not it was seen.
+    with _stand(_first_lock(factors={"10x": -6.0}), offset=FLOOR) as stand:
+        _see(stand)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == CONTRADICTS.format(
+            factor="-6", larger="smaller", direction="decreasing"
+        )
+        assert refused.value.how_to_force == ""
+        assert stand.core.log == []
+
+
+def test_a_first_lock_on_a_stand_with_no_turret_skips_the_factors_check_and_logs_only_its_own_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # No objective turret: the label reads None, no factor can exist, so D12 does
+    # not apply and nothing is logged for it (m2 §12.12 D12, amended by #487). A
+    # contradicting factor is declared on purpose: it must not be read.
+    core = _ti2_core(turret=False)
+    core.setPosition("ZDrive", Z0)
+    core.setPosition("PFSOffset", FLOOR)
+    with _ti2(_first_lock(factors={"10x": -6.0}), core=core) as stand:
+        _plane_follows_the_offset(stand)
+        with caplog.at_level(logging.DEBUG, logger="smc.hardware.backends.mm"):
+            assert stand.af.engage() is True
+        assert stand.core.log == [ON]
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "smc.hardware.backends.mm"
+        ] == [
+            "autofocus PFS: a first lock from the offset's floor (5000 PFSOffset "
+            "units, m2 §12.10): Z may move away from the sample, and at most 50 µm "
+            "toward it"
+        ]
+
+
+def test_a_first_lock_whose_turret_cannot_be_read_sends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Not the no-turret case: the read raises before D12 is reached (FM-19), so a
+    # turret that does not answer is a fault and not "no factor".
+    with _stand(_first_lock(factors={"10x": 6.0}), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        read_label = stand.core.getStateLabel
+
+        def get_state_label(label: str) -> str:
+            if label == "Nosepiece":
+                raise RuntimeError("turret does not answer")
+            return read_label(label)
+
+        monkeypatch.setattr(stand.core, "getStateLabel", get_state_label)
+        with pytest.raises(HardwareError) as unread:
+            stand.af.engage()
+        assert str(unread.value) == (
+            "objective_turret: getStateLabel('Nosepiece') failed (turret does not "
+            "answer); check the device: power, cable, another program holding it"
         )
         assert stand.core.log == []
 
@@ -1704,3 +1771,35 @@ def test_a_first_lock_below_the_floor_that_drops_past_the_z_soft_limit_says_set_
             Z0 + (4000.0 - SEEN_OFFSET) / 6.0,
         )
         assert stand.core.log == [ON, OFF]
+
+
+def test_the_advice_to_set_the_floor_on_a_device_that_truncates_is_followed_to_the_same_offset_and_says_so_each_time() -> (
+    None
+):
+    # The circle of m2 §12.12.1 end to end, on the real autofocus over a core that holds
+    # whole units: the floor 7927.5 reads 7927, a first lock from there drops Z past the
+    # 4000 µm soft limit and says "set the offset to its floor" (D14), and following it
+    # lands at 7927 again. D16 says so each time, before any engage (FM-237).
+    core = _ti2_core()
+    core.hold_whole_units("PFSOffset")
+    profile = _first_lock(
+        autofocus_offset_soft_limits=(7927.5, 12000.0),
+        z_soft_limits_um=(4000.0, 4350.0),
+    )
+    with _stand(profile, offset=7927.0, core=core) as stand:
+        _jumps_to(stand, 3614.94)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert "set the offset to its floor and engage again" in str(jumped.value)
+
+        for _ in range(2):
+            assert set_autofocus_offset(stand.microscope, None) == DriveResult(
+                "offset 7927 PFSOffset units, although 7927.5 was asked: below the "
+                "floor, so setting the floor again may change nothing; either this "
+                "device does not hold the floor as written (set the floor, [safety] "
+                "autofocus_offset_soft_limits, to a value it holds) or it did not "
+                "take the write (read the offset again and check the stand) (m2 "
+                "§12.12 D16)",
+                reached=False,
+            )
+            assert stand.core.getPosition("PFSOffset") == 7927.0

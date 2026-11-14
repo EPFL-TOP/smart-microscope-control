@@ -405,6 +405,17 @@ def _outside_clause(
     return ""
 
 
+# What the floor read back off itself says of its cause, after the side (m2 §12.12
+# D16): one readback cannot tell a device that rounds from one that ignored the
+# write, since the device's step is not known, so both are named, the one the
+# profile can fix first.
+_FLOOR_NOT_HELD = (
+    "; either this device does not hold the floor as written (set the floor, [safety] "
+    "autofocus_offset_soft_limits, to a value it holds) or it did not take the write "
+    "(read the offset again and check the stand) (m2 §12.12 D16)"
+)
+
+
 def read_autofocus_offset(microscope: Microscope) -> DriveResult:
     """The autofocus offset and its soft limits, whose lower bound is a first lock's floor (m2 §12.10).
 
@@ -440,8 +451,15 @@ def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveRe
     write moves no Z. One mutating call (m5 §6.1): the soft limits and the
     offset are reads. The text is the readback, and one that differs from the
     value asked says so with ``reached`` false (FM-155): the Ti2-E holds whole
-    units, so 7927.5 honestly reads 7927. The floor read back above itself
-    also says to set a floor the device holds (m2 §12.12 D16).
+    units, so 7927.5 honestly reads 7927. On a stand that declares
+    ``engage_drives_z_to_offset``, the floor read back on either side of
+    itself also says so, with both causes: a device that does not hold the
+    floor as written, or one that did not take the write. A first lock's trip
+    sends the operator here ("set the offset to its floor"), and a floor the
+    device does not hold would land at the same offset again (m2 §12.12 D16,
+    #487). Off a declared stand no first lock is taken, the floor has no such
+    role, and the text is the readback's; ``--to`` and a readback that is not
+    finite get no clause either.
 
     Raises:
         CapabilityMissingError: The stand has no autofocus.
@@ -469,15 +487,23 @@ def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveRe
         )
     if landed != value:
         text = f"offset {_offset_text(autofocus, landed)}, although {value:g} was asked"
-        if floor_asked and landed > value:
-            # A device that rounds up: above the floor engage() takes no first
-            # lock and says to set the offset to its floor, which lands here
-            # again (m2 §12.12 D16). Below it, engage() takes one (D14).
-            text += (
-                ": above the floor, where engage() takes no first lock; set the floor "
-                "([safety] autofocus_offset_soft_limits) to a value this device holds "
-                "(m2 §12.12 D16)"
-            )
+        if (
+            floor_asked
+            and math.isfinite(landed)
+            and microscope.profile.autofocus.engage_drives_z_to_offset
+        ):
+            # On a declared stand the floor is where a first lock starts, and the
+            # advice of an engage (D14: "set the offset to its floor") sends the
+            # operator back here: a floor the device does not hold lands at the
+            # same offset again, and nothing else says so (m2 §12.12 D16). A
+            # readback that is not finite lies on no side, so it gets no clause.
+            if landed > value:
+                text += ": above the floor, where engage() takes no first lock"
+            else:
+                text += (
+                    ": below the floor, so setting the floor again may change nothing"
+                )
+            text += _FLOOR_NOT_HELD
         return DriveResult(text, reached=False)
     return DriveResult(f"offset {_offset_text(autofocus, landed)}")
 

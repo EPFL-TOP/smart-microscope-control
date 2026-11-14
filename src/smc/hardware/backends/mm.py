@@ -2011,6 +2011,15 @@ class MMAutofocus:
         factor for the objective in place, nothing changes: a first lock is how
         an objective is locked before its factor is measured. The profile
         refuses a zero factor, so the sign is never zero here.
+
+        A stand with no objective turret has no factor either (the profile
+        keys them by the turret's labels), so the check does not apply and
+        nothing is logged: nothing is unknown there (m2 §12.12 D12). A turret
+        that cannot be read is not that case: the read raised before this call.
+
+        The closing clause of the refusal says what is refused and nothing of
+        what is allowed: the floor may have been read locked, and D9 makes the
+        engage a first lock all the same (m2 §12.12 D12, amended by #487).
         """
         factor = None if objective is None else self._offset_per_um.get(objective)
         if factor is None or (factor > 0) == (direction == "decreasing"):
@@ -2023,8 +2032,8 @@ class MMAutofocus:
             f"says a larger offset gives a {larger} Z and [safety] "
             f'z_away_from_sample is "{direction}", so the floor\'s plane lies toward '
             f"the sample (m2 §12.12 D12). One of the two is wrong for this stand: "
-            f"check both at the stand; until then smc engages only at an offset it "
-            f"has read locked",
+            f"check both at the stand; until then smc takes no first lock from the "
+            f"offset's floor",
             label=self._label,
         )
 
