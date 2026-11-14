@@ -152,8 +152,6 @@ DryRunOption = Annotated[
 
 if TYPE_CHECKING:
     from smc.discovery.config_build import ConfigPlan
-    from smc.hardware.profile import ObjectiveOffsetEntry
-    from smc.plugins.slots import ObjectiveOffsetsResult
 
     _StreamHandler = logging.StreamHandler[TextIO]
 else:  # StreamHandler is subscriptable only from Python 3.11
@@ -1754,23 +1752,24 @@ def _offsets_from_run_doc(
     session: str | None,
     write: bool,
 ) -> None:
-    """``smc objective offset --from-run-doc``: what the run measured would put into the profile; with ``--write``, put it there (m3 §20.7).
+    """``smc objective offset --from-run-doc``: what the run measured would put into the profile; with ``--write``, put it there (m3 §20.7, §20.11).
 
-    No stand is opened. In this order, each failure a ``✗`` line and exit 1: the
-    profile (it must be a file), the run document's result (usable, of this
-    profile, one this smc reads), the reference as the profile has it now, and
-    the new section. Then the lines, plain (FM-36), and either the preview
-    (``nothing was written``) or the write. The preview is the confirmation: the
-    CLI has no prompt anywhere, and the old values are printed before they are
-    replaced (FM-172).
+    A shell around ``smc.plugins.objective_offsets.profile_offsets``, which the plate
+    page shares. No stand is opened. In this order, each failure a ``✗`` line and exit
+    1: the profile (it must be a file), the run document, then what the plan refuses
+    (a result that is not usable, of this profile, one this smc reads, the reference
+    as the profile has it now, the new section). Then the lines, plain (FM-36), and
+    either the preview (``nothing was written``) or the write. The preview is the
+    confirmation: the CLI has no prompt anywhere, and the old values are printed
+    before they are replaced (FM-172).
     """
-    # Imported here: the plate-scan slots, the writer and pydantic are not what
-    # `smc --help` and the stage commands load.
-    from pydantic import ValidationError
-
-    from smc.hardware.profile import ObjectivesSection, profile_text
-    from smc.plugins.slots import ObjectiveOffsetsResult
-    from smc.run.files import AtomicWriteError, write_atomically
+    # Imported here: the plate-scan slots and pydantic are not what `smc --help` and
+    # the stage commands load, and the library imports `tomli-w` only to write.
+    from smc.plugins.objective_offsets.profile_offsets import (
+        OffsetsWriteError,
+        plan_offsets,
+        write_offsets,
+    )
 
     with _Reported(ctx):
         loaded = Profile.load(profile_name)
@@ -1782,155 +1781,28 @@ def _offsets_from_run_doc(
             )
             raise typer.Exit(code=_EXIT_ERROR)
 
-        where = run_doc.as_posix()
         document = RunDocument.load(run_doc)
-        reason = document.unusable(
-            "objective-offsets", profile=loaded.microscope.name, dry_run=False
-        )
-        record = document.provider("objective-offsets")
-        if reason is not None or record is None or record.result is None:
-            _fail(f"in {where}: {reason or 'it holds no result'}")
-            raise typer.Exit(code=_EXIT_ERROR)
-        result: ObjectiveOffsetsResult | None = None
         try:
-            result = ObjectiveOffsetsResult.model_validate(record.result)
-        except ValidationError:
-            result = None
-        if result is None or record.finished_utc is None:
-            _fail(
-                f"the objective-offsets result in {where} is not one this smc "
-                "reads; run objective-offsets again"
-            )
-            raise typer.Exit(code=_EXIT_ERROR)
+            plan = plan_offsets(loaded, document, run_doc, session=session)
+        except OffsetsWriteError as exc:
+            _fail(str(exc))
+            raise typer.Exit(code=_EXIT_ERROR) from None
 
-        # The reference now: the offsets are the run's only if the profile's
-        # reference is still the one it measured them from.
-        now = loaded.objectives.reference.strip() or None
-        measured_from = result.reference if result.reference_in_profile else None
-        if now != measured_from:
-            _fail(
-                f"the profile's offsets are now from {now or '(none)'}, and the run "
-                f"measured them from {measured_from or '(none)'}: run "
-                "objective-offsets again"
-            )
-            raise typer.Exit(code=_EXIT_ERROR)
-
-        # Entries are replaced, not merged (FM-99): each label the run measured
-        # gets a new entry, and one it held a Z for loses it, which is said below.
-        # Only the run document's name is kept, never its folder (FM-50).
-        date = record.finished_utc.astimezone(timezone.utc).date().isoformat()
-        by = f"{session}, " if session else ""
-        measured = f"{date}, {by}objective-offsets in {run_doc.name}"
-        old = loaded.objectives.offsets
-        entries: dict[str, Any] = {
-            label: entry.model_dump() for label, entry in old.items()
-        }
-        written: dict[str, tuple[float, float]] = {}
-        for offset in result.offsets:
-            x_um, y_um = (round(value, 2) + 0.0 for value in offset.xy_offset_um)
-            written[offset.objective] = (x_um, y_um)
-            entries[offset.objective] = {
-                "xy_offset_um": [x_um, y_um],
-                "measured": measured,
-            }
-        problem = ""
-        try:
-            section = ObjectivesSection.model_validate(
-                {"reference": result.reference, "offsets": entries}
-            )
-        except ValidationError as exc:
-            problem = "; ".join(
-                str(error["msg"]).removeprefix("Value error, ")
-                for error in exc.errors()
-            )
-        if problem:
-            # Text, never the error: nothing here keeps it (FM-98).
-            _fail(f"the offsets would not be valid in the profile: {problem}")
-            raise typer.Exit(code=_EXIT_ERROR)
-
-        _say_offsets_to_write(result, old, written, measured, now is None)
+        for line in plan.lines:
+            _say(line)
 
         if not write:
             _say(f"nothing was written: add --write to write these into {source}")
             return
-        # Only the write needs the writer, and with it `tomli-w`: a PC updated with
-        # `git pull` and not reinstalled still shows the preview, and is told what
-        # is missing when it writes (as `smc presets save` is).
-        missing = False
         try:
-            from smc.hardware.profile_write import with_objectives
-        except ImportError:
-            missing = True
-        if missing:
-            _fail(
-                "writing the profile needs the tomli-w package, which this install "
-                "lacks: run pip install -e . in the smc folder, then write again"
-            )
-            raise typer.Exit(code=_EXIT_ERROR)
-        text = with_objectives(profile_text(source), section, where=str(source))
-        failed = ""
-        try:
-            write_atomically(source, text.encode("utf-8"), make_parents=False)
-        except AtomicWriteError as exc:
-            # The profile is as it was. When only the rename failed (Windows: an
-            # editor or a sync client holds the file), the whole new text is kept.
-            failed = f"{source} was not changed: {exc.strerror or exc}" + (
-                f"; the whole new text is kept in {exc.kept}: close what holds the "
-                "profile and write again, then delete that file"
-                if exc.kept
-                else ""
-            )
-        if failed:
-            _fail(failed)
-            raise typer.Exit(code=_EXIT_ERROR)
+            write_offsets(plan)
+        except OffsetsWriteError as exc:
+            _fail(str(exc))
+            raise typer.Exit(code=_EXIT_ERROR) from None
         _ok(
             f"wrote [objectives] into {source}; smc objective offset -p "
             f"{profile_name} reads them back against the turret"
         )
-
-
-def _say_offsets_to_write(
-    result: ObjectiveOffsetsResult,
-    old: dict[str, ObjectiveOffsetEntry],
-    written: dict[str, tuple[float, float]],
-    measured: str,
-    new_reference: bool,
-) -> None:
-    """The lines of the preview, in the order the design fixes: targets, labels, dropped Z, reference, text (m3 §20.7).
-
-    Printed with ``_say``: a label or a measured text holds brackets and quotes
-    that rich would read as markup (FM-36). A value is signed and rounded as the
-    read-out prints it, and ``+ 0.0`` keeps a ``-0.0`` from showing.
-    """
-    for measure in result.measures:
-        x_um, y_um = (value + 0.0 for value in measure.shift_xy_um)
-        wells = ", ".join(well.well for well in measure.wells)
-        _say(
-            f"{measure.objective!r}  shift from {result.plate_objective!r} "
-            f"({x_um:+.2f}, {y_um:+.2f}) µm, spread {measure.spread_um:.2f} µm over "
-            f"{wells} (bound {measure.max_spread_um:.2f} µm)"
-        )
-    for label, (x_um, y_um) in written.items():
-        before = old.get(label)
-        if before is None or before.xy_offset_um is None:
-            was = "was unknown"
-        else:
-            old_x, old_y = (value + 0.0 for value in before.xy_offset_um)
-            was = f"was xy ({old_x:+.2f}, {old_y:+.2f}) µm"
-            if before.measured:
-                was += f", measured {before.measured}"
-        _say(f"{label!r}  xy ({x_um:+.2f}, {y_um:+.2f}) µm  {was}")
-    for label in written:
-        before = old.get(label)
-        if before is not None and before.z_offset_um is not None:
-            _say(
-                f"{label!r}: its z_offset_um {before.z_offset_um + 0.0:+.2f} µm "
-                f"(measured {before.measured}) is dropped: objective-offsets "
-                "measures XY only"
-            )
-    new = "  (new: the profile named none)" if new_reference else ""
-    _say(f"reference {result.reference!r}{new}")
-    _say(f'measured = "{measured}"')
 
 
 @objective_app.command("set")
