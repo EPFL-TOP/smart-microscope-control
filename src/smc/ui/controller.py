@@ -55,9 +55,11 @@ from smc.hardware.errors import (
     MicroscopeBusyError,
     MicroscopeHaltedError,
     MotionStoppedError,
+    ProfileError,
     StopRefusedError,
 )
 from smc.hardware.microscope import describe_autofocus
+from smc.hardware.profile import Profile
 from smc.hardware.safety import Safety
 from smc.plugins import (
     ParamsError,
@@ -79,6 +81,14 @@ from smc.plugins.camera_calibration.plugin import calibration_from
 from smc.plugins.frames import stage_side_of_image_side
 from smc.plugins.geometry import Matrix2
 from smc.plugins.objective_offsets.algorithm import MAX_TARGETS
+from smc.plugins.objective_offsets.profile_offsets import (
+    OffsetsPlan,
+    OffsetsWriteError,
+    plan_offsets,
+)
+from smc.plugins.objective_offsets.profile_offsets import (
+    write_offsets as write_offsets_block,
+)
 from smc.plugins.presets import (
     NOT_IN_PARAMS,
     Preset,
@@ -130,7 +140,9 @@ from smc.ui.guide import (
     NOT_CONNECTED,
     OFFSETS_DRY_RUN,
     OFFSETS_NO_DOCUMENT,
+    OFFSETS_NO_FILE,
     OFFSETS_NOTHING_ARMED,
+    OFFSETS_PLAN_CHANGED,
     OFFSETS_TOO_MANY,
     OFFSETS_TURRET_UNREAD,
     PLATE_NOT_CHOSEN,
@@ -171,7 +183,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from smc.hardware.microscope import Microscope
-    from smc.hardware.profile import HolderSection, Profile
+    from smc.hardware.profile import HolderSection
 
 __all__ = [
     "JOG_WALL_MARGIN_UM",
@@ -187,6 +199,7 @@ __all__ = [
     "CheckItem",
     "LoadedPreset",
     "OffsetsOffer",
+    "OffsetsPlanView",
     "OffsetsStep",
     "PageServerError",
     "PageStatus",
@@ -602,6 +615,23 @@ class OffsetsStep:
     targets: tuple[str, ...]
     reads: tuple[CalibrationRead, ...]
     wait: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OffsetsPlanView:
+    """What writing the offsets would put into the profile, as the block draws it (m5 §18.3, D7).
+
+    ``file`` is the profile's file name (``""`` for a profile with no file), ``lines`` the
+    preview of ``plan_offsets``, as they are, with the old values in them; ``problem`` is why
+    there is nothing to write (the library's words, or the page's) and then ``lines`` is
+    empty; ``written`` says the usable result is the one this page wrote into this file.
+    Everything empty and no problem: there is no usable result to preview.
+    """
+
+    file: str
+    lines: tuple[str, ...]
+    problem: str | None
+    written: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1669,6 +1699,10 @@ class PlatePage:
         # event set (``stop()`` sets it and takes no lock, FM-70); the next activity of that
         # name removes it, so a later run says its own end.
         self._stopped_activity: set[str] = set()
+        # What this page wrote into a profile's file, under ``_lock``: the ``finished_utc`` of the
+        # ``objective-offsets`` result and the file (m5 §18.2 D7). The block says *Written* while
+        # the usable result is that one, and no longer once the tool has run again.
+        self._offsets_written: tuple[datetime, Path] | None = None
         # The plugin a resumed run is counted for and its plan's field count, under ``_lock``
         # (review of #496): a resumed ``scan`` counts ``done`` and ``total`` over the wells its
         # checkpoint does not hold (``wells_to_scan``), and ``_on_progress`` adds back the plan
@@ -5297,6 +5331,107 @@ class PlatePage:
         if step.targets != tuple(armed):
             return offsets_changed(armed, step.targets)
         return step
+
+    def offsets_plan(self, session: str) -> OffsetsPlanView:
+        """What writing the usable ``objective-offsets`` result would put into the profile, from a fresh load of its file (m5 §18.2 D7).
+
+        The command's own reading (``Profile.load(source)``), never the page's in-memory profile:
+        the preview names what the file holds now, and a stand already connected goes on with the
+        offsets it opened with. Only a usable result has a preview; the library's refusals
+        (a result of another profile, a reference changed since the run, one that does not
+        validate, a session of more than one line) are ``problem``, the preview's place, and so
+        are a profile with no file and a file or a document that cannot be read. Nothing is
+        written. Called at ``refresh()`` and at a change of the session text, never by the tick
+        (FM-145): it reads two files.
+        """
+        return self._offsets_plan(session)[1]
+
+    def _offsets_plan(
+        self, session: str
+    ) -> tuple[OffsetsPlan | None, OffsetsPlanView, datetime | None]:
+        """``offsets_plan`` with the library's plan, which ``write_offsets`` writes, and when the result it is made from finished."""
+        source = self._profile.source
+        if source is None:
+            return None, OffsetsPlanView("", (), OFFSETS_NO_FILE, False), None
+        file = source.name
+        doc, unreadable = self._document()
+        if unreadable is not None:
+            return (
+                None,
+                OffsetsPlanView(file, (), f"run document: {_flat(unreadable)}", False),
+                None,
+            )
+        record = doc.provider("objective-offsets")
+        if record is None or self._unusable(doc, "objective-offsets") is not None:
+            return None, OffsetsPlanView(file, (), None, False), None
+        with self._lock:
+            kept = self._offsets_written
+        written = (
+            kept is not None
+            and record.finished_utc is not None
+            and kept == (record.finished_utc, source)
+        )
+        problem = ""
+        plan: OffsetsPlan | None = None
+        try:
+            # The profile as the file holds it now, by its path (a name would be searched for).
+            plan = plan_offsets(
+                Profile.load(source),
+                doc,
+                self._run_doc,
+                session=session.strip() or None,
+            )
+        except (OffsetsWriteError, ProfileError) as exc:
+            # Text, never the error (FM-98).
+            problem = _flat(str(exc))
+        if plan is None:
+            return (
+                None,
+                OffsetsPlanView(file, (), problem, written),
+                record.finished_utc,
+            )
+        return (
+            plan,
+            OffsetsPlanView(file, plan.lines, None, written),
+            record.finished_utc,
+        )
+
+    def write_offsets(self, session: str, shown: Sequence[str]) -> None:
+        """Write the offsets into the profile's file, if they are the lines the operator was shown (m5 §18.2 D7, FM-172).
+
+        The plan is computed again, from a fresh load of the file, and written only when its
+        ``lines`` are the ``shown`` ones: the offsets, the profile or the session may have
+        changed since the preview was drawn (another tab, an editor, a tool run again), and the
+        operator confirmed what replaces what, not whatever replaces something. Otherwise
+        nothing is written and the outcome says to look again. The refusals are outcomes,
+        ``Objective offsets: <why>``; a write is ``Offsets written into <file name>``. The page
+        does not reload its profile: a stand already connected goes on with the offsets it
+        opened with.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page is closed.
+        """
+        self._refuse_if_busy()
+        plan, view, finished = self._offsets_plan(session)
+        title = tool_title("objective-offsets")
+        if plan is None:
+            self._set_outcome(f"{title}: {view.problem or OFFSETS_NO_DOCUMENT}")
+            return
+        if tuple(shown) != plan.lines:
+            self._set_outcome(f"{title}: {OFFSETS_PLAN_CHANGED}")
+            return
+        failure = ""
+        try:
+            write_offsets_block(plan)
+        except OffsetsWriteError as exc:
+            failure = _flat(str(exc))
+        if failure:
+            self._set_outcome(f"{title}: {failure}")
+            return
+        with self._lock:
+            if finished is not None:
+                self._offsets_written = (finished, plan.source)
+        self._set_outcome(f"Offsets written into {plan.source.name}")
 
     def _registration_step(self, why: list[str]) -> tuple[list[str], str | None]:
         """The pairs of ``plate-registration`` and what it waits for, with a line of ``why`` for them.

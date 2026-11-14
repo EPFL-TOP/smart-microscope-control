@@ -27,6 +27,7 @@ import smc.ui.controller as controller_module
 from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveTurret
 from smc.hardware.profile import Profile
+from smc.hardware.profile_write import BLOCK_BEGIN, BLOCK_END
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.errors import PluginRunError
 from smc.plugins.objective_offsets.plugin import _refuse_wells_that_disagree
@@ -43,7 +44,12 @@ from smc.plugins.slots import (
 )
 from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
-from smc.ui.controller import NOT_CONNECTED, CalibrationRead, PlatePage
+from smc.ui.controller import (
+    NOT_CONNECTED,
+    CalibrationRead,
+    OffsetsPlanView,
+    PlatePage,
+)
 from smc.ui.guide import (
     OFFSETS_DRY_RUN,
     OFFSETS_NO_DOCUMENT,
@@ -156,13 +162,15 @@ def _measure(
 
 
 def _result(
-    *targets: tuple[str, tuple[float, float]], plate_objective: str = TEN
+    *targets: tuple[str, tuple[float, float]],
+    plate_objective: str = TEN,
+    reference_in_profile: bool = False,
 ) -> ObjectiveOffsetsResult:
     """A result of the plate registered under ``plate_objective``, each target's offset its own shift."""
     return ObjectiveOffsetsResult(
         plate_objective=plate_objective,
         reference=plate_objective,
-        reference_in_profile=False,
+        reference_in_profile=reference_in_profile,
         measures=tuple(_measure(label, shift) for label, shift in targets),
         offsets=tuple(
             MeasuredOffset(objective=label, xy_offset_um=shift)
@@ -1092,3 +1100,287 @@ def test_nothing_else_in_the_page_writes_confirm_turns() -> None:
         "guide.py": 0,
         "plate_page.py": 0,
     }
+
+
+# --- the plan and the write (D7) ----------------------------------------------------
+
+DEMO_PROFILE = Path(__file__).resolve().parents[2] / "profiles" / "demo.toml"
+#: What an earlier write left: the profile's own block, between the markers smc writes.
+HELD = f"""
+{BLOCK_BEGIN}
+[objectives]
+reference = "{TEN}"
+
+[objectives.offsets."{FORTY}"]
+xy_offset_um = [1.0, 2.0]
+measured = "2026-11-01, session 2"
+{BLOCK_END}
+"""
+
+
+@pytest.fixture
+def stand_file(tmp_path: Path) -> Path:
+    """A copy of ``demo.toml`` in the test's own folder: the one file a write may replace."""
+    path = tmp_path / "stand.toml"
+    path.write_bytes(DEMO_PROFILE.read_bytes())
+    return path
+
+
+@pytest.fixture
+def make_stand(
+    fake_core: FakeCore, stand_file: Path
+) -> Iterator[Callable[[str], Microscope]]:
+    """Builds the fake stand on the profile loaded from ``stand_file`` (with ``extra`` TOML appended first), so that the page's profile has a ``source``."""
+    stands: list[Microscope] = []
+
+    def make(extra: str = "") -> Microscope:
+        if extra:
+            stand_file.write_bytes(stand_file.read_bytes() + extra.encode("utf-8"))
+        stand = Microscope.from_core(
+            cast("CMMCorePlus", fake_core), Profile.load(stand_file)
+        )
+        stands.append(stand)
+        return stand
+
+    try:
+        yield make
+    finally:
+        for stand in stands:
+            stand.close()
+
+
+def _plan_page(
+    make_stand: Callable[[str], Microscope], run_doc: Path, *, held: bool
+) -> PlatePage:
+    """A page whose document holds the plate and a result of the 40X measured from the 10X.
+
+    With ``held`` the profile already names the 10X as its reference and an offset for the
+    40X, and the result was measured from that reference (``reference_in_profile``); the page
+    holds the profile as it was when it was built.
+    """
+    stand = make_stand(HELD if held else "")
+    _seed_plate(run_doc)
+    _seed_offsets(run_doc, _result((FORTY, (-37.5, 12.25)), reference_in_profile=held))
+    return _stub_page(stand, run_doc)
+
+
+def _lines(was: str | None) -> tuple[str, ...]:
+    """The preview of the 40X's result, written out from the numbers; ``was`` is what the profile held for the 40X (``None``: no reference at all)."""
+    shift = (
+        f"'{FORTY}'  shift from '{TEN}' (-37.50, +12.25) µm, spread 0.03 µm over A1, "
+        "H12, A12 (bound 2.00 µm)"
+    )
+    if was is None:
+        return (
+            shift,
+            f"'{FORTY}'  xy (-37.50, +12.25) µm  was unknown",
+            f"reference '{TEN}'  (new: the profile named none)",
+            'measured = "2026-11-14, objective-offsets in run.json"',
+        )
+    return (
+        shift,
+        f"'{FORTY}'  xy (-37.50, +12.25) µm  was xy ({was}) µm, measured "
+        "2026-11-01, session 2",
+        f"reference '{TEN}'",
+        'measured = "2026-11-14, objective-offsets in run.json"',
+    )
+
+
+def test_the_plan_is_drawn_from_a_fresh_load_of_the_profile_file(
+    make_stand: Callable[[str], Microscope], run_doc: Path, stand_file: Path
+) -> None:
+    page = _plan_page(make_stand, run_doc, held=True)
+    try:
+        first = page.offsets_plan("")
+        # The operator edits the profile in an editor while the page is open: the page's own
+        # profile, loaded when it was built, still holds (1.0, 2.0); the file holds (3.0, 4.0).
+        stand_file.write_text(
+            stand_file.read_text(encoding="utf-8").replace(
+                "xy_offset_um = [1.0, 2.0]", "xy_offset_um = [3.0, 4.0]"
+            ),
+            encoding="utf-8",
+        )
+        second = page.offsets_plan("")
+        in_memory = page._profile.objectives.offsets[FORTY].xy_offset_um
+    finally:
+        page.close()
+
+    assert in_memory == (1.0, 2.0)
+    assert first == OffsetsPlanView("stand.toml", _lines("+1.00, +2.00"), None, False)
+    assert second == OffsetsPlanView("stand.toml", _lines("+3.00, +4.00"), None, False)
+
+
+def test_the_plan_names_the_session_and_says_when_the_profile_names_no_reference(
+    make_stand: Callable[[str], Microscope], run_doc: Path
+) -> None:
+    page = _plan_page(make_stand, run_doc, held=False)
+    try:
+        plain = page.offsets_plan("")
+        typed = page.offsets_plan("  session 3 (#412)  ")
+        bad = page.offsets_plan("two\nlines")
+    finally:
+        page.close()
+
+    assert plain.lines == _lines(None)
+    assert typed.lines[-1] == (
+        'measured = "2026-11-14, session 3 (#412), objective-offsets in run.json"'
+    )
+    assert bad == OffsetsPlanView(
+        "stand.toml",
+        (),
+        "the session is one line of text: no tab, no line break",
+        False,
+    )
+
+
+def test_there_is_no_preview_without_a_usable_result_and_a_broken_file_is_text(
+    make_stand: Callable[[str], Microscope], run_doc: Path, stand_file: Path
+) -> None:
+    _seed_plate(run_doc)
+    page = _stub_page(make_stand(""), run_doc)
+    try:
+        # No record of the tool at all, then one that failed: nothing to preview, no problem.
+        nothing = page.offsets_plan("")
+        _seed_offsets(run_doc, status=StageStatus.failed, error="PluginRunError: no")
+        failed = page.offsets_plan("")
+        # A result, and a profile file that is no longer TOML: the reason, as text.
+        _seed_offsets(run_doc, _result((FORTY, (-37.5, 12.25))), minute=2)
+        stand_file.write_text("[microscope\nname = ", encoding="utf-8")
+        broken = page.offsets_plan("")
+        # A run document that cannot be read is not an empty one (FM-229).
+        stand_file.write_bytes(DEMO_PROFILE.read_bytes())
+        run_doc.write_text("{not json", encoding="utf-8")
+        unreadable = page.offsets_plan("")
+    finally:
+        page.close()
+
+    assert nothing == OffsetsPlanView("stand.toml", (), None, False)
+    assert failed == OffsetsPlanView("stand.toml", (), None, False)
+    assert broken.lines == ()
+    assert broken.problem is not None
+    assert broken.problem.startswith(str(stand_file.resolve()))
+    assert unreadable.lines == ()
+    assert unreadable.problem is not None
+    assert unreadable.problem.startswith("run document: ")
+
+
+def test_write_offsets_writes_only_the_lines_that_were_shown(
+    make_stand: Callable[[str], Microscope], run_doc: Path, stand_file: Path
+) -> None:
+    page = _plan_page(make_stand, run_doc, held=True)
+    changed = (
+        "Objective offsets: the offsets or the profile changed since they were shown: "
+        "look at them again (Refresh)"
+    )
+    try:
+        shown = page.offsets_plan("session 3").lines
+        before = stand_file.read_bytes()
+        # (a) the session text changed since the preview: its line is not the one shown.
+        page.write_offsets("session 4", shown)
+        after_session = (stand_file.read_bytes(), page.status().outcome)
+        # (b) the profile was edited since the preview: what is replaced is not what was shown.
+        stand_file.write_text(
+            stand_file.read_text(encoding="utf-8").replace(
+                "xy_offset_um = [1.0, 2.0]", "xy_offset_um = [3.0, 4.0]"
+            ),
+            encoding="utf-8",
+        )
+        edited = stand_file.read_bytes()
+        page.write_offsets("session 3", shown)
+        after_edit = (stand_file.read_bytes(), page.status().outcome)
+        # (c) the lines shown are the ones now: it writes.
+        fresh = page.offsets_plan("session 3").lines
+        page.write_offsets("session 3", fresh)
+        written = stand_file.read_bytes()
+        outcome = page.status().outcome
+    finally:
+        page.close()
+
+    assert after_session == (before, changed)
+    assert after_edit == (edited, changed)
+    assert written != edited
+    assert outcome == "Offsets written into stand.toml"
+    offsets = Profile.load(stand_file).objectives.offsets[FORTY]
+    assert offsets.xy_offset_um == (-37.5, 12.25)
+    assert offsets.measured == "2026-11-14, session 3, objective-offsets in run.json"
+
+
+def test_write_offsets_refuses_while_a_run_goes(
+    make_stand: Callable[[str], Microscope], run_doc: Path, stand_file: Path
+) -> None:
+    page = _plan_page(make_stand, run_doc, held=False)
+    try:
+        shown = page.offsets_plan("").lines
+        before = stand_file.read_bytes()
+        page.run("slow", [])
+        assert Slow.started.wait(10.0)
+        with pytest.raises(RuntimeError, match=r"^slow is running$"):
+            page.write_offsets("", shown)
+        after = stand_file.read_bytes()
+    finally:
+        Slow.release.set()
+        assert page.join(10.0)
+        page.close()
+
+    assert after == before
+
+
+def test_a_profile_with_no_file_has_nothing_to_write(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    assert fake_microscope.profile.source is None
+    _seed_plate(run_doc)
+    _seed_offsets(run_doc, _result((FORTY, (-37.5, 12.25))))
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        view = page.offsets_plan("")
+        page.write_offsets("", ())
+        outcome = page.status().outcome
+    finally:
+        page.close()
+
+    assert view == OffsetsPlanView(
+        "",
+        (),
+        "this stand's profile is built into smc, with no file to write",
+        False,
+    )
+    assert outcome == (
+        "Objective offsets: this stand's profile is built into smc, with no file to write"
+    )
+
+
+def test_after_a_write_the_plan_says_written_and_a_second_write_is_refused_by_the_reference_check(
+    make_stand: Callable[[str], Microscope], run_doc: Path, stand_file: Path
+) -> None:
+    page = _plan_page(make_stand, run_doc, held=False)
+    refusal = (
+        f"the profile's offsets are now from {TEN}, and the run measured them from "
+        "(none): run objective-offsets again"
+    )
+    try:
+        shown = page.offsets_plan("").lines
+        assert page.offsets_plan("").written is False
+        page.write_offsets("", shown)
+        once = stand_file.read_bytes()
+        after = page.offsets_plan("")
+        # A second click on the same lines: the file holds a reference now, and the result
+        # measured the offsets from none: the library refuses, nothing is written.
+        page.write_offsets("", shown)
+        twice = stand_file.read_bytes()
+        outcome = page.status().outcome
+        # The tool runs again: its result is not the one written, so the block says nothing
+        # of a write any more.
+        page.run(
+            "objective-offsets",
+            [f'targets=["{FORTY}"]', 'calibrations=["cal.json"]', "confirm_turns=true"],
+        )
+        assert page.join(10.0)
+        again = page.offsets_plan("")
+    finally:
+        page.close()
+
+    assert after == OffsetsPlanView("stand.toml", (), refusal, True)
+    assert twice == once
+    assert outcome == f"Objective offsets: {refusal}"
+    assert again.written is False
