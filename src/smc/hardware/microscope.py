@@ -161,6 +161,9 @@ class _Stops:
     done: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    #: The roles whose own stop raised a declared refusal, for the clause on
+    #: moves cut into segments (m2 §11.12 D5).
+    refused_roles: list[Role] = field(default_factory=list)
 
 
 def _note_still_moving(exc: BaseException | None, tracked: tuple[str, ...]) -> None:
@@ -270,6 +273,8 @@ class Microscope:
             max_engage_excursion_um=safety.max_engage_excursion_um,
             z_away_from_sample=safety.z_away_from_sample,
             first_lock_max_rise_um=safety.first_lock_max_rise_um,
+            max_segment_um=safety.max_segment_um,
+            max_z_segment_um=safety.max_z_segment_um,
         )
         self._lock = threading.RLock()
         # FM-15: waiting for the lock is bounded like a device call.
@@ -829,11 +834,12 @@ class Microscope:
             "The microscope stays halted: stop the stage at the stand if it still "
             "moves, then call `resume()`"
         )
+        segmented = self._segmented_clause(stops.refused_roles)
         if stops.failed:
             refused = (
                 f"; {join_names(stops.refused)} refused the stop, as the profile "
                 f"declares ([safety] stop_refused_by), so a move under way runs to "
-                f"its target"
+                f"its target{segmented}"
                 if stops.refused
                 else ""
             )
@@ -851,10 +857,32 @@ class Microscope:
                 f"the emergency stop halted the microscope{switched}, but "
                 f"{join_names(stops.refused)} refused the stop, as the profile "
                 f"declares ([safety] stop_refused_by): a move under way runs to "
-                f"its target. The microscope stays halted: stop the stage with "
-                f"the stand's own controls if it must not finish its move, then "
-                f"call `resume()`",
+                f"its target{segmented}. The microscope stays halted: stop the "
+                f"stage with the stand's own controls if it must not finish its "
+                f"move, then call `resume()`",
             )
+
+    def _segmented_clause(self, refused: list[Role]) -> str:
+        """The emergency stop's clause for a refused role whose moves are cut (m2 §11.12 D5).
+
+        A halt refuses the next segment, so such a move ends with its current
+        one, not at its target: the operator is told which keys make it so.
+        """
+        safety = self.profile.safety
+        keys = [
+            key
+            for key, role, cap in (
+                ("max_segment_um", Role.xy_stage, safety.max_segment_um),
+                ("max_z_segment_um", Role.focus, safety.max_z_segment_um),
+            )
+            if cap is not None and role in refused
+        ]
+        if not keys:
+            return ""
+        return (
+            f"; a move cut into segments ([safety] {join_names(keys)}) ends with its "
+            f"current segment, since the halt refuses the next"
+        )
 
     def resume(self) -> None:
         """Clear the halt and forget every motion still tracked; starts nothing (§13)."""
@@ -1040,6 +1068,7 @@ class Microscope:
             try:
                 done = self._stop_one(capability, role)
             except StopRefusedError as exc:
+                stops.refused_roles.append(role)
                 # Once each, in order of first appearance: Z's stop reaches
                 # the offset again through its link, and `refused` also names
                 # the offset device's own (m2 §11.11 E1).

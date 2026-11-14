@@ -871,6 +871,34 @@ _LET_IT_FINISH = f"let it finish or stop it with the stand's own controls, then 
             f"{_LET_IT_FINISH}",
             id="still-moving",
         ),
+        pytest.param(
+            (
+                StopNote("xy_stage XYStage", StopOutcome.refused),
+                StopNote("xy_stage XYStage", StopOutcome.rest_not_sent),
+            ),
+            "interrupted — xy_stage XYStage refuses a stop on this stand ([safety] "
+            "stop_refused_by), so it runs to the end of its current segment; the "
+            "rest of xy_stage XYStage's move was not sent: the profile cuts it into "
+            f"segments; {_LET_IT_FINISH}",
+            id="refused-then-rest-not-sent",
+        ),
+        pytest.param(
+            (StopNote("xy_stage XYStage", StopOutcome.rest_not_sent),),
+            "interrupted — the rest of xy_stage XYStage's move was not sent: the "
+            f"profile cuts it into segments; {_READ}",
+            id="rest-not-sent",
+        ),
+        pytest.param(
+            (
+                StopNote("z ZDrive", StopOutcome.refused),
+                StopNote("xy_stage XYStage", StopOutcome.rest_not_sent),
+            ),
+            "interrupted — z ZDrive refuses a stop on this stand ([safety] "
+            "stop_refused_by), so it runs to its target; the rest of xy_stage "
+            "XYStage's move was not sent: the profile cuts it into segments; "
+            f"{_LET_IT_FINISH}",
+            id="another-motion-is-not-cut",
+        ),
     ],
 )
 def test_the_ctrl_c_line_says_what_the_stop_did(
@@ -956,6 +984,40 @@ def test_say_stop_refused_reads_the_profile_section_and_filters_by_roles(
     only_xy = demo.model_copy(update={"stop_refused_by": (Role.xy_stage,)})
     cli._say_stop_refused(only_xy, [Role.xy_stage, Role.focus])
     assert capsys.readouterr().out.splitlines() == [_XY_DECLARED_LINE]
+    # The keys of m2 §11.12 are read from the same section.
+    cut = declared.model_copy(update={"max_segment_um": 5000.0})
+    cli._say_stop_refused(cut, [Role.xy_stage])
+    assert capsys.readouterr().out.splitlines() == [
+        f"{_XY_DECLARED_LINE}; but an xy_stage move is sent in segments of at most "
+        "5000 µm ([safety] max_segment_um), so Ctrl-C ends it at the end of the "
+        "current segment"
+    ]
+
+
+def test_the_stop_refused_line_names_the_segments_of_each_role_with_a_key() -> None:
+    # m2 §11.12 D5: one clause per named role whose key is set, in role order.
+    line = cli._stop_refused_line(
+        [Role.focus, Role.xy_stage, Role.autofocus_offset],
+        {Role.xy_stage: 5000.0, Role.focus: 100.0},
+    )
+    assert line == (
+        "! the profile declares that this stand refuses stop() on xy_stage, focus "
+        "and autofocus_offset ([safety] stop_refused_by): once sent, a move runs to "
+        "its target, and Ctrl-C ends smc, not the move; but an xy_stage move is sent "
+        "in segments of at most 5000 µm ([safety] max_segment_um), so Ctrl-C ends it "
+        "at the end of the current segment; but a focus move is sent in segments of "
+        "at most 100 µm ([safety] max_z_segment_um), so Ctrl-C ends it at the end of "
+        "the current segment"
+    )
+    # A role not named gets no clause, even with its key set.
+    assert cli._stop_refused_line([Role.focus], {Role.xy_stage: 5000.0}) == (
+        "! the profile declares that this stand refuses stop() on focus ([safety] "
+        "stop_refused_by): once sent, a move runs to its target, and Ctrl-C ends smc, "
+        "not the move"
+    )
+    # Without a key, the line is §11.6's.
+    assert cli._stop_refused_line([Role.xy_stage]) == _XY_DECLARED_LINE
+    assert cli._stop_refused_line([], {Role.xy_stage: 5000.0}) is None
 
 
 @pytest.mark.demo
