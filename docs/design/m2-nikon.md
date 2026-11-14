@@ -4551,7 +4551,8 @@ hold the floor as written (set the floor, [safety]
 autofocus_offset_soft_limits, to a value it holds) or it did not take the
 write (read the offset again and check the stand) (m2 §12.12 D16) ``
 
-Not a declared stand, or `--to VALUE`: `offset 7927 PFSOffset units,
+Not a declared stand, or `--to VALUE`, or a readback that is not finite
+(it lies on no side, as in §12.10.6): `offset 7927 PFSOffset units,
 although 7927.5 was asked`, as today; a readback equal to the floor says
 only the offset; the dry-run text is unchanged. The `profiles/README.md`
 row of `autofocus_offset_soft_limits` says that the command says so on a
