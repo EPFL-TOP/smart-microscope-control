@@ -324,6 +324,12 @@ _CLOSE_WAIT_S = 10.0
 _READS_WAIT_S = 5.0
 _READS_POLL_S = 0.01
 
+#: How long a stand read that runs off the loop may go unanswered while an activity
+#: goes before ``status()`` says so in ``problems``, in seconds (m3 §15.4 D5). Far
+#: above a snap (166 to 198 ms measured at the Ti2-E) and the exposures M3 uses; a
+#: strip that stays still without a word would hide a device that stopped answering.
+_STAND_READ_LATE_S = 10.0
+
 #: How long ``release()`` waits for a connect that ``close()`` gave up on, in
 #: seconds. 10 (``close``) + 10 (the server's stop) + 8 is 28 s, inside the service's
 #: ``AppStopMethodConsole 30000`` (``docs/ui/service.md``).
@@ -952,10 +958,11 @@ class ChainStatus:
 
 @dataclass(frozen=True, slots=True)
 class PageStatus:
-    """The stand and the run, read now.
+    """The run read now, and the stand read now, or during an activity the latest stand read (m3 §15.4).
 
     ``stand`` is the profile's ``microscope.name``. ``xy_um`` to ``halted`` are
-    ``Microscope.state()``'s; ``stop_refused`` are the roles the profile declares
+    ``Microscope.state()``'s; during an activity they are the latest read's, about
+    a second old, and unknown (``None``, ``?``) before the first; ``stop_refused`` are the roles the profile declares
     refuse their stop, so that the page can say that STOP does not stop a move in
     flight on this stand (FM-117). With ``connected`` false the page holds no
     stand, and every read of it is unknown (``None``, ``?``), never a fault.
@@ -990,6 +997,28 @@ class PageStatus:
     clock: RunClock | None = None
     chain: ChainStatus | None = None
     goto_answer: GotoAnswer | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _StandRead:
+    """One read of the stand: the fields of ``PageStatus`` that come from a device (m3 §15.4 D2).
+
+    ``began_s`` is ``time.monotonic()`` before the read's first device call, so
+    that of two reads the one that began later is the newer, whichever ended
+    last (D3). ``connected`` false is the closed stand's read: every field
+    unknown, a fact and not a fault.
+    """
+
+    began_s: float
+    connected: bool
+    xy_um: tuple[float, float] | None
+    z_um: float | None
+    objective: str | None
+    autofocus: str
+    light_on: bool | None
+    moving: tuple[str, ...]
+    halted: bool
+    problems: tuple[str, ...]
 
 
 def jog_crossing(
@@ -1680,6 +1709,14 @@ class PlatePage:
         # across a device call, and ``stop()`` never takes it (FM-70).
         self._lock = threading.Lock()
         self._current_run: tuple[str, threading.Event] | None = None
+        # The stand as the latest read saw it, what ``status()`` serves while an
+        # activity goes (m3 §15.4): the newest read by ``began_s``, the start
+        # (``time.monotonic()``) of the one read in flight off the loop, or ``None``,
+        # and the text of the last background read that raised, a string and never
+        # the exception (FM-98). All three under ``_lock``, never held across a read.
+        self._stand_read: _StandRead | None = None
+        self._stand_read_in_flight: float | None = None
+        self._stand_read_error: str | None = None
         self._progress: Progress | None = None
         # The latest activity's clock (m5 §17.10.2), under ``_lock`` with the progress it
         # times: the name, ``time.monotonic()`` at its start and at its end (``None``
@@ -4276,13 +4313,17 @@ class PlatePage:
         self._stop_note = None
 
     def status(self) -> PageStatus:
-        """The run and the stand now: the progress queue is drained and the stand is read.
+        """The run now, and the stand: read now between activities, the latest read during one (m3 §15.4).
 
-        The latest ``Progress`` is kept, so that every session sees the same. The
-        stand's read takes no lock and tolerates a failed device: what failed is in
-        ``problems``. The facade is read once; when a ``disconnect`` dropped it
-        during the read, the status is the closed stand's, so a read of a released
-        stand is never told as its fault (``another program holding it``).
+        The progress queue is drained and the latest ``Progress`` is kept, so that
+        every session sees the same. With no activity going the stand is read on
+        the caller's thread, as ``_read_stand`` says, and the read is kept. While
+        an activity goes this calls **no device**: the tick that calls it is on the
+        loop that also takes the click on STOP, and ``state()`` waits on the camera
+        for as long as a snap (133 ms median, 464 ms at most at the Ti2-E). The
+        stand's fields are then those of the latest read, one in flight at most on
+        a daemon thread (``_read_stand_in_background``), unknown before any
+        (``?``); a read that raised or that does not answer is said in ``problems``.
         """
         latest: Progress | None = None
         while True:
@@ -4290,6 +4331,8 @@ class PlatePage:
                 latest = self._queue.get_nowait()
             except queue.Empty:
                 break
+        served: _StandRead | None = None
+        start = False
         with self._lock:
             if latest is not None:
                 self._progress = latest
@@ -4300,12 +4343,55 @@ class PlatePage:
             goto_answer = self._goto_answer
             clock = self._clock()
             chain = self._chain
+            if running is not None:
+                served, start = self._served_stand_read(time.monotonic())
         stand = self._profile.microscope.name
         stop_refused = tuple(
             role.value for role in self._profile.safety.stop_refused_by
         )
-        # The whole read of the facade, from ``state()`` to the status built for it, is
-        # registered: a Disconnect waits for it before it unloads (m5 §7.2).
+        if served is None:
+            read = self._read_stand()
+            self._keep_stand_read(read)
+        else:
+            read = served
+            if start:
+                self._start_stand_read()
+        return PageStatus(
+            stand=stand,
+            dry_run=self._dry_run,
+            running=running,
+            progress=progress,
+            outcome=outcome,
+            stop_note=self._stop_note,
+            xy_um=read.xy_um,
+            z_um=read.z_um,
+            objective=read.objective,
+            autofocus=read.autofocus,
+            light_on=read.light_on,
+            moving=read.moving,
+            halted=read.halted,
+            stop_refused=stop_refused,
+            problems=read.problems,
+            connected=read.connected,
+            goto=goto,
+            clock=clock,
+            chain=chain,
+            goto_answer=goto_answer,
+        )
+
+    def _read_stand(self) -> _StandRead:
+        """Read the stand once, as ``status()`` shows it (m3 §15.4 D2).
+
+        Takes no lock and tolerates a failed device: what failed is in
+        ``problems``. The facade is read once; when a ``disconnect`` dropped it
+        during the read, the answer is the closed stand's, so a read of a released
+        stand is never told as its fault (``another program holding it``). The whole
+        read, from ``state()`` to the fields built for it, is registered: a
+        Disconnect waits for it before it unloads (m5 §7.2). ``began_s`` is taken
+        before the first device call, so that the newer of two reads is the one that
+        began later (D3).
+        """
+        began_s = time.monotonic()
         with self._reading() as microscope:
             if microscope is not None:
                 state = microscope.state()
@@ -4328,13 +4414,9 @@ class PlatePage:
                     else "no autofocus"
                 )
                 if self._microscope is microscope:
-                    return PageStatus(
-                        stand=stand,
-                        dry_run=self._dry_run,
-                        running=running,
-                        progress=progress,
-                        outcome=outcome,
-                        stop_note=self._stop_note,
+                    return _StandRead(
+                        began_s=began_s,
+                        connected=True,
                         xy_um=None
                         if state.xy is None
                         else (state.xy.x_um, state.xy.y_um),
@@ -4344,20 +4426,11 @@ class PlatePage:
                         light_on=light_on,
                         moving=tuple(state.moving),
                         halted=state.halted,
-                        stop_refused=stop_refused,
                         problems=tuple(problems),
-                        goto=goto,
-                        clock=clock,
-                        chain=chain,
-                        goto_answer=goto_answer,
                     )
-        return PageStatus(
-            stand=stand,
-            dry_run=self._dry_run,
-            running=running,
-            progress=progress,
-            outcome=outcome,
-            stop_note=self._stop_note,
+        return _StandRead(
+            began_s=began_s,
+            connected=False,
             xy_um=None,
             z_um=None,
             objective=None,
@@ -4365,14 +4438,123 @@ class PlatePage:
             light_on=None,
             moving=(),
             halted=False,
-            stop_refused=stop_refused,
             problems=(),
-            connected=False,
-            goto=goto,
-            clock=clock,
-            chain=chain,
-            goto_answer=goto_answer,
         )
+
+    def _served_stand_read(self, now: float) -> tuple[_StandRead, bool]:
+        """The stand as ``status()`` shows it during an activity, and whether to start a read; the caller holds ``_lock`` (m3 §15.4 D1, D4 to D6).
+
+        The latest stored read with the problems of the background read added: the
+        text of the one that raised (D6), then, when the read in flight began
+        ``_STAND_READ_LATE_S`` ago or more, that the stand has not answered (D5).
+        With nothing stored (an activity that began before the first status) every
+        field is unknown, and ``connected`` is whether the page holds a facade (D4):
+        never a direct read, which is what this method exists to avoid. A stored
+        read of a stand the page no longer holds, or does not hold yet (the closed
+        read kept before a Connect, the connected one kept before a Disconnect), is
+        no read either: serving it would say ``not connected`` of a page that holds a
+        stand, until the first background read lands. When no read is in flight, the
+        start of the new one is set here, in the same critical section as the check,
+        so that two tabs never start two.
+        """
+        stored = self._stand_read
+        if stored is not None and stored.connected != (self._microscope is not None):
+            stored = None
+        in_flight = self._stand_read_in_flight
+        start = in_flight is None
+        if start:
+            self._stand_read_in_flight = now
+        problems = [] if stored is None else list(stored.problems)
+        if self._stand_read_error is not None:
+            problems.append(self._stand_read_error)
+        if in_flight is not None and now - in_flight >= _STAND_READ_LATE_S:
+            problems.append(
+                f"the stand has not answered a read for {now - in_flight:.0f} s; "
+                "the strip shows its last answer"
+            )
+        if stored is None:
+            read = _StandRead(
+                began_s=now,
+                connected=self._microscope is not None,
+                xy_um=None,
+                z_um=None,
+                objective=None,
+                autofocus="?",
+                light_on=None,
+                moving=(),
+                halted=False,
+                problems=tuple(problems),
+            )
+        else:
+            read = replace(stored, problems=tuple(problems))
+        return read, start
+
+    def _keep_stand_read(self, read: _StandRead) -> None:
+        """Keep ``read`` unless it began before the one kept, and forget the text of a read that raised (m3 §15.4 D3).
+
+        Both paths store: a background read that began before a direct one and ends
+        after it never replaces it. Two reads that began at the same clock value
+        keep the one that ends last: ``time.monotonic()`` ticks every 15.6 ms on
+        Windows before Python 3.13 (FM-197), and a tie must never keep the older
+        read of a stage that has moved since. A read that did not raise clears the
+        text of the one that did. ``_lock`` is taken here and never held across a
+        read.
+        """
+        with self._lock:
+            kept = self._stand_read
+            if kept is None or read.began_s >= kept.began_s:
+                self._stand_read = read
+            self._stand_read_error = None
+
+    def _start_stand_read(self) -> None:
+        """Start the one background read ``_served_stand_read`` asked for; never raises.
+
+        A process that cannot start a thread is a read that raised: the text is
+        kept, and the in-flight mark is cleared so that the next status tries again.
+        """
+        thread = threading.Thread(
+            target=self._read_stand_in_background, name="smc-stand-read", daemon=True
+        )
+        try:
+            thread.start()
+        except Exception as exc:
+            with self._lock:
+                self._stand_read_in_flight = None
+            self._note_stand_read_failed(
+                f"stand read: {type(exc).__name__}: {_one_line(exc)}"
+            )
+
+    def _read_stand_in_background(self) -> None:
+        """The body of ``smc-stand-read``: one stand read, kept, off the loop that handles STOP.
+
+        A read that raises (a facade released under it, m5 §7.2; any device error
+        ``state()`` did not tolerate) keeps nothing but its text, a string and never
+        the exception (FM-98). The in-flight mark is cleared whatever happens, so
+        that the next status starts a read again. It is registered through
+        ``_reading()`` like every read, so a Disconnect waits for it.
+        """
+        try:
+            self._keep_stand_read(self._read_stand())
+        except Exception as exc:
+            self._note_stand_read_failed(
+                f"stand read: {type(exc).__name__}: {_one_line(exc)}"
+            )
+        finally:
+            with self._lock:
+                self._stand_read_in_flight = None
+
+    def _note_stand_read_failed(self, text: str) -> None:
+        """Keep ``text`` as the background read's failure, and log it once when it is a new one (FM-62).
+
+        The line is written after the text is kept, and only when it differs from
+        the text already kept: a stand that fails every second would otherwise
+        write a line every second to a console that may block (FM-148).
+        """
+        with self._lock:
+            new = text != self._stand_read_error
+            self._stand_read_error = text
+        if new:
+            log.warning("%s", text)
 
     def _clock(self) -> RunClock | None:
         """The latest activity's clock, or ``None`` before any and for Live; the caller holds ``_lock`` (m5 §17.10.2).
