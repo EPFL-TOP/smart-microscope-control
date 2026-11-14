@@ -96,6 +96,7 @@ from smc.plugins.slots import (
     CameraCalibration,
     DensityResult,
     ImageSide,
+    ObjectiveOffsetsResult,
     PlateResult,
     RouteResult,
     ScanPlanResult,
@@ -124,6 +125,7 @@ from smc.ui.guide import (
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     NOT_CONNECTED,
+    OFFSETS_DRY_RUN,
     PLATE_NOT_CHOSEN,
     RUN_ALL_LABEL,
     SCAN_CHECKPOINT_KEPT,
@@ -139,6 +141,8 @@ from smc.ui.guide import (
     command_line,
     local_time,
     next_slot,
+    offsets_card_lines,
+    offsets_plate_refusal,
     register_objective_refusal,
     replace_note,
     scan_plan_card_lines,
@@ -167,6 +171,7 @@ __all__ = [
     "ChainStatus",
     "CheckItem",
     "LoadedPreset",
+    "OffsetsOffer",
     "PageServerError",
     "PageStatus",
     "PlanLayer",
@@ -257,6 +262,11 @@ _CARD_CHARS = 80
 #: An assumption and an error are diagnoses whose end often says what to do: they are
 #: cut later than a value (more than twice the longest assumption a plugin writes).
 _CARD_TEXT_CHARS = 600
+
+#: ``objective-offsets``' refusal of spreads names every well of every target (about 230
+#: characters a target: five targets and six wells come to about 1 400), and its end says
+#: which target to measure again: a cut at ``_CARD_TEXT_CHARS`` would clip it (m5 §18.2 D6).
+_OFFSETS_ERROR_CHARS = 2000
 
 #: The strip says a finished run's first assumption, cut here: a pointer to the card, which
 #: holds every line at ``_CARD_TEXT_CHARS`` (m5 §8.8.2).
@@ -532,6 +542,18 @@ class SideLabel:
 
 
 @dataclass(frozen=True, slots=True)
+class OffsetsOffer:
+    """The offsets block is offered: the plate was registered from its walls, with this objective (m5 §18.2 D2).
+
+    ``plate_objective`` is the objective the plate's centres were measured with, and the one
+    every other objective's offset is measured from in this run. Nothing else is in it: the
+    turret's other labels are read from the stand when the block is drawn.
+    """
+
+    plate_objective: str
+
+
+@dataclass(frozen=True, slots=True)
 class PlateView:
     """A snapshot of what the run document says, as the page needs it (a pure read).
 
@@ -580,6 +602,9 @@ class PlateView:
     the latest ``scan`` record ended when it is ``stopped`` or ``failed`` (m5 §17.12 D17):
     the Scan screen says it and, with a reachable checkpoint, offers *Continue the scan* and
     *Start again*; ``None`` for no record, one that goes or one that ended ``done``.
+    ``offsets`` is the offsets block's offer (m5 §18.2 D2): the usable ``plate`` slot is the
+    page's plate, was registered from images (``walls``) and records the objective it was
+    registered with; ``None`` otherwise, and the block is hidden.
     """
 
     plate: str
@@ -605,6 +630,7 @@ class PlateView:
     register_refusal: str | None = None
     frame_wells: tuple[str, ...] = ()
     scan_end: ScanEnd | None = None
+    offsets: OffsetsOffer | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1080,6 +1106,34 @@ def _scan_plan_of(record: StageRecord) -> ScanPlanResult | None:
         return None
 
 
+def _offsets_of(record: StageRecord) -> ObjectiveOffsetsResult | None:
+    """``record``'s result as an ``ObjectiveOffsetsResult``, or ``None``: anything else is the generic card.
+
+    Tried only for the record that provides ``objective-offsets`` and never an exception
+    for a document that is data (FM-125): a result that does not validate keeps the generic
+    card, and the block's preview says why it has nothing to write (m5 §18.2 D6).
+    """
+    if record.provides != "objective-offsets" or record.result is None:
+        return None
+    try:
+        return ObjectiveOffsetsResult.model_validate(record.result)
+    except ValidationError:
+        return None
+
+
+def _offsets_offer_of(registered: PlateResult | None) -> OffsetsOffer | None:
+    """The offsets block's offer for a usable plate that is the page's: registered from images, with its objective recorded (m5 §18.2 D2).
+
+    A plate registered by eye, fitted by ``plate-finding`` or registered before the objective
+    was recorded is no case for the tool (m3 §20.6 item 3): the block is hidden, and the
+    accordion's section gives the tool's own refusal. A plate whose wall images name another
+    objective is offered, and the block's wait says so (``offsets_plate_refusal``).
+    """
+    if registered is None or registered.walls is None or not registered.objective:
+        return None
+    return OffsetsOffer(registered.objective)
+
+
 def _plan_layer(
     plan: ScanPlanResult | None, scan: ScanResult | None, problems: list[str]
 ) -> PlanLayer | None:
@@ -1163,7 +1217,11 @@ def _card(
     does not validate as one is the generic card, never an exception (FM-125).
 
     A ``scan-plan`` result shows its wells, fields, field and estimate instead of
-    its first keys, which cut ``estimate_s`` away (m5 §14.3); the same rule.
+    its first keys, which cut ``estimate_s`` away (m5 §14.3); the same rule. An
+    ``objective-offsets`` result shows each target's shift, spread, wells and bound, the
+    offsets to write and where the turret is left, instead of ``measures: 2 items`` (m5
+    §18.2 D6), and its ``error`` is kept to ``_OFFSETS_ERROR_CHARS``: the tool's refusal
+    of spreads names every well of every target.
     """
     when_utc = _when_utc(record)
     lines: list[str] = []
@@ -1172,6 +1230,7 @@ def _card(
     if record.status is StageStatus.done and record.result is not None:
         from_images = _plate_from_images(record.result)
         planned = _scan_plan_of(record)
+        offsets = _offsets_of(record)
         if from_images is not None:
             lines = [_cut(_flat(line)) for line in walls_card_lines(from_images)]
             folder = None if from_images.walls is None else from_images.walls.folder
@@ -1188,6 +1247,11 @@ def _card(
             lines = [
                 _cut(_flat(line), _CARD_TEXT_CHARS)
                 for line in scan_plan_card_lines(planned)
+            ]
+        elif offsets is not None:
+            lines = [
+                _cut(_flat(line), _CARD_TEXT_CHARS)
+                for line in offsets_card_lines(offsets)
             ]
         else:
             for key, value in record.result.items():
@@ -1225,7 +1289,12 @@ def _card(
         error=(
             None
             if record.error is None
-            else _cut(_flat(record.error), _CARD_TEXT_CHARS)
+            else _cut(
+                _flat(record.error),
+                _OFFSETS_ERROR_CHARS
+                if record.provides == "objective-offsets"
+                else _CARD_TEXT_CHARS,
+            )
         ),
         stale=stale and record.status is StageStatus.done,
         files=tuple(files),
@@ -2545,6 +2614,14 @@ class PlatePage:
             # §11.4): a usable plate would be replaced by a failure. The page refuses
             # first, nothing written, before the parameters are read (FM-169, m5 §12.3).
             return f"{plugin}: {refusal}"
+        if plugin == "objective-offsets" and (
+            refusal := self._offsets_refusal(self._document()[0])
+        ):
+            # The tool refuses a dry run and a plate it cannot measure from too, but its refusal
+            # is a `failed` record that replaces a usable result (§11.4): the page refuses first,
+            # nothing written, before the parameters are read (FM-169, FM-206, m5 §18.2 D8). A
+            # document that cannot be read is read again below, and refused with its error.
+            return f"{tool_title(plugin)}: {refusal}"
         if plugin == "plate-registration" and (
             refusal := self._registration_objective_refusal(params)
         ):
@@ -4498,6 +4575,7 @@ class PlatePage:
             register_refusal=self._register_refusal(),
             frame_wells=self._frame_wells(doc),
             scan_end=self._scan_end(doc),
+            offsets=(None if plate_record is None else _offsets_offer_of(registered)),
         )
 
     def _scan_end(self, doc: RunDocument) -> ScanEnd | None:
@@ -4920,6 +4998,30 @@ class PlatePage:
             return walls_square_wells(self._plate)
         return None
 
+    def _offsets_refusal(self, doc: RunDocument) -> str | None:
+        """Why the page does not run ``objective-offsets`` in this mode or on this plate, or ``None`` (m5 §18.2 D8, FM-206).
+
+        A dry run first, then, **when the ``plate`` slot of ``doc`` is usable**, the tool's three
+        refusals of a plate that is not from the walls, records no objective, or whose wall images
+        name another one (m3 §20.6 item 3, in the tool's words). The tool refuses all of them
+        before it turns anything, but its refusal is a ``failed`` record, and the latest attempt
+        decides the slot (§11.4): a usable result of the tool would be replaced by a failure the
+        page could foresee. One source for the accordion's reason (``_blocked``), the click
+        (``_prepare``) and the block's wait (``offsets_step``), so that they agree (FM-169).
+
+        An unusable or absent plate is ``None``: the reason that follows it in ``_blocked`` comes
+        from ``reads``, as for every tool. So is a document that could not be read: ``_document()``
+        answers it with an empty one and the error beside it, and a decision from the empty
+        document alone would read the plate as absent (FM-229); the callers that need to say why
+        take the error too (``offsets_step``) or let the next read refuse with it (``_prepare``).
+        What depends on the stand or on a document alone (a calibration of another frame, a Z that
+        moves) is the tool's, after the click.
+        """
+        if self._dry_run:
+            return OFFSETS_DRY_RUN
+        plate = self._slot(doc, "plate", PlateResult, [])
+        return None if plate is None else offsets_plate_refusal(plate)
+
     def _walls_is_next(self, providers: Sequence[ToolView]) -> bool:
         """Whether ``plate-walls`` is the tool of the ``plate`` slot's step, not the first provider (m5 §12.4).
 
@@ -5164,6 +5266,8 @@ class PlatePage:
             )
             if reason is None and name == "plate-walls":
                 reason = self._walls_refusal()
+            if reason is None and name == "objective-offsets":
+                reason = self._offsets_refusal(doc)
             if reason is None:
                 reason = next(
                     (
