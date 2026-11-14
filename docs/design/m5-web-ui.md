@@ -5758,3 +5758,339 @@ browser errors.
 **Not verified (for the owner)**: the page read by a newcomer once more (#475's last
 criterion); the layout on the stand PC's screen and over RDP; a STOP at the Ti2-E on a
 stand whose profile says `stop_refused_by`; *Measure the time* at the Ti2-E with PFS.
+
+## 18. The page measures the offsets between objectives (#382)
+
+Fixed by #382's plan (2026-11-14). M3 §20 (`objective-offsets`, #380) measures how far
+each other objective's view of a registered plate is shifted from the objective the
+plate was registered with, and `smc objective offset --from-run-doc` writes the result
+into the profile; §17.12 D13 (#373) makes a plate registered on the page record the
+objective its centres were captured with. This section is the page's part: **one
+block** that starts the tool after the turns are confirmed, says which objective is in
+place, draws what was measured, and writes the profile after showing what it replaces.
+It adds no plugin, slot or command, and changes no tool: the tool's checks, refusals and
+texts stay M3 §20's, and the write is M3 §20.11 (a library the command and the page
+share).
+
+### 18.1 What was measured (2026-11-14, planning #382)
+
+Throwaway scripts that are not committed, on `main` at `70d5753`, pymmcore-plus 0.18.1,
+Python 3.13.0, Panel 1.10.0: a copy of `profiles/demo-sample.toml` with its `[sample]`
+turned as M3 §20.1 did (camera 30° and mirrored, plate 1.2°, shifts 10X `(5.0, -2.5)`,
+20X `(0, 0)`, 40X `(-32.5, 9.75)`), the documents built through `run_plugin`
+(`camera-calibration` under the 20X and the 40X into one document each, and under the
+10X with `plate-walls` on A1, H12 and A12 into `run.json`), the controller opened on
+`run.json` and connected.
+
+- **The page's own run.** `PlatePage.run("objective-offsets", [targets=<JSON>,
+  calibrations=<JSON>, confirm_turns=true])` ran to `done`: 62.8 s for two targets and three
+  wells on the demo stage's default 10 mm/s (the walk between two wells is 12 s; the tests
+  raise `Velocity`), 24 reports `<target>: <well> <side>`, `done in 62.8 s`. `view().cards`
+  held `measures: 2 items` and `offsets: 2 items`: the generic card tells an operator
+  nothing, and the tool's `assumed` lines were five.
+- **Without `confirm_turns`** the record is `failed` with the tool's text (`objective-offsets
+  turns the turret to <t1>, <t2> with the plate on the stage: … then give confirm_turns=true`)
+  and `status().objective` still read the 10X: nothing turned.
+- **The objective in place is live.** `status().objective`, polled every 20 ms: the 10X, then
+  the 40X at 0.03 s (the first report came at 5.9 s, after the walk to A1), and the 20X at
+  the **last report of the 40X's walk** (the report still said `40X: A12 -Y` while the status
+  said 20X), whose first report came 9.9 s later. So the status moves with each turn and the
+  report lags it by a walk: the page reads both, never the report alone.
+- **A failed run replaces the usable result.** After a refusal for a missing calibration the
+  checklist's `objective-offsets` read `unusable` (`the last run of objective-offsets ended
+  failed; run it again`) and the `error` of its card was `PluginRunError: objective-offsets:
+  no camera calibration of <t> in calibrations: …`: the latest attempt decides the slot (§11.4).
+- **`calibration_from`** (M3 §20.3) returned, for a document of the build above, the
+  objective and the date (`2026-11-14T14:06:37+00:00`); it refused a missing file
+  (`<path>: does not exist`) and a file that is not JSON (`<path>: is not valid JSON: …`) as
+  `PluginRunError`s whose `reason` is the text without the tool's name, and it **accepted
+  `run.json`** (a calibration of the plate's own objective, which the tool refuses later).
+- **The next step** after the walls registration is `scan-plan`; `objective-offsets` is an
+  extra, optional slot of the checklist and is not on the path (`_CHECKLIST` is unchanged).
+- **The preview** of `smc objective offset --from-run-doc` on that run, with `--session
+  "session 3 (#412)"`, is these lines, which D7 draws as they are:
+
+  ```text
+  'Nikon 40X Plan Fluor ELWD'  shift from 'Nikon 10X S Fluor' (-37.51, +12.25) µm, spread 0.03 µm over A1, H12, A12 (bound 2.00 µm)
+  'Nikon 20X Plan Fluor ELWD'  shift from 'Nikon 10X S Fluor' (-5.02, +2.49) µm, spread 0.03 µm over A1, H12, A12 (bound 2.00 µm)
+  'Nikon 40X Plan Fluor ELWD'  xy (-37.51, +12.25) µm  was unknown
+  'Nikon 20X Plan Fluor ELWD'  xy (-5.02, +2.49) µm  was unknown
+  reference 'Nikon 10X S Fluor'  (new: the profile named none)
+  measured = "2026-11-14, session 3 (#412), objective-offsets in run.json"
+  ```
+
+- `Profile.load` of `demo-sample.toml` and of `nikon-ti2.toml`: 0.2 and 0.3 ms, with no
+  cache: a load at each click reads the file as it is.
+- A profile loaded from a file has a `source` (a path); the built-in `demo` has none.
+- **Not measurable here**: what the Ti2-E's turret reads *during* a turn (M2 §8.11: a
+  position between two objectives, unknown). The block says `not known` for a `None`.
+
+### 18.2 Decisions
+
+- **D1 One block, on the Plate screen and in the expert view.** *Measure the offsets
+  between objectives*: one `pn.Card` (that text is its title), listed on the **Plate screen
+  after *Other ways to register* and before *Continue to Wells***, and in the **expert view
+  after the next-step region**; one instance (D5 of §17.2). The next step (§8.3) and the
+  checklist (`_CHECKLIST`) are **not** changed: an offset is measured once per stand, not
+  once per scan, and the scan's chain must not stop on it. The issue's *next step after a
+  registration* is this block, drawn as soon as the plate is registered from its walls. The
+  tool's own section in the accordion (under *More*) stays as it is: its form, with its
+  `confirm_turns` checkbox, is the expert's own way, and `PAGE_PARAMS` is **not** changed for
+  it (a pair the page fills silently could not confirm a turn: FM-14).
+- **D2 When it is offered.** `view().offsets` is an `OffsetsOffer(plate_objective)` exactly
+  when the usable `plate` slot is the page's plate, its `walls` is not `None` (registered
+  from images, M3 §17) **and** its `objective` is recorded (§17.12 D13); `None` otherwise,
+  and the block is hidden. A plate registered by eye, by `plate-finding` or before
+  `objective` existed is no case for the tool (M3 §20.6 item 3). `OTHER_WAYS_TO_REGISTER` is
+  unchanged; `docs/ui/plate-page.md` says that the offsets need a registration from the walls.
+- **D3 The objectives are the calibrations' (the one choice the owner may overrule at this
+  PR).** The block has **one** field, `calibrations_input` (`pn.widgets.TextAreaInput`, three
+  rows): one run document per objective to measure, one path per line, in the order the turret
+  is to turn (the last one stays in place). The page reads each document with
+  `calibration_from` (M3 §20.3) and the objective to measure is **the objective that document
+  holds**: the page derives `targets` and never asks for them, so a document with no target and
+  a target with no document cannot be typed. A pasted path loses one pair of surrounding `"`
+  (Windows' *Copy as path* adds them) and a blank line is nothing. Under the field, one line per
+  document: `<path as typed>: calibrated at <objective> on <date>` or the tool's reason
+  (`<path>: does not exist`, …). The page adds three refusals of its own, the first that holds
+  in line order: `<objective> is the objective the plate was registered with: its offset from
+  itself is zero; leave its document out`, `<objective> is not on the turret: <labels>`,
+  `<objective> is in two documents: <a> and <b>`; and `at most 5 objectives in one run`
+  (`MAX_TARGETS`: the sixth line is not read). These are foresight (FM-206): the tool checks
+  every one again.
+- **D4 The turns' confirmation, two clicks (FM-14).** *Measure the offsets* only **arms**: it
+  reads the documents (`offsets_step`) and, when nothing waits, draws the confirmation and its
+  two buttons, *Turn and measure* and *Cancel*; nothing turns. The text is
+  `offsets_confirm_text` (§18.3), and the *Turn and measure* click calls `measure_offsets(armed,
+  text)`, the **only** place in the page that writes `confirm_turns=true`. The armed objectives
+  belong to the view (`_offsets_armed`, per tab: FM-151) and are dropped by *Cancel*, by an edit
+  of the field, by a Disconnect and by any activity that goes (as the drive's confirmation is, in
+  `_draw_drive`). The controller refuses on its own
+  (FM-169): `measure_offsets` reads the documents **again** and, when the objectives are not the
+  armed ones, turns nothing and says `the objectives changed since you confirmed them (<was> →
+  <now>): measure again`. A *Turn and measure* with nothing armed turns nothing and says
+  `choose the documents and press Measure the offsets again`.
+- **D5 The objective in place, before, during and after.** The block's second line is
+  `Objective in place: <label>` from the tick's `PageStatus.objective` (`not known` when it is
+  `None`: a turret between two objectives, or a read that failed), redrawn at **every** tick,
+  text only (FM-145). The confirmation names it (`In place now: <label>`) before the turns.
+  While the tool runs, the line under it is the tool's last report with its count, `<report>
+  (<done> of <total>)`, and before the first report `no report yet: the turn and the walk to the
+  first well come first` (the first report came 5.9 s after the click, §18.1); the report names
+  the target it measured, and the in-place line moves at each turn ahead of it. After the run:
+  `Objective in place: <label> (the turret is not turned back)`. Nothing in the page turns it
+  back (FM-88).
+- **D6 The card.** `_card` builds the `objective-offsets` record's lines with
+  `offsets_card_lines(result)` when the result validates as `ObjectiveOffsetsResult`, as it builds
+  `plate-walls`' and `scan-plan`'s: the same card in the block and in the accordion. One line per
+  target, `<objective>: shift from <plate objective> (<+x>, <+y>) µm, spread <s> µm over A1, H12,
+  A12 (bound <b> µm)` (`:+.2f`, `+ 0.0` against `-0.0`, `:.2f` for the spread and the bound), then
+  `offsets to write: <label> (<+x>, <+y>) µm, …` and `the turret is left at <label>`; each line
+  through `_cut(_flat(…), _CARD_TEXT_CHARS)`, with the test of FM-205 for a line that carries a
+  label. The `assumed` lines (up to seven) are the card's. A refusal is the card's `error`, drawn
+  by the block **as the tool words it**, without the exception's type (`error_words`); for this
+  tool only its bound is `_OFFSETS_ERROR_CHARS = 2000` and not 600: the spread refusal names every
+  well of every target (about 230 characters a target, so five targets and six wells come to about
+  1 400, which a cut at 600 would clip). A stale result says so (`out of date: the plate was
+  registered again since`).
+- **D7 The write, after what it replaces.** Under the card: *Session* (`offsets_session_input`, a
+  `TextInput`: it goes into each offset's `measured` text; optional) and the **preview**, the
+  `lines` of M3 §20.11's `plan_offsets` drawn as they are, under `Writing these replaces what
+  <profile path> holds:`; the old values are in them (`was xy (…) µm, measured …`, `was unknown`,
+  a dropped Z). The preview is drawn at every `refresh()` that finds a usable result and at each
+  change of the session text (`value`, not each key), from a **fresh load of the profile's file**
+  (`Profile.load(source)`), never the page's in-memory profile: the command's reading. The button
+  *Write these offsets into <file name>* is enabled when a plan exists and no run goes.
+  `write_offsets(session, shown)` recomputes the plan and writes only when its `lines` equal the
+  `shown` ones the view drew: if the offsets, the profile or the session changed, it writes
+  nothing and says `the offsets or the profile changed since they were shown: look at them again
+  (Refresh)`. A plan the library refuses (another profile's result, a reference changed since the
+  run, a result that does not validate) is the preview's place: the refusal's text, no button.
+  After a write the block says `Written into <path>. The page keeps the offsets it was started
+  with: restart it to use these.` while the result is the one written (its `finished_utc`, kept by
+  the controller); the write **does not reload the page's profile**, so a stand already connected
+  goes on with the offsets it opened with. A profile with no `source` (the built-in `demo`) has no
+  file: `this stand's profile is built into smc, with no file to write`, no button.
+- **D8 One helper for what the page foresees (FM-206).** `PlatePage._offsets_refusal(doc)` returns
+  the first of: a dry-run page (`a dry run cannot turn the turret or image the walls; run it without
+  --dry-run`), then, **when the `plate` slot is usable**, M3 §20.6 item 3's three texts for a plate
+  that is not from the walls, records no objective, or whose wall images name another objective
+  (the tool's words, verbatim); `None` otherwise (an unusable or absent plate gives `None`: the
+  reason that follows it in `_blocked`, from `reads`, says that, as for every tool). It is
+  called from `_blocked` (the accordion section's reason, **before** `reads`', as
+  `plate-walls`' dry run is), `_prepare` (the refusal of `run("objective-offsets", …)` before
+  anything is parsed or written, `Objective offsets: <reason>`), `offsets_step` (the block's
+  wait) and nowhere else: a
+  failed record replaces a usable result, which a refusal the page can foresee must not do. What
+  depends on the stand or on a document alone (a calibration of another frame, a Z that moves) is
+  the tool's, after the click; D3's reading of documents serves the block's own click only, and
+  the accordion's form is as `smc run` is: the tool's refusals are a failed record.
+- **D9 Where the page does not go.** It does not make the calibration documents (#501: a run into a
+  document other than `run.json`, with its own card); the block's closed *How to make a
+  calibration document* says how, in words (the commands of M3 §20), and that the terminal needs
+  the stand: *Disconnect* on the Stand screen, the commands, *Connect* again. It offers no `wells`,
+  `search_um`, `max_spread_um` or `settle_ms` field (the accordion's form has them), does not turn
+  back, does not write a Z offset, and keeps no preset for the block (`NOT_IN_PARAMS` is
+  unchanged).
+- **D10 `/ui-check`.** The script serves `demo-sample` always with `--dry-run`, and the tool
+  refuses a dry run, so the block is **not** one of its states and must not appear in them: the
+  dry-run page's plate is registered from the sample's centres, not from walls, so the block is
+  hidden, which is the regression to read. The block is checked in a **one-off browser session**,
+  as the scan in motion is (`/ui-check`, *A scan in motion*): a scratch copy of `demo-sample.toml`
+  with `[sample]` turned and `objective_shift_um` set (M3 §20.1, §20.8), a scratch run folder
+  holding the documents of §18.1, the page served **without** `--dry-run`, driven through the
+  Plate screen to the card and the preview; the PNGs are in the Report and never committed. A run
+  takes about a minute at the demo's default velocity, long enough to photograph the block while
+  it measures. `SKILL.md` of `/ui-check` gains a paragraph that names it.
+
+### 18.3 Interface
+
+`smc/ui/guide.py` (pure, no Panel):
+
+```python
+OFFSETS_TITLE = "Measure the offsets between objectives"
+
+
+def offsets_others(labels: Sequence[str], plate_objective: str) -> tuple[str, ...]: ...
+def calibration_paths(text: str) -> tuple[str, ...]: ...
+def offsets_lead(plate_objective: str, others: Sequence[str]) -> str: ...
+def objective_in_place_line(objective: str | None, *, running: bool) -> str: ...
+def offsets_run_line(progress: Progress | None) -> str: ...
+def offsets_confirm_text(in_place: str | None, targets: Sequence[str]) -> str: ...
+def offsets_card_lines(result: ObjectiveOffsetsResult) -> tuple[str, ...]: ...
+def error_words(text: str) -> str: ...
+```
+
+- `offsets_others`: the turret's labels in order, without the empty ones and without
+  `plate_objective`. `calibration_paths`: the lines of `text`, each stripped of its line ends and
+  of one pair of surrounding `"`, blank ones dropped.
+- `offsets_lead`: `The plate was registered with <O>. Other objectives on the turret: <a>, <b>.
+  The page turns the turret to each objective of the documents below, finds the walls of the
+  wells it registered again, and says how far the same wells moved.`; with no other label,
+  `The plate was registered with <O>. The turret has no other objective.`.
+- `objective_in_place_line`: `Objective in place: <label>`, or `Objective in place: not known`
+  and, when `running`, ` (the turret may be turning)`.
+- `offsets_run_line`: D5's two forms (`no report yet: …`, `<report> (<done> of <total>)`); an
+  unknown total is the report alone.
+- `offsets_confirm_text`: `Turn the turret to <a>, then <b>, with the plate on the stage? Check
+  that each objective clears the plate (its working distance, the plate's height) and that the
+  stage is clear. In place now: <label, or not known>. The turret is left at <b>, not turned
+  back, and the autofocus is switched off and not engaged again.`
+- `error_words`: `text` without a leading `<Name>Error: ` and without the tool's own
+  `objective-offsets: ` prefix; other text unchanged.
+- Every text is plain (FM-139) and one line (`_flat`); a label is the stand's, a path the
+  operator's.
+
+`smc/ui/controller.py`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class CalibrationRead:
+    path: str
+    objective: str | None
+    measured: str
+    problem: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OffsetsStep:
+    pairs: tuple[str, ...]
+    targets: tuple[str, ...]
+    reads: tuple[CalibrationRead, ...]
+    wait: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OffsetsOffer:
+    plate_objective: str
+
+
+@dataclass(frozen=True, slots=True)
+class OffsetsPlanView:
+    file: str
+    lines: tuple[str, ...]
+    problem: str | None
+    written: bool
+```
+
+```python
+PlateView.offsets: OffsetsOffer | None = None  # a new field with a default
+
+
+def offsets_step(self, calibrations_text: str) -> OffsetsStep: ...
+def measure_offsets(self, armed: Sequence[str], calibrations_text: str) -> None: ...
+def offsets_plan(self, session: str) -> OffsetsPlanView: ...
+def write_offsets(self, session: str, shown: Sequence[str]) -> None: ...
+```
+
+- `offsets_step`: `reads` has one entry for each path of `calibration_paths(text)` (at most
+  `MAX_TARGETS`), by `calibration_from("objective-offsets", Path(path), profile=<the page's
+  profile name>, dry_run=<the page's mode>)`; a `PluginRunError` is `problem = exc.reason`, any
+  other exception `problem = "<path>: <Type>: <one line>"` (a typed path is data: FM-125, FM-98:
+  the text, never the exception). `targets` are the objectives of the reads, in line order.
+  `wait` is the first of: the stand closed (`NOT_CONNECTED`), `_offsets_refusal`, a run going
+  (`busy_note`), no document (`Give the camera calibration of each objective to measure: one run
+  document per line.`), the first read with a `problem` (its text), then D3's three. With a
+  `wait`, `pairs` is `()`; otherwise `pairs` is `("targets=<json.dumps(list)>",
+  "calibrations=<json.dumps(list of the paths as typed)>")`: JSON, so that a Windows path's
+  backslashes are doubled by the encoder and not by the operator. It reads the turret's labels
+  with `objective_labels()` inside a read a Disconnect waits for.
+- `measure_offsets`: D4. It runs `run("objective-offsets", [*step.pairs, "confirm_turns=true"])`;
+  the controller's own refusals (`_prepare`) apply.
+- `offsets_plan` and `write_offsets`: D7, through M3 §20.11's `plan_offsets` and `write_offsets`
+  on `RunDocument.load_or_new(self.run_doc)`, `Profile.load(source)` (`file` is `source.name`,
+  `""` for none) and the record of the usable `objective-offsets` slot. `write_offsets` is
+  refused while an activity goes (`RuntimeError`, as `run`), sets the outcome `Offsets written
+  into <file name>` and keeps `(finished_utc, source)` of what it wrote.
+- `_card` uses `offsets_card_lines`; `ResultCard` is unchanged.
+
+`smc/ui/plate_page.py` (`PlatePageView`): `offsets_box` (the `pn.Card`), `offsets_lead_text`,
+`objective_in_place_text`, `calibrations_input`, `calibration_reads_text`, `calibration_how_card`
+(closed: the commands and the Disconnect note), `offsets_measure_button` (*Measure the offsets*),
+`offsets_wait_text`, `offsets_confirm_text`, `offsets_turn_button` (*Turn and measure*),
+`offsets_cancel_button` (*Cancel*), `offsets_run_text`, `offsets_result_text`,
+`offsets_session_input`, `offsets_plan_text`, `offsets_write_button`, `offsets_write_note`;
+`_offsets_armed: tuple[str, ...] | None`; handlers `on_offsets_measure`, `on_offsets_turn`,
+`on_offsets_cancel`, `on_offsets_write` and `_on_calibrations_changed`, every one registered
+through `_handler` (FM-171) and every text through `_say`; drawers `_draw_offsets(status)` from
+`tick()` (text only, FM-145) and `_draw_offsets_view()` from `refresh()` (the offer, the lead, the
+card, the preview). The block is listed in `screens["plate"]` and `screens["expert"]` and is a
+container, never a figure (FM-174).
+
+### 18.4 Tests and failure modes
+
+- `tests/unit/test_profile_offsets.py` (M3 §20.11) is new; `tests/test_cli_objective_offsets.py`
+  stays untouched and green.
+- `tests/unit/test_ui_guide.py` gains the pure tests of D3, D5, D6 and §18.3 (names in the plan).
+  `tests/unit/test_plate_page_offsets_view.py` (new, Panel) holds the block's widgets and
+  handlers; `tests/test_plate_page_offsets_demo.py` (new, `@pytest.mark.demo`) holds the
+  controller on `demo-sample` with the shifts: a real run through the confirmation, the refusals
+  before anything turns or is written, and the write.
+- **Failure modes**: FM-14 (the turn is confirmed by a click that names what it turns), FM-24 and
+  FM-50 (typed paths: as typed, never resolved, JSON-encoded), FM-36 (the preview's brackets),
+  FM-38 (the library's atomic write), FM-64 (a STOP in a walk), FM-88 (nothing turns back), FM-98,
+  FM-113 and FM-125 (a typed path and a record are data), FM-139 (plain text: labels and paths come
+  from outside), FM-145 (the tick reads nothing new), FM-151 (the armed objectives and the typed
+  field are the view's), FM-169 (every refusal in the controller; the confirm click with nothing
+  armed), FM-171 (every handler through `_handler`; the guard test walks `screens`), FM-172 (what
+  the write replaces is shown, and only what was shown is written), FM-182 (the block walked on a
+  dry-run page), FM-205 (the card's longest lines through the bound), FM-206 (one helper for what
+  the page foresees), FM-216 (a document of its own per objective), FM-226 (the accordion's section
+  keeps its own notes). **New entry**, named by its text and written by the develop session only if
+  a review confirms a variant the tests miss: *a confirmation the controller does not compare with
+  what it then runs* (D4's armed objectives).
+
+### 18.5 What this does not do
+
+- It does not make the calibration documents (#501), turn the turret back, write a Z offset, or
+  reload the profile of a connected page.
+- It does not measure from a plate registered by eye, by `plate-finding` or before the objective
+  was recorded; it says so by hiding the block (D2), and the accordion's section gives the tool's
+  own refusal.
+- It does not guard the accordion's own *Run objective-offsets* against the tool's refusals that
+  depend on the documents (a failed record replaces a usable result there, as `smc run` does): the
+  block is the protected way.
+
+**Not verified (for the owner)**: the block at the Ti2-E (a turn at the plate's height, what the
+turret reads during it, the run's time, the offsets 4× → 10× and 4× → 40×: M3 §20.10) and read by a
+newcomer; the profile written from the page on the stand PC.
