@@ -425,7 +425,10 @@ offset limits of `--profile`:
   `no-objective`) or `no peak`. **Stderr** has one `select_fields: warning:` line for each
   reason a stop lost its offset, and one for what that costs: `nis-export` carries one
   autofocus flag for the whole list, so one stop with no offset takes the autofocus
-  offsets from every stop (its `z` mode). The exit code stays 0.
+  offsets from every stop (its `z` mode). The exit code stays 0, so a run that ends well
+  writes to stderr: in **Windows PowerShell 5.1**, `2>&1` shows each of those lines as an
+  error record (`NativeCommandError`) although nothing failed (read from the shell's
+  documentation, not run at a stand PC); read the exit code, not the colour.
 - A scan with no focus step is printed and recorded as before: no line, an empty stderr.
 - `selection.json`'s `pfs_offset` is the **frame's** reading, a candidate's feature; a
   stop's offset is in the record of the copy.

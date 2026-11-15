@@ -3483,8 +3483,16 @@ def test_the_table_shows_the_derived_offsets_and_the_profile_used(
     assert (
         "  offsets: 4 of 6 stops carry a pfs_offset derived for the cells' plane" in out
     )
+    # The derived line's range and factor, whole, in the console's ASCII: `..` and `um`,
+    # not the escapes of a micro sign and an ellipsis (FM-20); the record keeps the signs.
+    assert "their frame was taken -3.00..+2.70 um from the plane PFS held" in out
+    assert "112.6 offset units per um for Nikon 10X S Fluor" in out
     assert out.isascii()
+    assert "\\u2026" not in out
+    assert "\\xb5" not in out
     stage = RunDocument.load(tmp_path / "run-selected.json").stages["route-prototype"]
+    saved = RouteResult.model_validate(stage.result).assumed
+    assert any("taken -3.00…+2.70 µm from the plane PFS held" in line for line in saved)
     stops = _stops_of(tmp_path / "run-selected.json")
     assert [s.pfs_offset for s in stops] == [
         1662.0,
@@ -3496,9 +3504,13 @@ def test_the_table_shows_the_derived_offsets_and_the_profile_used(
     ]
     assert stage.params["offset_profile"] == "demo"
     assert stage.params["offset_limits"] == [0.0, 20000.0]
-    # The profile is named, never the path it was read from (FM-50).
-    assert str(tmp_path) not in json.dumps(stage.model_dump(mode="json"))
-    assert str(profile) not in out.replace(f"wrote {tmp_path}", "")
+    # The profile is named, never the path it was read from (FM-50). The dump is JSON,
+    # which doubles a Windows path's backslashes: compare the escaped folder, and the
+    # file's name, which no escaping changes.
+    dumped = json.dumps(stage.model_dump(mode="json"))
+    assert json.dumps(str(tmp_path))[1:-1] not in dumped
+    assert "stand.toml" not in dumped
+    assert "stand.toml" not in out
 
 
 def test_an_offset_outside_the_limits_or_a_scan_with_no_objective_is_a_warning_too(
@@ -3563,7 +3575,22 @@ def test_a_profile_of_another_stand_than_the_scans_is_refused(
     assert not (tmp_path / "run-selected.json").exists()
 
 
-def test_a_profile_that_does_not_load_is_a_refusal_before_any_frame_is_read(
+def test_a_profile_that_does_not_load_is_a_refusal(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _focused(tmp_path)
+    broken = tmp_path / "broken.toml"
+    broken.write_text("[microscope\nname = ", encoding="utf-8")
+    for source in (str(broken), "no-such-profile-488"):
+        code, out, err = _main(sf, capsys, seed.path, "--profile", source)
+        assert (code, out) == (2, "")
+        assert err.startswith("select_fields: ")
+        assert "Traceback" not in err
+    assert "no-such-profile-488" in err
+    assert not (tmp_path / "run-selected.json").exists()
+
+
+def test_the_profile_is_read_before_any_frame_is_read(
     tmp_path: Path,
     sf: ModuleType,
     capsys: pytest.CaptureFixture[str],
@@ -3577,14 +3604,133 @@ def test_a_profile_that_does_not_load_is_a_refusal_before_any_frame_is_read(
     seed = _focused(tmp_path)
     broken = tmp_path / "broken.toml"
     broken.write_text("[microscope\nname = ", encoding="utf-8")
-    for source in (str(broken), "no-such-profile-488"):
-        code, out, err = _main(sf, capsys, seed.path, "--profile", source)
-        assert (code, out) == (2, "")
-        assert err.startswith("select_fields: ")
-        assert "Traceback" not in err
-    assert "no-such-profile-488" in err
     mismatch = _profile_file(tmp_path, name="nikon-ti2")
-    code, _, _ = _main(sf, capsys, seed.path, "--profile", str(mismatch))
-    assert code == 2
+    for source in (str(broken), "no-such-profile-488", str(mismatch)):
+        code, _, _ = _main(sf, capsys, seed.path, "--profile", source)
+        assert code == 2
     assert reads == []  # no frame was opened by any of the three refusals
     assert not (tmp_path / "selection").exists()
+    # The stub is called when the profile is good: six frames, one read each.
+    code, _, _ = _main(sf, capsys, seed.path, "--profile", str(_profile_file(tmp_path)))
+    assert code == 0
+    assert len(reads) == 6
+
+
+def test_a_profile_without_limits_or_without_the_objectives_factor_is_said_with_its_objective(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # No limits: the table says so, and the record has none (the demo's own case).
+    seed = _focused(tmp_path)
+    no_limits = _profile_file(tmp_path, limits=None)
+    code, out, err = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--profile", str(no_limits)
+    )
+    assert (code, err) == (0, "")
+    assert "  offsets: profile demo, no offset limits" in out
+    stage = RunDocument.load(tmp_path / "run-selected.json").stages["route-prototype"]
+    assert (stage.params["offset_profile"], stage.params["offset_limits"]) == (
+        "demo",
+        None,
+    )
+    # A profile with a factor for another objective only: the scan's is named, in the
+    # table and on stderr, as it is in the record.
+    other = _profile_file(tmp_path, factors={"Plan Apo 40x": FACTOR}, filename="o.toml")
+    code, out, err = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--profile", str(other)
+    )
+    assert code == 0
+    named = "they keep z_um, the cells' plane (objective: Nikon 10X S Fluor)"
+    assert any(line.endswith(named) for line in out.splitlines())
+    assert err.splitlines()[0].endswith(named)
+
+
+def test_a_stop_carries_its_own_frames_plane_when_the_route_order_is_not_the_choice_order(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 1, 3 and 2 cells in frames 0, 1 and 2: the choice ranks them 1, 2, 0 while the
+    # route, which starts at the field nearest the well's first planned field, visits
+    # 0, 1, 2. Each stop must take the plane of the frame it is, in the record and in
+    # the table, and not that of the frame at its rank or at its place in the choice.
+    def cells(scan: ScanResult) -> list[Cell]:
+        return [
+            Cell(
+                well="A1",
+                x_um=frame.x_um - 40.0 + 40.0 * i,
+                y_um=frame.y_um,
+                label="single",
+                score=0.9,
+                frame=k,
+                box_px=(0.0, 0.0, 10.0, 10.0),
+            )
+            for k, frame in enumerate(scan.frames)
+            for i in range((1, 3, 2)[k])
+        ]
+
+    seed = seed_run(
+        tmp_path,
+        cells=cells,
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        cell_focus_of={("A1", i): focus_step(DZ[i]) for i in range(3)},
+    )
+    options = _with_profile(sf, min_spacing_um=30.0)
+    choices = _choices(sf, seed, options)
+    assert [s.candidate.frame for s in choices[0].chosen] == [1, 2, 0]
+    result = sf.route_result(seed.scan, seed.plan, choices, options=options)
+    assert [_frame_of_stop(seed, s) for s in result.positions] == [0, 1, 2]
+    for stop in result.positions:
+        k = _frame_of_stop(seed, stop)
+        assert (stop.z_um, stop.pfs_offset) == (1000.0 + 10.0 * k, OFFSET_OF[k])
+        assert stop.offset_from_focus == OffsetFromFocus(
+            lock_offset=2000.0 + 10.0 * k, dz_um=DZ[k], offset_per_um=FACTOR
+        )
+    profile = _profile_file(tmp_path)
+    code, out, _ = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--profile", str(profile)
+    )
+    assert code == 0
+    rows = _stop_rows(out)
+    assert list(rows.items()) == [
+        (0, ("1662", "derived")),
+        (1, ("2314", "derived")),
+        (2, ("1688", "derived")),
+    ]
+
+
+def test_a_stderr_that_goes_away_does_not_cost_the_files(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `select_fields.py run.json 2> warnings.log` on a full disk, or a closed stream: the
+    # warnings cannot be written, and the minutes of reading still end in the files (FM-30).
+    seed = _focused(tmp_path)  # no profile: four stops lose their offset, so it warns
+    here = sys.stderr
+    monkeypatch.setattr(sys, "stderr", _GoneReader())
+    assert sf.main([str(seed.path), "--min-spacing-um", "30"]) == 0
+    monkeypatch.setattr(sys, "stderr", here)
+    for name in ("selection/selection.json", "selection/A1.png", "run-selected.json"):
+        assert (tmp_path / name).is_file(), name
+    assert len(_stops_of(tmp_path / "run-selected.json")) == 6
+    capsys.readouterr()
+
+
+def test_the_warnings_come_before_a_failed_write_and_do_not_end_the_run(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _focused(tmp_path)
+    (tmp_path / "blocker").write_text("a file", encoding="utf-8")
+    inside_a_file = tmp_path / "blocker" / "sub"  # not there, so the pre-check passes
+    code, _, err = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--out-dir", str(inside_a_file)
+    )
+    assert code == 1
+    lines = err.splitlines()
+    assert len(lines) == 3
+    assert all(line.startswith("select_fields: warning: ") for line in lines[:2])
+    assert lines[2].startswith("select_fields: could not write")
+    assert (
+        tmp_path / "run-selected.json"
+    ).is_file()  # the copy does not need the folder
