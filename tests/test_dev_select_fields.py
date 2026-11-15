@@ -3401,15 +3401,17 @@ def _stop_rows(out: str) -> dict[int, tuple[str, str | None]]:
 def test_the_table_and_stderr_say_which_stops_have_no_offset_without_a_profile(
     tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # One frame too far from the lock's plane (its line holds a micro sign), two with a
-    # distance to convert and no factor to convert it with, and one with no step: what the
-    # command prints is ASCII (FM-20) and what it says is on stderr as well as in the table.
+    # One frame too far from the lock's plane (its line holds a micro sign), one with a
+    # distance to convert and no factor to convert it with, and one at the lock's plane;
+    # what the command prints is ASCII (FM-20) and what it says is on stderr as well as
+    # in the table. Frames 1 and 2 had a sweep that found no peak (a record that also
+    # gives frame 1 a distance is an edited one: it tells a lost stop from a flagged one).
     seed = _row_of_three(
         tmp_path,
         scan_objective="Plan Apo λ 40x",
         cell_focus_of={
             ("A1", 0): focus_step(60.0),
-            ("A1", 1): focus_step(-3.0),
+            ("A1", 1): focus_step(-3.0, source="swept", outcome="flat"),
             ("A1", 2): focus_step(0.0, source="swept", outcome="flat"),
         },
     )
@@ -3417,7 +3419,7 @@ def test_the_table_and_stderr_say_which_stops_have_no_offset_without_a_profile(
     assert code == 0
     assert _stop_rows(out) == {
         0: ("-", "implausible"),
-        1: ("-", "no-factor"),
+        1: ("-", "no-factor, no peak"),
         2: ("2020", "no peak"),
     }
     # The script's own line first, then `route`'s for the frame that is too far, written
@@ -3435,11 +3437,11 @@ def test_the_table_and_stderr_say_which_stops_have_no_offset_without_a_profile(
         "right; run scan again; they keep z_um"
     )
     no_peak = (
-        "1 of 3 stops took their frame from a field whose focus sweep found no peak "
+        "2 of 3 stops took their frame from a field whose focus sweep found no peak "
         "(flat, at an edge or two peaks): its plane is the sweep's centre, not the "
         "cells' plane"
     )
-    # The table says the no-peak stop too; stderr does not (it is not an offset lost).
+    # The table says the no-peak stops too; stderr does not (it is not an offset lost).
     assert (
         f"  offsets: {no_profile}\n  offsets: {too_far}\n  offsets: {no_peak}\n" in out
     )
@@ -3497,6 +3499,40 @@ def test_the_table_shows_the_derived_offsets_and_the_profile_used(
     # The profile is named, never the path it was read from (FM-50).
     assert str(tmp_path) not in json.dumps(stage.model_dump(mode="json"))
     assert str(profile) not in out.replace(f"wrote {tmp_path}", "")
+
+
+def test_an_offset_outside_the_limits_or_a_scan_with_no_objective_is_a_warning_too(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # With a profile, the stops that lose their offset are said on stderr as well: the
+    # first offset refused (1662, frame 0, one unit under the limit) and the scan that
+    # recorded no objective, so that no factor could be looked up.
+    seed = _focused(tmp_path)
+    profile = _profile_file(tmp_path, limits=(1663, 2313))
+    code, _, err = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--profile", str(profile)
+    )
+    assert code == 0
+    assert err.splitlines() == [
+        "select_fields: warning: 2 of 6 stops have no pfs_offset: the offset derived "
+        "for the cells' plane (1662 for the first) lies outside the profile's "
+        "autofocus_offset_soft_limits [1663, 2313]; they keep z_um, the cells' plane",
+        "select_fields: warning: 2 of 6 stops have no pfs_offset, so nis-export "
+        "writes the whole list without the autofocus offsets",
+    ]
+    (tmp_path / "none").mkdir()
+    unknown = _focused(tmp_path / "none", scan_objective=None)
+    profile = _profile_file(tmp_path / "none")
+    code, _, err = _main(
+        sf, capsys, unknown.path, "--min-spacing-um", "30", "--profile", str(profile)
+    )
+    assert code == 0
+    lines = err.splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith(
+        "select_fields: warning: 4 of 6 stops have no pfs_offset:"
+    )
+    assert "the scan recorded no objective" in lines[0]
 
 
 def test_without_a_profile_the_record_says_none_was_given(
