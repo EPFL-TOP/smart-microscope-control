@@ -39,7 +39,9 @@ from smc.plugins.slots import (
     Cell,
     CellsFile,
     CellsResult,
+    FieldFocus,
     FocusState,
+    FocusSweep,
     PlateResult,
     ScanFrame,
     ScanPlanResult,
@@ -165,6 +167,35 @@ def extent_of(matrix: Matrix2, shape: tuple[int, int]) -> tuple[float, float]:
     return (max(xs) - min(xs), max(ys) - min(ys))
 
 
+def focus_step(
+    dz_um: float, *, source: str = "well", outcome: str = "peak"
+) -> FieldFocus:
+    """The focus step of a frame taken at the cells' plane (m3 §21.5): ``dz_um`` from the lock's plane.
+
+    A ``swept`` step has a sweep of three planes (the least a ``FocusSweep`` takes),
+    whose ``outcome`` is the caller's; a ``well`` step has none. Copied from
+    ``tests/test_route_demo.py::_step``, as the rest of this module copies the
+    route's builders: the prototype must read what the scan writes.
+    """
+    sweep = None
+    if source == "swept":
+        sweep = FocusSweep(
+            score="brenner",
+            centre_um=1000.0,
+            z_um=(999.0, 1000.0, 1001.0),
+            scores=(0.1, 0.3, 0.2),
+            outcome=outcome,  # type: ignore[arg-type]
+            best_z_um=1000.2 if outcome == "peak" else None,
+        )
+    return FieldFocus(
+        source=source,  # type: ignore[arg-type]
+        sweep=sweep,
+        dz_um=dz_um,
+        frame_score=0.4,
+        duration_s=0.3,
+    )
+
+
 def flat_frame(shape: tuple[int, int]) -> npt.NDArray[np.uint16]:
     """The frame a scan with no pixels of interest holds: one value everywhere."""
     return np.full(shape, 1000, dtype=np.uint16)
@@ -181,6 +212,7 @@ def seed_run(
     columns: int = 2,
     overlap: float = 0.1,
     focus_of: Mapping[tuple[str, int], FocusState] | None = None,
+    cell_focus_of: Mapping[tuple[str, int], FieldFocus] | None = None,
     frame_pixels: Callable[[ScanFrame], npt.NDArray[np.generic]] | None = None,
     write_frames: bool = True,
     scan_objective: str | None = OBJECTIVE,
@@ -206,7 +238,9 @@ def seed_run(
     10 k``, ``pfs_offset = 2000 + 10 k`` for the k-th frame). ``focus_of`` gives
     the autofocus state of the frames it names, keyed by ``(well, field index)``;
     the others are ``locked``, and a frame that is ``off`` or ``none`` has no
-    autofocus offset. ``frame_pixels`` gives a frame's pixels (flat by default);
+    autofocus offset. ``cell_focus_of`` gives the focus step (m3 §21.5) of the
+    frames it names, by the same key: ``pfs_offset`` stays the lock's, as a scan
+    that focused on the cells reads it. ``frame_pixels`` gives a frame's pixels (flat by default);
     ``write_frames=False`` leaves the TIFFs unwritten, so that every read fails.
     """
     path = tmp_path / "run.json"
@@ -263,6 +297,7 @@ def seed_run(
                 z_um=1000.0 + 10.0 * k,
                 focus=focus,
                 pfs_offset=None if focus in ("off", "none") else 2000.0 + 10.0 * k,
+                cell_focus=(cell_focus_of or {}).get((field.well, field.index)),
                 t_s=float(k),
             )
         )

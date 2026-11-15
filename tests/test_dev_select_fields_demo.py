@@ -16,8 +16,10 @@ from types import ModuleType
 import pytest
 
 from select_fields_seed import (
+    OBJECTIVE,
     Seed,
     cell_at,
+    focus_step,
     load_script,
     seed_run,
 )
@@ -152,6 +154,92 @@ def test_an_older_route_record_stays_in_the_copy_and_the_export_is_the_prototype
     exported = RunDocument.load(copy).stages["nis-export"]
     assert exported.reads["route"] is not None
     assert exported.reads["route"].plugin == "route-prototype"
+
+
+#: The distance of frame k from the lock's plane, for k = 0 to 5 (a lock of 2000 + 10 k).
+#: The offset of the cells' plane of each, by hand, with a factor of 112.6 offset units
+#: per um: 2000 - 337.8, 2010 + 304.02, 2020 - 332.17, 2030 + 152.01, and the lock's own
+#: where the frame is at the lock's plane (k = 4, 5).
+_DZ = (-3.0, 2.7, -2.95, 1.35, 0.0, 0.0)
+_DERIVED = (1662.0, 2314.0, 1688.0, 2182.0, 2040.0, 2050.0)
+
+
+def _focused(tmp_path: Path) -> Seed:
+    steps = {
+        (well, i): focus_step(_DZ[3 * w + i])
+        for w, well in enumerate(("A1", "A2"))
+        for i in range(3)
+    }
+    return seed_run(
+        tmp_path,
+        cells=_cells,
+        wells=("A1", "A2"),
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        cell_focus_of=steps,
+    )
+
+
+def _profile(folder: Path, objective: str) -> Path:
+    path = folder / "stand.toml"
+    path.write_text(
+        f'[microscope]\nname = "demo"\nvendor = "test"\n'
+        f"[safety]\nautofocus_offset_soft_limits = [0, 20000]\n"
+        f'[autofocus.offset_per_um]\n"{objective}" = 112.6\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_nis_export_says_and_writes_a_derived_offset(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    seed = _focused(tmp_path)
+    profile = _profile(tmp_path, OBJECTIVE)
+    code = sf.main(
+        [str(seed.path), "--min-spacing-um", "30", "--profile", str(profile)]
+    )
+    capsys.readouterr()
+    assert code == 0
+
+    result = _export(demo_microscope, tmp_path / "run-selected.json")
+
+    assert (result.positions, result.z_mode) == (6, "pfs-offset")
+    points = decode((tmp_path / result.file).read_bytes())
+    frames = {(f.x_um, f.y_um): k for k, f in enumerate(seed.scan.frames)}
+    for point in points:
+        k = frames[(point.x_um, point.y_um)]
+        assert (point.z_um, point.pfs_offset) == (1000.0 + 10.0 * k, _DERIVED[k])
+    # The export says that four of its offsets were derived and never read locked.
+    assert any(
+        line.startswith("4 of 6 positions have a dPFSOffset that route derived")
+        for line in result.assumed
+    )
+
+
+def test_a_list_that_lost_an_offset_is_exported_in_z_mode(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # No --profile: the four frames that have a distance to convert get no offset, and
+    # one flag covers the whole list, so the export carries Z for every stop and the
+    # autofocus for none: what the command's last warning says.
+    seed = _focused(tmp_path)
+    assert sf.main([str(seed.path), "--min-spacing-um", "30"]) == 0
+    assert "nis-export writes the whole list without" in capsys.readouterr().err
+
+    result = _export(demo_microscope, tmp_path / "run-selected.json")
+
+    assert (result.positions, result.z_mode) == (6, "z")
+    points = decode((tmp_path / result.file).read_bytes())
+    assert [p.pfs_offset for p in points] == [None] * 6
+    assert not any("derived" in line for line in result.assumed)
 
 
 def test_a_stop_without_a_wanted_cell_is_never_exported(

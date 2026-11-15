@@ -13,8 +13,9 @@ import itertools
 import json
 import math
 import os
+import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import ModuleType
 
@@ -27,11 +28,13 @@ from scipy.spatial import cKDTree
 from select_fields_seed import (
     CENTRES,
     CLASSES,
+    OBJECTIVE,
     PIXEL_UM,
     SHAPE,
     UPRIGHT,
     Seed,
     cell_at,
+    focus_step,
     load_script,
     matrix_of,
     seed_run,
@@ -41,6 +44,7 @@ from smc.plugins.geometry import Matrix2, footprint, stage_of_pixel
 from smc.plugins.route.algorithm import allowed
 from smc.plugins.slots import (
     Cell,
+    OffsetFromFocus,
     RouteResult,
     ScanFrame,
     ScanResult,
@@ -3145,3 +3149,406 @@ def test_a_neighbour_exactly_at_the_spacing_is_isolated(
     (over,), _ = _candidates(sf, seed, min_spacing_um=30.5)
     assert at.nn_median_um == 30.0
     assert (at.isolated, over.isolated) == (2, 0)
+
+
+# ------------------------------------------------ the cells' plane's offset (#488)
+#
+# A frame taken at the cells' plane with the autofocus off records the lock's offset
+# and its distance from the lock's plane. The prototype hands each stop to the route's
+# own `stop_focus`, with the profile's factor and offset limits, so that its record
+# carries the offset of the cells' plane, or none and the reason. The numbers below are
+# written here from the seed's frames (a lock of 2000 + 10 k, a Z of 1000 + 10 k) and
+# the factor, by hand, never read from the result (FM-124). The seed's frames are
+# 60 x 80 pixels (FM-73).
+
+FACTOR = 112.6  # offset units per um, as the 40x's profile entry holds it
+#: Frame k of `_two_wells` (A1: 0 to 2, A2: 3 to 5): its distance from the lock's plane.
+DZ = {0: -3.0, 1: 2.7, 2: -2.95, 3: 1.35}
+#: The offset of the cells' plane of each, by hand: 2000 - 337.8, 2010 + 304.02,
+#: 2020 - 332.17 (1687.83: a truncation would give 1687) and 2030 + 152.01. Frame 4's
+#: sweep found no peak and frame 5 is at the lock's plane: both keep the lock's.
+OFFSET_OF = {0: 1662.0, 1: 2314.0, 2: 1688.0, 3: 2182.0, 4: 2040.0, 5: 2050.0}
+STEPS = {
+    ("A1", 0): focus_step(DZ[0]),
+    ("A1", 1): focus_step(DZ[1]),
+    ("A1", 2): focus_step(DZ[2]),
+    ("A2", 0): focus_step(DZ[3]),
+    ("A2", 1): focus_step(0.0, source="swept", outcome="flat"),
+    ("A2", 2): focus_step(0.0),
+}
+NO_PROFILE_LINE = (
+    "4 of 6 stops have no pfs_offset: their frame was taken away from the plane PFS "
+    "held (the focus on the cells) and select_fields.py was run without --profile, "
+    "so the profile's offset_per_um factor could not be read; give --profile with "
+    "the scan's profile to derive it; they keep z_um, the cells' plane"
+)
+
+
+def _focused(tmp_path: Path, **given) -> Seed:
+    """Two wells of three touching fields, each with the focus step of `STEPS`: six stops."""
+    return _two_wells(tmp_path, cell_focus_of=STEPS, **given)
+
+
+def _with_profile(
+    sf: ModuleType,
+    *,
+    factors: Mapping[str, float] | None = None,
+    limits: tuple[float, float] | None = None,
+    **given,
+):
+    """Options as `--profile` leaves them: the factors and limits of a profile called demo."""
+    return _options(
+        sf,
+        profile="demo",
+        offset_factors={OBJECTIVE: FACTOR} if factors is None else dict(factors),
+        offset_limits=limits,
+        **given,
+    )
+
+
+def _frame_of_stop(seed: Seed, stop) -> int:
+    """The position in the scan of the frame at a stop's readback position."""
+    found = [
+        k
+        for k, f in enumerate(seed.scan.frames)
+        if (round(f.x_um, 3), round(f.y_um, 3))
+        == (round(stop.x_um, 3), round(stop.y_um, 3))
+    ]
+    assert len(found) == 1
+    return found[0]
+
+
+def _profile_file(
+    folder: Path,
+    *,
+    name: str = "demo",
+    factors: Mapping[str, float] | None = None,
+    limits: tuple[int, int] | None = (0, 20000),
+    filename: str = "stand.toml",
+) -> Path:
+    """A profile on disk with these offset factors and limits, for `--profile`."""
+    lines = ["[microscope]", f'name = "{name}"', 'vendor = "test"']
+    if limits is not None:
+        lines += [
+            "[safety]",
+            f"autofocus_offset_soft_limits = [{limits[0]}, {limits[1]}]",
+        ]
+    lines.append("[autofocus.offset_per_um]")
+    for label, factor in ({OBJECTIVE: FACTOR} if factors is None else factors).items():
+        lines.append(f'"{label}" = {factor}')
+    path = folder / filename
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_a_stop_of_a_cell_focused_frame_takes_the_offset_of_the_cells_plane(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _focused(tmp_path)
+    result = _result(sf, seed, options=_with_profile(sf))
+    assert len(result.positions) == 6
+    for stop in result.positions:
+        k = _frame_of_stop(seed, stop)
+        assert (stop.z_um, stop.pfs_offset) == (1000.0 + 10.0 * k, OFFSET_OF[k])
+        expected = (
+            OffsetFromFocus(
+                lock_offset=2000.0 + 10.0 * k, dz_um=DZ[k], offset_per_um=FACTOR
+            )
+            if k in DZ
+            else None
+        )
+        assert stop.offset_from_focus == expected
+    # The key is in the record for a derived stop and left out of the others'.
+    dumped = result.model_dump(mode="json")["positions"]
+    assert sorted("offset_from_focus" in p for p in dumped) == [False] * 2 + [True] * 4
+    # The route's own lines say it: a derived line with the range and the factor, and
+    # the no-peak line, after the prototype's five.
+    assert len(result.assumed) == 7
+    assert result.assumed[5].startswith(
+        "4 of 6 stops carry a pfs_offset derived for the cells' plane, not read "
+        "with PFS locked there: their frame was taken -3.00…+2.70 µm from the plane"
+    )
+    assert result.assumed[5].endswith("112.6 offset units per µm for Nikon 10X S Fluor")
+    assert result.assumed[6].startswith(
+        "1 of 6 stops took their frame from a field whose focus sweep found no peak"
+    )
+
+
+def test_without_a_profile_a_cell_focused_stop_has_no_offset_keeps_z_and_the_record_says_why(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _focused(tmp_path)
+    result = _result(sf, seed)  # no profile: no factor
+    for stop in result.positions:
+        k = _frame_of_stop(seed, stop)
+        assert stop.z_um == 1000.0 + 10.0 * k  # the cells' plane, kept
+        assert stop.offset_from_focus is None
+        # Four frames have a distance to convert and get none; the other two are as
+        # the scan recorded them.
+        assert stop.pfs_offset == (None if k in DZ else OFFSET_OF[k])
+    assert result.assumed[5] == NO_PROFILE_LINE
+    # The route's own "the profile has no factor" would say a profile was read.
+    assert not any("the profile has no" in line for line in result.assumed)
+    assert len(result.assumed) == 7  # the no-peak line follows
+
+
+def test_the_factor_is_the_scans_objectives_and_a_scan_with_none_has_no_offset(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _focused(tmp_path)
+    other = _result(
+        sf, seed, options=_with_profile(sf, factors={"Plan Apo 40x": FACTOR})
+    )
+    assert [s.pfs_offset for s in other.positions if _frame_of_stop(seed, s) in DZ] == [
+        None
+    ] * 4
+    assert other.assumed[5].endswith(
+        "factor for the scan's objective; they keep z_um, the cells' plane "
+        "(objective: Nikon 10X S Fluor)"
+    )
+    assert not any("without --profile" in line for line in other.assumed)
+
+    (tmp_path / "none").mkdir()
+    unknown = _focused(tmp_path / "none", scan_objective=None)
+    result = _result(sf, unknown, options=_with_profile(sf))
+    assert [
+        s.pfs_offset for s in result.positions if _frame_of_stop(unknown, s) in DZ
+    ] == [None] * 4
+    assert "the scan recorded no objective" in result.assumed[5]
+
+
+def test_a_frame_without_a_focus_step_or_at_the_centre_is_as_the_scan_recorded_it(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    # No step, and a step at the lock's plane (no distance to convert): the offset is
+    # the frame's reading with or without a profile, and nothing is said.
+    plain = _row_of_three(tmp_path)
+    (tmp_path / "centre").mkdir()
+    centre = _row_of_three(
+        tmp_path / "centre",
+        cell_focus_of={("A1", i): focus_step(0.0) for i in range(3)},
+    )
+    for seed in (plain, centre):
+        without = _result(sf, seed)
+        given = _result(sf, seed, options=_with_profile(sf))
+        assert without == given
+        assert len(without.assumed) == 5
+        for stop in without.positions:
+            frame = seed.scan.frames[_frame_of_stop(seed, stop)]
+            assert (stop.z_um, stop.pfs_offset) == (frame.z_um, frame.pfs_offset)
+            assert stop.offset_from_focus is None
+        dumped = without.model_dump(mode="json")["positions"]
+        assert not any("offset_from_focus" in p for p in dumped)
+
+
+def test_the_profiles_offset_limits_reach_the_stops_from_both_sides(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _focused(tmp_path)
+    # Offsets 1662 (frame 0) and 2314 (frame 1): limits on them keep both ...
+    kept = _result(sf, seed, options=_with_profile(sf, limits=(1662.0, 2314.0)))
+    assert [s.pfs_offset for s in kept.positions if _frame_of_stop(seed, s) in DZ] == [
+        1662.0,
+        2314.0,
+        1688.0,
+        2182.0,
+    ]
+    # ... one unit inside each side leaves the two out, and says the first.
+    refused = _result(sf, seed, options=_with_profile(sf, limits=(1663.0, 2313.0)))
+    by_frame = {_frame_of_stop(seed, s): s.pfs_offset for s in refused.positions}
+    assert by_frame == {0: None, 1: None, 2: 1688.0, 3: 2182.0, 4: 2040.0, 5: 2050.0}
+    assert refused.assumed[5].startswith("2 of 6 stops carry a pfs_offset derived")
+    assert refused.assumed[6] == (
+        "2 of 6 stops have no pfs_offset: the offset derived for the cells' plane "
+        "(1662 for the first) lies outside the profile's autofocus_offset_soft_limits "
+        "[1663, 2313]; they keep z_um, the cells' plane"
+    )
+    assert all(
+        s.z_um == 1000.0 + 10.0 * _frame_of_stop(seed, s) for s in refused.positions
+    )
+
+
+def test_a_sweep_without_a_peak_is_counted_in_the_assumed_lines(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _row_of_three(
+        tmp_path,
+        cell_focus_of={
+            ("A1", 0): focus_step(0.0, source="swept", outcome="flat"),
+            ("A1", 1): focus_step(0.0, source="swept", outcome="peak"),
+            ("A1", 2): focus_step(0.0),
+        },
+    )
+    result = _result(sf, seed)  # no profile is needed: nothing is converted
+    assert len(result.assumed) == 6
+    assert result.assumed[5] == (
+        "1 of 3 stops took their frame from a field whose focus sweep found no peak "
+        "(flat, at an edge or two peaks): its plane is the sweep's centre, not the "
+        "cells' plane"
+    )
+    assert [s.pfs_offset for s in result.positions] == [2000.0, 2010.0, 2020.0]
+
+
+_STOP_LINE = re.compile(r"^\s+r\d+ frame (\d+) .* pfs=(\S+)(?: \(([^)]*)\))?")
+
+
+def _stop_rows(out: str) -> dict[int, tuple[str, str | None]]:
+    """The table's chosen stops: frame -> (the pfs cell, the note after it)."""
+    found = [_STOP_LINE.match(line) for line in out.splitlines()]
+    return {int(m.group(1)): (m.group(2), m.group(3)) for m in found if m is not None}
+
+
+def test_the_table_and_stderr_say_which_stops_have_no_offset_without_a_profile(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # One frame too far from the lock's plane (its line holds a micro sign), two with a
+    # distance to convert and no factor to convert it with, and one with no step: what the
+    # command prints is ASCII (FM-20) and what it says is on stderr as well as in the table.
+    seed = _row_of_three(
+        tmp_path,
+        scan_objective="Plan Apo λ 40x",
+        cell_focus_of={
+            ("A1", 0): focus_step(60.0),
+            ("A1", 1): focus_step(-3.0),
+            ("A1", 2): focus_step(0.0, source="swept", outcome="flat"),
+        },
+    )
+    code, out, err = _main(sf, capsys, seed.path, "--min-spacing-um", "30")
+    assert code == 0
+    assert _stop_rows(out) == {
+        0: ("-", "implausible"),
+        1: ("-", "no-factor"),
+        2: ("2020", "no peak"),
+    }
+    # The script's own line first, then `route`'s for the frame that is too far, written
+    # with `um` and `..` where `route` writes a micro sign (the record keeps its text).
+    no_profile = (
+        "1 of 3 stops have no pfs_offset: their frame was taken away from the plane "
+        "PFS held (the focus on the cells) and select_fields.py was run without "
+        "--profile, so the profile's offset_per_um factor could not be read; give "
+        "--profile with the scan's profile to derive it; they keep z_um, the cells' "
+        "plane"
+    )
+    too_far = (
+        "1 of 3 stops have no pfs_offset: their frame's plane is not within 50 um of "
+        "the plane PFS held (the focus sweep's largest range), so the record cannot be "
+        "right; run scan again; they keep z_um"
+    )
+    no_peak = (
+        "1 of 3 stops took their frame from a field whose focus sweep found no peak "
+        "(flat, at an edge or two peaks): its plane is the sweep's centre, not the "
+        "cells' plane"
+    )
+    # The table says the no-peak stop too; stderr does not (it is not an offset lost).
+    assert (
+        f"  offsets: {no_profile}\n  offsets: {too_far}\n  offsets: {no_peak}\n" in out
+    )
+    assert err.splitlines() == [
+        f"select_fields: warning: {no_profile}",
+        f"select_fields: warning: {too_far}",
+        "select_fields: warning: 2 of 3 stops have no pfs_offset, so nis-export "
+        "writes the whole list without the autofocus offsets",
+    ]
+    assert out.isascii()
+    assert err.isascii()
+    stops = _stops_of(tmp_path / "run-selected.json")
+    assert [s.pfs_offset for s in stops] == [None, None, 2020.0]
+    assert [s.z_um for s in stops] == [1000.0, 1010.0, 1020.0]
+    stage = RunDocument.load(tmp_path / "run-selected.json").stages["route-prototype"]
+    saved = RouteResult.model_validate(stage.result).assumed
+    assert no_profile in saved
+    assert any("is not within 50 µm of the plane PFS held" in line for line in saved)
+
+
+def test_the_table_shows_the_derived_offsets_and_the_profile_used(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _focused(tmp_path)
+    profile = _profile_file(tmp_path)
+    code, out, err = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--profile", str(profile)
+    )
+    assert (code, err) == (0, "")
+    assert "  offsets: profile demo, offset limits [0, 20000]" in out
+    assert _stop_rows(out) == {
+        0: ("1662", "derived"),
+        1: ("2314", "derived"),
+        2: ("1688", "derived"),
+        3: ("2182", "derived"),
+        4: ("2040", "no peak"),
+        5: ("2050", None),
+    }
+    assert (
+        "  offsets: 4 of 6 stops carry a pfs_offset derived for the cells' plane" in out
+    )
+    assert out.isascii()
+    stage = RunDocument.load(tmp_path / "run-selected.json").stages["route-prototype"]
+    stops = _stops_of(tmp_path / "run-selected.json")
+    assert [s.pfs_offset for s in stops] == [
+        1662.0,
+        2314.0,
+        1688.0,
+        2182.0,
+        2040.0,
+        2050.0,
+    ]
+    assert stage.params["offset_profile"] == "demo"
+    assert stage.params["offset_limits"] == [0.0, 20000.0]
+    # The profile is named, never the path it was read from (FM-50).
+    assert str(tmp_path) not in json.dumps(stage.model_dump(mode="json"))
+    assert str(profile) not in out.replace(f"wrote {tmp_path}", "")
+
+
+def test_without_a_profile_the_record_says_none_was_given(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _row_of_three(tmp_path)
+    code, out, err = _main(sf, capsys, seed.path, "--min-spacing-um", "30")
+    assert (code, err) == (0, "")
+    assert "offsets:" not in out  # a scan with no focus step is printed as before
+    stage = RunDocument.load(tmp_path / "run-selected.json").stages["route-prototype"]
+    assert stage.params["offset_profile"] is None
+    assert stage.params["offset_limits"] is None
+
+
+def test_a_profile_of_another_stand_than_the_scans_is_refused(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The factors and the limits belong to a stand: another one's would put the plane
+    # where nobody looked (FM-214). The scan was run on the profile called demo.
+    seed = _focused(tmp_path)
+    profile = _profile_file(tmp_path, name="nikon-ti2")
+    code, out, err = _main(sf, capsys, seed.path, "--profile", str(profile))
+    assert (code, out) == (2, "")
+    assert err.startswith(
+        "select_fields: --profile nikon-ti2 is not the scan's profile"
+    )
+    assert "(demo)" in err
+    assert not (tmp_path / "run-selected.json").exists()
+
+
+def test_a_profile_that_does_not_load_is_a_refusal_before_any_frame_is_read(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A frame that cannot be read is counted and the run goes on, so a stub that raises
+    # would prove nothing: it records (FM-211). The profile is read before the frames,
+    # as every other option is checked (FM-30).
+    reads: list[object] = []
+    monkeypatch.setattr(sf, "load_frame", lambda *args: reads.append(args))
+    seed = _focused(tmp_path)
+    broken = tmp_path / "broken.toml"
+    broken.write_text("[microscope\nname = ", encoding="utf-8")
+    for source in (str(broken), "no-such-profile-488"):
+        code, out, err = _main(sf, capsys, seed.path, "--profile", source)
+        assert (code, out) == (2, "")
+        assert err.startswith("select_fields: ")
+        assert "Traceback" not in err
+    assert "no-such-profile-488" in err
+    mismatch = _profile_file(tmp_path, name="nikon-ti2")
+    code, _, _ = _main(sf, capsys, seed.path, "--profile", str(mismatch))
+    assert code == 2
+    assert reads == []  # no frame was opened by any of the three refusals
+    assert not (tmp_path / "selection").exists()
