@@ -36,6 +36,14 @@ Decisions that were made on measurements, not on taste:
   the plan's copy is never read (FM-124).
 * **A position is the stage's readback** (FM-167), and an ``unlocked`` frame is never a
   candidate (FM-154): its Z is wherever the autofocus search had got to.
+* **A stop's autofocus offset is the cells' plane's, or none** (#488, m3 §26). On a scan
+  taken with the focus on the cells a frame's ``pfs_offset`` is the lock's, ``dz_um``
+  away from the plane the frame was taken at, and ``nis-export`` would engage the
+  autofocus there. So a stop takes its Z and offset from ``route``'s own ``stop_focus``
+  on its frame, with the factor and the offset limits of the profile ``--profile``
+  names, and says what became of them; with no ``--profile`` a frame that has a
+  distance to convert gets no offset, in the table and on stderr. ``selection.json``'s
+  ``pfs_offset`` stays the frame's reading: it is a candidate's feature, not a stop's.
 * **No matrix product on coordinate arrays** (FM-131): the entries of the inverse are
   written out, as in ``route.algorithm``.
 * **The PNG's canvas is cut to the well**, never to the frames' bounding box
@@ -63,7 +71,7 @@ import sys
 import uuid
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
@@ -73,6 +81,7 @@ import numpy.typing as npt
 from pydantic import BaseModel, ValidationError
 
 import smc
+from smc.hardware.profile import Profile, ProfileError
 
 # The route's own arithmetic for "inside a field" and for "overlap" (FM-132): private
 # helpers, imported on purpose so that the prototype and the plugin cannot disagree.
@@ -85,6 +94,7 @@ from smc.plugins.route.algorithm import (
     order_route,
     path_length_um,
 )
+from smc.plugins.route.focus import StopFocus, focus_assumed, stop_focus
 from smc.plugins.slots import (
     Cell,
     CellsResult,
@@ -962,6 +972,10 @@ class Options:
 
     ``spacing_given`` says whether ``min_spacing_um`` was typed or measured, and
     ``spacing_cells`` is the number of wanted cells it was measured over.
+    ``profile`` is the **name** of the profile ``--profile`` loaded (never the path it
+    was typed as, FM-50), ``offset_factors`` its offset units per um by objective label
+    and ``offset_limits`` its autofocus offset limits; with no ``--profile`` they are
+    ``None``, empty and ``None``, and no distance can be turned into an offset.
     """
 
     labels: tuple[str, ...]
@@ -974,6 +988,9 @@ class Options:
     min_spacing_um: float
     spacing_given: bool
     spacing_cells: int
+    profile: str | None = None
+    offset_factors: Mapping[str, float] = field(default_factory=dict)
+    offset_limits: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1056,16 +1073,98 @@ def first_field_of(plan: ScanPlanResult, well: str) -> tuple[float, float]:
     Raises:
         Refusal: The plan has no field for the well.
     """
-    for field in plan.fields:
-        if field.well == well:
-            return (field.x_um, field.y_um)
+    for planned in plan.fields:
+        if planned.well == well:
+            return (planned.x_um, planned.y_um)
     raise Refusal(f"the scan plan has no field for well {well!r}; run scan-plan again")
 
 
-def assumed_lines(
-    options: Options, *, unlocked: int, unreadable: int
+#: What the stops that lost their offset were left with (``StopFocus.outcome``): the ones
+#: ``stderr`` is told about, and the ones that take ``nis-export`` to a list with no
+#: autofocus offset, because one flag covers the whole list.
+_LOST = ("no-objective", "no-factor", "outside-limits", "implausible")
+
+_NO_PROFILE = (
+    "{n} of {total} stops have no pfs_offset: their frame was taken away from the "
+    "plane PFS held (the focus on the cells) and select_fields.py was run without "
+    "--profile, so the profile's offset_per_um factor could not be read; give "
+    "--profile with the scan's profile to derive it; they keep z_um, the cells' plane"
+)
+
+
+def stop_focuses(
+    scan: ScanResult,
+    choices: Sequence[WellChoice],
+    orders: Sequence[Sequence[int]],
+    options: Options,
+) -> list[list[StopFocus]]:
+    """For each well, what ``route``'s ``stop_focus`` makes of each of its stops, in route order.
+
+    A stop is its candidate's own frame, so there is no nearest-frame rule here (m3
+    §11's is for a lattice). ``stop_focus`` is ``route``'s and is not re-derived: the
+    factor is the **scan's** objective's by exact label, an offset outside the limits or
+    a distance beyond the largest sweep is no offset and never a clamp, and a frame that
+    has no distance to convert is as the scan recorded it (m3 §26.3).
+    """
+    return [
+        [
+            stop_focus(
+                scan.frames[choice.chosen[index].candidate.frame],
+                objective=scan.objective,
+                factors=options.offset_factors,
+                offset_limits=options.offset_limits,
+            )
+            for index in order
+        ]
+        for choice, order in zip(choices, orders, strict=True)
+    ]
+
+
+def focus_lines(
+    focuses: Sequence[StopFocus],
+    *,
+    total: int,
+    objective: str | None,
+    options: Options,
 ) -> tuple[str, ...]:
-    """What the result rests on and did not measure: the texts the plan fixed, in its order."""
+    """The lines about the stops' offsets: ``route``'s own, and with no ``--profile`` the one that says so.
+
+    ``focus_assumed`` is ``route``'s and its texts are its (m3 §26.6, each only when its
+    count is above 0). Its line for a stop whose objective has no factor says "the
+    profile has no factor": with no profile given that would say a profile was read.
+    Those stops are counted by this script's own line instead, and ``route``'s other
+    lines are asked for with them left out (passed as ``recorded``, so no text is
+    matched). ``total`` is every stop of the route, ``focuses`` the ones concerned.
+    """
+    lines = focus_assumed(
+        focuses, total=total, objective=objective, offset_limits=options.offset_limits
+    )
+    unread = sum(f.outcome == "no-factor" for f in focuses)
+    if options.profile is not None or not unread:
+        return lines
+    others = [
+        replace(f, outcome="recorded") if f.outcome == "no-factor" else f
+        for f in focuses
+    ]
+    return (
+        _NO_PROFILE.format(n=unread, total=total),
+        *focus_assumed(
+            others,
+            total=total,
+            objective=objective,
+            offset_limits=options.offset_limits,
+        ),
+    )
+
+
+def assumed_lines(
+    options: Options,
+    *,
+    unlocked: int,
+    unreadable: int,
+    focus: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """What the result rests on and did not measure: the texts the plan fixed, in its order, then ``focus`` (the stops' offsets)."""
     weights = ", ".join(f"{name}={options.weights[name]:g}" for name in WEIGHT_NAMES)
     if options.spacing_given:
         spacing = f"min_spacing_um={options.min_spacing_um:g}, given"
@@ -1095,7 +1194,7 @@ def assumed_lines(
             f"{unreadable} frames could not be read and were left out of the mosaic "
             f"and of the pixel features"
         )
-    return tuple(lines)
+    return (*lines, *focus)
 
 
 def route_orders(
@@ -1141,15 +1240,21 @@ def route_result(
     ``route``'s ``order_route``. A stop is the **frame's** readback position, Z and
     autofocus offset, taken together from the one frame that was scored and will be
     imaged again (FM-167, FM-154), and its counts have every wanted label, zeros
-    included. ``uncovered`` has every well, in the plan's order, zeros included.
-    ``travel_s`` is ``None``: no timings are read, and unknown is not zero.
+    included. The offset is the frame's as the scan read it, unless the frame has a
+    distance from the lock's plane to convert: then it is the cells' plane's, derived
+    with the options' profile, or none (``stop_focuses``), and ``assumed`` says which.
+    ``uncovered`` has every well, in the plan's order, zeros included. ``travel_s`` is
+    ``None``: no timings are read, and unknown is not zero.
     """
     positions: list[RoutePosition] = []
     uncovered: dict[str, int] = {}
-    for choice, order in zip(choices, route_orders(plan, choices), strict=True):
+    orders = route_orders(plan, choices)
+    focuses = stop_focuses(scan, choices, orders, options)
+    for choice, order, focus_of in zip(choices, orders, focuses, strict=True):
         uncovered[choice.well] = choice.uncovered
         for k, index in enumerate(order):
             candidate = choice.chosen[index].candidate
+            focus = focus_of[k]
             positions.append(
                 RoutePosition(
                     order=len(positions),
@@ -1157,9 +1262,10 @@ def route_result(
                     name=f"{choice.well}_r{k:03d}",
                     x_um=candidate.x_um,
                     y_um=candidate.y_um,
-                    z_um=candidate.z_um,
-                    pfs_offset=candidate.pfs_offset,
+                    z_um=focus.z_um,
+                    pfs_offset=focus.pfs_offset,
                     counts=dict(choice.counts[index]),
+                    offset_from_focus=focus.derived,
                 )
             )
     points = [(p.x_um, p.y_um) for p in positions]
@@ -1177,6 +1283,12 @@ def route_result(
             options,
             unlocked=sum(choice.skipped.unlocked for choice in choices),
             unreadable=unreadable,
+            focus=focus_lines(
+                [f for focus_of in focuses for f in focus_of],
+                total=len(positions),
+                objective=scan.objective,
+                options=options,
+            ),
         ),
     )
 
@@ -1195,6 +1307,10 @@ def record_params(
         "exclude_centre_um": options.exclude_centre_um,
         "min_spacing_um": options.min_spacing_um,
         "min_spacing_source": "given" if options.spacing_given else "measured",
+        "offset_profile": options.profile,
+        "offset_limits": (
+            list(options.offset_limits) if options.offset_limits is not None else None
+        ),
         "wells": list(wells),
         "pixels": pixels,
     }
@@ -1348,6 +1464,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="cells closer than this are not isolated (default: 3 median cell lengths)",
     )
     parser.add_argument(
+        "--profile",
+        default=None,
+        metavar="NAME_OR_PATH",
+        help=(
+            "the scan's profile, for the offset units per um and the offset limits "
+            "that turn a frame taken at the cells' plane into the offset of that "
+            "plane (a name smc profiles lists, or a .toml path); without it such a "
+            "stop has no pfs_offset"
+        ),
+    )
+    parser.add_argument(
         "--no-pixels",
         action="store_true",
         help="do not read the frames: no sharpness, no background, no mosaic",
@@ -1384,6 +1511,7 @@ class Request:
     wall_margin_um: float
     exclude_centre_um: float
     min_spacing_um: float | None
+    profile: str | None
     pixels: bool
     png: bool
     png_max_px: int
@@ -1479,6 +1607,7 @@ def parse_request(argv: Sequence[str] | None) -> Request:
         wall_margin_um=args.wall_margin_um,
         exclude_centre_um=args.exclude_centre_um,
         min_spacing_um=args.min_spacing_um,
+        profile=args.profile,
         pixels=not args.no_pixels,
         png=not args.no_png,
         png_max_px=args.png_max_px,
@@ -1558,6 +1687,40 @@ def load_upstream(doc: RunDocument, run_doc: Path, labels: Sequence[str]) -> Ups
     except ValueError as exc:
         raise Refusal(f"{exc}; run cells again") from exc
     return Upstream(plan, scan, cells_result, cells, scan_record.profile)
+
+
+def load_focus_profile(
+    source: str | None, scan_profile: str
+) -> tuple[str | None, dict[str, float], tuple[float, float] | None]:
+    """The name, the offset factors and the offset limits of the profile ``--profile`` names; nothing without it.
+
+    The factors and the limits belong to a stand: another stand's would put the cells'
+    plane where nobody looked (FM-214), so a profile that is not the one the scan was
+    run on is refused, as ``nis-export`` refuses a record of another profile. What is
+    returned is the profile's **name**, never the path it was typed as (FM-50).
+
+    Raises:
+        Refusal: The profile does not load (its own message says why), or is not the
+            scan's.
+    """
+    if source is None:
+        return None, {}, None
+    try:
+        profile = Profile.load(source)
+    except ProfileError as exc:
+        raise Refusal(str(exc)) from exc
+    name = profile.microscope.name
+    if name != scan_profile:
+        raise Refusal(
+            f"--profile {name} is not the scan's profile ({scan_profile}): its offset "
+            f"factors and offset limits belong to another stand; give the profile the "
+            f"scan was run on"
+        )
+    return (
+        name,
+        dict(profile.autofocus.offset_per_um),
+        profile.safety.autofocus_offset_soft_limits,
+    )
 
 
 def wells_to_run(
@@ -1702,6 +1865,12 @@ def _say(line: str = "") -> None:
         _CONSOLE["open"] = False
 
 
+def _warn(line: str) -> None:
+    """One line on stderr, ASCII; a stream that is gone costs the line and not the files (FM-30)."""
+    with contextlib.suppress(OSError, ValueError):
+        print(_ascii(line), file=sys.stderr)
+
+
 def _pasteable(text: str, placeholder: str) -> str:
     """``text`` in double quotes, which cmd, PowerShell and a POSIX shell all read as one word; the placeholder when it cannot be pasted.
 
@@ -1740,6 +1909,70 @@ def _finite(value: float | None) -> float | None:
 
 def _cell(value: float | None, spec: str) -> str:
     return "-" if value is None else format(value, spec)
+
+
+def _plain(text: str) -> str:
+    """``route``'s text with its two non-ASCII signs written as ASCII, for the console: ``um`` and ``..``.
+
+    The record keeps the text as ``route`` writes it. An escape (``\\xb5m``) would be
+    what the console printed otherwise (FM-20), and it is a unit that someone reads.
+    """
+    return text.replace("µm", "um").replace("…", "..")
+
+
+def _note_of(focus: StopFocus) -> str:
+    """What became of a stop's offset, after its ``pfs=`` cell: ``derived``, the reason it has none, ``no peak``; empty when it is as the scan read it."""
+    notes = [focus.outcome] if focus.outcome != "recorded" else []
+    if focus.no_peak:
+        notes.append("no peak")
+    return f" ({', '.join(notes)})" if notes else ""
+
+
+def _offset_lines(
+    focuses: Sequence[StopFocus], *, total: int, scan: ScanResult, options: Options
+) -> list[str]:
+    """The table's lines about the stops' offsets: the profile used, then ``route``'s lines; none for a scan that needs neither.
+
+    A scan with no focus step has no line here, so its table is what it was before the
+    stops' offsets were derived. ``focuses`` are every stop of the route.
+    """
+    lines: list[str] = []
+    if options.profile is not None:
+        limits = (
+            f"offset limits [{options.offset_limits[0]:g}, {options.offset_limits[1]:g}]"
+            if options.offset_limits is not None
+            else "no offset limits"
+        )
+        lines.append(f"  offsets: profile {options.profile}, {limits}")
+    for line in focus_lines(
+        focuses, total=total, objective=scan.objective, options=options
+    ):
+        lines.append(f"  offsets: {_plain(line)}")
+    return lines
+
+
+def warnings_of(
+    focuses: Sequence[StopFocus], *, scan: ScanResult, options: Options
+) -> list[str]:
+    """The lines for stderr: each line about the stops that lost their offset, then what that costs the export.
+
+    ``nis-export`` carries one autofocus flag for the whole list, so a single stop with
+    no offset takes it from every stop: the last line says so. The stops are counted
+    as ``route`` counts them (``total`` is every stop). No line when none was lost; a
+    sweep that found no peak is the table's to say, not a warning.
+    """
+    lost = [replace(f, no_peak=False) for f in focuses if f.outcome in _LOST]
+    if not lost:
+        return []
+    lines = focus_lines(
+        lost, total=len(focuses), objective=scan.objective, options=options
+    )
+    lines = (
+        *lines,
+        f"{len(lost)} of {len(focuses)} stops have no pfs_offset, so nis-export writes "
+        f"the whole list without the autofocus offsets",
+    )
+    return [f"select_fields: warning: {_plain(line)}" for line in lines]
 
 
 def table_lines(
@@ -1788,6 +2021,15 @@ def table_lines(
             else ""
         ),
     ]
+    focuses = stop_focuses(scan, choices, orders, options)
+    lines.extend(
+        _offset_lines(
+            [f for focus_of in focuses for f in focus_of],
+            total=len(result.positions),
+            scan=scan,
+            options=options,
+        )
+    )
     columns = (
         "rank",
         "frame",
@@ -1805,7 +2047,7 @@ def table_lines(
         "focus",
         "stop",
     )
-    for choice, order in zip(choices, orders, strict=True):
+    for choice, order, focus_of in zip(choices, orders, focuses, strict=True):
         stop_of = {choice.chosen[i].candidate.frame: k for k, i in enumerate(order)}
         lines.append("")
         lines.append(
@@ -1854,10 +2096,12 @@ def table_lines(
         lines.append("   chosen, in route order:")
         for k, i in enumerate(order):
             c = choice.chosen[i].candidate
+            focus = focus_of[k]
             counts = " ".join(f"{label}={n}" for label, n in choice.counts[i].items())
             lines.append(
                 f"     r{k:03d} frame {c.frame} {c.name}  x={c.x_um:.1f} y={c.y_um:.1f} "
-                f"z={_cell(c.z_um, '.1f')} pfs={_cell(c.pfs_offset, 'g')}  {counts}"
+                f"z={_cell(focus.z_um, '.1f')} pfs={_cell(focus.pfs_offset, 'g')}"
+                f"{_note_of(focus)}  {counts}"
             )
         lines.append(
             f"   uncovered: {choice.uncovered} of {choice.n_wanted} wanted cells"
@@ -1970,6 +2214,11 @@ def run(argv: Sequence[str] | None) -> int:
     if request.out_dir.exists() and not request.out_dir.is_dir():
         raise Refusal(f"--out-dir {request.out_dir} is a file, not a folder")
     upstream = load_upstream(doc, run_doc, request.labels)
+    # Before any frame is read (FM-30): a profile that does not load, or is not the
+    # scan's, must not end minutes of work.
+    profile_name, offset_factors, offset_limits = load_focus_profile(
+        request.profile, upstream.profile
+    )
     plan, scan = upstream.plan, upstream.scan
     wells = wells_to_run(plan, upstream.cells_result, request.wells)
     geometries: dict[str, WellGeometry] = {}
@@ -2008,6 +2257,9 @@ def run(argv: Sequence[str] | None) -> int:
         min_spacing_um=spacing,
         spacing_given=given,
         spacing_cells=len(wanted_cells),
+        profile=profile_name,
+        offset_factors=offset_factors,
+        offset_limits=offset_limits,
     )
 
     pixels: Pixels | None = None
@@ -2050,6 +2302,16 @@ def run(argv: Sequence[str] | None) -> int:
         pixels=pixels,
     ):
         _say(line)
+    for warning in warnings_of(
+        [
+            f
+            for focus_of in stop_focuses(scan, choices, orders, options)
+            for f in focus_of
+        ],
+        scan=scan,
+        options=options,
+    ):
+        _warn(warning)
 
     failed = _write_files(
         request, upstream, doc, options, choices, orders, result, pixels, wells

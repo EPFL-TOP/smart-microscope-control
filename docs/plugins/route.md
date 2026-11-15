@@ -318,6 +318,7 @@ smc run nis-export -p <profile> --run-doc run-selected.json
 | `--min-score` | 0 | The choice stops at the first score below this (0 to 1). |
 | `--wall-margin-um`, `--exclude-centre-um` | 0 | As `route`'s `wall_margin_um` and `exclude_centre_um`: a candidate whose footprint breaks either is not a candidate. |
 | `--min-spacing-um` | measured | Wanted cells closer than this to another cell are not isolated; see below. |
+| `--profile NAME_OR_PATH` | none | The **scan's** profile (a name `smc profiles` lists, or a `.toml` path): its offset units per µm and its offset limits turn a frame taken at the cells' plane into that plane's autofocus offset. A profile that is not the one the scan was run on is refused. Without it such a stop has no `pfs_offset`; see "The autofocus offset of a stop". |
 | `--no-pixels` | | Do not read the frames: no `sharp`, no `bg`, no mosaic. |
 | `--no-png`, `--png-max-px` | 1600 | No pictures; the longer side of a picture (256 to 8000). |
 | `--show` | 15 | Candidates listed per well in the table (the rest are in `selection.json`). |
@@ -395,6 +396,47 @@ columns are `n` (wanted cells), `dens/mm2`, `iso` (the isolated count), `purity`
   That is why the column is called `sharp`. It is not corrected.
 - **`bg`** is the frame's median.
 
+### The autofocus offset of a stop
+
+On a scan taken with the focus on the cells (see `focus-on-cells.md`) a frame's `pfs_offset`
+is the lock's, `dz_um` away from the plane the frame was taken at. Exported as it is,
+NIS-Elements would engage the autofocus at the plane the lock held, and not at the cells'.
+So the prototype hands each stop's frame to `route`'s own rule, `stop_focus`
+([`m3-plugins.md`](../design/m3-plugins.md) §26), with the offset units per µm and the
+offset limits of `--profile`:
+
+- **With `--profile`**, a stop whose frame has a distance from the lock's plane gets
+  `round(lock + dz_um × factor)` as its `pfs_offset`, and `offset_from_focus` says how it
+  was derived. The factor is the **scan's objective's**, by its exact label. An offset
+  outside the profile's limits, a distance beyond 50 µm (the largest sweep), no factor
+  for the objective or a scan that recorded no objective gives the stop **no**
+  `pfs_offset`, never a clamped one, and it keeps its Z, which is the cells' plane. A
+  frame with no focus step, or at the lock's plane, is as the scan read it and needs no
+  factor.
+- **Without `--profile`** such a stop has no `pfs_offset` and keeps its Z.
+- **The profile must be the scan's.** Its factors and limits belong to a stand, so the
+  command refuses another's (as `nis-export` refuses a record of another profile) before
+  any frame is read. The record names the profile (`offset_profile`) and its limits
+  (`offset_limits`) among its parameters, never the path it was typed as.
+- **The table** says it: a line `offsets: profile <name>, offset limits [...]`; `route`'s
+  own lines about the stops' offsets (the same text as in the record's `assumed`, with
+  `um` where the record has a micro sign), and a note after each chosen stop's `pfs=`:
+  `derived`, the reason it has none (`no-factor`, `outside-limits`, `implausible`,
+  `no-objective`) or `no peak`. **Stderr** has one `select_fields: warning:` line for each
+  reason a stop lost its offset, and one for what that costs: `nis-export` carries one
+  autofocus flag for the whole list, so one stop with no offset takes the autofocus
+  offsets from every stop (its `z` mode). The exit code stays 0, so a run that ends well
+  writes to stderr: in **Windows PowerShell 5.1**, `2>&1` shows each of those lines as an
+  error record (`NativeCommandError`) although nothing failed (read from the shell's
+  documentation, not run at a stand PC); read the exit code, not the colour.
+- A scan with no focus step is printed and recorded as before: no line, an empty stderr.
+- `selection.json`'s `pfs_offset` is the **frame's** reading, a candidate's feature; a
+  stop's offset is in the record of the copy.
+
+Not verified at the stand: that NIS-Elements takes a derived `dPFSOffset` as it takes a
+read one, and the factor at the offsets the stops use ([`m3-plugins.md`](../design/m3-plugins.md)
+§26.9).
+
 ### Things to know
 
 - **The candidates overlap, so a chosen field excludes its neighbours.** The scan's
@@ -409,7 +451,8 @@ columns are `n` (wanted cells), `dens/mm2`, `iso` (the isolated count), `purity`
   earlier field holds (`route`'s rule). The two differ only for a cell on an edge that
   two touching fields share, which the first chosen holds.
 - A stop is the frame's **readback** position, and its Z and autofocus offset come
-  together from that frame. An `unlocked` frame is never a candidate (its Z is wherever
+  together from that frame (the offset derived for the cells' plane when the scan
+  focused on the cells: see above). An `unlocked` frame is never a candidate (its Z is wherever
   the autofocus search had got to), and the result says how many were left out. A frame
   that cannot be read (missing, corrupt, of another shape than the scan's) is counted,
   skipped and said; it is not a candidate for a pixel weight and stays one otherwise.
