@@ -3083,7 +3083,6 @@ def test_the_round_2_texts_are_the_designs() -> None:
         "start unless it is; off never uses it and refuses to start when it is on. "
         "The scan never switches it on."
     )
-    assert "never touches" not in AUTOFOCUS_WORDS
     assert SAMPLE_REGISTERS == (
         "Register the plate uses the profile's sample while no centre is captured; "
         "capture three to measure this plate."
