@@ -4542,7 +4542,9 @@ Run.
   `Scan A1, A2 and A3`, and from four wells `Scan 12 wells`. Lead: *<n> fields at
   <objective>. STOP, at the top right, stops the scan.*, the plan's own count and
   objective; on a stand whose profile says `stop_refused_by`, the lead adds *A move
-  already sent finishes first on this stand.*
+  already sent finishes first on this stand.*, and, when the profile also cuts a
+  refused role's moves into segments, *; a long one ends at the end of its current
+  segment (at most 5000 µm in XY, 100 µm in Z)* (§17.12.10).
 - Action: *Start the scan* (`scan`, the same handler as the tool's *Run*). Waits, the
   first that holds: the stand is closed, no usable plan (`LAY_OUT_FIRST`), the tool's
   other reason (a checkpoint: the page never starts a stage afresh over one, §2; from
@@ -4872,7 +4874,12 @@ LAY_OUT_FIRST = "lay out the fields first: step 3, Wells"
 
 def wells_text(wells: Sequence[str]) -> str: ...
 def scan_title(plan_wells: Sequence[str], selection: Sequence[str]) -> str: ...
-def scan_lead(plan: PlanLayer | None, *, stop_refused: bool) -> str: ...
+def scan_lead(
+    plan: PlanLayer | None,
+    *,
+    stop_refused: bool,
+    stop_segments_um: Sequence[tuple[str, float]] = (),  # §17.12.10, #509
+) -> str: ...
 def wells_known_lines(
     *,
     objective: str | None,
@@ -4926,8 +4933,10 @@ def plain_default(default: str) -> str: ...
   with neither, `SCREEN_TITLES["scan"]` unchanged (`Scan the selected wells`).
 - `scan_lead`: `<n> fields at <objective>. ` or `<n> fields. ` (`1 field`; no
   objective), then `STOP, at the top right, stops the scan.`, then ` A move already sent
-  finishes first on this stand.` when `stop_refused`. With no plan, `SCREEN_LEADS["scan"]`
-  plus the same addition.
+  finishes first on this stand` when `stop_refused`, then `; a long one ends at the end
+  of its current segment (at most <cap> µm in XY, <cap> µm in Z)` for the roles of
+  `stop_segments_um` (§17.12.10), then `.`. With no plan, `SCREEN_LEADS["scan"]` plus the
+  same addition.
 - `wells_known_lines`, in order, each line only when it applies: `Objective: <label>, in
   place` or `Objective: not known`; `Fields: <n> in <w> wells` (`1 field in 1 well`),
   `Fields: out of date (<out_of_date>)` when the plan is unusable and the checklist says
@@ -5799,8 +5808,8 @@ is renamed or removed, and D23's "what stays" is answered for one case (the firs
   current segment (sent in segments of at most 500 µm)` (`a focus move …` for focus; the
   size is the profile's, `:g`), clauses joined by `; `, and `; any other move under way
   runs to its target` when a refused role is not cut. As the CLI's `!` line has said since
-  #507. The Scan lead's `A move already sent finishes first on this stand.` stays: the
-  segment sent finishes first.
+  #507. The Scan lead's `A move already sent finishes first on this stand.` stayed in this
+  point, since the segment sent finishes first; §17.12.10 (#509) adds the cut to it.
 - **D26 The drive line takes its height.** `drive_text` is an outcome line like
   `run_text` (`visible` always, `min_height = _RUN_LINE_PX`) and its text is the toggle's:
   `DRIVE: the next click on a well moves the stage there` while Drive is armed, empty
@@ -5835,6 +5844,68 @@ action y 302 to 333) and the Plate screen (y 462 to 494), and `_STEP_PANEL_MAX_H
 to two lines (header 171 px): the *Drive* toggle is at y 775 to 806, 6 px below the page
 (it was inside, by 11 px). D15 already says that a long outcome makes the header taller; the
 Report says it.
+
+#### 17.12.10 The Scan lead names the segments (#509, 2026-11-16)
+
+Fixed by #509's plan. #507 taught the CLI's `!` line, its Ctrl-C line and the emergency
+stop that a move on a stand whose profile cuts it into segments ends with its current
+segment (m2 §11.12 D5); D25 above taught the strip. The Scan lead still says only `A move
+already sent finishes first on this stand.`, so on the Ti2-E, the one stand with the keys,
+the page and the CLI describe STOP differently. D25 left it, because the segment sent does
+finish first; the sentence is true and errs on the safe side, but it says that the *move*
+finishes, and a 9 mm step between two wells does not (it ends after the segment under way,
+5000 µm at most). #509 asks that the lead say what the strip says. **This reverses D25's
+last sentence** (the choice for the owner to overrule: close #509 on D25's reason instead).
+
+**What was measured** (2026-11-16, `main` at `1058638`, throwaway script, not committed):
+`_stop_segments_um(Profile.load("profiles/nikon-ti2.toml").safety)` is `(("xy_stage",
+5000.0), ("focus", 100.0))`, the profile's order, so the lead needs no new field and no new
+read. The lead of a 72-field plan at the Ti2-E is 121 characters today and 209 with the
+clause below. The step panel is 400 px wide (`STEP_PANEL_WIDTH_PX`) and the text is
+about 7.2 px a character (#326's figure, from `/ui-check`'s PNGs), so the lead goes from three
+lines to four: an estimate from those two numbers, not a browser measure. The build
+measures it and says so in its Report.
+
+- **D29 The words.** On a stand with `stop_refused` and a non-empty `stop_segments_um`
+  the lead's second sentence is `A move already sent finishes first on this stand; a long
+  one ends at the end of its current segment (at most 5000 µm in XY, 100 µm in Z).` Each pair of
+  `stop_segments_um`, in the order it comes, gives `<size:g> µm in <axis>`, the axis being
+  `XY` for `xy_stage` and `Z` for `focus`; the pairs are joined by `, `; a role that is not
+  one of the two is skipped, and when none is left the sentence is today's. One role cut
+  says `(at most 5000 µm in XY)`: a Z move of a stand that refuses it and does not cut it
+  is still the first half's. The sentence is the same with a plan and without (the
+  addition goes to `stop`, as today's), and a stand with no refusal (`stop_refused` false)
+  gets none, whatever `stop_segments_um` holds (the controller already drops a key on a
+  role that is not refused, D25).
+  - Why the first half stays: a move no longer than a segment is one segment and still
+    finishes first, and every stand without the keys keeps its text, pinned.
+  - Why `XY` and `Z`, not `xy_stage` and `focus`: the strip is the engineer's line (it
+    names the roles the profile names); the lead is read at the Scan step by the operator,
+    whose status line says `XY (…) µm | Z … µm`. The size is the profile's, never typed
+    here, in `:g` as the strip and the CLI write it.
+  - Not chosen: *the strip's clause again* (`an xy_stage move ends at the end of its current
+    segment (sent in segments of at most 5000 µm)`, and a focus one): 183 characters
+    on top of today's 121, in a 400 px panel. *Dropping the first
+    half on a stand whose refused roles are all cut*: a move within a segment still runs to
+    its target, and the sentence stays true on every stand that has the key.
+- **The interface.** `smc/ui/guide.py` (pure): `STOP_SEGMENT_AXES: Mapping[str, str] =
+  {"xy_stage": "XY", "focus": "Z"}`, `stop_segments_clause(segments_um: Sequence[tuple[str,
+  float]]) -> str` (the text between `on this stand` and the full stop, `""` when no role is
+  left), and `scan_lead(plan, *, stop_refused, stop_segments_um=())` as §17.10.2 says. The
+  view passes `status.stop_segments_um` (`()` while there is no status). No new
+  `PageStatus` field, no new read of the profile or of a device (FM-239); the lead is drawn
+  from the status as before, with the stand open or closed.
+- **Tests and failure modes.** `tests/unit/test_ui_guide.py` pins the clause (one role, two,
+  `:g`, an unknown role, none) and `scan_lead` with and without segments, with and without
+  a plan, and with segments but no refusal; today's two pins of the unsegmented lead stay
+  as they are. `tests/unit/test_plate_page_wells_scan_view.py` drives the view over a
+  profile with the keys and over one without. FM-117 (a text says what the stop does, per
+  stand, never more), FM-139 (plain text), FM-239 (nothing is read for it). The new entry
+  of the build, named by its text: *a page text that restates a layer's rule goes stale
+  when the layer refines the rule* (#507 refined the CLI, the errors and `close()`; the
+  strip followed in #527, the lead in #509).
+- **Not here.** The strip (D25), the CLI, `Microscope.stop()` and the errors; the Plate
+  and Stand screens; the strip's three lines on the Ti2-E's profile (#529).
 
 ## 18. The page measures the offsets between objectives (#382)
 
