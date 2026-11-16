@@ -71,6 +71,8 @@ __all__ = [
     "CAPTURE_WELLS",
     "CENTRES_CUT_NOTE",
     "CENTRES_UNREACHABLE_NOTE",
+    "CHECKPOINT_NOTE",
+    "CHECKPOINT_NOTE_SCAN",
     "COVERAGE_WORDS",
     "DISCONNECT_RELEASES",
     "DRY_RUN_NO_FRAME",
@@ -166,6 +168,7 @@ __all__ = [
     "centres_reach_note",
     "centres_text",
     "chain_line",
+    "checkpoint_note",
     "colour_bar_title",
     "command_line",
     "continue_label",
@@ -453,6 +456,18 @@ SCAN_REPLACES = "Starting the scan again replaces this one ({frames} frames)."
 SCAN_CHECKPOINT_KEPT = (
     "{status} with a checkpoint: Continue the scan, on the Scan screen, takes it up; "
     "Start again there drops it"
+)
+#: What a single run of a tool that feeds a stopped or failed stage's checkpoint says **before**
+#: the click (m5 §17.12.11 D30): the run is not refused (it is the operator's deliberate choice,
+#: FM-236), but it makes the checkpoint out of date in one click. ``{status}`` is ``stopped`` or
+#: ``failed``, ``{stage}`` the stage's plugin name (the command's).
+CHECKPOINT_NOTE_SCAN = (
+    "This puts the {status} scan out of date: Continue the scan will not be offered "
+    "any more, and Start the scan takes it from the first field."
+)
+CHECKPOINT_NOTE = (
+    "This puts the {status} {stage} out of date: smc run {stage} --resume cannot "
+    "continue it afterwards."
 )
 #: The Wells screen's button while the plan has no time (m5 §17.12 D18), and its wait on a page
 #: served with ``--dry-run``: ``timing`` refuses a dry run, whose calls take no time to measure.
@@ -2287,6 +2302,17 @@ def _sentence(text: str) -> str:
     """``text`` on one line and ending with a full stop: an outcome comes from outside and may end with none."""
     flat = _flat(text).strip()
     return flat if flat.endswith(".") else flat + "."
+
+
+def checkpoint_note(stage: str, status: str) -> str:
+    """What running a tool that feeds ``stage`` does to its ``status`` checkpoint, said before the click (m5 §17.12.11 D30).
+
+    ``scan`` is continued from the Scan screen, so its note names the buttons; any other
+    stage is continued with ``smc run <stage> --resume``. Both take strings, not the
+    controller's types: this module imports nothing from the controller at run time.
+    """
+    template = CHECKPOINT_NOTE_SCAN if stage == "scan" else CHECKPOINT_NOTE
+    return template.format(status=status, stage=stage)
 
 
 def chain_line(chain: ChainStatus | None) -> str:

@@ -28,7 +28,7 @@ import queue
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
@@ -163,6 +163,7 @@ from smc.ui.guide import (
     busy_note,
     calibration_paths,
     centres_reach_note,
+    checkpoint_note,
     command_line,
     local_time,
     next_slot,
@@ -696,7 +697,11 @@ class PlateView:
     *Start again*; ``None`` for no record, one that goes or one that ended ``done``.
     ``offsets`` is the offsets block's offer (m5 §18.2 D2): the usable ``plate`` slot is the
     page's plate, was registered from images (``walls``) and records the objective it was
-    registered with; ``None`` otherwise, and the block is hidden.
+    registered with; ``None`` otherwise, and the block is hidden. ``checkpoint_notes`` maps each
+    registered tool whose single run would put a stopped or failed stage's reachable checkpoint
+    out of date to the note that says so (m5 §17.12.11 D30): the page draws it under *Lay out
+    the fields* and under the expert view's *Run* of that tool. The run is not refused (FM-236);
+    the map is empty when no stage holds a checkpoint ``--resume`` can continue.
     """
 
     plate: str
@@ -723,6 +728,7 @@ class PlateView:
     frame_wells: tuple[str, ...] = ()
     scan_end: ScanEnd | None = None
     offsets: OffsetsOffer | None = None
+    checkpoint_notes: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3056,42 +3062,95 @@ class PlatePage:
     ) -> str | None:
         """Why running ``left`` would put a stopped or failed stage's reachable checkpoint out of date, or ``None``.
 
-        A stage reads what a tool of ``left`` provides (``reads`` or ``reads_optional``, the
-        rule of ``RunDocument.is_stale``) and holds a checkpoint ``reachable_checkpoint`` finds,
-        and the chain does not run that stage itself: the chain's end would leave it stale, and
-        its checkpoint lost to ``--resume`` (FM-172). The first such pair, in the chain's order.
+        A stage that holds a checkpoint ``reachable_checkpoint`` finds reads, through the
+        closure of ``_slot_closure``, what a tool of ``left`` provides, and the chain does not
+        run that stage itself: the chain's end would leave it stale, and its checkpoint lost to
+        ``--resume`` (FM-172). The first such tool, in the chain's order. The closure is the
+        same rule the notes use (``_checkpoint_feeders``): a chain of ``timing`` alone is
+        refused over a stopped scan, which reads the plan that reads the timings (m5 §17.12.11
+        D30).
+        """
+        feeders = self._checkpoint_feeders(doc, running=left)
+        for tool in left:
+            found = feeders.get(tool)
+            if found is None:
+                continue
+            stage, status = found
+            way = (
+                "Continue the scan or Start again, on the Scan screen, first"
+                if stage == "scan"
+                else f"continue it first (smc run {stage} --resume)"
+            )
+            return (
+                f"{tool_title(tool)} would put the checkpoint of the "
+                f"{status.value} {tool_title(stage)} out of date: {way}"
+            )
+        return None
+
+    def _slot_closure(self, stage: str) -> frozenset[str]:
+        """The slots ``stage`` reads, directly or through the tools that provide them (m5 §17.12.11 D30).
+
+        The stage's plugin's ``reads`` and ``reads_optional``, then those of every registered
+        plugin that provides one of the slots found, and so on, with a visited set (the
+        declared reads can loop). ``RunDocument.is_stale`` is transitive by the records' own
+        reads; the plugins' declared ones are what the page can know before a run, so a run of
+        any tool that provides a slot of the closure makes the stage's record stale. A slot no
+        registered plugin provides stays in the set. A stage that is not registered reads nothing.
+        """
+        plugins = self._registry().plugins
+        entry = plugins.get(stage)
+        if entry is None:
+            return frozenset()
+        providers: dict[str, list[str]] = {}
+        for name, other in plugins.items():
+            providers.setdefault(other.plugin.provides, []).append(name)
+        found: set[str] = set()
+        todo = [*entry.plugin.reads, *entry.plugin.reads_optional]
+        while todo:
+            slot = todo.pop()
+            if slot in found:
+                continue
+            found.add(slot)
+            for name in providers.get(slot, ()):
+                provider = plugins[name].plugin
+                todo.extend((*provider.reads, *provider.reads_optional))
+        return frozenset(found)
+
+    def _checkpoint_feeders(
+        self, doc: RunDocument, *, running: Collection[str] = ()
+    ) -> dict[str, tuple[str, StageStatus]]:
+        """For each registered tool whose run puts a reachable checkpoint out of date: the first such stage and its status (m5 §17.12.11 D30).
+
+        A stage counts when ``reachable_checkpoint`` finds a checkpoint ``--resume`` can still
+        continue (the profile, a dry run's, a stale record) and the tool's ``provides`` is in
+        the stage's ``_slot_closure``. The stage that is first in the registry's order names the
+        tool; the tool itself and the stages in ``running`` (a chain runs those itself, and they
+        are made again) are never the stage. The one rule of the chain's refusal
+        (``_chain_drops_a_checkpoint``) and of the notes under the buttons (``view()``). A
+        closure is built only for a stage that holds a checkpoint, so that a page with none
+        pays what ``_blocked``'s own loop pays.
         """
         registry = self._registry().plugins
         profile = self._profile.microscope.name
-        kept: dict[str, StageStatus] = {}
-        for name in registry:
-            if name in left:
+        kept: dict[str, tuple[StageStatus, frozenset[str]]] = {}
+        for stage in registry:
+            if stage in running:
                 continue
             status = reachable_checkpoint(
-                name, doc, profile=profile, dry_run=self._dry_run
+                stage, doc, profile=profile, dry_run=self._dry_run
             )
             if status is not None:
-                kept[name] = status
+                kept[stage] = (status, self._slot_closure(stage))
+        feeders: dict[str, tuple[str, StageStatus]] = {}
         if not kept:
-            return None
-        for tool in left:
-            entry = registry.get(tool)
-            if entry is None:
-                continue
+            return feeders
+        for tool, entry in registry.items():
             slot = entry.plugin.provides
-            for stage, status in kept.items():
-                reader = registry[stage].plugin
-                if slot in (*reader.reads, *reader.reads_optional):
-                    way = (
-                        "Continue the scan or Start again, on the Scan screen, first"
-                        if stage == "scan"
-                        else f"continue it first (smc run {stage} --resume)"
-                    )
-                    return (
-                        f"{tool_title(tool)} would put the checkpoint of the "
-                        f"{status.value} {tool_title(stage)} out of date: {way}"
-                    )
-        return None
+            for stage, (status, closure) in kept.items():
+                if stage != tool and slot in closure:
+                    feeders[tool] = (stage, status)
+                    break
+        return feeders
 
     def _run_chain(
         self,
@@ -4987,6 +5046,10 @@ class PlatePage:
             frame_wells=self._frame_wells(doc),
             scan_end=self._scan_end(doc),
             offsets=(None if plate_record is None else _offsets_offer_of(registered)),
+            checkpoint_notes={
+                tool: checkpoint_note(stage, status.value)
+                for tool, (stage, status) in self._checkpoint_feeders(doc).items()
+            },
         )
 
     def _scan_end(self, doc: RunDocument) -> ScanEnd | None:

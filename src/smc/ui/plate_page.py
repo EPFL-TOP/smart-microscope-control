@@ -3594,10 +3594,13 @@ class PlatePageView:
         live = self.page.is_live
         busy = None if running is None else busy_note(running, live=live)
         replaces = {} if self._view is None else self._view.replaces
+        kept = {} if self._view is None else self._view.checkpoint_notes
         for name, button in self.tool_runs.items():
             reason = self._blocked.get(name)
             button.disabled = running is not None or reason is not None
-            lines = (reason or busy, replaces.get(name))
+            # Last: what a click on a tool that feeds a stopped scan would put out of date
+            # (m5 §17.12.11 D30); the run is not refused, so the button is not disabled for it.
+            lines = (reason or busy, replaces.get(name), kept.get(name))
             self.tool_notes[name].object = "\n".join(line for line in lines if line)
         # The next step's button: while an activity goes, or when the step says why not.
         blocked = None if self._next_drawn is None else self._next_drawn.blocked
@@ -4241,7 +4244,11 @@ class PlatePageView:
         if "scan-plan" not in self.tool_runs:
             lay_out = "scan-plan did not load: the problems line says why"
         self.layout_button.disabled = running is not None or lay_out is not None
-        self._say(self.layout_wait, lay_out or busy or "")
+        # The last text: a wait or the busy note comes first. With nothing in the way, a stopped
+        # scan's checkpoint that this click would put out of date says so (m5 §17.12.11 D30);
+        # the button stays enabled, since a single run is the operator's deliberate choice.
+        kept = None if view is None else view.checkpoint_notes.get("scan-plan")
+        self._say(self.layout_wait, lay_out or busy or kept or "")
         start = scan_wait(
             connected=connected,
             blocked=self._blocked.get("scan"),

@@ -134,6 +134,7 @@ from smc.ui.guide import (
     centres_reach_note,
     centres_text,
     chain_line,
+    checkpoint_note,
     colour_bar_title,
     command_line,
     continue_label,
@@ -3708,6 +3709,29 @@ def test_the_chain_line_names_a_tool_outside_results_by_its_plain_title() -> Non
         None,
     )
     assert chain_line(done) == "Done: Timing, Field layout."
+
+
+def test_checkpoint_note_names_the_status_and_the_way_for_scan_and_for_any_other_stage() -> (
+    None
+):
+    """What a single run of a tool that feeds a stopped stage says before the click (m5 §17.12.11 D30)."""
+    assert checkpoint_note("scan", "stopped") == (
+        "This puts the stopped scan out of date: Continue the scan will not be offered "
+        "any more, and Start the scan takes it from the first field."
+    )
+    assert checkpoint_note("scan", "failed").startswith(
+        "This puts the failed scan out of date: "
+    )
+    assert checkpoint_note("plate-finding", "failed") == (
+        "This puts the failed plate-finding out of date: "
+        "smc run plate-finding --resume cannot continue it afterwards."
+    )
+    assert checkpoint_note("plate-finding", "stopped").startswith(
+        "This puts the stopped plate-finding out of date: "
+    )
+    # One sentence, plain text: a stage's name is a plugin's.
+    for stage in ("scan", "plate-finding"):
+        assert "\n" not in checkpoint_note(stage, "stopped")
 
 
 # -- the offsets between objectives (m5 §18, #382) ----------------------------------------
