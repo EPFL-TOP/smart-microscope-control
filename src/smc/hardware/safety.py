@@ -510,11 +510,19 @@ class SegmentPlan(Generic[T]):
     max_segment_um: float
 
 
-def _coords(point: tuple[float, ...]) -> str:
-    """A point as the move lines write it: ``12.0`` for Z, ``(1.0, 2.0)`` for XY."""
-    if len(point) == 1:
-        return str(point[0])
-    return f"({', '.join(str(value) for value in point)})"
+def _coords(point: tuple[float, ...], digits: int | None = None) -> str:
+    """A point as the move lines write it: ``12.0`` for Z, ``(1.0, 2.0)`` for XY.
+
+    ``digits`` rounds each value for a line an operator reads at the console: a third of
+    250 µm was logged as ``-83.33333333333333`` (#514). The diagnosis of a segment that did
+    not land keeps the full values (``None``): it compares a reading with a tolerance, and
+    two rounded numbers could look equal while one is beyond it. ``+ 0.0`` keeps a
+    ``-0.0`` from showing.
+    """
+    values = point if digits is None else tuple(round(v, digits) + 0.0 for v in point)
+    if len(values) == 1:
+        return str(values[0])
+    return f"({', '.join(str(value) for value in values)})"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1288,7 +1296,7 @@ class Executor:
         """
         n = len(plan.targets)
         target = plan.targets[k - 1]
-        line = f"{plan.log}, segment {k} of {n} to {_coords(target)} µm"
+        line = f"{plan.log}, segment {k} of {n} to {_coords(target, 2)} µm"
         step = plan.step(line, target)
         if sending is not None:
             command = step.send

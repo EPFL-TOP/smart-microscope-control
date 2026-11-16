@@ -1088,6 +1088,40 @@ def test_the_progress_block_goes_once_the_scan_is_done(
     assert view.scan_button.disabled is False
 
 
+def test_the_scan_screen_says_left_is_not_known_while_the_plan_has_no_timing(
+    page: PlatePage, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #514 point 1: the Wells screen said `Time: not known` for the plan while the Scan screen
+    # drew `Left about 1 s` for the 8 s the stage took between two wells. The same reports as
+    # the test above (2 s a field), a plan with no timing: no number, and no `about`.
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(estimate_s=None))
+    view = PlatePageView(page)
+    view.show_step("scan")
+    view.refresh()
+    clock = Clock(100.0)
+    with monkeypatch.context() as patch:
+        patch.setattr(controller_module, "time", clock.namespace())
+        _run_a_scan_to(page, view, clock, pause_at=5)
+        view.tick()
+        assert view._view is not None
+        assert view._view.plan is not None
+        assert view._view.plan.estimate_s is None
+        assert view.scan_progress_text.object == "\n".join(
+            (
+                "Field 5 of 12",
+                "Elapsed 12 s",
+                "Left: not known (no timing measured yet)",
+            )
+        )
+        clock.now = 140.0
+        StubScan.before_report = lambda position: setattr(clock, "now", 140.0)
+        StubScan.release.set()
+        _worker(page).join(BOUND_S)
+        assert not _worker(page).is_alive()
+    assert page.join(BOUND_S)
+
+
 def test_the_progress_block_goes_with_the_next_activity_and_is_not_lives(
     page: PlatePage, run_doc: Path
 ) -> None:

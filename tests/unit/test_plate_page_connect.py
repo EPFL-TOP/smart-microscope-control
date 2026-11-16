@@ -38,7 +38,7 @@ from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.registry import GROUP
 from smc.run import StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
-from smc.ui.controller import NOT_CONNECTED, PlatePage
+from smc.ui.controller import NOT_CONNECTED, PageStatus, PlatePage
 from smc.ui.frames import Frame
 
 
@@ -240,6 +240,44 @@ def test_a_closed_page_reads_the_profile_and_not_the_stand(
     assert status.problems == ()
     assert page.jog_limits_um()[0] == declared.safety.max_jog_um
     assert opener.calls == 0
+
+
+def test_the_status_says_which_refused_roles_are_cut_into_segments(
+    run_doc: Path, opener: Opener
+) -> None:
+    # The header's STOP note needs to know that a refused stop still ends a move at the end
+    # of its current segment (#507, #514 point 2): the profile's keys, read as it is.
+    demo = Profile.demo()
+
+    def with_safety(**safety: Any) -> Profile:
+        merged = {**demo.safety.model_dump(), **safety}
+        return demo.model_copy(
+            update={"safety": type(demo.safety).model_validate(merged)}
+        )
+
+    def status_of(profile: Profile) -> PageStatus:
+        controller = _closed(run_doc, opener, profile=profile)
+        try:
+            return controller.status()
+        finally:
+            controller.close()
+            controller.release()
+
+    # No declaration, or a declaration with no key: nothing is cut.
+    assert status_of(demo).stop_segments_um == ()
+    declared = with_safety(stop_refused_by=["xy_stage", "focus"])
+    assert status_of(declared).stop_segments_um == ()
+    # Each key marks its own role, in the order the profile declares the refusals.
+    both = with_safety(
+        stop_refused_by=["focus", "xy_stage"],
+        max_segment_um=500.0,
+        max_z_segment_um=25.0,
+    )
+    assert status_of(both).stop_segments_um == (("focus", 25.0), ("xy_stage", 500.0))
+    only_xy = with_safety(stop_refused_by=["xy_stage", "focus"], max_segment_um=1000.0)
+    status = status_of(only_xy)
+    assert status.stop_segments_um == (("xy_stage", 1000.0),)
+    assert status.stop_refused == ("xy_stage", "focus")
 
 
 def test_every_call_that_needs_the_stand_says_it_is_not_connected(

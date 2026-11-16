@@ -59,7 +59,8 @@ from smc.hardware.errors import (
     StopRefusedError,
 )
 from smc.hardware.microscope import describe_autofocus
-from smc.hardware.profile import Profile
+from smc.hardware.profile import Profile, SafetySection
+from smc.hardware.roles import Role
 from smc.hardware.safety import Safety
 from smc.plugins import (
     ParamsError,
@@ -976,7 +977,10 @@ class PageStatus:
     end until another activity starts, and ``None`` before any chain and while a later
     activity goes. ``goto_answer`` is what the same drive came to as the Plate row it was
     sent from says it (m5 §17.12.3): the well, and going, at, refused or failed; ``goto``
-    stays the drive bar's line.
+    stays the drive bar's line. ``stop_segments_um`` are the ``(role, segment)`` pairs of the
+    refused roles whose moves the profile cuts into segments (``max_segment_um``,
+    ``max_z_segment_um``): such a move ends at the end of its current segment, so the strip
+    does not say it runs to its target (m2 §11.12, #514).
     """
 
     stand: str
@@ -999,6 +1003,23 @@ class PageStatus:
     clock: RunClock | None = None
     chain: ChainStatus | None = None
     goto_answer: GotoAnswer | None = None
+    stop_segments_um: tuple[tuple[str, float], ...] = ()
+
+
+def _stop_segments_um(safety: SafetySection) -> tuple[tuple[str, float], ...]:
+    """``(role, segment_um)`` for each role the profile says refuses its stop **and** cuts its moves; the profile's order.
+
+    The profile's loader already refuses a segment key without the declaration (m2 §11.12
+    D1), and the filter here is the same rule read again: a key on a role that does not
+    refuse is no stop to speak of, so the strip never names it.
+    """
+    caps = {Role.xy_stage: safety.max_segment_um, Role.focus: safety.max_z_segment_um}
+    cut: list[tuple[str, float]] = []
+    for role in safety.stop_refused_by:
+        segment_um = caps.get(role)
+        if segment_um is not None:
+            cut.append((role.value, segment_um))
+    return tuple(cut)
 
 
 @dataclass(frozen=True, slots=True)
@@ -4399,6 +4420,7 @@ class PlatePage:
         stop_refused = tuple(
             role.value for role in self._profile.safety.stop_refused_by
         )
+        stop_segments_um = _stop_segments_um(self._profile.safety)
         if served is None:
             read = self._read_stand()
             self._keep_stand_read(read)
@@ -4427,6 +4449,7 @@ class PlatePage:
             clock=clock,
             chain=chain,
             goto_answer=goto_answer,
+            stop_segments_um=stop_segments_um,
         )
 
     def _read_stand(self) -> _StandRead:

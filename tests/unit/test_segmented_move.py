@@ -44,6 +44,7 @@ from smc.hardware.roles import Role
 from smc.hardware.safety import (
     SEGMENT_END_TOLERANCE_UM,
     Safety,
+    _coords,
     segment_targets_um,
 )
 from smc.testing import FakeCore, FakeDevice
@@ -197,8 +198,9 @@ def test_a_long_xy_move_is_sent_in_segments_and_lands_on_its_target(
         ]
     assert landed == XY(2500.0, 0.0)
     assert _segment_lines(caplog.messages) == [
-        f"xy_stage: move_to (2500.0, 0.0) µm, segment 1 of 3 to ({FIRST!r}, 0.0) µm",
-        f"xy_stage: move_to (2500.0, 0.0) µm, segment 2 of 3 to ({SECOND!r}, 0.0) µm",
+        # The line is read at a console: hundredths of a µm, not 833.3333333333334 (#514).
+        "xy_stage: move_to (2500.0, 0.0) µm, segment 1 of 3 to (833.33, 0.0) µm",
+        "xy_stage: move_to (2500.0, 0.0) µm, segment 2 of 3 to (1666.67, 0.0) µm",
         "xy_stage: move_to (2500.0, 0.0) µm, segment 3 of 3 to (2500.0, 0.0) µm",
     ]
 
@@ -706,10 +708,10 @@ def test_a_segmented_move_in_dry_run_logs_each_segment_and_sends_nothing(
         assert _xy_sends(core) == []
     assert landed == XY(2500.0, 0.0)
     assert [m for m in caplog.messages if m.startswith("[dry-run]")] == [
-        f"[dry-run] xy_stage: move_to (2500.0, 0.0) µm, segment 1 of 3 to ({FIRST!r}, "
-        f"0.0) µm",
-        f"[dry-run] xy_stage: move_to (2500.0, 0.0) µm, segment 2 of 3 to "
-        f"({SECOND!r}, 0.0) µm",
+        "[dry-run] xy_stage: move_to (2500.0, 0.0) µm, segment 1 of 3 to (833.33, "
+        "0.0) µm",
+        "[dry-run] xy_stage: move_to (2500.0, 0.0) µm, segment 2 of 3 to "
+        "(1666.67, 0.0) µm",
         "[dry-run] xy_stage: move_to (2500.0, 0.0) µm, segment 3 of 3 to (2500.0, "
         "0.0) µm",
     ]
@@ -730,12 +732,31 @@ def test_a_long_z_move_without_an_autofocus_is_sent_in_segments(
             "setPosition('Z', 250.0)",
         ]
     assert landed == 250.0
-    # A Z point is one number, not a 1-tuple.
+    # A Z point is one number, not a 1-tuple, rounded to hundredths in the line (the
+    # device was sent the full value, above).
     assert _segment_lines(caplog.messages) == [
-        f"z: move_to 250.0 µm, segment 1 of 3 to {250.0 / 3!r} µm",
-        f"z: move_to 250.0 µm, segment 2 of 3 to {500.0 / 3!r} µm",
+        "z: move_to 250.0 µm, segment 1 of 3 to 83.33 µm",
+        "z: move_to 250.0 µm, segment 2 of 3 to 166.67 µm",
         "z: move_to 250.0 µm, segment 3 of 3 to 250.0 µm",
     ]
+
+
+def test_the_segment_lines_round_the_coordinates_to_hundredths_and_the_move_does_not(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #514 point 5: `segment 1 of 3 to -83.33333333333333 µm` at a console. Only the words
+    # are rounded: the stage is sent the full value, and a diagnosis keeps its own numbers.
+    with _stand(_segmented_profile(xy=100.0)) as (core, microscope):
+        with caplog.at_level(logging.INFO, logger=LOGGER):
+            microscope.require(XYStage).move_to_um(-250.0, 0.0)
+        assert _xy_sends(core)[0] == f"setXYPosition('XY', {-250.0 / 3!r}, 0.0)"
+    assert _segment_lines(caplog.messages)[0] == (
+        "xy_stage: move_to (-250.0, 0.0) µm, segment 1 of 3 to (-83.33, 0.0) µm"
+    )
+    assert "83.333333" not in "".join(_segment_lines(caplog.messages))
+    # A value that rounds to zero is not written with a minus sign, and no digits is as it was.
+    assert _coords((-0.001, 4.0), 2) == "(0.0, 4.0)"
+    assert _coords((-250.0 / 3,)) == repr(-250.0 / 3)
 
 
 def test_a_z_segment_that_does_not_land_says_so_in_single_numbers() -> None:

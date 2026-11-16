@@ -1395,7 +1395,10 @@ def test_a_tap_in_drive_mode_moves_once(
     _seed(run_doc, "plate-registration", "plate", _plate())
     view = PlatePageView(page)
     stage = fake_microscope.require(XYStage)
-    assert not view.drive_text.visible
+    # The line is always there, so that arming Drive moves nothing (#514 point 3): its words
+    # come and go, not its height.
+    assert view.drive_text.visible
+    assert view.drive_text.object == ""
     view.drive_toggle.value = True
     assert view.drive_text.visible
     assert view.drive_text.object == (
@@ -1406,7 +1409,8 @@ def test_a_tap_in_drive_mode_moves_once(
     assert stage.position_um().x_um == pytest.approx(_centre("C5")[0], abs=1e-6)
     assert stage.position_um().y_um == pytest.approx(_centre("C5")[1], abs=1e-6)
     assert not view.drive_toggle.value
-    assert not view.drive_text.visible
+    assert view.drive_text.visible
+    assert view.drive_text.object == ""
     assert page.selection == ()
     moved = stage.position_um()
     attempt = RunDocument.load(run_doc).stages["goto-well"].attempt
@@ -1416,6 +1420,52 @@ def test_a_tap_in_drive_mode_moves_once(
     assert page.status().running is None
     assert stage.position_um() == moved
     assert RunDocument.load(run_doc).stages["goto-well"].attempt == attempt
+
+
+#: A point of the map that is on no well of any plate the tests register (a metre away).
+_OFF_THE_PLATE = (1.0e6, 1.0e6)
+
+
+def test_a_drive_click_on_no_well_says_so_and_disarms_drive(
+    run_doc: Path, page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # #514 point 3: a click on no well did nothing, said nothing and disarmed Drive, so the
+    # operator pressed again without knowing why the stage had not moved.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    view = PlatePageView(page)
+    stage = fake_microscope.require(XYStage)
+    before = stage.position_um()
+    view.drive_toggle.value = True
+    _tap(view, *_OFF_THE_PLATE)
+    assert page.join(10.0)
+    assert stage.position_um() == before
+    assert page.status().running is None
+    assert not view.drive_toggle.value
+    assert view.drive_text.visible
+    # The sentence the operator reads, whole: that nothing moved, and that Drive is off.
+    assert view.drive_text.object == (
+        "No well was under that click, so nothing moved. Drive is off again."
+    )
+    assert view.drive_text.object == plate_page.DRIVE_MISSED
+    assert view.message.object == ""
+    # It is the answer to that click: arming again replaces it, and so does disarming.
+    view.drive_toggle.value = True
+    assert view.drive_text.object == plate_page.DRIVE_TEXT
+    view.drive_toggle.value = False
+    assert view.drive_text.object == ""
+    # A miss in select mode is only a click on the paper: it says nothing, and it clears
+    # the answer to a drive click that is no longer the last click.
+    view.drive_toggle.value = True
+    _tap(view, *_OFF_THE_PLATE)
+    assert view.drive_text.object == plate_page.DRIVE_MISSED
+    _tap(view, *_OFF_THE_PLATE)
+    assert view.drive_text.object == ""
+    assert page.selection == ()
+    # A click on a well that Drive moves to says nothing of a miss.
+    view.drive_toggle.value = True
+    _tap(view, *_centre("C5"))
+    assert page.join(10.0)
+    assert view.drive_text.object == ""
 
 
 def test_a_drive_tap_that_is_refused_says_why_and_disarms_the_toggle(
@@ -1854,6 +1904,57 @@ def test_the_stand_is_one_line_and_unknown_is_a_question_mark() -> None:
     )
 
 
+def test_the_stop_note_says_where_a_segmented_move_ends() -> None:
+    # Since #507 a stand whose profile cuts a move into segments ends it at the end of the
+    # current segment: the note said `runs to its target` for every refused role (#514 point
+    # 2). Each shape is whole, FM-117: STOP is promised no more, and no less, than it does.
+    def note(refused: tuple[str, ...], cut: tuple[tuple[str, float], ...]) -> str:
+        line = plate_page.status_line(
+            _status(stop_refused=refused, stop_segments_um=cut)
+        )
+        head = "light ? | "
+        return line[line.index(head) + len(head) :]
+
+    # No role cut: the words are what they were.
+    assert note(("xy_stage", "focus"), ()) == (
+        "STOP is refused by xy_stage, focus on this stand: "
+        "a move under way runs to its target"
+    )
+    # Every refused role cut: no move of this stand runs to its target.
+    assert note(("xy_stage",), (("xy_stage", 500.0),)) == (
+        "STOP is refused by xy_stage on this stand: an xy_stage move ends at the end "
+        "of its current segment (sent in segments of at most 500 µm)"
+    )
+    # One role cut, one whole: each is said for its own role.
+    assert note(("xy_stage", "focus"), (("xy_stage", 500.0),)) == (
+        "STOP is refused by xy_stage, focus on this stand: an xy_stage move ends at "
+        "the end of its current segment (sent in segments of at most 500 µm); any "
+        "other move under way runs to its target"
+    )
+    # Both cut, each with its own size (``:g``: 25 µm, not 25.0 µm).
+    assert note(("xy_stage", "focus"), (("xy_stage", 1000.0), ("focus", 25.0))) == (
+        "STOP is refused by xy_stage, focus on this stand: an xy_stage move ends at "
+        "the end of its current segment (sent in segments of at most 1000 µm); a "
+        "focus move ends at the end of its current segment (sent in segments of at "
+        "most 25 µm)"
+    )
+    # A role that is cut but is not refused is no refusal to speak of: the key is ignored.
+    assert note(("focus",), (("xy_stage", 500.0),)) == (
+        "STOP is refused by focus on this stand: a move under way runs to its target"
+    )
+    # With the stand closed the strip says no more than it did.
+    assert (
+        plate_page.status_line(
+            _status(
+                connected=False,
+                stop_refused=("xy_stage",),
+                stop_segments_um=(("xy_stage", 500.0),),
+            )
+        )
+        == "demo | not connected"
+    )
+
+
 def test_the_run_is_its_progress_its_outcome_and_the_last_stop() -> None:
     from smc.plugins.api import Progress
 
@@ -2219,7 +2320,7 @@ def test_the_replace_note_is_drawn_under_the_tool_that_would_replace_the_plate(
     # The page was built before the record: the operator named the plate since.
     page.choose_plate("96-well")
     view = PlatePageView(page)
-    when = T0.astimezone().strftime("%Y-%m-%d %H:%M")
+    when = T0.strftime("%Y-%m-%d %H:%M UTC")
     note = (
         f"Run replaces the plate registered {when} (references, 2 wells). "
         "A failed run leaves no plate; the captures stay, so Forget the wrong one "
@@ -2788,7 +2889,7 @@ def test_the_walls_run_is_disabled_with_the_reason_beside_it_and_enabled_when_no
     view = PlatePageView(walls_page)
     run, note = view.tool_runs["plate-walls"], view.tool_notes["plate-walls"]
     stage = fake_microscope.require(XYStage)
-    when = T0.astimezone().strftime("%Y-%m-%d %H:%M")
+    when = T0.strftime("%Y-%m-%d %H:%M UTC")
     replace = (
         f"Run replaces the plate registered {when} (references, 2 wells). "
         "A failed run leaves no plate; the captures stay, so Forget the wrong one "

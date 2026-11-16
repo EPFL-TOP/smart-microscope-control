@@ -827,6 +827,7 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
     # right edge in `/ui-check`'s `turned` state. Plain text, never Markdown (FM-139).
     for pane in (
         view.connection_text,
+        view.drive_text,
         view.run_text,
         view.message,
         view.problems_text,
@@ -842,9 +843,7 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
     assert view.message.visible is True
     view.message.object = ""
     assert view.message.visible is False
-    # `drive_text` has its own rule: it shows while the Drive toggle is on.
-    assert view.drive_text.visible is False
-    view.drive_toggle.value = True
+    # `drive_text` has its own rule, below: it takes its height like `run_text`.
     assert view.drive_text.visible is True
     # Their order under the strip, inside the sticky header, and the step bar after them;
     # the centre is below the header (B2, D12).
@@ -857,6 +856,33 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
         view.problems_text,
     ]
     assert view.layout[0] is view.header
+
+
+def test_the_drive_line_takes_its_height_whether_drive_is_armed_or_not(
+    page: PlatePage,
+) -> None:
+    # A line that appeared with the toggle moved the map down by about 27 px under the click
+    # the operator had aimed before arming (the Ti2-E rehearsal, #514 point 3): the line is
+    # always there, as `run_text`'s is, and says its words only while Drive is armed.
+    view = PlatePageView(page)
+    assert view.drive_text.visible is True
+    assert view.drive_text.min_height == plate_page._RUN_LINE_PX
+    # 17 px and not 27: Panel's 5 px above and below would make the header 164 px, and
+    # `_STEP_PANEL_MAX_HEIGHT` (the header's 154 px plus 3) rests on the line's height
+    # (`/ui-check`'s `header:` figure). It is a warning, as it was.
+    assert view.drive_text.margin == (0, 10)
+    assert view.drive_text.styles["color"] == plate_page._WARNING
+    assert view.drive_text.object == ""
+    view.drive_toggle.value = True
+    assert view.drive_text.visible is True
+    assert view.drive_text.object == plate_page.DRIVE_TEXT
+    view.drive_toggle.value = False
+    assert view.drive_text.visible is True
+    assert view.drive_text.min_height == plate_page._RUN_LINE_PX
+    assert view.drive_text.object == ""
+    # A redraw (the tick, Refresh) leaves the line as it is: no hide-when-empty rule is on it.
+    view.refresh()
+    assert view.drive_text.visible is True
 
 
 # --- round 2: the map's frame, the density select, the header (m5 §17.12 D15, D16, #475) ---
