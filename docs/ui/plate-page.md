@@ -449,8 +449,9 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
 - **coverage** (`scan-plan`'s) and **autofocus** (`scan`'s), the tools' own fields, each with
   **what it is in plain words above it** (`How much of each well's width the fields span: 0.4 is
   40 %.`; `Autofocus: if-engaged uses it when it is on and locked; required refuses to start
-  unless it is; off never touches it. The scan never switches it on.`): what you
-  type here is what the tools' sections in the expert view hold, and the other way round.
+  unless it is; off never uses it and refuses to start when it is on. The scan never switches
+  it on.`): what you type here is what the tools' sections in the expert view hold, and the
+  other way round.
   Under each, where its value comes from: `from the preset <name>`, `from the profile's
   suggestions`, `typed on this page`, or `the tool's default: 1.0` while it is empty. The
   light grey text in an empty field is that default, **without the quotes** a string carries

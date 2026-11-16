@@ -3076,7 +3076,14 @@ def test_the_round_2_texts_are_the_designs() -> None:
     assert COVERAGE_WORDS == (
         "How much of each well's width the fields span: 0.4 is 40 %."
     )
-    assert AUTOFOCUS_WORDS.startswith("Autofocus: if-engaged uses it when it is on")
+    # `off` is refused when the autofocus is on (m3 §5.7 D2, #478): the page must not promise
+    # that it "never touches" it (#498).
+    assert AUTOFOCUS_WORDS == (
+        "Autofocus: if-engaged uses it when it is on and locked; required refuses to "
+        "start unless it is; off never uses it and refuses to start when it is on. "
+        "The scan never switches it on."
+    )
+    assert "never touches" not in AUTOFOCUS_WORDS
     assert SAMPLE_REGISTERS == (
         "Register the plate uses the profile's sample while no centre is captured; "
         "capture three to measure this plate."

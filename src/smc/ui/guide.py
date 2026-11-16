@@ -420,7 +420,8 @@ LEFT_NOT_KNOWN_NO_TIMING = "Left: not known (no timing measured yet)"
 COVERAGE_WORDS = "How much of each well's width the fields span: 0.4 is 40 %."
 AUTOFOCUS_WORDS = (
     "Autofocus: if-engaged uses it when it is on and locked; required refuses to "
-    "start unless it is; off never touches it. The scan never switches it on."
+    "start unless it is; off never uses it and refuses to start when it is on. "
+    "The scan never switches it on."
 )
 
 #: Why everything that needs the stand is refused while the page holds none (m5 §7.2):
