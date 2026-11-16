@@ -1795,6 +1795,13 @@ class PlatePage:
         # event set (``stop()`` sets it and takes no lock, FM-70); the next activity of that
         # name removes it, so a later run says its own end.
         self._stopped_activity: set[str] = set()
+        # The ``attempt`` of each plugin's record as that plugin's latest activity of this page
+        # left it, under ``_lock`` (m5 §17.12.11 D34): ``_reported`` and ``_stopped_activity``
+        # describe *that* record and no other. A later record of the same tool that this page
+        # did not run (``smc run scan --resume`` in a terminal, another attempt that failed
+        # for another reason) has another attempt, and the Scan screen then says its own end.
+        # Dropped with them at an activity's start, set by ``_note_attempt``.
+        self._attempts: dict[str, str] = {}
         # What this page wrote into a profile's file, under ``_lock``: the ``finished_utc`` of the
         # ``objective-offsets`` result and the file (m5 §18.2 D7). The block says *Written* while
         # the usable result is that one, and no longer once the tool has run again.
@@ -3269,6 +3276,7 @@ class PlatePage:
             self._progress = None
             self._reported.pop(tool, None)
             self._stopped_activity.discard(tool)
+            self._attempts.pop(tool, None)
             self._first_report = self._last_report = None
             while True:
                 try:
@@ -3307,6 +3315,7 @@ class PlatePage:
             self._progress = None
             self._reported.pop(name, None)
             self._stopped_activity.discard(name)
+            self._attempts.pop(name, None)
             self._counted_over = None
             self._clock_of = name
             self._clock_start = time.monotonic()
@@ -3454,12 +3463,37 @@ class PlatePage:
         ended = self._run_plugin_once(
             plugin, entry, parsed, event, preset, resume, planned
         )
+        self._note_attempt(plugin)
         self._last_ended = ended
         if entry.plugin.provides == "plate":
             with self._lock:
                 self._goto = ""
                 self._goto_answer = None
         return ended
+
+    def _note_attempt(self, plugin: str) -> None:
+        """Keep the ``attempt`` of ``plugin``'s record, the one the run that just ended wrote (m5 §17.12.11 D34).
+
+        ``_scan_end`` uses the count and the STOP flag this page kept only for the record they
+        describe. The document is read **outside** ``_lock`` (the tick takes it, and I/O under
+        it would stall every tab) and the attempt is stored under it. An unreadable document or a
+        missing record stores nothing: then the page says the record's own words, without a count
+        (FM-98: nothing is raised, and no exception is kept).
+        """
+        try:
+            doc, unreadable = self._document()
+            record = None if unreadable is not None else doc.stages.get(plugin)
+        except (
+            Exception
+        ) as exc:  # a note of the end must never cost the run its outcome
+            log.info(
+                "%s: its record's attempt was not read: %s", plugin, type(exc).__name__
+            )
+            return
+        if record is None:
+            return
+        with self._lock:
+            self._attempts[plugin] = record.attempt
 
     def _run_plugin_once(
         self,
@@ -5082,8 +5116,12 @@ class PlatePage:
         The record says the status and the error; this page says whether STOP was pressed in
         that scan (``_stopped_activity``: a STOP in a move is a ``failed`` record, FM-64) and
         how far it got (the last report it kept of it, ``_reported``). Both are read in one
-        section under ``_lock`` (FM-151). Whether the checkpoint can be continued is
-        ``reachable_checkpoint``'s, the test the runner's resume passes from the document.
+        section under ``_lock`` with the attempt they belong to (FM-151), and are used only
+        when that attempt is this record's (m5 §17.12.11 D34): a later record of the scan that
+        this page did not run (a terminal's ``smc run scan --resume`` that failed for another
+        reason) says its own end, as a new page does, with no count and its status's words.
+        Whether the checkpoint can be continued is ``reachable_checkpoint``'s, the test the
+        runner's resume passes from the document.
         """
         record = doc.stages.get("scan")
         if record is None or record.status not in (
@@ -5094,6 +5132,10 @@ class PlatePage:
         with self._lock:
             reported = self._reported.get("scan")
             stopped_here = "scan" in self._stopped_activity
+            ours = self._attempts.get("scan") == record.attempt
+        if not ours:
+            reported = None
+            stopped_here = False
         kind: Literal["stopped", "failed"] = (
             "stopped"
             if record.status is StageStatus.stopped or stopped_here
