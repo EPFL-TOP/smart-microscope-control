@@ -28,7 +28,12 @@ as for any stage move:
   disengaged: it is switched off and on again `repeats` times, and engaging drives Z
   on the Ti2-E. The plugin never switches on an autofocus that was off (that is the
   operator's call, and where it drives Z to), so a stand that is not locked gets an
-  *assumed* refocus (below) and no Z motion from this plugin.
+  *assumed* refocus (below) and no Z motion from this plugin. The lock is timed
+  **first**, with the stage where you left it; then any autofocus still engaged
+  (the one just timed, one that was not timed, one that is on and searching) is
+  **switched off before the stage moves, and left off**: a PFS locked during the 9 mm
+  probe would follow its reference over a well's wall with nothing to stop it (m3 §12,
+  #513). **Engage it again before the scan**, in the well you scan first.
 - **A snap is taken at the channel and exposure the stand has**, `repeats` times, and
   with `channels` the stand selects each channel in turn.
 
@@ -50,7 +55,7 @@ smc run timing -p <profile> --run-doc run.json --param 'channels=["DAPI","FITC"]
 |---|---|---|
 | `repeats` | 3 | Samples per distance, autofocus lock, bare snap and channel (1 to 20). The median of each is kept, so one slow sample does not move it. |
 | `distances_um` | `[200, 9000]` | The short and the long probe, in µm along X: a field-to-field hop and a well-to-well move. Each in (0, 50000] and the second longer; two equal distances fit no line. |
-| `with_autofocus` | `true` | Time the autofocus lock. `false` touches nothing and assumes the refocus. |
+| `with_autofocus` | `true` | Time the autofocus lock. `false` times no lock and assumes the refocus, but an engaged autofocus is still switched off before the stage moves and left off. |
 | `channels` | none | Channels to time, by name, at most 32, none empty, none twice. Each must be a channel of this stand: a name it does not have is refused before anything moves, and the text lists the ones it has. |
 
 On the demo (the demo stage moves at 10 mm/s, and its autofocus is off):
@@ -68,16 +73,17 @@ INFO assumed (not measured): the stage reports no soft limits: the probe moves w
 ```
 
 (The command line shows the first and the last progress line, as for any plugin; the
-demo's travel time is the demo's, 10 mm/s, and its overhead fits as 0.) The steps are `stage <d> µm` for each distance, `autofocus lock` (only when it
-is measured), `snap`, and `channel <name>` for each channel. A dry run is refused: the
+demo's travel time is the demo's, 10 mm/s, and its overhead fits as 0.) The steps are
+`autofocus lock` (only when it is measured, and then first), `stage <d> µm` for each
+distance, `snap`, and `channel <name>` for each channel. A dry run is refused: the
 calls that would be timed are skipped, so their durations are not the stand's. A
 stopped timing is measured again; `--resume` re-measures, and nothing half-done is
 stored.
 
 ## What it measures
 
-- **The stage.** For each distance, `repeats` times: out along X and back, each move
-  timed. The timed call is the facade's `move_to_um`, which returns once the stage has
+- **The stage**, after the refocus below and the switch-off that follows it. For each
+  distance, `repeats` times: out along X and back, each move timed. The timed call is the facade's `move_to_um`, which returns once the stage has
   arrived: the cost a scan pays. A point of the fit is the **median of the distances
   the stage read back** and the median of its `2 · repeats` times, and the line is
   `ms = overhead + rate · mm` through the two points, each clamped at 0. The distance
@@ -89,7 +95,13 @@ stored.
   The first lock that does not come (`engage()` returns `False`) or is refused ends
   the section: another sample would wait the whole lock timeout again, and a search
   drives Z. Anything else (a halt, an excursion) is not "it did not lock": it ends the
-  run.
+  run. It runs **before the stage moves**, with the stage where it was found.
+- **The switch-off.** Once the refocus is done (or skipped), and before the first move,
+  an autofocus that reads engaged (`is_engaged()`, so one that is searching counts) is
+  switched off and read back, the call the wall walks use (`plate-walls`,
+  `objective-offsets`). One that is off is left alone, and nothing is said. A switch-off
+  that cannot be made or read back ends the run **before the stage moves**, since PFS
+  may still be on; a stop asked before it sends nothing.
 - **The snap.** `snap_ms` is the median of `repeats` bare snaps.
 - **The channels.** With `channels`, each is selected (one switch sample) and snapped
   `repeats` times (`channel_ms[name]` is the median). The channel the stand was on is
@@ -103,9 +115,9 @@ snaps, and per channel `repeats` snaps plus its switch samples.
 
 ## What it leaves
 
-When the run ends normally the **stage is back at the start**, the **autofocus is as it
-was** (a measured run ends on a lock, so it is on and locked again) and the **channel the
-stand was on is selected back**. After **a stop, a halt or a fault nothing is put back**: a return, an
+When the run ends normally the **stage is back at the start**, an autofocus that was
+engaged is **off** (switched off before the probe and never engaged again; one that was
+off is as it was) and the **channel the stand was on is selected back**. After **a stop, a halt or a fault nothing is put back**: a return, an
 engage or a select after the operator's stop would be another motion nobody asked
 for, and an engage drives Z. A WARNING says what was left: where the stage is and where
 it started; the autofocus the run switched off, **read back** (`left off`, `still ON`
@@ -118,8 +130,8 @@ the return is compared with the start, and one more than 5 µm from it gets a WA
 with both positions (the tolerance of a probe is between two readbacks, so a return that
 stopped 150 µm short of a 9000 µm probe would pass it unseen).
 
-The one exception on a normal end: a lock that did not come leaves the autofocus **off**,
-and the result and a WARNING say so (below). Engage it again before the scan.
+The result and a WARNING say that the autofocus was switched off (below), and so does a
+lock that did not come, which also leaves it **off**. Engage it again before the scan.
 
 ## The result
 
@@ -137,6 +149,9 @@ The slot `timings` holds a `TimingsResult` (`smc.plugins.slots`):
 
 `assumed` can hold, each as a line of its own:
 
+- first, when the run switched an engaged autofocus off before the probe: `the autofocus
+  was switched off before anything moved, so that no lock crossed a well's wall: engage
+  it again on the sample`. `scan-plan` copies it, so the page's strip shows it.
 - `the stage reports no soft limits: the probe moves were not checked against its travel`.
 - `refocus 400 ms is assumed: with_autofocus is false`, `...: the autofocus was off, and
   the plugin does not switch it on: engaging drives Z`, `...: the autofocus was on but
