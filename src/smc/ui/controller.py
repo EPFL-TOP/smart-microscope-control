@@ -137,6 +137,7 @@ from smc.ui.guide import (
     GOTO_UNPLACED,
     GOTO_WALL_NEEDS_REGISTRATION,
     MAP_FIELDS_UP_TO,
+    MEASURE_NOT_IN_A_DRY_RUN,
     NO_CALIBRATION_FOR_SIDES,
     NOT_CONNECTED,
     OFFSETS_DRY_RUN,
@@ -2852,6 +2853,13 @@ class PlatePage:
             # §11.4): a usable plate would be replaced by a failure. The page refuses
             # first, nothing written, before the parameters are read (FM-169, m5 §12.3).
             return f"{plugin}: {refusal}"
+        if plugin == "timing" and (refusal := self._timing_refusal()) is not None:
+            # `timing` refuses a dry run too, and its refusal is a `failed` record that
+            # replaces any usable `timings` (§11.4): *Measure the time*'s view waits for it,
+            # but a click that arrives anyway (FM-169) or a tab on another page's state would
+            # write one. Refused here first, nothing written, before the parameters are read
+            # (m5 §17.12.11 D33). It says the tool by its title, as the outcome line does (D20).
+            return f"{tool_title(plugin)}: {refusal}"
         if plugin == "objective-offsets" and (
             refusal := self._offsets_refusal(self._document()[0])
         ):
@@ -5379,6 +5387,17 @@ class PlatePage:
             blocked=blocked.get(tool.name) or stuck,
         )
 
+    def _timing_refusal(self) -> str | None:
+        """Why the page does not run ``timing`` on this page, or ``None``: a dry run has no time to measure (m5 §17.12.11 D33).
+
+        The tool refuses a dry run itself, before it moves anything, but the refusal is a
+        ``failed`` record, and the latest attempt decides the ``timings`` slot (m5 §11.4): a
+        usable measurement would be replaced by a failure. One source for ``_prepare``, for
+        ``_blocked`` (the expert view's *Run* and *Measure the time* wait with it) and so for
+        the button's wait (FM-169, FM-182).
+        """
+        return MEASURE_NOT_IN_A_DRY_RUN if self._dry_run else None
+
     def _walls_refusal(self) -> str | None:
         """Why the page does not run ``plate-walls`` in this mode or on this plate, or ``None`` (m5 §12.3, #375).
 
@@ -5907,6 +5926,8 @@ class PlatePage:
             )
             if reason is None and name == "plate-walls":
                 reason = self._walls_refusal()
+            if reason is None and name == "timing":
+                reason = self._timing_refusal()
             if reason is None and name == "objective-offsets":
                 reason = self._offsets_refusal(doc)
             if reason is None:

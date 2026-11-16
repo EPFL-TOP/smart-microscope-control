@@ -57,6 +57,7 @@ from smc.ui.controller import NOT_CONNECTED, ChainStatus, PlatePage
 from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     LAY_OUT_FIRST,
+    MEASURE_NOT_IN_A_DRY_RUN,
     MEASURE_THE_TIME,
     PLATE_NOT_CHOSEN,
     REGISTER_FIRST,
@@ -2282,6 +2283,55 @@ def test_on_a_dry_run_page_measure_waits_and_a_dry_scan_replaces_nothing_said(
     )
     assert view.scanned_block.object.startswith("Scanned in a dry run")
     assert view.scan_replaces_text.visible is False
+
+
+def test_a_chain_with_timing_on_a_dry_run_page_is_refused_before_anything_is_written(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """``timing`` refuses a dry run too, but its refusal is a ``failed`` record over any usable timings (m5 §17.12.11 D33)."""
+    page = make_page(dry_run=True, real=("scan-plan", "timing"), stubs=(StubScan, Slow))
+    _seed_plate(run_doc, dry_run=True)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None), dry_run=True)
+    page.select_text("B11, B2")
+    before = run_doc.read_bytes()
+    reason = "A dry run cannot time the stand: serve the page without --dry-run to measure it."
+
+    # The view's wait says it from `blocked`: one source for the button and the controller.
+    assert page.view().blocked["timing"] == reason == MEASURE_NOT_IN_A_DRY_RUN
+
+    page.run_chain(
+        ("timing", "scan-plan"),
+        {"timing": [], "scan-plan": page.page_params("scan-plan")},
+        label=MEASURE_THE_TIME,
+    )
+    assert page.join(BOUND_S)
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith(
+        "Measure the time: Timing: A dry run cannot time the stand"
+    )
+    assert outcome.endswith("; not run: Field layout")
+    chain = page.status().chain
+    assert chain is not None
+    assert [(end.plugin, end.how) for end in chain.ended] == [("timing", "refused")]
+    # Nothing written: no `timing` record, and the run document is the bytes it was.
+    assert "timing" not in RunDocument.load(run_doc).stages
+    assert run_doc.read_bytes() == before
+
+    # A single run is refused with the same words and writes nothing either.
+    page.run("timing", [])
+    assert page.status().outcome == f"Timing: {reason}"
+    assert "timing" not in RunDocument.load(run_doc).stages
+    assert run_doc.read_bytes() == before
+
+
+def test_a_page_that_is_not_a_dry_run_does_not_refuse_timing(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(real=("scan-plan", "timing"), stubs=(StubScan, Slow))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    assert "timing" not in page.view().blocked
 
 
 def test_a_stop_with_no_checkpoint_says_it_and_keeps_start_the_scan(

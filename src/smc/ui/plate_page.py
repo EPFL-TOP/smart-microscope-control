@@ -88,7 +88,6 @@ from smc.ui.guide import (
     END_LIVE_LABEL,
     FILES_HEADING,
     MEASURE_AFTER_THE_SCAN,
-    MEASURE_NOT_IN_A_DRY_RUN,
     MEASURE_THE_TIME,
     NO_FILES_YET,
     OFFSETS_NOT_TURNED_BACK,
@@ -4296,9 +4295,10 @@ class PlatePageView:
         """*Measure the time* and its wait: offered while the usable plan has no time and both tools loaded (m5 §17.12 D18).
 
         Disabled while an activity goes or a tool of the chain cannot run (the controller's
-        reason, ``timing``'s first), and on a page served with ``--dry-run``, which ``timing``
-        refuses (its calls take no time to measure). The controller's chain refuses on its own
-        (FM-169), and ``timing`` refuses a dry run before it moves anything.
+        reason, ``timing``'s first). That includes a page served with ``--dry-run``, which
+        ``timing`` refuses (its calls take no time to measure): the controller's
+        ``_timing_refusal`` is the one source, in ``blocked`` for this wait and in ``_prepare``
+        for a click that arrives anyway (m5 §17.12.11 D33, FM-169, FM-182).
         """
         view = self._view
         plan = None if view is None else view.plan
@@ -4312,15 +4312,9 @@ class PlatePageView:
         if not shown:
             self._say(self.measure_time_wait, "")
             return
-        status = self._status
         reason = (
             self._blocked.get("timing")
             or self._blocked.get("scan-plan")
-            or (
-                MEASURE_NOT_IN_A_DRY_RUN
-                if status is not None and status.dry_run
-                else None
-            )
             or (
                 MEASURE_AFTER_THE_SCAN
                 if view is not None
