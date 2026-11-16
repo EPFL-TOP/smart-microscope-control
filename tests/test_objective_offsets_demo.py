@@ -1976,6 +1976,29 @@ def test_a_failure_with_the_autofocus_already_off_says_nothing_of_it_in_objectiv
     assert "disengage" not in af.calls
 
 
+def test_a_second_run_that_fails_with_the_autofocus_the_first_switched_off_says_nothing_of_it_in_objective_offsets(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator fixes the offsets and runs again: PFS is off since the first run, which this one did not switch off (FM-165)."""
+    stand = open_stand()
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+    targets, calibrations, params, _, end = _a_run_that_fails(
+        "disagree", stand, run_doc, documents, monkeypatch
+    )
+
+    first = _refused(stand, run_doc, targets, calibrations, **params)
+    second = _refused(stand, run_doc, targets, calibrations, **params)
+
+    assert first.reason.endswith(end + AUTOFOCUS_LEFT_OFF)
+    assert second.reason.endswith(end)
+    assert "autofocus" not in second.reason
+    assert af.calls.count("disengage") == 1
+
+
 def _a_fault() -> Exception:
     return CoreError("the turret did not answer")
 

@@ -2235,6 +2235,23 @@ def test_a_failure_with_the_autofocus_already_off_says_nothing_of_it_in_plate_wa
     assert af.calls == ["is_engaged"]
 
 
+def test_a_second_run_that_fails_with_the_autofocus_the_first_switched_off_says_nothing_of_it_in_plate_walls(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The operator fixes the walk and runs again: PFS is off since the first run, which this one did not switch off (FM-165)."""
+    run_doc, refs, params, _, end = _a_walk_that_fails("fit", fake_microscope, tmp_path)
+    af = _engaged(fake_microscope)
+
+    first = _refused(fake_microscope, run_doc, refs, **params)
+    second = _refused(fake_microscope, run_doc, refs, **params)
+
+    assert first.reason.endswith(end + AUTOFOCUS_LEFT_OFF)
+    assert second.reason.endswith(end)
+    assert "autofocus" not in second.reason
+    # One switch-off, by the first run; the second only reads.
+    assert af.calls == ["is_engaged", "disengage", "is_engaged", "is_engaged"]
+
+
 def _a_fault() -> Exception:
     return CoreError("the stage did not answer")
 

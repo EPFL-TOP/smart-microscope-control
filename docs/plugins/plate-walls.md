@@ -189,9 +189,10 @@ had switched the PFS off before anything moved, ends with `; the autofocus was s
 off before anything moved and was not engaged again: engage it again on the sample`. The
 page shows the reason and a WARNING only goes to the log, so the sentence is what tells you
 that the PFS is off after a run that gave no result. A run that found the PFS off says
-nothing of it. A halt, a stop (STOP on the page, Ctrl-C) and an error of the stage or of
-the camera keep their own words and type, which the command line's exit code and the
-page's *stopped by STOP* read: for those, the WARNING of the switch-off is the only trace.
+nothing of it. A halt and a stop (STOP on the page, Ctrl-C) keep their own words and type,
+which the command line's exit code and the page's *stopped by STOP* read, and so does for
+now an error of the stage or of the camera (#524): for those, the WARNING of the
+switch-off is the only trace.
 
 **A rotation near 180°.** A plate put in its holder the other way round fits a
 rotation near 180° from the wells named on it (the Ti2-E's plate did in session 3, see

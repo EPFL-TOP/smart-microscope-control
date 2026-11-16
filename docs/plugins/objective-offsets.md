@@ -137,10 +137,10 @@ When the run had switched the PFS off before anything moved, a **refusal** after
 with `; the autofocus was switched off before anything moved and was not engaged again:
 engage it again on the sample`: the page shows the reason, and a WARNING only goes to the
 log, so the sentence is what tells you that the PFS is off after a run that gave no
-result. A run that found the PFS off says nothing of it. A halt, a stop and an error of the
-stage, the turret or the camera keep their own words and type (the command line's exit code
-and the page's *stopped by STOP* read the type): for those, the WARNING of the switch-off is
-the only trace.
+result. A run that found the PFS off says nothing of it. A halt and a stop keep their own
+words and type (the command line's exit code and the page's *stopped by STOP* read the
+type), and so does for now an error of the stage, the turret or the camera (#524): for
+those, the WARNING of the switch-off is the only trace.
 
 ## What you get
 

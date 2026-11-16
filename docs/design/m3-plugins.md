@@ -2328,10 +2328,16 @@ sentence, the family of the scan's `_FOCUS_LEFT_OFF` (§8):
 - **Which errors**: a `PluginRunError` raised after the switch-off, wherever
   in the run: a move or a turn the layer refused, a wall not found, a fit or a
   set of offsets refused. **Everything else passes unchanged** (FM-64):
-  `MicroscopeHaltedError`, `MotionStoppedError`, `StopRequested` and a raw
-  `HardwareError` are read by their type (the CLI's exit code, the page's
-  `stopped by STOP`, the record's `stopped`), so their text cannot carry the
-  sentence. Their trace stays D1's WARNING.
+  `MicroscopeHaltedError` and `MotionStoppedError` (the page's `stopped by
+  STOP`), `StopRequested` (the record's `stopped`) and Ctrl-C (exit 130) are
+  read by their type, so their text cannot carry the sentence; their trace stays
+  D1's WARNING. A raw `HardwareError` that is none of those (a camera or a
+  stage that did not answer) passes unchanged **for another reason**: the CLI
+  gives it exit 1, as it does a `PluginError`, so its type is not what keeps it
+  apart, but a `PluginRunError` raised after the handler (FM-98) would drop its
+  traceback, which is the diagnosis of a device fault and what `smc --debug`
+  shows. It says nothing of PFS in the strip for now: a decision of its own
+  (#524).
 - **How**: `run_saying_autofocus_left_off(body)` in `plate_walls/loop.py`,
   with a holder `SwitchOff` whose `switched` the tool sets where it inserts
   `AUTOFOCUS_OFF_LINE`. Each tool's `run` calls its body (`_run`, the old
@@ -2339,9 +2345,13 @@ sentence, the family of the scan's `_FOCUS_LEFT_OFF` (§8):
   the new error **after** the handler (FM-98; the scan's way: `__context__` and
   `__cause__` are `None`). `switch_off_autofocus`'s signature and texts are
   D1's and do not change.
-- **Not here**: `timing` (§12, #513), whose own flags (`left.autofocus_off` has
-  two meanings there) and WARNING cover every exit and whose failure reasons
-  are a follow-up of their own, and the exits that keep their type (above).
+- **The refusal's own traceback is not kept**: the new error carries the
+  wrapper's frames only (the scan's `_FOCUS_LEFT_OFF` makes the same trade).
+  A refusal's text is its diagnosis; the frames of the walk add nothing to it.
+- **Not here** (#524): `timing` (§12, #513), whose own flags
+  (`left.autofocus_off` has two meanings there) and WARNING cover every exit and
+  whose failure reasons are a follow-up of their own, and a device fault after
+  the switch-off (above).
 
 **Tests of #497**: on the demo stands with `RecordingAutofocus`, for each tool:
 three failures from three places (`plate-walls`: a move the layer refuses, a
@@ -2349,10 +2359,12 @@ wall lost in the frame centred on it, a plate fit refused by the residual;
 `objective-offsets`: a turn the layer refuses, wells that disagree, an offset
 beyond the profile's bound) each ending with the sentence, whole, and the stored
 `error` the same line; the same failures with an autofocus that was off, and a
-refusal before the switch-off, ending with the refusal's own text; a halt, a
-motion stop and a raw `HardwareError` after the switch-off reaching the caller
-as they were; a stop ending `stopped`. **Failure modes**: FM-64, FM-88, FM-98,
-FM-165, FM-223.
+second run that fails again with the autofocus the first one switched off,
+ending with the refusal's own text (the sentence is about this run, FM-165); a
+halt, a motion stop and a raw `HardwareError` after the switch-off reaching the
+caller as they were; a stop ending `stopped`. A refusal before the switch-off
+is #478's own tests, which carry an engaged autofocus and assert the whole
+reason. **Failure modes**: FM-64, FM-88, FM-98, FM-165, FM-223.
 
 **Tests of #478** (names in the plan on the issue): on the demo stands with
 `RecordingAutofocus`, for `plate-walls` and `objective-offsets` (the latter

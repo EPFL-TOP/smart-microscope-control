@@ -372,13 +372,15 @@ def run_saying_autofocus_left_off(body: Callable[[SwitchOff], _T]) -> _T:
     run that fails has no result: the WARNING is then the only trace, and the
     page's strip shows the reason, which tells the operator to fix the walk and
     run again. Only a ``PluginRunError`` is given the sentence. A halt, a motion
-    stop, a stop and a raw ``HardwareError`` are read by their type (the CLI's
-    exit code, the page's ``stopped by STOP``, the record's ``stopped``), so they
-    pass unchanged (FM-64).
+    stop, a stop and Ctrl-C are read by their type (the page's ``stopped by
+    STOP``, the record's ``stopped``, exit 130), so they pass unchanged (FM-64).
+    So does a raw ``HardwareError``, for another reason: converting it would drop
+    its traceback, the diagnosis of a device fault (#524).
 
     The new error is raised **after** the handler (FM-98, the scan's way): the
     handler keeps two strings and no exception, so nothing here puts the
-    refusal on the new error's traceback or keeps the stand's frames alive.
+    refusal on the new error's traceback or keeps the stand's frames alive. The
+    refusal's own traceback is not kept: its text is its diagnosis.
     """
     state = SwitchOff()
     plugin = ""
