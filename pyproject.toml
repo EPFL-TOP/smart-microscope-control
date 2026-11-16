@@ -161,6 +161,8 @@ convention = "google"
 # FakeCore mirrors MMCore's camelCase API; a method that deviates from MMCore
 # or models a quirk still says so in a docstring.
 "src/smc/testing/fakes.py" = ["N802", "D102"]
+# FakeMTB implements the Protocols of zeiss_mtb.api, documented there.
+"src/smc/testing/fake_mtb.py" = ["D102"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "pymmcore_plus".msg = "Hardware is reached only through smc.hardware (ADR-0003, CLAUDE.md); ask for a capability instead."
@@ -188,6 +190,12 @@ ignore_missing_imports = true
 follow_untyped_imports = true
 
 # torch is an optional extra: typed as Any with or without it, so mypy agrees on every PC (measured, m3 §9.0).
+# pythonnet and the Zeiss assembly exist only on the Zeiss stand's Windows PC;
+# zeiss_mtb.dotnet imports them inside its functions (m4 §5).
+[[tool.mypy.overrides]]
+module = ["clr", "System", "System.*", "ZEISS", "ZEISS.*"]
+ignore_missing_imports = true
+
 [[tool.mypy.overrides]]
 module = ["torch", "torch.*", "torchvision", "torchvision.*"]
 ignore_missing_imports = true
