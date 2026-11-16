@@ -15,6 +15,7 @@ import logging
 import math
 import threading
 import time
+import types
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import cast
@@ -1078,6 +1079,29 @@ def test_segment_targets_name_the_key_xy_names_by_default() -> None:
     assert refused.value.reason == _too_many("1.5e+06", "5000", "max_segment_um")
 
 
+def test_the_refusal_writes_the_distance_to_four_significant_digits() -> None:
+    # 20000.5 and 1.5e6 have two digits once written: this one has four.
+    with pytest.raises(SafetyRefusedError) as refused:
+        segment_targets_um((0.0,), (23456.7,), 100.0)
+    assert refused.value.reason == _too_many("2.346e+04", "100", "max_segment_um")
+
+
+def test_the_bound_is_on_the_euclidean_length_not_on_an_axis_or_a_norm() -> None:
+    # 150000 µm on each axis is 212132 µm along the line: 213 segments at 1000 µm,
+    # where the larger axis alone (150) or the sum of the axes would say another count.
+    with pytest.raises(SafetyRefusedError, match=r"more than the 200 segments"):
+        segment_targets_um((0.0, 0.0), (150_000.0, 150_000.0), 1000.0)
+    # 110000 on each axis is 155563 µm: 156 segments, where the sum of the axes
+    # (220000 µm) would refuse it.
+    ends = segment_targets_um((0.0, 0.0), (110_000.0, 110_000.0), 1000.0)
+    assert len(ends) == 156
+    assert ends[-1] == (110_000.0, 110_000.0)
+    # Along y only, and from a start that is not the origin.
+    with pytest.raises(SafetyRefusedError, match=r"more than the 200 segments"):
+        segment_targets_um((50.0, -1e5), (50.0, 1e5 + 1e3), 1000.0)
+    assert len(segment_targets_um((50.0, -1e5), (50.0, 1e5), 1000.0)) == 200
+
+
 def test_segment_targets_refuse_a_huge_plan_before_ceil_and_before_any_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1087,11 +1111,16 @@ def test_segment_targets_refuse_a_huge_plan_before_ceil_and_before_any_list(
     def boom(_: object) -> int:
         raise AssertionError("math.ceil reached: the bound was not applied first")
 
-    monkeypatch.setattr("smc.hardware.safety.math.ceil", boom)
+    # Only safety.py's own name for ``math`` is replaced, by a copy with the spy: the
+    # stdlib module, shared by every thread of the process, keeps the real ``ceil``
+    # (FM-44).
+    spied = types.SimpleNamespace(**{**vars(math), "ceil": boom})
+    monkeypatch.setattr("smc.hardware.safety.math", spied)
     for start, target, cap in (
         ((0.0,), (1e308,), 100.0),  # a ratio of 1e306
         ((0.0, 0.0), (1e300, 0.0), 5000.0),
-        ((0.0, 0.0), (1e7, 0.0), 5000.0),  # 2000 segments, the smallest of the three
+        ((0.0, 0.0), (1e7, 0.0), 5000.0),  # 2000 segments
+        ((0.0, 0.0), (0.0, 1e10), 5000.0),  # along y only: the 2e6 segments measured
     ):
         with pytest.raises(SafetyRefusedError):
             segment_targets_um(start, target, cap)

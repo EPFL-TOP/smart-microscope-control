@@ -1509,10 +1509,12 @@ def test_max_segment_um_of_two_loads_on_a_declared_stand(
     assert getattr(Profile.load(path).safety, key) == 2.0
 
 
-def test_max_segment_um_is_told_the_floor_before_the_declared_role(
+def test_max_segment_um_below_the_floor_is_refused_without_a_declared_refusal_too(
     tmp_path: Path,
 ) -> None:
-    # D7's order: a boolean, finite and > 0, the floor, then the role.
+    # The floor is a field check, so the declared role (a model check, which pydantic
+    # runs only once the fields passed) never hides it. The order itself is the
+    # framework's here; ``Safety`` has its own test of it.
     msg = _load_error(tmp_path, "[safety]\nmax_segment_um = 1.0\n")
     assert "max_segment_um must be at least 2 µm, got 1.0" in msg
 
