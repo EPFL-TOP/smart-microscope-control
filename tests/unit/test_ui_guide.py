@@ -684,6 +684,12 @@ def test_replace_note_converts_a_start_that_is_not_in_utc_to_utc() -> None:
     assert note.startswith(
         "Run replaces the plate registered 2026-11-03 09:20 UTC (seed, 1 well). "
     )
+    # A start with no zone is UTC, as the run document's times are (`local_time` reads it the
+    # same way); `astimezone()` would read it as the PC's own and move it by the PC's offset.
+    naive = datetime(2026, 11, 3, 14, 20)
+    assert "registered 2026-11-03 14:20 UTC (" in replace_note(
+        _plate_result("seed", 1), naive, keeps_captures=True
+    )
     # A start across midnight changes the day too, not only the hour.
     late = datetime(2026, 11, 3, 1, 5, tzinfo=timezone(timedelta(hours=2)))
     assert "registered 2026-11-02 23:05 UTC (" in replace_note(

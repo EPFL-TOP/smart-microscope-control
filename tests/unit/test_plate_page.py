@@ -1442,6 +1442,10 @@ def test_a_drive_click_on_no_well_says_so_and_disarms_drive(
     assert page.status().running is None
     assert not view.drive_toggle.value
     assert view.drive_text.visible
+    # The sentence the operator reads, whole: that nothing moved, and that Drive is off.
+    assert view.drive_text.object == (
+        "No well was under that click, so nothing moved. Drive is off again."
+    )
     assert view.drive_text.object == plate_page.DRIVE_MISSED
     assert view.message.object == ""
     # It is the answer to that click: arming again replaces it, and so does disarming.

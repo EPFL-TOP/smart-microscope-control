@@ -867,6 +867,11 @@ def test_the_drive_line_takes_its_height_whether_drive_is_armed_or_not(
     view = PlatePageView(page)
     assert view.drive_text.visible is True
     assert view.drive_text.min_height == plate_page._RUN_LINE_PX
+    # 17 px and not 27: Panel's 5 px above and below would make the header 164 px, and
+    # `_STEP_PANEL_MAX_HEIGHT` (the header's 154 px plus 3) rests on the line's height
+    # (`/ui-check`'s `header:` figure). It is a warning, as it was.
+    assert view.drive_text.margin == (0, 10)
+    assert view.drive_text.styles["color"] == plate_page._WARNING
     assert view.drive_text.object == ""
     view.drive_toggle.value = True
     assert view.drive_text.visible is True
