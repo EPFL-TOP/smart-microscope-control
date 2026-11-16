@@ -36,6 +36,13 @@ Hardware behaviour encoded here (#77):
   throws out of a callback and aborts the process. Both ways of releasing a core
   (``close_core``, ``Microscope.close()``) end with ``detach_callbacks``, which
   waits for the handler in flight (#311, design §7).
+* **A stand reached through Python devices needs a ``UniMMCore``.** A plain
+  ``CMMCorePlus`` reads a ``.cfg``'s ``#py`` lines as comments, without a word,
+  and loads nothing but ``Core``; so the opener reads the file's bytes for one
+  and builds a ``UniMMCore`` only then (ADR-0007, m4 §3). unicore only *logs* a
+  Python device whose ``initialize()`` failed, so the opener reads every
+  device's initialisation state after the load and fails the open naming each
+  one that did not initialise.
 """
 
 from __future__ import annotations
@@ -58,6 +65,7 @@ __all__ = [
     "CoreError",
     "MicroManagerStatus",
     "close_core",
+    "declares_python_devices",
     "detach_callbacks",
     "find_install",
     "new_core",
@@ -250,20 +258,40 @@ def new_core(adapter_search_paths: Sequence[str | Path] = ()) -> CMMCorePlus:
     return _new_core(adapter_search_paths)[0]
 
 
+def declares_python_devices(config: Path) -> bool:
+    """Whether a line of ``config``, stripped of leading spaces, starts with ``#py ``.
+
+    The file is read as bytes, never as text: a ``.cfg`` saved in cp1252 holds
+    bytes (a ``µ`` is ``0xB5``) that UTF-8 refuses (FM-05, FM-80), and the
+    marker is ASCII in every encoding a ``.cfg`` is saved in.
+    """
+    return any(
+        line.lstrip(b" \t").startswith(b"#py ")
+        for line in config.read_bytes().splitlines()
+    )
+
+
 def _new_core(
-    adapter_search_paths: Sequence[str | Path],
+    adapter_search_paths: Sequence[str | Path], *, python_devices: bool = False
 ) -> tuple[CMMCorePlus, str]:
     """:func:`new_core`, and the suffix that tells a failed load where it searched.
 
     ``open_core`` appends the suffix to the errors of its load. It is empty when
-    no extra directory was given, as before the split.
+    no extra directory was given, as before the split. With ``python_devices``
+    the core is a ``UniMMCore``, imported only then, so that the Nikon stands
+    and the demo never import unicore (ADR-0007 point 2).
     """
     from pymmcore_plus import CMMCorePlus
 
     # Checked before any core exists: MMCore would take a missing directory
     # without a word, and a failed check must not leave a core behind.
     extras = _checked_dirs(adapter_search_paths)
-    core = CMMCorePlus()
+    if python_devices:
+        from pymmcore_plus.experimental.unicore import UniMMCore
+
+        core: CMMCorePlus = UniMMCore()
+    else:
+        core = CMMCorePlus()
     # Done on every open, with or without extras, so that the log and PATH
     # look the same everywhere. It replaces the core's list, hence the merge.
     effective = _merge_search_paths(extras, core.getDeviceAdapterSearchPaths())
@@ -328,8 +356,8 @@ def open_core(
         TypeError: When ``adapter_search_paths`` is a single path, not a
             sequence of them.
     """
-    core, searched = _new_core(adapter_search_paths)
     if config is None:
+        core, searched = _new_core(adapter_search_paths)
         if find_install() is None:
             raise CoreError(INSTALL_HINT)
         try:
@@ -344,10 +372,50 @@ def open_core(
     if not path.exists():
         raise CoreError(f"configuration not found: {path}")
     try:
+        python_devices = declares_python_devices(path)
+    except OSError as exc:
+        raise CoreError(f"could not read {path}: {exc}") from exc
+    core, searched = _new_core(adapter_search_paths, python_devices=python_devices)
+    try:
         core.loadSystemConfiguration(str(path))
     except Exception as exc:
         raise CoreError(f"could not load {path}: {exc}{searched}") from exc
+    if python_devices:
+        _require_initialized(core, path)
     return core
+
+
+def _require_initialized(core: CMMCorePlus, path: Path) -> None:
+    """Fail the open, closing the core, when a device did not initialise.
+
+    unicore runs a Python device's ``initialize()`` and only *logs* its failure
+    (m4 §1.2), so without this check the stand would open with a device that
+    does nothing: an XY stage that never moves, a light that is never gated.
+    Every device is named, in load order, so the operator sees them all at once.
+    """
+    from pymmcore_plus import DeviceInitializationState
+
+    failed: list[str] = []
+    try:
+        is_python = getattr(core, "isPyDevice", None)
+        for label in core.getLoadedDevices():
+            # A C++ device that fails its initialise fails the load itself.
+            if is_python is None or not is_python(label):
+                continue
+            state = core.getDeviceInitializationState(label)
+            if state != DeviceInitializationState.InitializedSuccessfully:
+                failed.append(str(label))
+    except Exception as exc:
+        close_core(core)
+        raise CoreError(
+            f"could not read the initialisation state of the devices of {path}: {exc}"
+        ) from exc
+    if failed:
+        close_core(core)
+        raise CoreError(
+            f"{path}: these devices did not initialise: {', '.join(failed)}; each "
+            "one's own ERROR line in the log carries the cause"
+        )
 
 
 def detach_callbacks(core: object) -> None:

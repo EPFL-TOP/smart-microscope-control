@@ -1999,6 +1999,7 @@ def test_the_profiles_directory_holds_the_profiles_this_repository_ships() -> No
         "demo-sample",
         "nikon-ti2",
         "nikon-tie",
+        "zeiss-observer7",
     }
 
 

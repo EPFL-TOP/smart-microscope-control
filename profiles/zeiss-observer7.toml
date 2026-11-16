@@ -1,0 +1,33 @@
+[microscope]
+name = "zeiss-observer7"
+vendor = "Zeiss"
+description = "Axio Observer 7: MTB 2011 through pythonnet as unicore devices, Prime 95B on PVCAM (ADR-0007)"
+
+[micromanager]
+config = "zeiss-observer7.cfg"
+device_timeout_ms = 60000
+adapter_search_paths = []
+
+[roles.assign]
+xy_stage = "XYStage"
+focus = "Focus"
+objective_turret = "Objective"
+filter_turret = "Reflector"
+light_path = "Sideport"
+shutter = "Colibri"
+light_source = "Colibri"
+
+[light_source]
+intensity_property = "Intensity"
+
+[safety]
+max_jog_um = 5000.0      # the layer's default, not chosen for this stand
+max_z_jog_um = 100.0     # the layer's default, not chosen for this stand
+turret_requires_confirm = true
+# MTB 2011 has no axis stop: a synchronous SetPosition runs to its end
+# (lightsheet-live-tracking-tool, mtb.py). Not measured with smc (#27).
+stop_refused_by = ["xy_stage", "focus"]
+max_segment_um = 5000.0  # chosen as m2 §11.12 D1: equal to max_jog_um; not measured
+max_z_segment_um = 100.0 # chosen as m2 §11.12 D1: equal to max_z_jog_um; not measured
+# z_soft_limits_um, xy_soft_limits_um and z_away_from_sample: measured at #27,
+# before any move beyond the jog limit.
