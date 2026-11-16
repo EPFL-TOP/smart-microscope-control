@@ -200,6 +200,53 @@ def test_the_plan_says_each_target_each_label_the_reference_and_the_text(
     )
 
 
+def test_a_shift_that_rounds_to_zero_prints_no_minus_sign(tmp_path: Path) -> None:
+    # #514 point 5: `smc objective offset --from-run-doc` previewed `(-0.00, -0.00)`. `+ 0.0`
+    # cures an exact `-0.0` only; -0.001 is a real negative number that `:+.2f` prints
+    # with its sign. -0.006 rounds to -0.01 and keeps its sign: only a zero loses it.
+    result = ObjectiveOffsetsResult(
+        plate_objective=TEN,
+        reference=TEN,
+        reference_in_profile=False,
+        measures=(
+            _measure(FOUR, (-0.001, -0.004)),
+            _measure(FORTY, (-0.006, 0.004)),
+        ),
+        offsets=(
+            MeasuredOffset(objective=FOUR, xy_offset_um=(-0.001, -0.004)),
+            MeasuredOffset(objective=FORTY, xy_offset_um=(-0.006, 0.004)),
+        ),
+        objective_in_place=FORTY,
+        elapsed_s=62.8,
+    )
+    profile, run_doc = _plan(tmp_path, result)
+
+    plan = plan_offsets(profile, RunDocument.load(run_doc), run_doc, session=None)
+
+    assert plan.lines[0].startswith(f"'{FOUR}'  shift from '{TEN}' (+0.00, +0.00) µm, ")
+    assert plan.lines[1].startswith(
+        f"'{FORTY}'  shift from '{TEN}' (-0.01, +0.00) µm, "
+    )
+    assert plan.lines[2] == f"'{FOUR}'  xy (+0.00, +0.00) µm  was unknown"
+    assert plan.lines[3] == f"'{FORTY}'  xy (-0.01, +0.00) µm  was unknown"
+    assert "-0.00" not in "".join(plan.lines)
+
+
+def test_a_held_offset_that_rounds_to_zero_prints_no_minus_sign(tmp_path: Path) -> None:
+    # The same rule for what the profile held: its xy and the Z that is dropped.
+    held = HELD.replace("xy_offset_um = [1.0, 2.0]", "xy_offset_um = [-0.001, 2.0]")
+    held = held.replace("z_offset_um = 0.5", "z_offset_um = -0.002")
+    profile = _profile(tmp_path, held)
+    result = _result(reference_in_profile=True, targets=(FOUR,))
+    _, run_doc = _plan(tmp_path, result, profile=profile)
+
+    plan = plan_offsets(profile, RunDocument.load(run_doc), run_doc, session=None)
+
+    assert "was xy (+0.00, +2.00) µm" in plan.lines[1]
+    assert plan.lines[2].startswith(f"'{FOUR}': its z_offset_um +0.00 µm (measured ")
+    assert "-0.00" not in "".join(plan.lines)
+
+
 def test_the_plan_names_the_run_document_and_never_its_folder(tmp_path: Path) -> None:
     # FM-50: a folder is the operator's machine; `measured` goes into a file in git.
     profile, run_doc = _plan(tmp_path)

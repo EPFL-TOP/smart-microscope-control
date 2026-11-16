@@ -160,12 +160,13 @@ def _preview_lines(
 
     Plain text, never markup: a label or a measured text holds brackets and quotes
     that a console would read as styles (FM-36). A value is signed and rounded as the
-    read-out prints it, and ``+ 0.0`` keeps a ``-0.0`` from showing.
+    read-out prints it, rounded **before** the ``+ 0.0`` that keeps a ``-0.0`` from
+    showing: ``-0.001`` is not ``-0.0`` and printed ``-0.00`` (#514).
     """
     old = profile.objectives.offsets
     lines: list[str] = []
     for measure in result.measures:
-        x_um, y_um = (value + 0.0 for value in measure.shift_xy_um)
+        x_um, y_um = (round(value, 2) + 0.0 for value in measure.shift_xy_um)
         wells = ", ".join(well.well for well in measure.wells)
         lines.append(
             f"{measure.objective!r}  shift from {result.plate_objective!r} "
@@ -177,7 +178,7 @@ def _preview_lines(
         if before is None or before.xy_offset_um is None:
             was = "was unknown"
         else:
-            old_x, old_y = (value + 0.0 for value in before.xy_offset_um)
+            old_x, old_y = (round(value, 2) + 0.0 for value in before.xy_offset_um)
             was = f"was xy ({old_x:+.2f}, {old_y:+.2f}) µm"
             if before.measured:
                 was += f", measured {before.measured}"
@@ -186,7 +187,7 @@ def _preview_lines(
         before = old.get(label)
         if before is not None and before.z_offset_um is not None:
             lines.append(
-                f"{label!r}: its z_offset_um {before.z_offset_um + 0.0:+.2f} µm "
+                f"{label!r}: its z_offset_um {round(before.z_offset_um, 2) + 0.0:+.2f} µm "
                 f"(measured {before.measured}) is dropped: objective-offsets "
                 "measures XY only"
             )
