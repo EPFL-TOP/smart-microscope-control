@@ -449,7 +449,11 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   one chain, each with what its own *Run* sends (the profile's suggestions are the fields'
   starting values). **`timing` moves the stage** 200 µm and 9 mm along X and back from where
   it stands, and switches the autofocus off and on again (it must be on and locked on the
-  sample): every guard of the layer applies, as to the expert view's own tool. The chain's
+  sample): the lock is timed first, then an engaged autofocus is switched off before the 9 mm
+  probe and **left off**, so that no lock crosses a well's wall (m3 §12, #513): **engage it
+  again before the scan**, and the plan's assumptions carry the line that says it was switched
+  off (`timings: ...`). Every guard of the
+  layer applies, as to the expert view's own tool. The chain's
   line is drawn under it (`Running Timing (1 of 2).`, `Done: Timing, Field layout.`, or where
   it stopped), and the plan's time follows. On a page served with `--dry-run` it waits (`A dry
   run cannot time the stand: ...`): `timing` refuses a dry run. It also waits while a stopped
