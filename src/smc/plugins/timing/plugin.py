@@ -152,7 +152,8 @@ class _Left:
 
     #: A move away from the start was sent and the return has not arrived.
     stage_away: bool = False
-    #: The plugin switched the autofocus off and it has not locked again.
+    #: The plugin switched the autofocus off, for a lock sample that has not locked
+    #: again, or before the probe (m3 §12): either way it is not engaged again.
     autofocus_off: bool = False
     #: A channel was selected and the one found is not back.
     channel_changed: bool = False
@@ -687,9 +688,10 @@ def _warn_left(
                 start.y_um + 0.0,
             )
     if left.autofocus_off and autofocus is not None:
-        # The flag says the run switched it off and it did not lock again, not
-        # that it is off: a `disengage()` that faulted, or an `engage()` that
-        # raised after it switched on, leaves it on, and possibly driving Z.
+        # The flag says the run switched it off (for a lock sample, or before the
+        # probe) and did not engage it again, not that it is off: a `disengage()`
+        # that faulted, or an `engage()` that raised after it switched on, leaves
+        # it on, and possibly driving Z.
         engaged: bool | None
         try:
             engaged = autofocus.is_engaged()

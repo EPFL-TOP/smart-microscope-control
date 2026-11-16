@@ -1878,6 +1878,11 @@ _STILL_READS_ON = (
             ["is_engaged", "disengage"],
         ),
         (
+            {"fails": "is_engaged"},
+            _NOT_SWITCHED_OFF.format(cause="CoreError: is_engaged failed on the fake"),
+            ["is_engaged"],
+        ),
+        (
             {"stays_on": True},
             _STILL_READS_ON,
             ["is_engaged", "disengage", "is_engaged"],
@@ -1890,7 +1895,7 @@ _STILL_READS_ON = (
             ["is_engaged", "disengage", "is_engaged"],
         ),
     ],
-    ids=["disengage-raises", "still-on", "read-back-raises"],
+    ids=["disengage-raises", "read-raises", "still-on", "read-back-raises"],
 )
 def test_a_switch_off_that_fails_ends_timing_before_the_stage_moves(
     fake_microscope: Microscope,
@@ -1918,6 +1923,35 @@ def test_a_switch_off_that_fails_ends_timing_before_the_stage_moves(
     assert af.calls == calls
     assert stage.moves == 0
     # Nothing was switched off by a lock section and nothing moved: nothing to say.
+    assert _warnings(caplog) == []
+    assert _stored(tmp_path).status is StageStatus.failed
+
+
+def test_a_halt_at_the_switch_off_propagates_unchanged_and_nothing_moves(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """FM-64: a halt is the stand's state, not "could not be switched off": it ends the run as itself."""
+    _engaged(fake_core)
+
+    def disengage() -> None:
+        raise MicroscopeHaltedError
+
+    _patch_autofocus(fake_microscope, disengage=disengage)
+    stage = _costed(fake_microscope, _Clock())
+
+    with pytest.raises(MicroscopeHaltedError):
+        _run(
+            fake_microscope,
+            tmp_path,
+            repeats=1,
+            distances_um=SHORT,
+            with_autofocus=False,
+        )
+
+    assert stage.moves == 0
     assert _warnings(caplog) == []
     assert _stored(tmp_path).status is StageStatus.failed
 
@@ -1958,16 +1992,21 @@ def test_a_searching_autofocus_is_switched_off_before_the_probe_and_not_timed(
     """PFS on and not locked drives Z the moment it finds its reference: `is_engaged()` decides."""
     af = RecordingAutofocus(engaged=True, locked=False)
     fake_microscope.override(Autofocus, af)
+    at_first_move: list[list[str]] = []
+    stage = _costed(
+        fake_microscope,
+        _Clock(),
+        on_move=lambda n: at_first_move.append(list(af.calls)) if n == 1 else None,
+    )
 
     result = _result(_run(fake_microscope, tmp_path, repeats=2, distances_um=SHORT))
 
-    assert af.calls == [
-        "is_engaged",
-        "is_locked",
-        "is_engaged",
-        "disengage",
-        "is_engaged",
-    ]
+    switch_off = ["is_engaged", "is_locked", "is_engaged", "disengage", "is_engaged"]
+    assert af.calls == switch_off
+    # The order: the whole switch-off and its read back came before the stage's
+    # first move, not only somewhere in the run.
+    assert at_first_move == [switch_off]
+    assert stage.moves == 8
     assert af.engaged is False
     assert result.assumed[0] == AUTOFOCUS_OFF_LINE
     assert (
