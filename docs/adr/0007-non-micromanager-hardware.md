@@ -1,8 +1,9 @@
 # 0007 — Hardware without a Micro-Manager adapter, and vendor-controlled systems
 
-- **Status**: **proposed** — revised 2026-11-16 with what M1–M3 taught
-  (first revision 2026-09-22, after the owner's direction on the LS1);
-  decision requested
+- **Status**: **accepted** 2026-11-16 by the owner (in chat, in the design
+  session of #25), as revised that day with what M1–M3 taught (first
+  revision 2026-09-22, after the owner's direction on the LS1). The design
+  for the Zeiss is [`docs/design/m4-zeiss.md`](../design/m4-zeiss.md)
 - **Date**: 2026-11-16 (first written 2026-09-22)
 - **Issue**: #4
 
