@@ -178,8 +178,11 @@ redraw that a run's end makes keeps it.
 **STOP says what it did.** `<title> told to stop; stopped: the stand is halted
 (Resume clears the halt)`, or `halted, but <why the stand refused>`, or `the stop failed:
 <why>`. On a stand whose stages refuse a stop (the Ti2-E's, [#204](https://github.com/EPFL-TOP/smart-microscope-control/issues/204)) the strip also says so: a move already under way
-runs to its target. After STOP every action is refused until **Resume**, which is
-refused while a run is going.
+runs to its target, **unless** the profile cuts that role's moves into segments
+(`[safety] max_segment_um`, `max_z_segment_um`): then the strip says `an xy_stage move ends
+at the end of its current segment (sent in segments of at most 500 µm)`, with the size the
+profile gives, and the rest of the move is never sent. After STOP every action is refused
+until **Resume**, which is refused while a run is going.
 
 **The regions, from the top** ([m5 §17.3](../design/m5-web-ui.md), at 1280 px wide and
 more):
@@ -216,15 +219,18 @@ the outcome line (always its height); the connection, message and problems lines
   under them. At 1280 x 800 its controls, down to the *Drive* toggle, are in view
   (`ui-check`'s `wells-selected` says `drive bar: yes`); the notes may be a scroll down. The
   figures are **360 px** high, the floor the layout allows: at 400 the toggle was 20 px below
-  the fold. The header is 137 px tall with its one outcome line (it was 180 on the owner's
-  walk), and a long outcome makes it taller.
+  the fold. The header is 154 px tall with its one outcome line and its drive line (it was
+  180 on the owner's walk, and 137 before the drive line took its height, so that arming
+  *Drive* does not move the map), and a long outcome makes it taller: one that wraps to two
+  lines (`ui-check`'s `turned` state, 171 px) leaves the *Drive* toggle 6 px below a 800 px
+  window.
 - **The wheel over a figure zooms that figure** (Bokeh's `wheel_zoom`), as it always did; the
   page scrolls with the wheel anywhere else. To scroll the page with the pointer over the map or
   the image, move it off the figure. **Reset** in a figure's toolbar frames it again.
 - **The step panel (400 px) scrolls on its own** when a screen is taller than the window;
   the header and the figures do not scroll with it. **A screen opens at its top**: a click
   on a step (or *Continue*, or the expert switch) shows the new screen scrolled to its
-  title, whatever the last one was scrolled to. The header is about 140 px tall, and a long
+  title, whatever the last one was scrolled to. The header is about 155 px tall, and a long
   outcome line makes it taller and pushes the panel down.
 
 **The five steps.** A step opens at any time: none is ever disabled (an action that cannot
@@ -520,8 +526,11 @@ move already sent finishes first**. From the top:
   on the demo and a fraction of a second for each next): it says `Left: not known yet (it needs
   two fields)` until there are two reports a clock tick apart, and is not drawn once the last
   field is done or the run has ended. Across a change of well *Left* does not know the stage's
-  long travel between the two wells, and says less than it takes; that stays so until a real
-  scan says it matters. Once the scan is done the result line below says it, and the bar goes.
+  long travel between the two wells, and says less than it takes (the Ti2-E rehearsal read
+  `Left about 1 s` for the 8 s it took): so while the plan has **no timing** (the Wells screen
+  says `Time: not known`) *Left* says `Left: not known (no timing measured yet)` and gives no
+  number. With a timing the pace stays as it is. Once the scan is done the result line below
+  says it, and the bar goes.
   Live never draws this bar: its frames have no total;
 - **what was scanned**, the result line from the run document, so it is there after a
   restart: `Scanned: 72 frames, 0 failed`, or `Scanned in a dry run: no frame was taken`, with
@@ -791,8 +800,9 @@ document read at the start. A range you typed **stays as you typed it** (`A1:D6`
 selection** (no wells), and the next click is written in it again; a text that names
 no well (`Z99`) is refused with the reason, and the old selection stays.
 
-**Driving to a well.** Switch **Drive** on (the strip then says `DRIVE: the next
-click on a well moves the stage there`) and click a well: `goto-well` runs for it, at
+**Driving to a well.** Switch **Drive** on (the header's drive line then says `DRIVE: the next
+click on a well moves the stage there`; the line is always there, empty while Drive is off,
+so that arming it does not move the map under your pointer) and click a well: `goto-well` runs for it, at
 its centre or at the wall chosen under **Drive to (wall as on the image)**: the wall is
 named as the image shows it (`left`, `right`, `top`, `bottom`), the page maps it to the
 stage's direction with the latest usable `camera-calibration`, and `goto-well` runs with
@@ -800,7 +810,9 @@ that (`side=+X` for the image's left on the Ti2-E at 10x). With no calibration i
 refuses a wall and says to run it (`walls are named on the image, and no camera
 calibration says which stage side that is: run camera-calibration (Set up), then try
 again`); the centre needs none. Drive is **one click**: the toggle
-goes back to select after it, even if the click found no well or was refused. The page
+goes back to select after it, even if the click found no well or was refused; a click on no
+well says so on the drive line (`No well was under that click, so nothing moved. Drive is off
+again.`). The page
 **refuses** to drive on a map of another plate than the registered one (it would send
 the stage to the same-named well of the other plate): choose the registered plate, or
 calibrate the one you chose.
@@ -1030,10 +1042,11 @@ A tool that provides the plate (`plate-registration`, `plate-walls`) says, under
 note, what a Run would replace once a plate is usable:
 
 ```text
-Run replaces the plate registered 2026-11-03 15:20 (seed, 1 well). A failed run leaves no plate; the captures stay, so Forget the wrong one and Run again to get a plate back.
+Run replaces the plate registered 2026-11-03 14:20 UTC (seed, 1 well). A failed run leaves no plate; the captures stay, so Forget the wrong one and Run again to get a plate back.
 ```
 
-The time is the record's start in the PC's local time. The page does not refuse: a
+The time is the record's start in UTC, as the card beside it says its time (the guided
+screens say local time, the expert view UTC). The page does not refuse: a
 registration is a pure function of its captures, which the page keeps. Under
 `plate-finding`, which runs from no capture, the note ends after `A failed run leaves no
 plate.` No other tool has this note. A plugin that failed to load, or whose parameters cannot be described, is not

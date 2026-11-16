@@ -3081,10 +3081,11 @@ had again by the same command, minus the capture that was wrong, and the page sa
 def replace_note(result: PlateResult, started_utc: datetime) -> str: ...
 ```
 
-in `guide.py`: `Run replaces the plate registered 2026-11-03 15:20 (seed, 1 well). A
+in `guide.py`: `Run replaces the plate registered 2026-11-03 14:20 UTC (seed, 1 well). A
 failed run leaves no plate; the captures stay, so Forget the wrong one and Run again
-to get a plate back.` The time is the record's `started_utc` in the PC's local time,
-to the minute; the method and `n_refs` are the result's own (`seed`, `references`,
+to get a plate back.` The time is the record's `started_utc` in UTC, to the minute, and
+says so (it was the PC's local time with no zone, beside a card that says UTC: §17.12.9
+D27); the method and `n_refs` are the result's own (`seed`, `references`,
 `lattice-fit`, `wall-images`); `1 well` and `2 wells`.
 
 `PlateView.replaces: Mapping[str, str]` (new, default empty): a tool's name to the
@@ -3394,7 +3395,7 @@ folder>/plate-walls/<token>` from `walls.folder` when it is a non-blank text, th
 
 `replace_note(result, started_utc, *, keeps_captures: bool)` (§11.4's amendment): with
 `keeps_captures` the text is §11.4's; without, `Run replaces the plate registered
-2026-11-03 15:20 (references, 3 wells). A failed run leaves no plate.`
+2026-11-03 14:20 UTC (references, 3 wells). A failed run leaves no plate.`
 `_replace_notes` passes `"refs" in PAGE_PARAMS.get(tool.name, ())`: a tool whose pairs
 the page fills from captures keeps them.
 
@@ -4558,6 +4559,8 @@ Run.
   each of the next (measured, §17.10.1), so a rate from the click would say 2 min 47 s
   left at the second field, where 13 s were. `Left` says `not known yet (it needs two fields)` until there are
   two reports a clock tick apart (FM-197), and is not drawn once the last field is done.
+  While the plan has no timing it says `Left: not known (no timing measured yet)` and no
+  number (§17.12.9 D24).
 - The map draws the plan's first `done` fields as imaged while the scan runs (the
   plan's fields are in visiting order, §14.1, and the scan visits them in it: measured,
   the reports' names are the plan's in order), and, from the run document afterwards,
@@ -4903,7 +4906,12 @@ def scan_wait(
     *, connected: bool, blocked: str | None, plan_usable: bool
 ) -> str | None: ...
 def scan_progress_lines(
-    done: int, total: int, clock: RunClock | None, *, running: bool
+    done: int,
+    total: int,
+    clock: RunClock | None,
+    *,
+    running: bool,
+    timing_known: bool = True,  # §17.12.9 D24, #514
 ) -> tuple[str, ...]: ...
 def scanned_line(summary: ScanSummary) -> str: ...
 def plain_default(default: str) -> str: ...
@@ -4948,7 +4956,9 @@ def plain_default(default: str) -> str: ...
   and `done < total`: `Left about <duration_text(left)> (estimated from the fields so
   far)`, `left = (total - done) * (last_t - first_t) / (last_done - first_done)` when
   `last_done > first_done` and `last_t > first_t`, else `Left: not known yet (it needs
-  two fields)`. Never negative, never a division by zero (FM-197).
+  two fields)`. Never negative, never a division by zero (FM-197). With `timing_known`
+  false (the plan has no `estimate_s`) the last line is `Left: not known (no timing
+  measured yet)` instead, whatever the clock says (§17.12.9 D24).
 - `scanned_line`: `Scanned: <frames> frames, <failed> failed` (`1 frame`), and for a dry
   run `Scanned in a dry run: no frame was taken`.
 - `plain_default("'if-engaged'")` is `if-engaged`: one pair of matching quotes, `'` or
@@ -5762,6 +5772,68 @@ browser errors.
 **Not verified (for the owner)**: the page read by a newcomer once more (#475's last
 criterion); the layout on the stand PC's screen and over RDP; a STOP at the Ti2-E on a
 stand whose profile says `stop_refused_by`; *Measure the time* at the Ti2-E with PFS.
+
+#### 17.12.9 Small page points from the Ti2-E session 5 rehearsal (#514, 2026-11-16)
+
+Five points found by the hardware-session prep on the demo stands. Additive: nothing above
+is renamed or removed, and D23's "what stays" is answered for one case (the first point).
+
+- **D24 *Left* is not a number while the plan has no timing.**
+  `scan_progress_lines(done, total, clock, *, running, timing_known=True)`: with
+  `timing_known` false and the scan running with fields left, the last line is
+  `Left: not known (no timing measured yet)` (`LEFT_NOT_KNOWN_NO_TIMING`), whatever the
+  clock holds. The page passes `plan is not None and plan.estimate_s is not None`. The
+  pace of the fields inside a well says nothing of the stage's travel between two wells
+  (the rehearsal read `Left about 1 s` for the 8 s that travel took, at field 9 of 18), a
+  plan with no timing has no figure for that travel either, and the Wells screen already
+  says `Time: not known` for it: the two screens agree. With a timing the line is §17.10.3's
+  (the pace between the first report and the latest): D23's question, whether a pace per
+  well is worth it, stays open for a plan that has one.
+- **D25 The STOP note names the segments.** `PageStatus` gains `stop_segments_um:
+  tuple[tuple[str, float], ...] = ()` (last field): `(role, segment_um)` for each role of
+  `stop_refused_by` whose key is set (`xy_stage` with `max_segment_um`, `focus` with
+  `max_z_segment_um`), in the profile's order. `stop_refused_note(roles, segments_um)`
+  (`plate_page.py`) is the strip's words: with no role cut they are as they were (`a move
+  under way runs to its target`); a cut role says `an xy_stage move ends at the end of its
+  current segment (sent in segments of at most 500 µm)` (`a focus move …` for focus; the
+  size is the profile's, `:g`), clauses joined by `; `, and `; any other move under way
+  runs to its target` when a refused role is not cut. As the CLI's `!` line has said since
+  #507. The Scan lead's `A move already sent finishes first on this stand.` stays: the
+  segment sent finishes first.
+- **D26 The drive line takes its height.** `drive_text` is an outcome line like
+  `run_text` (`visible` always, `min_height = _RUN_LINE_PX`) and its text is the toggle's:
+  `DRIVE: the next click on a well moves the stage there` while Drive is armed, empty
+  otherwise. A line that appeared with the toggle moved the map down by one line under a
+  click aimed before arming (the header is one line taller in every state; D15's budget is
+  measured again, below). A click in drive mode that falls on no well spends Drive as
+  before and says so on the same line: `No well was under that click, so nothing moved.
+  Drive is off again.` (`DRIVE_MISSED`); the next toggle replaces the text, and so does the
+  next tap in select mode. A refusal (a click on a well that `goto` refuses) stays the
+  message's. A select-mode click on no well says nothing.
+- **D27 One zone on the expert view's note.** D20 stands: the guided screens say local time
+  to the minute (no zone: the person at the PC reads it as theirs), the expert view's cards
+  say UTC. `replace_note` (§11.4, §12.7), which sits in the expert view under a tool's
+  *Run* beside the card's `done <time> UTC`, said the registration's start in local time
+  with no zone: it now says UTC to the minute, with the word: `Run replaces the plate
+  registered 2026-11-03 14:20 UTC (seed, 1 well). …`. The fallback for a start UTC cannot
+  hold is the record's ISO text, as before.
+- **D28 Cosmetic.** The segment log line (`safety.py`) writes a target to hundredths of a
+  µm (`segment 1 of 3 to -83.33 µm`); the diagnosis of a segment that did not land keeps
+  the full values, since it compares a reading with a tolerance. The offsets preview
+  (`smc objective offset --from-run-doc`, and the Plate screen's card) rounds a shift to
+  hundredths **before** `+ 0.0` removes a `-0.0`: `-0.001` printed `(-0.00, -0.00)`.
+
+**Header budget, measured again** (`/ui-check`, 1280 x 800, 2026-11-16, Chromium, Panel
+1.10.0, every state): the header is **154 px** with its outcome line and drive line empty
+(it was 137 px; `drive_text` has no vertical margin, so it costs the 17 px of its text:
+with Panel's default margins the line took 27 px and the header 164). D15's budget holds in
+every state with one outcome line: the drive bar is at y 758 to 789 of 800 (it was 741 to
+772), the title and the first action are inside the 620 px page on the Stand screen (first
+action y 302 to 333) and the Plate screen (y 462 to 494), and `_STEP_PANEL_MAX_HEIGHT` is
+`calc(100vh - 157px)`. The one state that leaves the budget is `turned`, whose outcome wraps
+to two lines (header 171 px): the *Drive* toggle is at y 775 to 806, 6 px below the page
+(it was inside, by 11 px). D15 already says that a long outcome makes the header taller; the
+Report says it.
 
 ## 18. The page measures the offsets between objectives (#382)
 
