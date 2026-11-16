@@ -14,7 +14,7 @@ and why.
 | [0004](0004-plugin-architecture.md) | Tools are plugins over capabilities | accepted |
 | [0005](0005-testing-strategy.md) | Testing strategy: simulator first, hardware by session | accepted (amended in part by 0009) |
 | [0006](0006-user-interface.md) | User interface: one simple interface for every microscope | accepted |
-| [0007](0007-non-micromanager-hardware.md) | Hardware without a Micro-Manager adapter (Zeiss MTB, Viventis) | **proposed** (revised 2026-11-16) |
+| [0007](0007-non-micromanager-hardware.md) | Hardware without a Micro-Manager adapter (Zeiss MTB, Viventis) | accepted (2026-11-16) |
 | [0008](0008-repository-workflow.md) | Repository workflow: issues, branches, PRs, CI | accepted (amended in part by 0009) |
 | [0009](0009-light-ci-full-nightly.md) | A light CI on pull requests, the full matrix every night (amends 0005, 0008) | accepted |
 

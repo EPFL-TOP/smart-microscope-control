@@ -82,6 +82,8 @@ Paused until this works: M4, M5 (except the plate page), M6, the Ti-E
   `Autofocus` implementation; PVCAM camera in the same core.
 - Profile, contract tests in a hardware session, port of the phototoxicity
   guards (darken on every exit path).
+- Design: [`docs/design/m4-zeiss.md`](design/m4-zeiss.md) (#25's interfaces;
+  #26 adds Definite Focus 2).
 
 ## M5 — Web UI
 
