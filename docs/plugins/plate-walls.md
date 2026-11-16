@@ -187,6 +187,16 @@ a WARNING:
 | `the fit turns the plate by <r>°, beyond ±<m>°: a reference well is misidentified …` | The tilt from the declared orientation is past `max_rotation_deg`: a well is misnamed. |
 | `<well> is <n> µm from where the other wells put it (bound <b> µm): record it again, or check the plate type` | A well that the others do not put where it is, or a plate whose pitch is not the one named (a 96-well plate of pitch 9.03 mm fitted as 9.0 mm leaves two wells 196 µm off). |
 
+**When the PFS was switched off first.** Every refusal of this second table, when the run
+had switched the PFS off before anything moved, ends with `; the autofocus was switched
+off before anything moved and was not engaged again: engage it again on the sample`. The
+page shows the reason and a WARNING only goes to the log, so the sentence is what tells you
+that the PFS is off after a run that gave no result. A run that found the PFS off says
+nothing of it. A halt and a stop (STOP on the page, Ctrl-C) keep their own words and type,
+which the command line's exit code and the page's *stopped by STOP* read, and so does for
+now an error of the stage or of the camera (#524): for those, the WARNING of the
+switch-off is the only trace.
+
 **A rotation near 180°.** A plate put in its holder the other way round fits a
 rotation near 180° from the wells named on it (the Ti2-E's plate did in session 3, see
 issue 414), and so do two references swapped. Declared `not-turned`, the fit refuses it
