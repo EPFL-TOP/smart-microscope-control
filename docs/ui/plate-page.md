@@ -278,8 +278,9 @@ disclosure shows the `smc run` line it makes.
   this page`; then **Plate lies** (which way the plate lies in its holder) and, while the
   plate is only the placeholder, the question *The plate is a …* that confirms it;
 - **three centres**, far apart (A1, the last column of row A and the last row of column 1,
-  as the plate prints them: `A1, A12, H1` on a 96-well plate, one well on a coverslip),
-  one row each, under **one note** that says what holds for every row, **once**: what runs
+  as the plate prints them: `A1, A12, H1` on a 96-well plate, one well on a coverslip;
+  **on a stand whose soft limits cut the corners, the far corners of the wells it can
+  reach**, see below), one row each, under **one note** that says what holds for every row, **once**: what runs
   (`goto-well is running: wait for it to end, or press STOP.`), or `End live to go to another
   well; Capture works during Live` during Live, and, while nothing is captured on a stand
   whose profile has a `[sample]` of this plate, that *Register the plate* uses the sample.
@@ -307,6 +308,21 @@ disclosure shows the `smc run` line it makes.
     where it is not), and two captures at one place (closer than half a pitch) are noted on
     both rows: `A12 and A1 were captured at the same place: redo the one that is wrong.` It is
     a note, never a refusal: the registration's own residual bound refuses a bad fit.
+- **Which three wells** (m5 §19, #512). The far corners, unless the stand's soft limits
+  (`[safety] xy_soft_limits_um`) cut them as its `[holder]` places the plate: then the rows
+  are the far corners of the wells the stage can reach, and **one line under the rows** says
+  so (`Not the plate's far corners (A1, A6 and D1): the stage's soft limits cut them, as the
+  holder places this plate.`). On the Ti2-E a Greiner 24-well in its holder has A6 and D1
+  outside the travel, so the rows are **B2, B5 and C2**; a 96-well gets B2, B11 and G2. A
+  well counts as reachable when its estimated centre is 1 000 µm or more inside the limits,
+  the room you need after *Go to* to centre it by eye. The rows are the holder's estimate for
+  the plate and the way it lies, never the registered plate's, so they do not move when a
+  capture or a registration shifts the plate's A1 (a turn renames them in place and keeps the
+  block); a profile whose `[sample]` is of this plate keeps the corners, since the sample's
+  own centres are the corners. When no well of the plate is inside the limits the rows stay
+  the corners and the line says `Go to will be refused`. It is a courtesy, built from the
+  profile and never from the connected stand: the layer's refusal of a target outside the soft
+  limits stays the guard, and no click forces it;
 - **Register the plate**, one button: `plate-registration` with the centres as the screen
   drew them. While it waits it says for what (`centre a well under the objective ...`,
   or `choose the plate on the stage first`). On a stand whose profile has a `[sample]` of

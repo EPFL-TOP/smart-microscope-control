@@ -160,6 +160,7 @@ from smc.ui.guide import (
     a1_corner,
     busy_note,
     calibration_paths,
+    centres_reach_note,
     command_line,
     local_time,
     next_slot,
@@ -174,6 +175,7 @@ from smc.ui.guide import (
     replace_note,
     scan_plan_card_lines,
     side_words,
+    suggested_centres,
     tool_title,
     walls_card_lines,
     walls_centres_problem,
@@ -1931,6 +1933,54 @@ class PlatePage:
             self._plate_chosen
             and not (self.refs or self.walls)
             and self.sample_plate == self._plate
+        )
+
+    def _reach_inputs(
+        self,
+    ) -> tuple[
+        tuple[float, float] | None,
+        tuple[tuple[float, float], tuple[float, float]] | None,
+    ]:
+        """The holder's centre and the soft limits the Plate screen's rows are cut by, as the profile has them (m5 §19.3).
+
+        Both are the profile's, which is the page's for its whole life, and never the
+        connected ``Microscope``'s: a closed stand draws the same rows (D2). A profile whose
+        ``[sample]`` is of the page's plate gives neither (D7): the sample's own references
+        are the plate's corners, and the test is the profile's (``sample_plate == plate``),
+        never ``registers_from_sample``, which turns false at the first capture and would
+        reshuffle the rows then.
+        """
+        if self.sample_plate == self._plate:
+            return None, None
+        profile = self._profile
+        return profile.holder.plate_centre_xy_um, profile.safety.xy_soft_limits_um
+
+    def suggested_centres(self) -> tuple[str, ...]:
+        """The wells the Plate screen's rows suggest: the plate's far corners, cut by what the stand reaches (m5 §19.3).
+
+        The holder's estimate for the page's plate and orientation, whatever the pose
+        (D2: the rows do not move under the operator's hands when a capture or a
+        registration changes the page's idea of A1), against ``[safety] xy_soft_limits_um``.
+        A courtesy: the layer's refusal of a target outside the soft limits stays the guard
+        (FM-169). Computed on an event, never on the tick (FM-145): 4 ms for 1536 wells, so
+        there is no cache.
+        """
+        centre, limits = self._reach_inputs()
+        return suggested_centres(
+            self._plate,
+            holder_centre_um=centre,
+            orientation=self.orientation,
+            xy_limits_um=limits,
+        )
+
+    def centres_reach_note(self) -> str:
+        """Why the rows are not the plate's far corners, or ``""`` when they are (m5 §19.2 D5)."""
+        centre, limits = self._reach_inputs()
+        return centres_reach_note(
+            self._plate,
+            holder_centre_um=centre,
+            orientation=self.orientation,
+            xy_limits_um=limits,
         )
 
     @property

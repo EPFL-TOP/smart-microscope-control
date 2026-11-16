@@ -22,6 +22,8 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.safety import Safety
 from smc.plugins.api import Progress
 from smc.plugins.geometry import Matrix2
 from smc.plugins.presets import Preset, PresetCheck, PresetFile
@@ -59,6 +61,8 @@ from smc.ui.guide import (
     CAPTURE_FAR,
     CAPTURE_SAME_PLACE,
     CAPTURE_WELLS,
+    CENTRES_CUT_NOTE,
+    CENTRES_UNREACHABLE_NOTE,
     COVERAGE_WORDS,
     DISCONNECT_RELEASES,
     DRY_RUN_NO_FRAME,
@@ -115,6 +119,7 @@ from smc.ui.guide import (
     ResultRow,
     StepName,
     StepState,
+    _join_names,
     a1_corner,
     again_note,
     busy_note,
@@ -125,6 +130,7 @@ from smc.ui.guide import (
     capture_note,
     capture_wall_label,
     centre_rows,
+    centres_reach_note,
     centres_text,
     chain_line,
     colour_bar_title,
@@ -1645,6 +1651,190 @@ def test_a_one_well_plate_suggests_one_centre() -> None:
     assert suggested_centres("coverslip-22mm-square") == ("A1",)
 
 
+# -- the centres a stand can reach (m5 §19, #512) -------------------------------------------
+
+#: The Ti2-E's ``[safety] xy_soft_limits_um`` and ``[holder] plate_centre_xy_um``
+#: (profiles/nikon-ti2.toml). Measured 2026-11-16 with ``holder_estimate("greiner-24-well",
+#: (400, -325), orientation)``: A1 (-48 225, 28 850), A6 (49 025, 28 850) and D1
+#: (-48 225, -29 500) µm, not turned; B2 (-28 775, 9 400), B5 (29 575, 9 400) and C2
+#: (-28 775, -10 050). Typed out, never read back from the function (FM-43).
+TI2E_LIMITS = ((-49000.0, 49000.0), (-29000.0, 29000.0))
+TI2E_HOLDER = (400.0, -325.0)
+GREINER_CORNERS_NOTE = (
+    "Not the plate's far corners (A1, A6 and D1): the stage's soft limits cut them, "
+    "as the holder places this plate."
+)
+NOTHING_REACHABLE_NOTE = (
+    "No well of this plate lies inside the stage's soft limits as the holder places it, "
+    "so Go to will be refused: check the profile's [holder] and [safety]."
+)
+
+
+@pytest.mark.parametrize("orientation", ["not-turned", "turned-180"])
+def test_suggested_centres_on_the_ti2e_stay_inside_its_soft_limits(
+    orientation: Literal["not-turned", "turned-180"],
+) -> None:
+    # A turn renames the wells in place and keeps the block (m5 §19.2 D2), so both
+    # orientations suggest the same three names.
+    assert suggested_centres(
+        "greiner-24-well",
+        holder_centre_um=TI2E_HOLDER,
+        orientation=orientation,
+        xy_limits_um=TI2E_LIMITS,
+    ) == ("B2", "B5", "C2")
+
+
+def test_suggested_centres_are_the_corners_without_a_holder_or_without_limits() -> None:
+    # Nothing placed, or nothing cut: the rows are what they were (m5 §19.2 D2).
+    corners = ("A1", "A6", "D1")
+    assert suggested_centres("greiner-24-well") == corners
+    assert suggested_centres("greiner-24-well", holder_centre_um=TI2E_HOLDER) == corners
+    assert suggested_centres("greiner-24-well", xy_limits_um=TI2E_LIMITS) == corners
+    # A stand whose travel holds the plate in its holder: the corners again.
+    wide = ((-100000.0, 100000.0), (-100000.0, 100000.0))
+    assert (
+        suggested_centres(
+            "greiner-24-well", holder_centre_um=TI2E_HOLDER, xy_limits_um=wide
+        )
+        == corners
+    )
+
+
+def test_suggested_centres_keep_the_corners_when_no_well_is_reachable() -> None:
+    # The rows are built once and never empty (m5 §19.2 D4): the corners stay and the
+    # note says why *Go to* will be refused.
+    far = ((1e6, 2e6), (1e6, 2e6))
+    assert suggested_centres(
+        "greiner-24-well", holder_centre_um=TI2E_HOLDER, xy_limits_um=far
+    ) == ("A1", "A6", "D1")
+
+
+def test_an_unknown_plate_is_refused_with_useqs_error_by_both() -> None:
+    with pytest.raises(ValueError, match="Unknown plate name 'nope'"):
+        suggested_centres("nope")
+    with pytest.raises(ValueError, match="Unknown plate name 'nope'"):
+        centres_reach_note("nope")
+    with pytest.raises(ValueError, match="Unknown plate name 'nope'"):
+        suggested_centres(
+            "nope", holder_centre_um=TI2E_HOLDER, xy_limits_um=TI2E_LIMITS
+        )
+    with pytest.raises(ValueError, match="Unknown plate name 'nope'"):
+        centres_reach_note(
+            "nope", holder_centre_um=TI2E_HOLDER, xy_limits_um=TI2E_LIMITS
+        )
+
+
+def test_the_reach_note_says_why_the_corners_are_not_the_rows() -> None:
+    # Some wells reachable and the rows are not the corners: the corners are named.
+    assert (
+        centres_reach_note(
+            "greiner-24-well",
+            holder_centre_um=TI2E_HOLDER,
+            xy_limits_um=TI2E_LIMITS,
+        )
+        == GREINER_CORNERS_NOTE
+    )
+    assert CENTRES_CUT_NOTE.format(corners="A1, A6 and D1") == GREINER_CORNERS_NOTE
+    # No well reachable: the rows are the corners and *Go to* is refused; the note says so.
+    far = ((1e6, 2e6), (1e6, 2e6))
+    assert (
+        centres_reach_note(
+            "greiner-24-well", holder_centre_um=TI2E_HOLDER, xy_limits_um=far
+        )
+        == NOTHING_REACHABLE_NOTE
+    )
+    assert CENTRES_UNREACHABLE_NOTE == NOTHING_REACHABLE_NOTE
+
+
+def test_the_reach_note_is_empty_where_nothing_is_cut() -> None:
+    # The rows are the corners, so there is nothing to explain (m5 §19.2 D5): no holder,
+    # no limits, neither, and a travel that holds every well.
+    assert centres_reach_note("greiner-24-well") == ""
+    assert centres_reach_note("greiner-24-well", holder_centre_um=TI2E_HOLDER) == ""
+    assert centres_reach_note("greiner-24-well", xy_limits_um=TI2E_LIMITS) == ""
+    wide = ((-100000.0, 100000.0), (-100000.0, 100000.0))
+    assert (
+        centres_reach_note(
+            "greiner-24-well", holder_centre_um=TI2E_HOLDER, xy_limits_um=wide
+        )
+        == ""
+    )
+    # The 6-well's corners are all inside the Ti2-E's travel (m5 §19.1).
+    assert (
+        centres_reach_note(
+            "6-well", holder_centre_um=TI2E_HOLDER, xy_limits_um=TI2E_LIMITS
+        )
+        == ""
+    )
+
+
+def test_the_reach_note_names_the_corners_of_another_plate() -> None:
+    # A 96-well whose holder centre is the origin, in a 40 mm square travel: the corners
+    # A1, A12 and H1 are far outside and the rows are the block that is inside. Typed
+    # out: the columns are 9 mm apart, so only x = +-4.5 and +-13.5 mm are 1 mm inside.
+    square = ((-20000.0, 20000.0), (-20000.0, 20000.0))
+    kwargs = {"holder_centre_um": (0.0, 0.0), "xy_limits_um": square}
+    assert suggested_centres("96-well", **kwargs) == ("C5", "C8", "F5")
+    assert centres_reach_note("96-well", **kwargs) == (
+        "Not the plate's far corners (A1, A12 and H1): the stage's soft limits cut them, "
+        "as the holder places this plate."
+    )
+
+
+def test_a_turn_gives_its_own_rows_on_a_travel_that_is_not_symmetric() -> None:
+    # On the Ti2-E's travel a turn only renames wells in place and the block keeps its
+    # names, so no test there can see the orientation. A 96-well centred on the origin in
+    # a travel that holds its left half only: not turned, the left half is columns 1 to 6;
+    # turned 180 degrees about the holder, those wells are named by the other half, 7 to
+    # 12. Typed out from the geometry (9 mm pitch, A1 at (-49 500, 31 500) not turned and
+    # at (49 500, -31 500) turned).
+    left_half = ((-60000.0, 0.0), (-40000.0, 40000.0))
+    kwargs = {"holder_centre_um": (0.0, 0.0), "xy_limits_um": left_half}
+    assert suggested_centres("96-well", orientation="not-turned", **kwargs) == (
+        "A1",
+        "A6",
+        "H1",
+    )
+    assert suggested_centres("96-well", orientation="turned-180", **kwargs) == (
+        "A7",
+        "A12",
+        "H7",
+    )
+    assert centres_reach_note("96-well", orientation="turned-180", **kwargs) == (
+        "Not the plate's far corners (A1, A12 and H1): the stage's soft limits cut them, "
+        "as the holder places this plate."
+    )
+
+
+def test_the_corners_are_joined_in_words() -> None:
+    assert _join_names(("A1",)) == "A1"
+    assert _join_names(("A1", "A4")) == "A1 and A4"
+    assert _join_names(("A1", "A6", "D1")) == "A1, A6 and D1"
+
+
+def test_every_suggested_centre_is_a_target_the_layers_guard_accepts() -> None:
+    # FM-169: the guard stays the guard and the list is a courtesy. The layer's own
+    # check accepts the estimated centre of each suggested well and refuses the corners
+    # the list used to offer (m5 §19.4). Positions typed out from the measurement above.
+    safety = Safety(max_jog_um=5000.0, xy_soft_limits_um=TI2E_LIMITS)
+    chosen = suggested_centres(
+        "greiner-24-well",
+        holder_centre_um=TI2E_HOLDER,
+        xy_limits_um=TI2E_LIMITS,
+    )
+    centres = {
+        "B2": (-28775.0, 9400.0),
+        "B5": (29575.0, 9400.0),
+        "C2": (-28775.0, -10050.0),
+    }
+    assert chosen == ("B2", "B5", "C2")
+    for well in chosen:
+        safety.check_xy_target_um(*centres[well])
+    for corner in ((49025.0, 28850.0), (-48225.0, -29500.0)):  # A6, D1
+        with pytest.raises(SafetyRefusedError, match="outside the soft limits"):
+            safety.check_xy_target_um(*corner)
+
+
 def test_known_text_says_where_each_value_comes_from_or_that_it_is_not_known() -> None:
     here = CalibrationNote(objective="Nikon 10X", when_utc="2026-11-12 09:30:00")
     lines = known_text(objective="Nikon 10X", calibration=here, light_on=True)
@@ -1744,6 +1934,54 @@ def test_centre_rows_list_the_suggested_wells_then_other_captures() -> None:
         "H1: known from the profile's sample, not measured",
     ]
     assert [row.captured for row in sample] == [False, False, False]
+
+
+def test_centre_rows_list_the_wells_they_are_given_and_the_other_captures_after() -> (
+    None
+):
+    # The page gives the wells the stand can reach (m5 §19.3): the rows are those, in
+    # that order, and a capture of A1, which is not among them, is listed after.
+    rows = centre_rows(
+        "greiner-24-well",
+        [_ref("A1", 5.0, 6.0)],
+        {"A1": "Nikon 10X"},
+        pose="estimated",
+        from_sample=False,
+        suggested=("B2", "B5", "C2"),
+    )
+    assert [row.well for row in rows] == ["B2", "B5", "C2", "A1"]
+    assert [row.captured for row in rows] == [False, False, False, True]
+    assert (
+        rows[0].text == "B2: go there (estimated position), centre it by eye, capture"
+    )
+    assert rows[3].text == "A1: captured at (5.0, 6.0) µm with Nikon 10X"
+    # A capture of a suggested well is that row, not a second one.
+    again = centre_rows(
+        "greiner-24-well",
+        [_ref("B2", 1.0, 2.0)],
+        {"B2": "Nikon 10X"},
+        pose="estimated",
+        from_sample=False,
+        suggested=("B2", "B5", "C2"),
+    )
+    assert [(row.well, row.captured) for row in again] == [
+        ("B2", True),
+        ("B5", False),
+        ("C2", False),
+    ]
+    # Without `suggested` the rows are the plate's own suggestion, as they were.
+    plain = centre_rows("greiner-24-well", [], {}, pose="estimated", from_sample=False)
+    assert [row.well for row in plain] == ["A1", "A6", "D1"]
+    # An empty suggestion is the page's choice too: it lists the captures only.
+    only = centre_rows(
+        "greiner-24-well",
+        [_ref("A1")],
+        {},
+        pose="registered",
+        from_sample=False,
+        suggested=(),
+    )
+    assert [row.well for row in only] == ["A1"]
 
 
 def test_a_capture_row_names_its_objective_or_says_it_is_not_known() -> None:

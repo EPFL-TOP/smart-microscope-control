@@ -44,7 +44,10 @@ found at the 40× with the PFS off across wells is **not verified** (see the end
 3. **Centre two or three wells by eye with the joystick**, far apart (A1 and the far
    corners; two wells fix the rotation, a third checks the fit). Centre each one
    roughly: it may be up to **half the well's radius** off, 3 900 µm on a 24-well
-   plate and 1 600 µm on a 96-well one. Read each position:
+   plate and 1 600 µm on a 96-well one. On a stand whose soft limits cut the corners
+   (the Ti2-E's Greiner 24-well has A6 and D1 outside its travel), far apart means the
+   corners of the wells inside the travel (`B2`, `B5`, `C2`), as the plate page's rows
+   give them. Read each position:
 
    ```text
    smc stage get -p <profile>

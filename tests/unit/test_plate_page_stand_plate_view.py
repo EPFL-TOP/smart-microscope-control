@@ -66,6 +66,14 @@ T0 = datetime(2026, 11, 12, 9, 0, tzinfo=timezone.utc)
 TEN_X = "Nikon 10X S Fluor"
 FORTY_X = "Nikon 40X Plan Fluor ELWD"
 PITCH_UM = 9000.0
+#: The Ti2-E's ``[safety] xy_soft_limits_um``. With its holder's centre (400, -325) a
+#: Greiner 24-well has A1 at (-48 225, 28 850), A6 at (49 025, 28 850) and D1 at
+#: (-48 225, -29 500) µm, and B2 at (-28 775, 9 400): measured 2026-11-16 (m5 §19.1).
+TI2E_LIMITS = ((-49000.0, 49000.0), (-29000.0, 29000.0))
+GREINER_CORNERS_NOTE = (
+    "Not the plate's far corners (A1, A6 and D1): the stage's soft limits cut them, "
+    "as the holder places this plate."
+)
 
 REAL = {
     "camera-calibration": "smc.plugins.camera_calibration.plugin:CameraCalibrationPlugin",
@@ -254,6 +262,46 @@ def holder_page(fake_core: FakeCore, run_doc: Path) -> Iterator[PlatePage]:
         microscope.close()
 
 
+def _ti2e_profile(base: Profile) -> Profile:
+    """``base`` with the Ti2-E's holder and XY soft limits (profiles/nikon-ti2.toml).
+
+    A Greiner 24-well in that holder has A6 and D1 outside that travel (m5 §19.1).
+    """
+    return base.model_copy(
+        update={
+            "holder": HolderSection(
+                plate_centre_xy_um=(400.0, -325.0), measured="a test's own centre"
+            ),
+            "safety": base.safety.model_copy(update={"xy_soft_limits_um": TI2E_LIMITS}),
+        }
+    )
+
+
+@pytest.fixture
+def ti2e_microscope(fake_core: FakeCore) -> Iterator[Microscope]:
+    """A stand with the Ti2-E's holder and soft limits."""
+    microscope = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), _ti2e_profile(Profile.demo())
+    )
+    try:
+        yield microscope
+    finally:
+        microscope.close()
+
+
+@pytest.fixture
+def ti2e_page(ti2e_microscope: Microscope, run_doc: Path) -> Iterator[PlatePage]:
+    """A page on that stand: the map is *estimated*, and some wells are out of reach."""
+    controller = PlatePage(
+        ti2e_microscope, run_doc, entry_points=_entry_points(StubGoto, Slow)
+    )
+    try:
+        yield controller
+    finally:
+        Slow.release.set()
+        controller.close()
+
+
 def _click(button: Any) -> None:
     button.clicks += 1
 
@@ -287,15 +335,18 @@ def _seed_plate(
     plugin: str = "plate-registration",
     assumed: tuple[str, ...] = (),
     minute: int = 0,
+    plate: str = "96-well",
+    a1_center_xy_um: tuple[float, float] = (0.0, 0.0),
 ) -> None:
     """A registered plate (the pose is *registered*): *Go to* then needs no holder.
 
     ``plugin`` is the tool that wrote it and ``minute`` orders the starts: a later record of
-    another tool is the one the page's plate comes from.
+    another tool is the one the page's plate comes from. ``plate`` and ``a1_center_xy_um`` are
+    what it registers.
     """
     result = PlateResult(
-        plate="96-well",
-        a1_center_xy_um=(0.0, 0.0),
+        plate=plate,
+        a1_center_xy_um=a1_center_xy_um,
         rotation_deg=0.0,
         method="references",
         residual_um=1.5,
@@ -316,7 +367,7 @@ def _seed_plate(
             profile="demo",
             dry_run=False,
             smc_version="0",
-            params={"plate": "96-well"},
+            params={"plate": plate},
             result=result.model_dump(mode="json"),
         ),
     )
@@ -1662,3 +1713,227 @@ def test_the_plate_screen_places_the_rows_note_every_rows_notes_and_the_replace_
     screen = view.screens["plate"]
     assert screen.index(view.register_replaces) > screen.index(view.registered_block)
     assert screen.index(view.rows_note) < screen.index(view.centre_slots[0].box)
+
+
+# -- the rows on a stand whose soft limits cut the corners (m5 §19, #512) ----------------
+
+
+def test_the_plate_screen_suggests_wells_inside_the_stands_soft_limits(
+    ti2e_page: PlatePage,
+) -> None:
+    page = ti2e_page
+    view = PlatePageView(page)
+    view.show_step("plate")
+    page.choose_plate("greiner-24-well")
+    view.refresh()
+    # The Ti2-E's A6 is 25 µm and its D1 500 µm outside the travel: *Go to* refuses both.
+    assert [slot.goto_button.label for slot in view.centre_slots] == [
+        "Go to B2",
+        "Go to B5",
+        "Go to C2",
+    ]
+    assert [slot.capture_button.label for slot in view.centre_slots] == [
+        "Capture the centre of B2",
+        "Capture the centre of B5",
+        "Capture the centre of C2",
+    ]
+    assert _row_texts(view) == [
+        f"{well}: go there (estimated position), centre it by eye, capture"
+        for well in ("B2", "B5", "C2")
+    ]
+    # The pane says why the rows are not the plate's far corners, in plain text, once.
+    assert view.reach_note.visible
+    assert view.reach_note.object == GREINER_CORNERS_NOTE
+    assert page.suggested_centres() == ("B2", "B5", "C2")
+    assert page.centres_reach_note() == GREINER_CORNERS_NOTE
+    # A turn renames the wells in place and keeps the block: the same three names.
+    page.choose_orientation("turned-180")
+    view.refresh()
+    assert [slot.goto_button.label for slot in view.centre_slots] == [
+        "Go to B2",
+        "Go to B5",
+        "Go to C2",
+    ]
+    assert view.reach_note.object == GREINER_CORNERS_NOTE
+
+
+def test_a_click_on_a_row_goes_to_the_well_the_row_names(
+    ti2e_page: PlatePage,
+) -> None:
+    # The row's *Go to* names B2, and the stub tool records the well it was run with.
+    page = ti2e_page
+    view = PlatePageView(page)
+    view.show_step("plate")
+    page.choose_plate("greiner-24-well")
+    view.refresh()
+    _click(view.centre_slots[0].goto_button)
+    assert page.join(10.0)
+    assert StubGoto.ran == ["B2"]
+
+
+def test_the_rows_keep_their_wells_after_a_capture_and_a_registered_plate(
+    ti2e_page: PlatePage, ti2e_microscope: Microscope, run_doc: Path
+) -> None:
+    # D2: the estimate is the holder's, whatever the pose, so that the rows do not move
+    # under the operator's hands when a capture or a registration changes the page's idea
+    # of A1 by hundreds of µm.
+    page = ti2e_page
+    view = PlatePageView(page)
+    view.show_step("plate")
+    page.choose_plate("greiner-24-well")
+    ti2e_microscope.require(XYStage).move_to_um(-28775.0, 9400.0)  # B2's estimate
+    page.capture_centre("B2")
+    view.refresh()
+    assert [slot.goto_button.label for slot in view.centre_slots] == [
+        "Go to B2",
+        "Go to B5",
+        "Go to C2",
+    ]
+    assert _row_texts(view)[0].startswith("B2: captured at (-28775.0, 9400.0) µm")
+    assert not view.other_captures.visible
+    # A registered Greiner whose A1 is 300 µm off the holder's (-48 225, 28 850): the map is
+    # registered now and its wells moved; the rows are the same three, and B2 is captured.
+    _seed_plate(run_doc, plate="greiner-24-well", a1_center_xy_um=(-47925.0, 28850.0))
+    view.refresh()
+    assert view._view is not None
+    assert view._view.pose.kind == "registered"
+    assert [slot.goto_button.label for slot in view.centre_slots] == [
+        "Go to B2",
+        "Go to B5",
+        "Go to C2",
+    ]
+    assert _row_texts(view)[0].startswith("B2: captured")
+    assert view.reach_note.object == GREINER_CORNERS_NOTE
+
+
+def test_the_page_gives_the_holders_estimate_the_orientation_it_shows(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    # On the Ti2-E's travel a turn keeps the names, so the orientation cannot be seen there.
+    # A 96-well centred on the origin in a travel that holds the left half only: the left
+    # half is columns 1 to 6 not turned and 7 to 12 turned (the geometry's, typed out).
+    base = Profile.demo()
+    profile = base.model_copy(
+        update={
+            "holder": HolderSection(
+                plate_centre_xy_um=(0.0, 0.0), measured="a test's own centre"
+            ),
+            "safety": base.safety.model_copy(
+                update={"xy_soft_limits_um": ((-60000.0, 0.0), (-40000.0, 40000.0))}
+            ),
+        }
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", fake_core), profile)
+    page = PlatePage(microscope, run_doc, entry_points=_entry_points(StubGoto, Slow))
+    try:
+        view = PlatePageView(page)
+        view.show_step("plate")
+        page.choose_plate("96-well")
+        view.refresh()
+        assert page.suggested_centres() == ("A1", "A6", "H1")
+        assert [slot.goto_button.label for slot in view.centre_slots] == [
+            "Go to A1",
+            "Go to A6",
+            "Go to H1",
+        ]
+        page.choose_orientation("turned-180")
+        view.refresh()
+        assert page.suggested_centres() == ("A7", "A12", "H7")
+        assert [slot.goto_button.label for slot in view.centre_slots] == [
+            "Go to A7",
+            "Go to A12",
+            "Go to H7",
+        ]
+        assert page.centres_reach_note().startswith(
+            "Not the plate's far corners (A1, A12 and H1)"
+        )
+    finally:
+        page.close()
+        microscope.close()
+
+
+def test_the_reach_note_takes_no_height_where_nothing_is_cut(
+    page: PlatePage, ti2e_page: PlatePage
+) -> None:
+    # No holder and no limits: today's rows, and no pane.
+    plain = PlatePageView(page)
+    plain.show_step("plate")
+    page.choose_plate("96-well")
+    plain.refresh()
+    assert not plain.reach_note.visible
+    assert plain.reach_note.object == ""
+    assert [slot.goto_button.label for slot in plain.centre_slots] == [
+        "Go to A1",
+        "Go to A12",
+        "Go to H1",
+    ]
+    # The Ti2-E's limits and a plate whose corners are all inside its travel: the same.
+    view = PlatePageView(ti2e_page)
+    view.show_step("plate")
+    ti2e_page.choose_plate("6-well")
+    view.refresh()
+    assert not view.reach_note.visible
+    assert view.reach_note.object == ""
+    assert [slot.goto_button.label for slot in view.centre_slots] == [
+        "Go to A1",
+        "Go to A3",
+        "Go to B1",
+    ]
+
+
+def test_the_reach_note_is_placed_after_the_rows_and_before_the_other_captures(
+    ti2e_page: PlatePage,
+) -> None:
+    # FM-201: a widget built and set but not placed draws nothing, and no test of its
+    # attributes would see it. Each screen's own list is walked.
+    view = PlatePageView(ti2e_page)
+    view.show_step("plate")
+    placed = {id(o) for o in _objects(list(view.step_panel.objects))}
+    assert id(view.reach_note) in placed
+    screen = view.screens["plate"]
+    assert screen.index(view.centre_slots[-1].box) < screen.index(view.reach_note)
+    assert screen.index(view.reach_note) < screen.index(view.other_captures)
+
+
+def test_a_profile_sample_of_the_plate_keeps_the_corners(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    # D7: the sample's own references are the plate's corners and a row then says `known from
+    # the profile's sample`: the rows name the wells the references name, so a profile that
+    # has both a [sample] of the page's plate and soft limits keeps the corners, and the note
+    # (which would explain a cut) is empty.
+    shipped = Path(__file__).resolve().parents[2] / "profiles" / "demo-sample.toml"
+    profile = _ti2e_profile(Profile.load(shipped))
+    microscope = Microscope.from_core(cast("CMMCorePlus", fake_core), profile)
+    page = PlatePage(microscope, run_doc, entry_points=_entry_points(StubGoto, Slow))
+    try:
+        view = PlatePageView(page)
+        view.show_step("plate")
+        view.refresh()
+        assert page.registers_from_sample
+        assert page.suggested_centres() == ("A1", "A12", "H1")
+        assert page.centres_reach_note() == ""
+        assert _row_texts(view) == [
+            f"{well}: known from the profile's sample, not measured"
+            for well in ("A1", "A12", "H1")
+        ]
+        assert not view.reach_note.visible
+        # The first capture ends `registers_from_sample`: the rows must not reshuffle then.
+        microscope.require(XYStage).move_to_um(*_well_centre("A1"))
+        page.capture_centre("A1")
+        view.refresh()
+        assert not page.registers_from_sample
+        assert [slot.goto_button.label for slot in view.centre_slots] == [
+            "Go to A1",
+            "Go to A12",
+            "Go to H1",
+        ]
+        assert not view.reach_note.visible
+        # Another plate than the sample's is cut by the same limits, as on any stand.
+        page.choose_plate("greiner-24-well")
+        view.refresh()
+        assert page.suggested_centres() == ("B2", "B5", "C2")
+        assert view.reach_note.object == GREINER_CORNERS_NOTE
+    finally:
+        page.close()
+        microscope.close()

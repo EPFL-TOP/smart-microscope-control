@@ -66,7 +66,10 @@ JSON`, or an unexpected extra argument).
 Use **A1 and the two far corners** (`A1`, `A12`, `H1` on a 96-well plate; `A1`, `A24`,
 `P1` on a 384-well one): adjacent wells barely constrain the rotation, so the extra
 travel buys real accuracy. Two references are enough to fit it, and a third makes
-the residual mean something.
+the residual mean something. On a stand whose soft limits cut those corners (the
+Ti2-E's Greiner 24-well in its holder has A6 and D1 outside its travel), take the
+corners of the wells inside the travel instead (`B2`, `B5`, `C2` there): the
+plate page's rows do so ([the three wells](../ui/plate-page.md)).
 
 The plate page ([`m3-plugins.md`](../design/m3-plugins.md) §15) collects the same
 references by clicks and calls the same plugins with the same parameters. In the

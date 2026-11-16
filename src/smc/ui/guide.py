@@ -27,8 +27,12 @@ import numpy.typing as npt
 from smc.plugins.frame_signal import carries_signal, saturated
 from smc.plugins.frames import image_direction_of_stage_step, stage_side_of_image_side
 from smc.plugins.objective_offsets.algorithm import MAX_TARGETS
-from smc.plugins.plate_registration.algorithm import GOOD_RESIDUAL_UM, suggested_refs
-from smc.plugins.slots import WellGeometry
+from smc.plugins.plate_registration.algorithm import (
+    GOOD_RESIDUAL_UM,
+    reachable_refs,
+    suggested_refs,
+)
+from smc.plugins.slots import WellGeometry, holder_estimate
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -64,6 +68,8 @@ __all__ = [
     "CAPTURE_FAR",
     "CAPTURE_SAME_PLACE",
     "CAPTURE_WELLS",
+    "CENTRES_CUT_NOTE",
+    "CENTRES_UNREACHABLE_NOTE",
     "COVERAGE_WORDS",
     "DISCONNECT_RELEASES",
     "DRY_RUN_NO_FRAME",
@@ -154,6 +160,7 @@ __all__ = [
     "capture_note",
     "capture_wall_label",
     "centre_rows",
+    "centres_reach_note",
     "centres_text",
     "chain_line",
     "colour_bar_title",
@@ -803,20 +810,110 @@ def known_text(
     return "\n".join(lines)
 
 
-def suggested_centres(plate: str) -> tuple[str, ...]:
-    """The wells the Plate screen suggests centring: A1, the last column of row A and the last row of column 1 (m5 §17.4.2).
+#: Why the rows are not the plate's far corners, when the stand's soft limits cut them
+#: (m5 §19.2 D5). ``{corners}`` is the plate's own list, joined in words. It says what
+#: the holder is: the rows are an estimate from the profile's ``[holder]`` and
+#: ``[safety]``, never a measurement (FM-217).
+CENTRES_CUT_NOTE = (
+    "Not the plate's far corners ({corners}): the stage's soft limits cut them, as the "
+    "holder places this plate."
+)
 
-    The names are the ones the plate prints, whatever way it lies in its holder (a turn
-    renames the operator's captures, §16 D6, never this list). They are far apart, so
-    they pin the rotation down: adjacent wells barely constrain it. It is the layer's
-    own list for the same purpose (``plate-registration``'s ``suggested_refs``, which
-    the sample's references use), so that the screen and the tool never disagree about
-    which three wells make a good calibration; a one-well plate (a coverslip) has one.
+#: The same line when no well of the plate is inside the limits as the holder places it:
+#: the rows are the corners (never an empty list, §19.2 D4), *Go to* is refused on each
+#: with the layer's own words, and this says where to look.
+CENTRES_UNREACHABLE_NOTE = (
+    "No well of this plate lies inside the stage's soft limits as the holder places it, "
+    "so Go to will be refused: check the profile's [holder] and [safety]."
+)
+
+
+def _reachable_centres(
+    plate: str,
+    holder_centre_um: tuple[float, float] | None,
+    orientation: PlateOrientation,
+    xy_limits_um: tuple[tuple[float, float], tuple[float, float]] | None,
+) -> tuple[str, ...] | None:
+    """The reachable far corners the rows would be, ``()`` when no well is inside, ``None`` when nothing is cut.
+
+    ``None`` is *nothing placed* (no holder: the plate's map is unplaced), *nothing
+    cut* (no soft limits) or *the corners are all inside* (the reachable ones are the
+    corners): the two public functions then fall back to ``suggested_refs``, and the
+    note is empty (m5 §19.2 D2, D5). The plate is checked first so that every path
+    raises ``useq``'s own error for a plate it does not know.
+    """
+    corners = suggested_refs(plate)
+    if holder_centre_um is None or xy_limits_um is None:
+        return None
+    reachable = reachable_refs(
+        holder_estimate(plate, holder_centre_um, orientation), xy_limits_um
+    )
+    return None if reachable == corners else reachable
+
+
+def _join_names(names: Sequence[str]) -> str:
+    """``A1``, ``A1 and A4``, ``A1, A6 and D1``: well names in words, for a note."""
+    if len(names) < 2:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def suggested_centres(
+    plate: str,
+    *,
+    holder_centre_um: tuple[float, float] | None = None,
+    orientation: PlateOrientation = "not-turned",
+    xy_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None,
+) -> tuple[str, ...]:
+    """The wells the Plate screen suggests centring: the plate's far corners, or the far corners of what the stage reaches (m5 §17.4.2, §19).
+
+    The corners are A1, the last column of row A and the last row of column 1, as the
+    plate prints them whatever way it lies in its holder (a turn renames the operator's
+    captures, §16 D6, never this list). They are far apart, so they pin the rotation
+    down: adjacent wells barely constrain it. It is the layer's own list for the same
+    purpose (``plate-registration``'s ``suggested_refs``, which the sample's references
+    use), so that the screen and the tool never disagree about which three wells make a
+    good calibration; a one-well plate (a coverslip) has one.
+
+    On a stand whose soft limits are narrower than the plate in its holder, the corners
+    include wells that *Go to* refuses (the Ti2-E's A6 and D1, #512). With the holder's
+    centre and the soft limits both given, the list is ``reachable_refs`` of the holder's
+    estimate: the far corners of the wells inside the travel, with a margin. Without
+    either, or when no well is inside, it is the corners (D2, D4): the layer's refusal
+    stays the guard and this list is a courtesy (FM-169), built from the profile and
+    never from the connected stand.
 
     Raises:
         ValueError: ``plate`` is not a plate of ``useq``'s registry.
     """
-    return suggested_refs(plate)
+    reachable = _reachable_centres(plate, holder_centre_um, orientation, xy_limits_um)
+    return reachable if reachable else suggested_refs(plate)
+
+
+def centres_reach_note(
+    plate: str,
+    *,
+    holder_centre_um: tuple[float, float] | None = None,
+    orientation: PlateOrientation = "not-turned",
+    xy_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None,
+) -> str:
+    """The line that says why the rows are not the plate's far corners, or ``""`` when they are (m5 §19.2 D5).
+
+    The arguments are ``suggested_centres``'. Plain text (FM-139), drawn under the rows
+    and taking no height while it has nothing to say. It names the corners that were cut
+    so that an operator who read the plate's far corners in the plugin docs finds the
+    difference explained, and it says that the position is the holder's, an estimate
+    (FM-217).
+
+    Raises:
+        ValueError: ``plate`` is not a plate of ``useq``'s registry.
+    """
+    reachable = _reachable_centres(plate, holder_centre_um, orientation, xy_limits_um)
+    if reachable is None:
+        return ""
+    if not reachable:
+        return CENTRES_UNREACHABLE_NOTE
+    return CENTRES_CUT_NOTE.format(corners=_join_names(suggested_refs(plate)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -844,6 +941,7 @@ def centre_rows(
     *,
     pose: PoseKind,
     from_sample: bool,
+    suggested: Sequence[str] | None = None,
 ) -> tuple[CentreRow, ...]:
     """The Plate screen's centres: the suggested wells in their order, then the other captures in capture order (m5 §17.4.2).
 
@@ -857,9 +955,14 @@ def centre_rows(
     *unplaced* one nothing can go there (``goto`` refuses) and the arrows do. With
     ``from_sample`` (a profile ``[sample]`` of this plate and nothing captured) the
     registration runs from the sample's own centres: *known, not measured* (m5 §8.2).
+
+    ``suggested`` is the wells to list, the page's choice (``PlatePage.suggested_centres``,
+    which cuts the plate's corners by the stand's soft limits, §19); ``None`` is the plate's
+    own ``suggested_centres(plate)``, as before.
     """
     captured = {ref.well: ref for ref in refs}
-    suggested = suggested_centres(plate)
+    if suggested is None:
+        suggested = suggested_centres(plate)
     wells = [*suggested, *(ref.well for ref in refs if ref.well not in suggested)]
     rows: list[CentreRow] = []
     for well in wells:

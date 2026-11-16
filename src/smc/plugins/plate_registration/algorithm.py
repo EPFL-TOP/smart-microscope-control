@@ -35,12 +35,14 @@ __all__ = [
     "DIAMETER_TOLERANCE",
     "GOOD_RESIDUAL_UM",
     "MAX_ROTATION_DEG",
+    "REACH_MARGIN_UM",
     "SCALE_TOLERANCE",
     "EdgeCentre",
     "calibrate",
     "centre_from_walls",
     "nearest_well",
     "nominal_offsets",
+    "reachable_refs",
     "suggested_refs",
     "wall_position",
 ]
@@ -60,6 +62,12 @@ DIAMETER_TOLERANCE = 0.10
 #: a well was misnamed (FM-121). The bound is a tilt from the declared
 #: orientation, not from 0° (m3 §24 D3).
 MAX_ROTATION_DEG = 10.0
+#: How far inside the stage's soft limits a well's centre must lie to be suggested as a
+#: reference (m5 §19.2 D3). It is the room the operator needs after *Go to*: the holder's
+#: centre has been 285 µm apart between two seatings of the same plate, and the arrows
+#: that centre a well by eye are bound by the same limits. 1 000 µm is three and a half
+#: times that spread; it is not a well's radius, which would leave a 6-well nothing.
+REACH_MARGIN_UM = 1000.0
 
 #: A wall is named by the stage direction that reaches it from the well's centre,
 #: along the plate's own axes. The operator's image words are the plate page's, and
@@ -120,6 +128,77 @@ def suggested_refs(plate: str) -> tuple[str, ...]:
     names = _plan_at_origin(plate).all_well_names
     return tuple(
         dict.fromkeys(str(n) for n in (names[0][0], names[0][-1], names[-1][0]))
+    )
+
+
+def reachable_refs(
+    plan: useq.WellPlatePlan,
+    xy_limits_um: tuple[tuple[float, float], tuple[float, float]],
+    *,
+    margin_um: float = REACH_MARGIN_UM,
+) -> tuple[str, ...]:
+    """The far corners of the wells a stage can reach: ``suggested_refs`` cut by its soft limits.
+
+    On a stand whose soft limits are narrower than the plate in its holder (the
+    Ti2-E's Greiner 24-well has A6 and D1 outside them) ``suggested_refs`` names
+    wells that ``Go to`` refuses, and the layer's refusal is the guard, not
+    something a list may walk into (FM-169). A well is *reachable* when its
+    centre in ``plan`` lies ``margin_um`` or more inside the limits on both axes,
+    the edge included as ``WellGeometry.contains`` counts it. Over the plate's
+    grid of names the result is, in this order: the reachable well with the
+    smallest (row, column); the reachable well of its row with the largest
+    column; the reachable well of its column with the largest row; a well named
+    twice is listed once. When every well is reachable these are
+    ``suggested_refs``' names.
+
+    Positions come from one ``all_well_positions`` call, as ``nominal_offsets``
+    does: a ``well_geometry`` per well is 100 times slower (FM-145).
+
+    Args:
+        plan: The plate as placed on the stage (the holder's estimate before a
+            registration); only its well names and centres are read.
+        xy_limits_um: ``((x_low, x_high), (y_low, y_high))``, as ``[safety]`` has it.
+        margin_um: How far inside the limits a centre must lie.
+
+    Returns:
+        Up to three well names, or ``()`` when no well of the plate is inside.
+
+    Raises:
+        ValueError: ``margin_um`` is negative or not finite.
+    """
+    if not (math.isfinite(margin_um) and margin_um >= 0.0):
+        raise ValueError(
+            f"margin_um must be finite and not negative, got {margin_um!r}"
+        )
+    (x_low, x_high), (y_low, y_high) = xy_limits_um
+    centres = {str(p.name): _xy(p) for p in plan.all_well_positions}
+
+    def reachable(name: str) -> bool:
+        x, y = centres[name]
+        return (
+            x_low + margin_um <= x <= x_high - margin_um
+            and y_low + margin_um <= y <= y_high - margin_um
+        )
+
+    grid = [[str(name) for name in row] for row in plan.all_well_names]
+    first = next(
+        (
+            (r, c)
+            for r, row in enumerate(grid)
+            for c, name in enumerate(row)
+            if reachable(name)
+        ),
+        None,
+    )
+    if first is None:
+        return ()
+    row, column = first
+    last_column = max(c for c, name in enumerate(grid[row]) if reachable(name))
+    last_row = max(r for r in range(len(grid)) if reachable(grid[r][column]))
+    return tuple(
+        dict.fromkeys(
+            (grid[row][column], grid[row][last_column], grid[last_row][column])
+        )
     )
 
 
