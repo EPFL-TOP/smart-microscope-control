@@ -35,6 +35,7 @@ if os.environ.get("SMC_REQUIRE_UI"):
 else:
     pn = pytest.importorskip("panel")
 
+import smc.ui.controller as controller_module
 import smc.ui.plate_page as plate_page
 from smc.hardware import Microscope
 from smc.hardware.profile import Profile
@@ -1299,14 +1300,29 @@ def test_a_scan_runs_through_to_the_export_from_one_click(
         assert outcome is not None
         # No number asserted: it is a duration (FM-197).
         assert outcome.startswith("Run all that are left: done in "), outcome
-        assert outcome.endswith(
+        # The real tools assume things (the detector's, the route's: m5 §17.12.11 D32), and the
+        # strip ends with the first, as a single run's does, the count being what the cards hold.
+        assert (
             " s (Count the cells, Density per well, Route, Report, Export for NIS-Elements)"
+            in outcome
         )
+        held = [
+            line
+            for tool in RESULT_TOOLS
+            for line in controller_module._card(
+                RunDocument.load(run_doc).stages[tool]
+            ).assumed
+        ]
+        assert held, "the real tools assume nothing: this test no longer sees the tail"
+        assert "; assumed: " in outcome
+        if len(held) > 1:
+            assert outcome.endswith(f" (+{len(held) - 1} more, on the card)")
         assert [
             row.state.object.startswith("Done ") for row in view.result_rows.values()
         ] == [True] * 5
         assert view.step_buttons["results"].label == "5. Results ✓"
         assert view.chain_text.object.startswith("Done: Count the cells, ")
+        assert ". Assumed: " in view.chain_text.object
         # The report and the export were written, and the files block names them.
         # ... as links, and what each link asks the route for is served (D21).
         links = re.findall(
