@@ -26,15 +26,17 @@ from smc.plugins.plate_registration import algorithm
 from smc.plugins.plate_registration.algorithm import (
     DIAMETER_TOLERANCE,
     GOOD_RESIDUAL_UM,
+    REACH_MARGIN_UM,
     SCALE_TOLERANCE,
     calibrate,
     centre_from_walls,
     nearest_well,
     nominal_offsets,
+    reachable_refs,
     suggested_refs,
     wall_position,
 )
-from smc.plugins.slots import PlateResult, WallTouch, WellRef
+from smc.plugins.slots import PlateResult, WallTouch, WellRef, holder_estimate
 
 ANISOTROPIC = "test-anisotropic-15"
 PLATES = ("6-well", "12-well", "24-well", "48-well", "96-well", "384-well", "1536-well")
@@ -134,6 +136,153 @@ def test_suggested_refs_are_the_far_corners() -> None:
 
 def test_a_single_well_plate_suggests_its_one_well_once() -> None:
     assert suggested_refs("coverslip-18mm-square") == ("A1",)
+
+
+# ---- the corners of what the stage can reach (m5 §19, #512) ---------------
+
+#: The Ti2-E's ``[safety] xy_soft_limits_um`` and ``[holder] plate_centre_xy_um``
+#: (profiles/nikon-ti2.toml): a Greiner 24-well in its holder has A6 25 µm and D1
+#: 500 µm outside this travel (measured 2026-11-16, m5 §19.1).
+TI2E_LIMITS = ((-49000.0, 49000.0), (-29000.0, 29000.0))
+TI2E_HOLDER_CENTRE = (400.0, -325.0)
+
+
+def _in_the_holder(
+    plate: str, orientation: Literal["not-turned", "turned-180"]
+) -> useq.WellPlatePlan:
+    return holder_estimate(plate, TI2E_HOLDER_CENTRE, orientation)
+
+
+def _pinned_at_the_origin(plate: str) -> useq.WellPlatePlan:
+    """A1 at (0, 0), not turned: a plate whose every well is where the plate says."""
+    return useq.WellPlatePlan(
+        plate=useq.WellPlate.from_str(plate), a1_center_xy=(0.0, 0.0), rotation=0.0
+    )
+
+
+@pytest.mark.parametrize("orientation", ["not-turned", "turned-180"])
+def test_reachable_refs_on_the_ti2e_are_the_corners_of_the_wells_inside_the_travel(
+    orientation: Literal["not-turned", "turned-180"],
+) -> None:
+    """A turn renames the wells in place and keeps the block, so the rows are the same names."""
+    assert reachable_refs(
+        _in_the_holder("greiner-24-well", orientation), TI2E_LIMITS
+    ) == (
+        "B2",
+        "B5",
+        "C2",
+    )
+    assert reachable_refs(_in_the_holder("96-well", orientation), TI2E_LIMITS) == (
+        "B2",
+        "B11",
+        "G2",
+    )
+    assert reachable_refs(_in_the_holder("384-well", orientation), TI2E_LIMITS) == (
+        "C2",
+        "C23",
+        "N2",
+    )
+
+
+def test_the_margin_decides_which_wells_are_inside() -> None:
+    """A1 of the Greiner is 775 µm inside in X and 150 µm in Y: 700 and 1 000 sit either side of it."""
+    plan = _in_the_holder("greiner-24-well", "not-turned")
+    assert reachable_refs(plan, TI2E_LIMITS, margin_um=700.0) == ("B1", "B5", "C1")
+    assert reachable_refs(plan, TI2E_LIMITS) == ("B2", "B5", "C2")
+    assert reachable_refs(plan, TI2E_LIMITS, margin_um=0.0) == ("A1", "A5", "C1")
+
+
+def test_the_default_margin_is_a_thousand_micrometres() -> None:
+    assert REACH_MARGIN_UM == 1000.0
+
+
+@pytest.mark.parametrize(
+    ("plate", "corners"),
+    [
+        ("96-well", ("A1", "A12", "H1")),
+        ("384-well", ("A1", "A24", "P1")),
+        ("1536-well", ("A1", "A48", "AF1")),
+        ("6-well", ("A1", "A3", "B1")),
+        ("greiner-24-well", ("A1", "A6", "D1")),
+        ("coverslip-18mm-square", ("A1",)),
+    ],
+)
+def test_a_travel_that_holds_the_plate_gives_the_plates_corners(
+    plate: str, corners: tuple[str, ...]
+) -> None:
+    """A stand whose travel holds every well sees the list it had before (D1)."""
+    huge = ((-1e6, 1e6), (-1e6, 1e6))
+    assert reachable_refs(_pinned_at_the_origin(plate), huge) == corners
+    assert reachable_refs(_pinned_at_the_origin(plate), huge) == suggested_refs(plate)
+
+
+def test_the_edge_of_the_travel_counts_as_inside() -> None:
+    """A1 sits at (0, 0), on the corner of the travel: a mutant that excludes the edge loses it."""
+    limits = ((0.0, 1e6), (-1e6, 0.0))
+    plan = _pinned_at_the_origin("96-well")
+    assert reachable_refs(plan, limits, margin_um=0.0) == ("A1", "A12", "H1")
+    # With the default margin A1's row and column leave: the travel's far sides are 1e6 away.
+    assert reachable_refs(plan, limits) == ("B2", "B12", "H2")
+
+
+def test_a_travel_that_holds_no_well_gives_nothing() -> None:
+    assert (
+        reachable_refs(_pinned_at_the_origin("96-well"), ((1e6, 2e6), (-1e6, 0.0)))
+        == ()
+    )
+
+
+@pytest.mark.parametrize("margin_um", [-1.0, math.nan, math.inf, -math.inf])
+def test_a_margin_that_is_not_a_distance_is_refused(margin_um: float) -> None:
+    with pytest.raises(ValueError, match="margin_um must be finite and not negative"):
+        reachable_refs(
+            _pinned_at_the_origin("96-well"), TI2E_LIMITS, margin_um=margin_um
+        )
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    plate=st.sampled_from(
+        ["6-well", "greiner-24-well", "96-well", "coverslip-18mm-square"]
+    ),
+    a1=st.tuples(
+        st.floats(min_value=-60000.0, max_value=60000.0),
+        st.floats(min_value=-60000.0, max_value=60000.0),
+    ),
+    x_low=st.floats(min_value=-120000.0, max_value=0.0),
+    x_span=st.floats(min_value=0.0, max_value=240000.0),
+    y_low=st.floats(min_value=-120000.0, max_value=0.0),
+    y_span=st.floats(min_value=0.0, max_value=240000.0),
+    margin_um=st.floats(min_value=0.0, max_value=5000.0),
+)
+def test_reachable_refs_lie_inside_the_limits(
+    plate: str,
+    a1: tuple[float, float],
+    x_low: float,
+    x_span: float,
+    y_low: float,
+    y_span: float,
+    margin_um: float,
+) -> None:
+    limits = ((x_low, x_low + x_span), (y_low, y_low + y_span))
+    plan = useq.WellPlatePlan(
+        plate=useq.WellPlate.from_str(plate), a1_center_xy=a1, rotation=0.0
+    )
+    centres = {str(p.name): (float(p.x), float(p.y)) for p in plan.all_well_positions}  # type: ignore[arg-type]
+
+    def inside(x: float, y: float) -> bool:
+        return (
+            limits[0][0] + margin_um <= x <= limits[0][1] - margin_um
+            and limits[1][0] + margin_um <= y <= limits[1][1] - margin_um
+        )
+
+    refs = reachable_refs(plan, limits, margin_um=margin_um)
+    assert 0 <= len(refs) <= 3
+    assert len(set(refs)) == len(refs)
+    for name in refs:
+        assert name in centres
+        assert inside(*centres[name])
+    assert bool(refs) == any(inside(x, y) for x, y in centres.values())
 
 
 # ---- round trips ---------------------------------------------------------
