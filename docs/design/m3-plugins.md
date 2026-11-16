@@ -1804,6 +1804,12 @@ def nearest_well(
     result: PlateResult, x_um: float, y_um: float
 ) -> tuple[str, float]: ...
 def suggested_refs(plate: str) -> tuple[str, ...]: ...
+def reachable_refs(
+    plan: useq.WellPlatePlan,
+    xy_limits_um: tuple[tuple[float, float], tuple[float, float]],
+    *,
+    margin_um: float = REACH_MARGIN_UM,
+) -> tuple[str, ...]: ...
 ```
 
 As `plate.py`: a rigid fit (Kabsch) with the scale fixed by the plate
@@ -1816,7 +1822,9 @@ plate type, or a misidentified well"); a duplicate well (after
 the size) or one wall plus the nominal radius, needs one X and one Y wall,
 and raises `ValueError` when an implied size is off by more than
 `DIAMETER_TOLERANCE`. `nearest_well` returns the name and the distance
-from its centre.
+from its centre. `reachable_refs` is `suggested_refs` for a stand whose soft limits
+cut the plate's corners (m5 §19, #512): the same three corners, of the block of wells
+whose centres lie `margin_um` or more inside the limits; `()` when no well does.
 
 ### 5.3 Plugins
 
