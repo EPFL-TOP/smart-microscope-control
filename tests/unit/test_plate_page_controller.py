@@ -3215,7 +3215,7 @@ def test_a_usable_plate_gives_each_plate_tool_a_replace_note(
     )
     page = _stood_page(fake_microscope, run_doc, "plate-registration", "plate-walls")
     try:
-        when = T0.astimezone().strftime("%Y-%m-%d %H:%M")
+        when = T0.strftime("%Y-%m-%d %H:%M UTC")
         note = (
             f"Run replaces the plate registered {when} (references, 2 wells). "
             "A failed run leaves no plate; the captures stay, so Forget the wrong "
@@ -3250,7 +3250,7 @@ def test_the_replace_note_under_plate_finding_does_not_mention_captures(
         "plate-finding",
     )
     try:
-        when = T0.astimezone().strftime("%Y-%m-%d %H:%M")
+        when = T0.strftime("%Y-%m-%d %H:%M UTC")
         head = f"Run replaces the plate registered {when} (references, 2 wells). "
         replaces = page.view().replaces
         assert replaces["plate-finding"] == f"{head}A failed run leaves no plate."

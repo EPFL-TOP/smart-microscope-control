@@ -209,6 +209,10 @@ SERVER_STOP_WAIT_S = 10.0
 
 DRIVE_TEXT = "DRIVE: the next click on a well moves the stage there"
 
+#: What the drive line says after an armed click that fell on no well (#514 point 3): the click
+#: spent Drive, and without a word the operator pressed it again not knowing why nothing moved.
+DRIVE_MISSED = "No well was under that click, so nothing moved. Drive is off again."
+
 #: The jog steps the Drive region offers, in µm (m5 §6.4): one jog per click, by a
 #: step the operator chooses, never a number typed (a typo is how a stage leaves the
 #: well). Only the steps up to the profile's jog limits are offered.
@@ -257,13 +261,14 @@ _CENTRE_SLOTS = 3
 
 #: The step panel scrolls on its own, below the header: a screen taller than the window
 #: scrolls inside the panel, and the map, the image and the header stay where they are
-#: (m5 §17.3). Its max-height is the window's less the header's, which is **137 px** at
-#: 1280 px wide with the outcome lines empty (the strip, the connection line, the step bar
-#: and its summaries), measured with ``scripts/dev/ui_snap.py``'s ``stand-620`` and
-#: ``plate-620`` states on 2026-11-12 (Chromium, Panel 1.10.0): with 130 the panel ended 7 px
-#: below a 620 px window. 140 leaves 3 px. A long outcome grows the header and pushes the panel
-#: down: it is reported, not clipped (m5 §17.2 D12).
-_STEP_PANEL_MAX_HEIGHT = "calc(100vh - 140px)"
+#: (m5 §17.3). Its max-height is the window's less the header's, which is **154 px** at
+#: 1280 px wide with the outcome lines empty (the strip, the drive line, the connection line,
+#: the step bar and its summaries), measured with ``scripts/dev/ui_snap.py``'s every state on
+#: 2026-11-16 (Chromium, Panel 1.10.0). It was 137 px before the drive line took its height
+#: (#514): measured on 2026-11-12, with 130 the panel ended 7 px below a 620 px window, and 3 px
+#: more than the header is what 140 left. 157 leaves the same 3 px. A long outcome grows the
+#: header and pushes the panel down: it is reported, not clipped (m5 §17.2 D12).
+_STEP_PANEL_MAX_HEIGHT = "calc(100vh - 157px)"
 
 #: The strip stays at the top of the window when the page scrolls: a white ground, so that
 #: what scrolls under it is not read through it.
@@ -396,11 +401,44 @@ def status_line(status: PageStatus) -> str:
     if status.halted:
         parts.append("HALTED")
     if status.stop_refused:
-        parts.append(
-            f"STOP is refused by {', '.join(status.stop_refused)} on this stand: "
-            f"a move under way runs to its target"
-        )
+        parts.append(stop_refused_note(status.stop_refused, status.stop_segments_um))
     return " | ".join(parts)
+
+
+#: How the strip names a move of a role whose profile key cuts it into segments.
+_SEGMENTED_MOVE_NAMES = {"xy_stage": "an xy_stage move", "focus": "a focus move"}
+
+
+def stop_refused_note(
+    roles: Sequence[str], segments_um: Sequence[tuple[str, float]] = ()
+) -> str:
+    """What STOP does not do on this stand, in the words of the strip (FM-117, #514).
+
+    A stop the device refuses lets a move already sent run to its target, **unless** the
+    profile cuts that role's moves into segments (``[safety] max_segment_um``,
+    ``max_z_segment_um``, #507): then the rest of the move is never sent and STOP ends it at
+    the end of the current segment. The CLI's ``!`` line says so; the strip said ``runs to its
+    target`` for every refused role. A role cut but not refused is not named (it has no
+    refusal to speak of), and the size is the profile's, never typed here.
+    """
+    head = f"STOP is refused by {', '.join(roles)} on this stand: "
+    cut = [
+        (role, size_um)
+        for role, size_um in segments_um
+        if role in roles and role in _SEGMENTED_MOVE_NAMES
+    ]
+    if not cut:
+        return head + "a move under way runs to its target"
+    clauses = [
+        f"{_SEGMENTED_MOVE_NAMES[role]} ends at the end of its current segment "
+        f"(sent in segments of at most {size_um:g} µm)"
+        for role, size_um in cut
+    ]
+    # A refused role whose moves are sent whole still runs to its target.
+    cut_roles = {role for role, _size_um in cut}
+    if any(role not in cut_roles for role in roles):
+        clauses.append("any other move under way runs to its target")
+    return head + "; ".join(clauses)
 
 
 def _a_connection_failed(outcome: str, stand: str) -> bool:
@@ -949,9 +987,16 @@ class PlatePageView:
         self.run_text = self._outcome_line()
         self.run_text.visible = True
         self.run_text.min_height = _RUN_LINE_PX
-        self.drive_text = pn.pane.Str(
-            DRIVE_TEXT, styles={"color": _WARNING}, visible=False
-        )
+        # The drive line takes its height too, empty or not: it came with the toggle, and the
+        # map moved down by a line under the click the operator had aimed before arming (the
+        # Ti2-E rehearsal, #514 point 3). Its words are the toggle's, not its visibility.
+        self.drive_text = self._outcome_line({"color": _WARNING})
+        self.drive_text.visible = True
+        self.drive_text.min_height = _RUN_LINE_PX
+        # No vertical margin: the line costs the 17 px of its text and not the 27 of a pane
+        # with Panel's 5 px above and below, which the header and the drive bar's budget
+        # (D15) cannot spare.
+        self.drive_text.margin = (0, 10)
         self.checklist_text = pn.pane.Str("")
         self.captures_text = pn.pane.Str("")
         # The run document's path heads its checklist; a path is as long as the
@@ -1080,7 +1125,9 @@ class PlatePageView:
         )
         self.drive_toggle.param.watch(
             self._handler(
-                lambda event: setattr(self.drive_text, "visible", bool(event.new))
+                lambda event: setattr(
+                    self.drive_text, "object", DRIVE_TEXT if event.new else ""
+                )
             ),
             "value",
         )
@@ -2273,17 +2320,28 @@ class PlatePageView:
         return True
 
     def on_tap(self, event: Any) -> None:
-        """A tap on the map: select the well under it, or (drive mode) drive to it, once."""
+        """A tap on the map: select the well under it, or (drive mode) drive to it, once.
+
+        A drive tap that falls on no well spends Drive all the same, and says so on the drive
+        line (``DRIVE_MISSED``, #514 point 3): the refusal of a click that did reach a well is
+        the message's, as it was. A tap in select mode clears an old answer of that line.
+        """
         drive = bool(self.drive_toggle.value)
         side = str(self.side_select.value)
-        self._try(
-            lambda: self.page.click(
-                float(event.x), float(event.y), drive=drive, side=side
+        found: list[str | None] = []
+        asked = self._try(
+            lambda: found.append(
+                self.page.click(float(event.x), float(event.y), drive=drive, side=side)
             )
         )
         if drive:
             # One click: an armed stage that stays armed after a mis-click is the danger.
             self.drive_toggle.value = False
+            # After the toggle: its watcher empties the line, and the miss is the answer.
+            if asked and found == [None]:
+                self.drive_text.object = DRIVE_MISSED
+        else:
+            self.drive_text.object = ""
         self.refresh()
         self.tick()
 
@@ -4072,7 +4130,12 @@ class PlatePageView:
                 self.scan_progress_text,
                 "\n".join(
                     scan_progress_lines(
-                        progress.done, total, status.clock, running=going
+                        progress.done,
+                        total,
+                        status.clock,
+                        running=going,
+                        # The plan's own timing: with none, *Left* is not a number (#514).
+                        timing_known=plan is not None and plan.estimate_s is not None,
                     )
                 ),
             )
