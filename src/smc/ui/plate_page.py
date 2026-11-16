@@ -4091,7 +4091,9 @@ class PlatePageView:
             () if plan is None else plan.well_names, self.page.selection
         )
         self.scan_lead_text.object = scan_lead(
-            plan, stop_refused=bool(status is not None and status.stop_refused)
+            plan,
+            stop_refused=bool(status is not None and status.stop_refused),
+            stop_segments_um=() if status is None else status.stop_segments_um,
         )
         self._say(
             self.scan_dry_note,
