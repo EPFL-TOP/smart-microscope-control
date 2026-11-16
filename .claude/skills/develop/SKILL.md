@@ -79,6 +79,11 @@ them if it is not the one you run on.
      (no redirection, no `--jq`), then Write what you read into the file.
    - **Append to a test file**: Read it, then Edit with the last lines as the
      anchor, or Write the whole file; never `cat >>` or a heredoc.
+   - **A command that names the scratchpad** (its path holds `github`) next
+     to a `;`, a pipe or `$PWD` is refused as a git command the sandbox
+     cannot verify (#444, #470, #488): one plain command per call, absolute
+     paths, output to a file; or a `mktemp -d` directory, created by a
+     command on its own.
    - **A scratch file for a comment's body** is not named `report.md`: the
      Write tool refuses that name, even as an input to `gh` (#358, #454).
      Name it for its content (`issue-<N>-report.txt`).

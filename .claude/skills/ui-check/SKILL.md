@@ -29,6 +29,14 @@ pip install -e ".[dev,ui]"                  # a worktree's `worktree.py setup` d
 python -m playwright install chromium       # about 290 MB, in the user's cache
 ```
 
+It is **once per Playwright version**, not once per PC: each version wants its
+own chromium build, a fresh worktree's `.venv` may hold a newer Playwright than
+the cache was filled for, and the install then **removes the older build** from
+the shared cache, which breaks `/ui-check` in every worktree that still has the
+older Playwright (#410, #382). When the script says the browser is missing, run
+the install with that worktree's own `.venv/bin/python`, and expect another
+worktree to need it again.
+
 On a bare Linux add `--with-deps` to the second command. The script says what to run
 when the package or the browser is missing, and does not start a server before it
 has both.
