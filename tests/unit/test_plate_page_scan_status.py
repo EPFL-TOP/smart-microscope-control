@@ -1147,6 +1147,27 @@ def test_a_document_that_cannot_be_read_at_the_end_of_a_run_keeps_no_attempt_and
     assert (end.kind, end.done, end.total) == ("stopped", None, None)
 
 
+def test_a_read_that_raises_at_the_end_of_a_run_costs_the_run_nothing(
+    scan_page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_note_attempt`` never raises (FM-98): an error of any kind from the read is no reason to lose the outcome."""
+
+    def refused(self: Any) -> Any:
+        raise OSError("the disk went away")
+
+    monkeypatch.setattr(PlatePage, "_document", refused)
+    scan_page.run("scan", [])
+    assert CheckpointScan.paused.wait(BOUND_S)
+    scan_page.stop()
+    CheckpointScan.release.set()
+    assert scan_page.join(BOUND_S)
+    monkeypatch.undo()
+    scan_page.resume()
+
+    assert scan_page.status().outcome == "Scan stopped"
+    assert "scan" not in scan_page._attempts
+
+
 def test_a_stop_in_another_tool_does_not_make_a_scan_failure_a_stop(
     scan_page: PlatePage,
 ) -> None:

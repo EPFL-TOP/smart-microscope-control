@@ -996,6 +996,22 @@ def test_a_chain_names_itself_in_its_outcome_and_its_status(page: PlatePage) -> 
     assert default.label == "Run all that are left"
 
 
+def test_the_chain_status_between_two_tools_carries_the_label(page: PlatePage) -> None:
+    """The status built when a tool ends and the next one starts is the one a second tab reads while that tool runs (FM-151)."""
+    _Stub.behaviour["density"] = "wait"
+
+    page.run_chain(("cells", "density"), {}, label="Measure the time")
+    assert _Stub.started["density"].wait(WAIT_S)
+    chain = page.status().chain
+    assert chain is not None
+    # `cells` ended and `density` goes: the label is still the button's, not the default.
+    assert [end.plugin for end in chain.ended] == ["cells"]
+    assert chain.current == "density"
+    assert chain.label == "Measure the time"
+    _Stub.release["density"].set()
+    _ended(page)
+
+
 @pytest.mark.parametrize("how", ["fail", "wait", "wait_ignoring_stop"])
 def test_a_chain_that_does_not_end_done_says_its_own_name_too(
     page: PlatePage, how: str

@@ -1151,8 +1151,10 @@ does before the click: under *Lay out the fields* on the Wells screen, and under
 of each such tool in the expert view, `This puts the stopped scan out of date: Continue the
 scan will not be offered any more, and Start the scan takes it from the first field.` (for
 another stage: `This puts the stopped plate-finding out of date: smc run plate-finding
---resume cannot continue it afterwards.`). *Calibrate the camera* and *Register the plate*
-keep their own words. A **chain** (*Run all that are left*, *Measure the time*) is one click
+--resume cannot continue it afterwards.`). The word for the scan is the one the Scan screen
+says: a STOP that landed in a move leaves a `failed` record, and both say `stopped`. A tool
+that cannot run (the stand closed, a dry-run page's `timing`) says its own reason and no
+note. *Calibrate the camera* and *Register the plate* keep their own words. A **chain** (*Run all that are left*, *Measure the time*) is one click
 that runs tools you did not each name, so it **refuses** instead, by the same rule: a chain of
 `timing` alone over a stopped scan says `Timing would put the checkpoint of the stopped Scan
 out of date: Continue the scan or Start again, on the Scan screen, first`, and nothing runs.

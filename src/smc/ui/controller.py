@@ -3509,12 +3509,11 @@ class PlatePage:
         missing record stores nothing: then the page says the record's own words, without a count
         (FM-98: nothing is raised, and no exception is kept).
         """
+        # Any error of the read: a note of the end must never cost the run its outcome.
         try:
             doc, unreadable = self._document()
             record = None if unreadable is not None else doc.stages.get(plugin)
-        except (
-            Exception
-        ) as exc:  # a note of the end must never cost the run its outcome
+        except Exception as exc:
             log.info(
                 "%s: its record's attempt was not read: %s", plugin, type(exc).__name__
             )

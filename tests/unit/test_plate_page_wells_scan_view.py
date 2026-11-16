@@ -19,6 +19,7 @@ import dataclasses
 import os
 import shlex
 import threading
+import time
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
@@ -78,6 +79,11 @@ pytestmark = [
     ),
     pytest.mark.usefixtures("handler_failures"),
 ]
+
+#: *Start again*'s shipped minimum age, read at import, before the autouse fixture below sets it to 0.0
+#: for the tests that click twice in a row on purpose (m5 §17.12.11 D35): the guard's test and the pin
+#: of the shipped value both use it.
+SHIPPED_SCAN_AGAIN_MIN_AGE_S = plate_page.SCAN_AGAIN_MIN_AGE_S
 
 T0 = datetime(2026, 11, 12, 9, 0, tzinfo=timezone.utc)
 TEN_X = "Nikon 10X S Fluor"
@@ -217,7 +223,6 @@ class Clock:
 
     def namespace(self) -> SimpleNamespace:
         # Only `monotonic` is the test's: the controller's waits sleep for real.
-        import time
 
         return SimpleNamespace(monotonic=lambda: self.now, sleep=time.sleep)
 
@@ -2147,7 +2152,9 @@ def test_start_again_ignores_a_second_click_younger_than_the_minimum_age(
     runs: bool,
 ) -> None:
     """A double-click delivers both clicks, and the second confirmed the drop of the checkpoint (m5 §17.12.11 D35, FM-172)."""
-    monkeypatch.setattr(plate_page, "SCAN_AGAIN_MIN_AGE_S", 1.0)
+    monkeypatch.setattr(
+        plate_page, "SCAN_AGAIN_MIN_AGE_S", SHIPPED_SCAN_AGAIN_MIN_AGE_S
+    )
     view = _stopped_view(page, run_doc)
     # The clock the view reads, which the test moves: the first click arms whatever it says,
     # 0.0 included (a falsy time is a time).
@@ -2174,6 +2181,14 @@ def test_start_again_ignores_a_second_click_younger_than_the_minimum_age(
     assert page.join(BOUND_S)
     assert StubScan.resumed == [None, None]
     assert RunDocument.load(run_doc).stages["scan"].status is StageStatus.done
+
+
+def test_start_again_ships_with_a_one_second_age_counted_on_the_monotonic_clock(
+    page: PlatePage,
+) -> None:
+    """The guard's test moves its own clock and sets the age: what is shipped is pinned here (D35)."""
+    assert SHIPPED_SCAN_AGAIN_MIN_AGE_S == 1.0
+    assert PlatePageView(page)._clock is time.monotonic
 
 
 def test_the_scan_command_has_no_resume_once_a_continued_scan_runs_and_the_screen_is_redrawn(
@@ -2827,6 +2842,97 @@ def test_a_scan_that_failed_with_no_stop_is_said_failed_by_the_notes(
     page.run_chain(("timing",), {})
     assert page.status().outcome is not None
     assert "of the failed Scan out of date" in page.status().outcome  # type: ignore[operator]
+
+
+class EarlyStage(CycleA):
+    """A stage that sorts before ``scan`` in the registry and reads the plan, as the scan does."""
+
+    name = provides = "aaa-stage"
+    reads: tuple[str, ...] = ("scan-plan",)
+    reads_optional: tuple[str, ...] = ()
+
+
+class StubPlate(CycleA):
+    """A provider of the ``plate`` slot with nothing to read: a tool with a *replaces* note."""
+
+    name = "stub-plate"
+    provides = "plate"
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+
+def test_the_first_stage_in_the_registrys_order_names_the_note_and_the_refusal(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """Two stages hold a reachable checkpoint and both read the plan: the registry's order (by name) picks the first."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming, EarlyStage))
+    _stopped_view(page, run_doc)
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="aaa-stage",
+            provides="aaa-stage",
+            attempt="e1",
+            status=StageStatus.stopped,
+            started_utc=T0,
+            finished_utc=T0,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=None,
+            reads={},
+            checkpoint={"done": 1},
+        ),
+    )
+    doc = RunDocument.load(run_doc)
+    profile = Profile.demo().microscope.name
+    assert reachable_checkpoint("scan", doc, profile=profile, dry_run=False)
+    assert reachable_checkpoint("aaa-stage", doc, profile=profile, dry_run=False)
+    assert list(page._registry().plugins).index("aaa-stage") < list(
+        page._registry().plugins
+    ).index("scan")
+
+    assert page.view().checkpoint_notes["timing"] == checkpoint_note(
+        "aaa-stage", "stopped"
+    )
+    assert page._chain_drops_a_checkpoint(("timing",), doc) == (
+        "Timing would put the checkpoint of the stopped aaa-stage out of date: "
+        "continue it first (smc run aaa-stage --resume)"
+    )
+
+
+def test_the_checkpoint_note_comes_after_the_reason_and_the_replace_note_and_never_beside_a_refusal(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(stubs=(StubScan, Slow, StubTiming, StubPlate))
+    view = _stopped_view(page, run_doc)
+    view.refresh()
+    assert view._view is not None
+    replace = view._view.replaces["stub-plate"]
+    note = checkpoint_note("scan", "stopped")
+    # The replace note, then the checkpoint note: the order the plan fixes.
+    assert view.tool_notes["stub-plate"].object == f"{replace}\n{note}"
+
+    # A tool that cannot run says its reason and no note: the click puts nothing out of date.
+    reason = "this tool waits for something"
+    view._blocked = {**view._blocked, "timing": reason}
+    view._draw_buttons()
+    assert view.tool_notes["timing"].object == reason
+
+
+def test_a_dry_run_pages_timing_says_its_refusal_and_not_a_note_beside_it(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """Found by the review of #499: the expert *Run* of ``timing`` said the refusal and then that it puts the scan out of date."""
+    page = make_page(dry_run=True, real=("scan-plan", "timing"), stubs=(StubScan, Slow))
+    view = _stopped_view(page, run_doc)
+    view.refresh()
+
+    assert page.view().blocked["timing"] == MEASURE_NOT_IN_A_DRY_RUN
+    assert view.tool_notes["timing"].object == MEASURE_NOT_IN_A_DRY_RUN
+    # The layout is not refused on a dry-run page, so its note stands.
+    assert view.tool_notes["scan-plan"].object == checkpoint_note("scan", "stopped")
 
 
 def test_a_single_run_of_a_tool_that_feeds_a_stopped_scan_still_runs(

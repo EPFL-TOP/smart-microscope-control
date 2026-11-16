@@ -3617,8 +3617,15 @@ class PlatePageView:
             reason = self._blocked.get(name)
             button.disabled = running is not None or reason is not None
             # Last: what a click on a tool that feeds a stopped scan would put out of date
-            # (m5 §17.12.11 D30); the run is not refused, so the button is not disabled for it.
-            lines = (reason or busy, replaces.get(name), kept.get(name))
+            # (m5 §17.12.11 D30); the run is not refused for it, so the button is not disabled
+            # for it. A tool that has a reason of its own cannot run (a dry-run page's `timing`,
+            # the stand closed...): the click puts nothing out of date, and the note would claim
+            # it beside a refusal (the Wells screen's wait drops it the same way, review of #499).
+            lines = (
+                reason or busy,
+                replaces.get(name),
+                None if reason else kept.get(name),
+            )
             self.tool_notes[name].object = "\n".join(line for line in lines if line)
         # The next step's button: while an activity goes, or when the step says why not.
         blocked = None if self._next_drawn is None else self._next_drawn.blocked
