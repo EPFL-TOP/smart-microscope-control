@@ -68,6 +68,8 @@ from smc.hardware.errors import (
 
 __all__ = [
     "DEFAULT_MAX_Z_JOG_UM",
+    "MAX_SEGMENTS",
+    "MIN_SEGMENT_CAP_UM",
     "POLL_INTERVAL_S",
     "SEGMENT_END_TOLERANCE_UM",
     "Executor",
@@ -77,6 +79,7 @@ __all__ = [
     "SegmentPlan",
     "Step",
     "StopLink",
+    "segment_cap_below_floor",
     "segment_targets_um",
     "segment_without_refusal",
 ]
@@ -93,6 +96,33 @@ DEFAULT_MAX_Z_JOG_UM = 100.0
 #: landing error (0.1 µm XY, 0.08 µm Z, session 2, #334).
 SEGMENT_END_TOLERANCE_UM = 1.0
 
+#: The most segments one move may have (m2 §11.12.8 D6). Chosen, not measured:
+#: 4.5 times the Ti2-E's largest plan (44 Z segments), and at 40 to 80 s of calls
+#: long, but still a move whose every segment logs a line and not a stand that
+#: looks hung. A plan beyond it is refused before any list is built.
+MAX_SEGMENTS = 200
+
+#: The least a segment cap may be (m2 §11.12.8 D7): every segment of ``n >= 2``
+#: equal ones is longer than ``cap / 2``, so a cap of twice the landing tolerance
+#: leaves every segment longer than the tolerance, and the landing check (D3) can
+#: fire on a segment that never moved. Derived, not chosen.
+MIN_SEGMENT_CAP_UM = 2 * SEGMENT_END_TOLERANCE_UM
+
+
+def segment_cap_below_floor(key: str, cap: float) -> str:
+    """Why a segment cap under ``MIN_SEGMENT_CAP_UM`` is refused (m2 §11.12.8 D7).
+
+    One text for the profile's validator and for ``Safety``, which code may
+    build directly. ``cap`` is written as given (``0.005``, ``1.0``): the
+    operator finds that number in their file.
+    """
+    return (
+        f"{key} must be at least {MIN_SEGMENT_CAP_UM:g} µm, got {cap}: a segment no "
+        f"longer than the {SEGMENT_END_TOLERANCE_UM:g} µm landing tolerance reads as "
+        f"landed even if it never moved, so the check that bounds a stop (m2 §11.12 "
+        f"D3) could not fire; raise {key}, or remove it"
+    )
+
 
 def segment_without_refusal(key: str, role: str) -> str:
     """Why a segment key is refused without its role's declared refusal (m2 §11.12.3).
@@ -108,7 +138,11 @@ def segment_without_refusal(key: str, role: str) -> str:
 
 
 def segment_targets_um(
-    start: tuple[float, ...], target: tuple[float, ...], max_segment_um: float
+    start: tuple[float, ...],
+    target: tuple[float, ...],
+    max_segment_um: float,
+    *,
+    key: str = "max_segment_um",
 ) -> tuple[tuple[float, ...], ...]:
     """The end of each segment of a straight move, the last being ``target`` itself (D2).
 
@@ -118,9 +152,26 @@ def segment_targets_um(
     in floating point may miss it by a rounding, and the move must land where
     it was asked to.
 
+    A plan of more than ``MAX_SEGMENTS`` is refused before anything is built
+    (m2 §11.12.8 D6): the count is bounded on the float ``d / max_segment_um``,
+    because a finite ratio of ``1e306`` would turn the list comprehension for
+    ever and one of ``inf`` would make ``math.ceil`` raise (FM-74). The floor of
+    ``MIN_SEGMENT_CAP_UM`` is not enforced here: ``Safety`` validated the cap, and
+    this stays arithmetic.
+
+    Args:
+        start: Where the move starts, one coordinate per axis.
+        target: Where it ends, as many coordinates as ``start``.
+        max_segment_um: The cap of one segment.
+        key: The ``[safety]`` key ``max_segment_um`` comes from, which a
+            refusal names so that the operator knows which one to look at.
+
     Raises:
         ValueError: The two points differ in length, a coordinate is not
             finite, or ``max_segment_um`` is not finite and > 0.
+        SafetyRefusedError: The plan would have more than ``MAX_SEGMENTS``
+            segments, or the move has no finite length (the subtraction
+            overflowed). Never forceable; nothing was sent.
     """
     if len(start) != len(target):
         raise ValueError(
@@ -134,7 +185,23 @@ def segment_targets_um(
         raise ValueError(
             f"max_segment_um must be finite and > 0, got {max_segment_um!r}"
         )
-    n = max(1, math.ceil(math.dist(start, target) / max_segment_um))
+    distance = math.dist(start, target)
+    if not math.isfinite(distance):
+        # Finite points whose difference overflows: ``math.dist`` is ``inf``
+        # without an exception, and the full numbers are the diagnosis.
+        raise SafetyRefusedError(
+            f"a move from {_coords(start)} to {_coords(target)} µm has no finite "
+            f"length, so it cannot be cut at {max_segment_um:g} µm ([safety] {key}); "
+            f"nothing was sent"
+        )
+    # ``not ratio <= MAX_SEGMENTS`` also refuses ``inf``, which ``math.ceil`` cannot take.
+    if not distance / max_segment_um <= MAX_SEGMENTS:
+        raise SafetyRefusedError(
+            f"a move of {distance:.4g} µm cut at {max_segment_um:g} µm ([safety] "
+            f"{key}) would be more than the {MAX_SEGMENTS} segments one move may "
+            f"have; nothing was sent. Move less far, or check {key}"
+        )
+    n = max(1, math.ceil(distance / max_segment_um))
     ends = [
         tuple(a + (b - a) * k / n for a, b in zip(start, target, strict=True))
         for k in range(1, n)
@@ -186,6 +253,8 @@ class Safety:
                 continue
             if isinstance(cap, bool) or not math.isfinite(cap) or cap <= 0:
                 raise ValueError(f"{key} must be finite and > 0, got {cap!r}")
+            if cap < MIN_SEGMENT_CAP_UM:
+                raise ValueError(segment_cap_below_floor(key, cap))
             if role not in self.stop_refused_by:
                 raise ValueError(segment_without_refusal(key, role))
         #: Cut an XY move into segments of at most this; ``None``: sent whole

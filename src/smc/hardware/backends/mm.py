@@ -426,7 +426,7 @@ class MMXYStage:
         here = _finite_start(self._motion.name, (start.x_um, start.y_um))
         return SegmentPlan(
             log=log,
-            targets=segment_targets_um(here, (x_um, y_um), cap),
+            targets=segment_targets_um(here, (x_um, y_um), cap, key="max_segment_um"),
             step=lambda line, end: self._step(line, end[0], end[1]),
             position=lambda xy: (xy.x_um, xy.y_um),
             key="max_segment_um",
@@ -644,7 +644,7 @@ class MMZStage:
         here = _finite_start(self._motion.name, (start,))
         return SegmentPlan(
             log=log,
-            targets=segment_targets_um(here, (z_um,), cap),
+            targets=segment_targets_um(here, (z_um,), cap, key="max_z_segment_um"),
             step=lambda line, end: self._step(line, end[0]),
             position=lambda z: (z,),
             key="max_z_segment_um",
