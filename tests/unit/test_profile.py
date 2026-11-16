@@ -1487,6 +1487,36 @@ def test_the_ti2_profile_cuts_its_moves_at_its_jog_limits() -> None:
     assert loaded.safety.max_z_segment_um == loaded.safety.max_z_jog_um == 100.0
 
 
+@pytest.mark.parametrize("key", ["max_segment_um", "max_z_segment_um"])
+@pytest.mark.parametrize("value", ["1.99", "1.0", "0.005"])
+def test_max_segment_um_below_the_landing_floor_is_refused(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    # A segment no longer than the 1 µm landing tolerance would read as landed
+    # without having moved, so the check that bounds a stop could not fire (m2
+    # §11.12.8 D7).
+    msg = _load_error(tmp_path, f"[safety]\n{_DECLARED_BOTH}{key} = {value}\n")
+    assert f"safety.{key}" in msg
+    assert f"{key} must be at least 2 µm, got {value}: a segment no longer than" in msg
+    assert f"could not fire; raise {key}, or remove it" in msg
+
+
+@pytest.mark.parametrize("key", ["max_segment_um", "max_z_segment_um"])
+def test_max_segment_um_of_two_loads_on_a_declared_stand(
+    tmp_path: Path, key: str
+) -> None:
+    path = write_profile(tmp_path / "p.toml", f"[safety]\n{_DECLARED_BOTH}{key} = 2\n")
+    assert getattr(Profile.load(path).safety, key) == 2.0
+
+
+def test_max_segment_um_is_told_the_floor_before_the_declared_role(
+    tmp_path: Path,
+) -> None:
+    # D7's order: a boolean, finite and > 0, the floor, then the role.
+    msg = _load_error(tmp_path, "[safety]\nmax_segment_um = 1.0\n")
+    assert "max_segment_um must be at least 2 µm, got 1.0" in msg
+
+
 # -- a first lock from below (m2 §12.10.3) ------------------------------------------
 
 

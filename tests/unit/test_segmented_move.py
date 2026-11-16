@@ -1036,3 +1036,201 @@ def test_the_emergency_stop_without_the_keys_has_no_segment_clause() -> None:
     ):
         microscope.stop()
     assert "segment" not in str(refused.value)
+
+
+# --- a bound on the plan, and a floor on the cap (m2 §11.12.8, #508) ------------------
+
+
+def _too_many(distance: str, cap: str, key: str) -> str:
+    """D6's first text: the distance is finite and the ratio is above the bound."""
+    return (
+        f"a move of {distance} µm cut at {cap} µm ([safety] {key}) would be more "
+        f"than the 200 segments one move may have; nothing was sent. Move less "
+        f"far, or check {key}"
+    )
+
+
+def _below_floor(key: str, cap: str) -> str:
+    """D7's text, as the profile and ``Safety`` both write it."""
+    return (
+        f"{key} must be at least 2 µm, got {cap}: a segment no longer than the "
+        f"1 µm landing tolerance reads as landed even if it never moved, so the "
+        f"check that bounds a stop (m2 §11.12 D3) could not fire; raise {key}, "
+        f"or remove it"
+    )
+
+
+def test_segment_targets_allow_the_bound_and_refuse_one_more() -> None:
+    # 20000.5 against a bound reached at 20000.0: one more µm than the bound allows.
+    ends = segment_targets_um((0.0,), (20000.0,), 100.0)
+    assert len(ends) == 200
+    assert ends[-1] == (20000.0,)
+    with pytest.raises(SafetyRefusedError) as refused:
+        segment_targets_um((0.0,), (20000.5,), 100.0, key="max_z_segment_um")
+    assert refused.value.reason == _too_many("2e+04", "100", "max_z_segment_um")
+    assert "[safety] max_z_segment_um" in refused.value.reason
+    assert refused.value.how_to_force == ""
+
+
+def test_segment_targets_name_the_key_xy_names_by_default() -> None:
+    with pytest.raises(SafetyRefusedError) as refused:
+        segment_targets_um((0.0, 0.0), (1.5e6, 0.0), 5000.0)
+    assert refused.value.reason == _too_many("1.5e+06", "5000", "max_segment_um")
+
+
+def test_segment_targets_refuse_a_huge_plan_before_ceil_and_before_any_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A ratio of 1e306 never ends if the plan is built (measured), so the test never
+    # builds it: ``math.ceil`` is the first thing the plan does with the ratio, and
+    # a guard placed after it, or none, reaches this spy at once (FM-74).
+    def boom(_: object) -> int:
+        raise AssertionError("math.ceil reached: the bound was not applied first")
+
+    monkeypatch.setattr("smc.hardware.safety.math.ceil", boom)
+    for start, target, cap in (
+        ((0.0,), (1e308,), 100.0),  # a ratio of 1e306
+        ((0.0, 0.0), (1e300, 0.0), 5000.0),
+        ((0.0, 0.0), (1e7, 0.0), 5000.0),  # 2000 segments, the smallest of the three
+    ):
+        with pytest.raises(SafetyRefusedError):
+            segment_targets_um(start, target, cap)
+    # A legal move reaches the spy: it is live.
+    with pytest.raises(AssertionError, match=r"math\.ceil reached"):
+        segment_targets_um((0.0,), (150.0,), 100.0)
+
+
+def test_a_distance_that_overflows_is_refused_not_an_overflow_error() -> None:
+    # The subtraction overflows: math.dist is inf without an exception.
+    with pytest.raises(SafetyRefusedError) as refused:
+        segment_targets_um((-1e308,), (1e308,), 100.0)
+    assert refused.value.reason == (
+        "a move from -1e+308 to 1e+308 µm has no finite length, so it cannot be cut "
+        "at 100 µm ([safety] max_segment_um); nothing was sent"
+    )
+    assert refused.value.how_to_force == ""
+    # The distance is finite and the ratio is inf.
+    with pytest.raises(SafetyRefusedError) as refused:
+        segment_targets_um((0.0, 0.0), (1e308, 0.0), 0.005, key="max_z_segment_um")
+    assert refused.value.reason == _too_many("1e+308", "0.005", "max_z_segment_um")
+
+
+def test_the_no_finite_length_text_writes_the_points_in_full_and_names_the_key() -> (
+    None
+):
+    with pytest.raises(SafetyRefusedError) as refused:
+        segment_targets_um(
+            (-1e308, 0.123456789), (1e308, 0.0), 2.5, key="max_z_segment_um"
+        )
+    assert refused.value.reason == (
+        "a move from (-1e+308, 0.123456789) to (1e+308, 0.0) µm has no finite length, "
+        "so it cannot be cut at 2.5 µm ([safety] max_z_segment_um); nothing was sent"
+    )
+
+
+@pytest.mark.parametrize("cap", [2.0, 2.5, 7.3])
+def test_the_least_cap_leaves_every_segment_longer_than_the_landing_tolerance(
+    cap: float,
+) -> None:
+    # Every segment of n = ceil(d / cap) equal ones is longer than cap (n - 1) / n,
+    # at least cap / 2 for n >= 2 (§11.12.8): a segment that never moved reads
+    # within the tolerance of its target only if it is no longer than it.
+    for n in range(2, 201):
+        distance = (n - 1) * cap * (1 + 1e-9)
+        ends = segment_targets_um((0.0,), (distance,), cap)
+        assert len(ends) == n
+        lengths = [b[0] - a[0] for a, b in zip(((0.0,), *ends), ends, strict=False)]
+        assert min(lengths) > SEGMENT_END_TOLERANCE_UM
+
+
+def test_a_cap_below_the_floor_admits_a_segment_the_landing_check_cannot_see() -> None:
+    # The case that justifies the floor: segments of 0.995 µm read as landed
+    # although they never moved. segment_targets_um does not enforce the floor.
+    ends = segment_targets_um((0.0,), (1.99 * (1 + 1e-9),), 1.99)
+    assert len(ends) == 2
+    assert ends[0][0] <= SEGMENT_END_TOLERANCE_UM
+
+
+def test_a_move_beyond_the_bound_is_refused_before_anything_is_sent() -> None:
+    with _stand() as (core, microscope):
+        stage = microscope.require(XYStage)
+        with pytest.raises(SafetyRefusedError) as to:
+            stage.move_to_um(201_000.0, 0.0)
+        with pytest.raises(SafetyRefusedError) as by:
+            stage.move_by_um(1e10, 0.0, force=True)
+        assert core.log == []
+        for refused in (to.value, by.value):
+            assert "([safety] max_segment_um)" in refused.reason
+            assert refused.how_to_force == ""
+            # The refusal comes before the first segment: no note about the rest.
+            assert stop_notes(refused) == ()
+        # The lock is free again.
+        assert stage.move_to_um(500.0, 0.0) == XY(500.0, 0.0)
+        assert core.log == ["setXYPosition('XY', 500.0, 0.0)"]
+
+
+def test_a_move_of_exactly_the_bound_is_sent_in_200_segments() -> None:
+    with _stand() as (core, microscope):
+        landed = microscope.require(XYStage).move_to_um(200_000.0, 0.0)
+        assert len(_xy_sends(core)) == 200
+        assert _xy_sends(core)[-1] == "setXYPosition('XY', 200000.0, 0.0)"
+    assert landed == XY(200_000.0, 0.0)
+
+
+def test_a_z_move_beyond_the_bound_is_refused_and_leaves_the_autofocus_alone() -> None:
+    with _ti2_stand() as (core, microscope):
+        z = microscope.require(ZStage)
+        with pytest.raises(SafetyRefusedError) as to:
+            z.move_to_um(20_100.0)
+        with pytest.raises(SafetyRefusedError) as by:
+            z.move_by_um(1e10, force=True)
+        # The key is the Z one: a Z plan that does not pass it names the XY key.
+        for refused in (to.value, by.value):
+            assert "([safety] max_z_segment_um)" in refused.reason
+            assert "max_segment_um" not in refused.reason.replace(
+                "max_z_segment_um", ""
+            )
+            assert refused.how_to_force == ""
+        assert core.log == []
+        assert core.isContinuousFocusLocked() is True
+
+
+def test_a_move_beyond_the_bound_is_refused_in_dry_run_too() -> None:
+    with _stand(dry_run=True) as (core, microscope):
+        with pytest.raises(SafetyRefusedError, match=r"\[safety\] max_segment_um"):
+            microscope.require(XYStage).move_to_um(201_000.0, 0.0)
+        assert core.log == []
+
+
+def test_without_the_keys_a_move_has_no_bound() -> None:
+    with _stand(_segmented_profile(xy=None, z=None)) as (core, microscope):
+        microscope.require(XYStage).move_to_um(1e6, 0.0)
+        assert core.log == ["setXYPosition('XY', 1000000.0, 0.0)"]
+
+
+@pytest.mark.parametrize("cap", [1.99, 1.0, 0.5, 0.005])
+def test_safety_refuses_a_segment_cap_below_the_landing_floor(cap: float) -> None:
+    declared = frozenset({"xy_stage", "focus"})
+    with pytest.raises(ValueError, match=r"\S") as xy:
+        Safety(max_jog_um=5000.0, stop_refused_by=declared, max_segment_um=cap)
+    assert str(xy.value) == _below_floor("max_segment_um", str(cap))
+    with pytest.raises(ValueError, match=r"\S") as z:
+        Safety(max_jog_um=5000.0, stop_refused_by=declared, max_z_segment_um=cap)
+    assert str(z.value) == _below_floor("max_z_segment_um", str(cap))
+
+
+def test_the_floor_is_checked_before_the_declared_role() -> None:
+    # A cap under the floor with no declared refusal is told the floor first (D7).
+    with pytest.raises(ValueError, match="must be at least 2 µm"):
+        Safety(max_jog_um=5000.0, max_segment_um=1.0)
+
+
+def test_safety_accepts_a_segment_cap_of_exactly_the_floor() -> None:
+    safety = Safety(
+        max_jog_um=5000.0,
+        stop_refused_by=frozenset({"xy_stage", "focus"}),
+        max_segment_um=2,
+        max_z_segment_um=2.0,
+    )
+    assert (safety.max_segment_um, safety.max_z_segment_um) == (2.0, 2.0)
+    assert isinstance(safety.max_segment_um, float)

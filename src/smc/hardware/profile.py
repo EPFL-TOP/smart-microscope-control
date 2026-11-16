@@ -31,6 +31,8 @@ from pydantic import (
 from smc.hardware.capabilities import ObjectiveOffset
 from smc.hardware.errors import ProfileError
 from smc.hardware.roles import Role
+from smc.hardware.safety import MIN_SEGMENT_CAP_UM
+from smc.hardware.safety import segment_cap_below_floor as _segment_cap_below_floor
 from smc.hardware.safety import segment_without_refusal as _segment_without_refusal
 
 if sys.version_info >= (3, 11):
@@ -268,6 +270,9 @@ class SafetySection(_Section):
                 f"{info.field_name} must be a positive, finite number of µm, got "
                 f"{value}"
             )
+        # Under the floor, the landing check could not fire (m2 §11.12.8 D7).
+        if value is not None and value < MIN_SEGMENT_CAP_UM:
+            raise ValueError(_segment_cap_below_floor(str(info.field_name), value))
         return value
 
     @model_validator(mode="after")
