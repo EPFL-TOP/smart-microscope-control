@@ -4246,7 +4246,9 @@ overwrite its own entry in `channel_ms`).
   reads 0.1 to 0.3 ms. `limits_um()` is `None`. The defaults take 5.5 s of
   stage time on the demo.
 - **Stage.** `xy.wait()`, then `start = xy.position_um()` (FM-85); a start that
-  is not finite refuses the run before anything moves (FM-125). For each
+  is not finite refuses the run before anything moves (FM-125). The probe runs
+  **after** the autofocus section and the switch-off of *PFS across a well's
+  wall* below (#513). For each
   distance, `repeats` times: `ctx.raise_if_stopped()`, the timed
   `move_to_um(start.x_um + s·d, start.y_um)`, `ctx.raise_if_stopped()`, the
   timed `move_to_um(start.x_um, start.y_um)`. `s` is `+1`, or `-1` when the
@@ -4269,6 +4271,7 @@ overwrite its own entry in `channel_ms`).
   stand's offset a *seen* offset on a stand that declares
   `engage_drives_z_to_offset` (m2 §12 D1; a `disengage()` does not forget it),
   so the engage below is allowed there. Measured iff all four hold. Then,
+  **before the stage probe** and with the stage where it was found (#513),
   `repeats` times: `ctx.raise_if_stopped()`; `is_engaged()`: if it is no longer
   on, something else switched it off (the operator, or a lost lock that the
   protocol answered), so the loop **does not switch it on** (FM-129) and stops;
@@ -4286,6 +4289,60 @@ overwrite its own entry in `channel_ms`).
   it stays off and `assumed` says `the autofocus was switched off for the
   measurement and did not lock again; engage it again before the scan`; the
   plugin never engages it again after a non-lock (FM-88).
+- **PFS across a well's wall (#513; m5 §17.12 D18).** **Merging this decides
+  it.** Measured on `main` dd1b473 (2026-11-16, `fake_microscope` with the
+  autofocus engaged and locked, `repeats=2`): every `setXYPosition` of the
+  probe came before the first `enableContinuousFocus`, so the default 9000 µm
+  probe carried a locked PFS past a 24-well well's radius (7.8 mm) and over the
+  walls of a 96-well plate, with no guard: FM-223's hazard, which §5.6 and §5.7
+  removed from every other tool that moves the stage across a wall. The rule
+  for `timing`:
+  - **The order of `run`**: the refusals that come before anything moves (the
+    dry run, the channels, the start, the soft limits) and the autofocus read
+    above, unchanged; then the autofocus section (when measured); then
+    `ctx.raise_if_stopped()`; then §5.7 D1's `switch_off_autofocus(_NAME,
+    autofocus, ctx)` from `plate_walls/loop.py`, with its three calls, texts
+    and failures unchanged; then the probe, the snaps and the channels. All of
+    it inside the `try` whose handler says what was left: the section before
+    the switch-off may have left the autofocus off. Measured on a prototype of
+    this order (same stand): the five `enableContinuousFocus` lines came before
+    the first `setXYPosition`, and the run ended with PFS off.
+  - **Every engaged autofocus is switched off, timed or not**: `with_autofocus`
+    false, on and searching (`is_engaged()` decides, as in §5.6), a lock
+    section that left it on. One that is off is left alone and nothing is
+    said; no autofocus, no call.
+  - **Never engaged again** (§5.7 D1, FM-88): the run ends with PFS off. Said
+    twice: `switch_off_autofocus`'s own WARNING, and `AUTOFOCUS_OFF_LINE` as the
+    **first** `assumed` line, before the soft-limits line, so that `scan-plan`
+    carries it (`timings: <line>`) and the page's strip shows it. The autofocus
+    is no longer left "as it was found": the tests that asserted it locked or
+    untouched at the end now assert it off.
+  - **A switch-off that cannot be made or read back fails the run before the
+    stage moves** (FM-19), with §5.7 D1's texts. Their "nothing moved" is the
+    stage: when the lock was timed first, its samples drove Z only to where
+    PFS held it, at the start.
+  - **Two meanings, two flags.** The lock section's own `left.autofocus_off`
+    (it did not lock again) is read into a local before the switch-off, and
+    that local alone decides the normal end's `_LEFT_OFF` WARNING and line. A
+    switch-off made here then sets `left.autofocus_off`, so a stop, a halt or a
+    fault during the probe, the snaps or the channels says `the autofocus was
+    switched off by this run and is left off, not engaged again: engaging
+    drives Z`, and a normal end does not say `did not lock again`.
+  - **Progress**: when measured, `autofocus lock` is the first step, before
+    `stage <d> µm`; the count does not change.
+  - **Not chosen**:
+    - *Switch off first, probe, then time the lock at the start, so that the
+      run ends locked as it was found*: every sample's engage would follow a
+      9 mm round trip whose return is only warned about beyond 5 µm, the
+      plugin would engage a PFS it switched off for a move (a restore of a
+      following device after a move, which §5.6 and §5.7 leave to the
+      operator), and the first sample would have to tell the plugin's own
+      switch-off from the operator's (FM-129). A follow-up if the owner wants
+      the stand to end locked.
+    - *Keeping the probe inside a well* (a shorter long distance): the long
+      probe is the well-to-well move whose cost the scan plan needs.
+    - *Refusing to start with PFS on*: §5.6's reason, and with PFS off the
+      lock cannot be timed.
 - **Snap and channels.** `snap_ms` is the median of `repeats` bare snaps, at the
   channel and exposure the stand has. With `channels`: the stand needs
   `Channels` and every name must be one of `names()`, else the run is refused

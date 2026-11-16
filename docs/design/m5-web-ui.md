@@ -5415,7 +5415,9 @@ after the other (both edit `controller.py`, `guide.py` and `plate_page.py`):
   camera* runs `camera-calibration`'s). The Wells screen draws the chain's line under
   it. `timing` moves the stage out and back from where it is (200 µm and 9 mm by
   default) and switches the autofocus; it is the expert view's own tool, with every
-  guard of the layer, and #454's rule for a locked PFS across a wall applies to it.
+  guard of the layer, and #454's rule for a locked PFS across a wall applies to it
+  (m3 §12, #513: the lock is timed first, then PFS is switched off before the probe
+  and left off, and the result's first `assumed` line says so).
 - **D19 A reason common to every action of a screen is drawn once.** The busy sentence
   (`busy_note`) and `GOTO_NOT_DURING_LIVE` are drawn once per screen, under the
   screen's first action (Plate: above the centre rows; Results: under *Run all that are
