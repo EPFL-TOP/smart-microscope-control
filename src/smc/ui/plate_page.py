@@ -1369,6 +1369,10 @@ class PlatePageView:
         self.rows_note = _wrapped_text()
         self.rows_note.visible = False
         self.centre_slots = [self._centre_slot(i) for i in range(_CENTRE_SLOTS)]
+        # Why the rows are not the plate's far corners, when the stand's soft limits cut
+        # them (m5 §19.2 D5): hidden, and taking no height, until it has something to say.
+        self.reach_note = _wrapped_text()
+        self.reach_note.visible = False
         self.other_captures = _wrapped_text()
         self.other_captures.visible = False
         self.register_button = pn.widgets.Button(
@@ -1931,6 +1935,7 @@ class PlatePageView:
                 plate_controls,
                 self.rows_note,
                 *(slot.box for slot in self.centre_slots),
+                self.reach_note,
                 self.other_captures,
                 self.register_button,
                 self.register_wait,
@@ -3618,7 +3623,9 @@ class PlatePageView:
         """The Plate screen from this redraw's view: where the plate comes from, the centre rows, what *Register* runs, what it came to (m5 §17.4.2).
 
         The rows are rewritten here and never rebuilt (D5), from the controller's captures
-        and the view's pose; the pairs *Register the plate* runs are the ones drawn now
+        and the view's pose, over the wells the controller suggests (the plate's far
+        corners, cut by the stand's soft limits, with ``reach_note`` saying so: m5 §19);
+        the pairs *Register the plate* runs are the ones drawn now
         (``on_register``), so a capture, a plate or a preset changed in any tab redraws
         them at the next tick (``_shared_state``). A slot with no row is hidden; the rows
         past the slots are text. The result line is the registered plate's, with the
@@ -3639,6 +3646,7 @@ class PlatePageView:
             page.capture_objectives,
             pose="unplaced" if view is None else view.pose.kind,
             from_sample=page.registers_from_sample,
+            suggested=page.suggested_centres(),
         )
         self._rows_drawn = rows
         for index, slot in enumerate(self.centre_slots):
@@ -3652,6 +3660,7 @@ class PlatePageView:
                 "Redo" if row.captured else f"Capture the centre of {row.well}"
             )
             self._say(slot.capture_note, self._capture_note_of(row, view))
+        self._say(self.reach_note, page.centres_reach_note())
         others = rows[len(self.centre_slots) :]
         self.other_captures.object = (
             "\n".join(["Other captures:", *(row.text for row in others)])
