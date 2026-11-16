@@ -22,6 +22,7 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 
 import numpy as np
 import numpy.typing as npt
@@ -59,7 +60,9 @@ from smc.plugins.slots import (
 from smc.run.files import write_atomically
 
 __all__ = [
+    "AUTOFOCUS_LEFT_OFF",
     "AUTOFOCUS_OFF_LINE",
+    "SwitchOff",
     "WallWalk",
     "Where",
     "check_calibration",
@@ -69,6 +72,7 @@ __all__ = [
     "checked_search",
     "measure_well",
     "move",
+    "run_saying_autofocus_left_off",
     "switch_off_autofocus",
     "warn_left",
 ]
@@ -88,6 +92,15 @@ AUTOFOCUS_OFF_LINE = (
     "the autofocus was switched off before anything moved, so that no lock crossed "
     "a well's wall: engage it again on the sample"
 )
+#: The end of the reason of a run that switched the autofocus off and then failed
+#: (m3 §5.7 D3), after ``; ``: the page's strip shows the reason, and D1's WARNING
+#: is only in the log. It says what this run did, never that PFS "is off now": an
+#: operator may have engaged it since (FM-129, FM-165).
+AUTOFOCUS_LEFT_OFF = (
+    "; the autofocus was switched off before anything moved and was not engaged "
+    "again: engage it again on the sample"
+)
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +350,46 @@ def switch_off_autofocus(
         stage,
     )
     return True
+
+
+@dataclass(slots=True)
+class SwitchOff:
+    """Whether this run switched the autofocus off: the tool sets ``switched`` where it inserts ``AUTOFOCUS_OFF_LINE``.
+
+    Read by ``run_saying_autofocus_left_off`` when the run ends in a refusal. It
+    is a fact about this run and nothing else (FM-165): an autofocus that was off
+    at the start, a stand without one and a refusal before the switch-off all
+    leave it ``False``.
+    """
+
+    switched: bool = False
+
+
+def run_saying_autofocus_left_off(body: Callable[[SwitchOff], _T]) -> _T:
+    """Run ``body``; a refusal after it switched the autofocus off ends with ``AUTOFOCUS_LEFT_OFF`` (m3 §5.7 D3).
+
+    D1 says the switch-off in a WARNING and in the result's ``assumed``, and a
+    run that fails has no result: the WARNING is then the only trace, and the
+    page's strip shows the reason, which tells the operator to fix the walk and
+    run again. Only a ``PluginRunError`` is given the sentence. A halt, a motion
+    stop, a stop and a raw ``HardwareError`` are read by their type (the CLI's
+    exit code, the page's ``stopped by STOP``, the record's ``stopped``), so they
+    pass unchanged (FM-64).
+
+    The new error is raised **after** the handler (FM-98, the scan's way): the
+    handler keeps two strings and no exception, so nothing here puts the
+    refusal on the new error's traceback or keeps the stand's frames alive.
+    """
+    state = SwitchOff()
+    plugin = ""
+    reason = ""
+    try:
+        return body(state)
+    except PluginRunError as exc:
+        if not state.switched:
+            raise
+        plugin, reason = exc.plugin, exc.reason
+    raise PluginRunError(plugin, reason + AUTOFOCUS_LEFT_OFF)
 
 
 def _one_line(exc: BaseException) -> str:

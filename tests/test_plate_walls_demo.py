@@ -2119,3 +2119,169 @@ def test_plate_walls_on_a_stand_without_an_autofocus_switches_nothing_off(
 
     assert result.assumed == TODAY_ASSUMED
     assert _warnings(caplog) == []
+
+
+# ------------------- A failure after the switch-off says PFS was switched off (#497)
+
+#: What a failure after the switch-off ends with (m3 §5.7 D3): the page's strip
+#: shows the reason, and the switch-off's WARNING is only in the log.
+AUTOFOCUS_LEFT_OFF = (
+    "; the autofocus was switched off before anything moved and was not engaged "
+    "again: engage it again on the sample"
+)
+
+
+def _a_walk_that_fails(
+    kind: str, stand: Microscope, tmp_path: Path
+) -> tuple[Path, tuple[WellRef, ...], dict[str, Any], str, str]:
+    """A run on the fake stand that ends in a refusal after its first frame, and what its reason starts and ends with.
+
+    The three come from three places of the run: the loop's move (the layer
+    refuses the third), the loop's search (the frame centred on the wall is
+    blank), and the plugin's fit (a plate of another pitch). All three are
+    ``PluginRunError``s raised inside the ``try`` whose handler says where the
+    stage was left.
+    """
+    run_doc = tmp_path / "run.json"
+    refs = _refs("A1", "H12")
+    if kind == "move":
+        _on_fake(stand)
+        _seed(run_doc, stand)
+        refusal = SafetyRefusedError("the target is outside the soft limits")
+        stand.override(XYStage, _Stage(stand.require(XYStage), raises={3: refusal}))
+        x, y = refs[0].x_um + RADIUS_UM - STEP_UM, refs[0].y_um
+        whole = (
+            f"A1's +X wall: the move to ({x:.1f}, {y:.1f}) µm was refused: the "
+            "target is outside the soft limits"
+        )
+        return run_doc, refs, {}, whole, whole
+    if kind == "wall":
+
+        def blank(snap: int, frame: npt.NDArray[np.uint16]) -> npt.NDArray[Any]:
+            return np.full_like(frame, 2000) if snap == 2 else frame
+
+        _on_fake(stand, spoil=blank)
+        _seed(run_doc, stand)
+        truth = _truth("A1")
+        exact = (
+            WellRef(well="A1", x_um=truth[0], y_um=truth[1]),
+            _refs("H12")[0],
+        )
+        return (
+            run_doc,
+            exact,
+            {},
+            "the wall of A1's +X side was lost in the frame centred on it at (",
+            " µm",
+        )
+    assert kind == "fit"
+    _on_fake(stand, _plate(pitch_um=9030.0))
+    _seed(run_doc, stand)
+    return (
+        run_doc,
+        _refs("A1", "H12", pitch_um=9030.0),
+        {"max_residual_um": 100.0},
+        "",
+        " µm from where the other wells put it (bound 100 µm): record it again, "
+        "or check the plate type",
+    )
+
+
+@pytest.mark.parametrize("kind", ["move", "wall", "fit"])
+def test_a_run_that_fails_after_the_autofocus_switch_off_says_so_in_its_reason_in_plate_walls(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """The reason the page shows ends with the sentence; the refusal's own words stay in front of it."""
+    run_doc, refs, params, start, end = _a_walk_that_fails(
+        kind, fake_microscope, tmp_path
+    )
+    af = _engaged(fake_microscope)
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        refused = _refused(fake_microscope, run_doc, refs, **params)
+
+    assert refused.reason.startswith(start)
+    assert refused.reason.endswith(end + AUTOFOCUS_LEFT_OFF)
+    assert refused.reason.count(AUTOFOCUS_LEFT_OFF) == 1
+    # The record carries it too: the reason, whole, after the plugin's name.
+    stored = _stored(run_doc)
+    assert stored.status is StageStatus.failed
+    assert stored.error == f"PluginRunError: plate-walls: {refused.reason}"
+    # D1 is unchanged: switched off once, read back, and nothing engages it (FM-88).
+    assert af.calls == ["is_engaged", "disengage", "is_engaged"]
+    assert af.engaged is False
+    assert AUTOFOCUS_OFF_WARNING in _warnings(caplog)
+
+
+@pytest.mark.parametrize("kind", ["move", "wall", "fit"])
+def test_a_failure_with_the_autofocus_already_off_says_nothing_of_it_in_plate_walls(
+    fake_microscope: Microscope, tmp_path: Path, kind: str
+) -> None:
+    """Nothing was switched off, so there is nothing to say (FM-165: a sentence about this run, not the stand)."""
+    run_doc, refs, params, start, end = _a_walk_that_fails(
+        kind, fake_microscope, tmp_path
+    )
+    af = RecordingAutofocus(engaged=False)
+    fake_microscope.override(Autofocus, af)
+
+    refused = _refused(fake_microscope, run_doc, refs, **params)
+
+    assert refused.reason.startswith(start)
+    assert refused.reason.endswith(end)
+    assert "autofocus" not in refused.reason
+    assert af.calls == ["is_engaged"]
+
+
+def _a_fault() -> Exception:
+    return CoreError("the stage did not answer")
+
+
+@pytest.mark.parametrize(
+    "make_fault",
+    [MicroscopeHaltedError, lambda: MotionStoppedError("xy_stage XY"), _a_fault],
+    ids=["halt", "motion-stopped", "hardware-error"],
+)
+def test_a_halt_a_motion_stop_or_a_hardware_error_after_the_switch_off_keeps_its_type_in_plate_walls(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    make_fault: Callable[[], Exception],
+) -> None:
+    """FM-64: the CLI's exit code and the page's ``stopped by STOP`` read the type, so the sentence is not theirs."""
+    _on_fake(fake_microscope)
+    run_doc = tmp_path / "run.json"
+    _seed(run_doc, fake_microscope)
+    fault = make_fault()
+    fake_microscope.override(
+        XYStage, _Stage(fake_microscope.require(XYStage), raises={3: fault})
+    )
+    af = _engaged(fake_microscope)
+
+    with pytest.raises(type(fault)) as info:
+        _run(fake_microscope, run_doc, _refs("A1", "H12"))
+
+    assert info.value is fault
+    assert AUTOFOCUS_LEFT_OFF not in str(info.value)
+    # Switched off, and still not engaged again.
+    assert af.engaged is False
+    assert "engage" not in af.calls
+    assert _stored(run_doc).status is StageStatus.failed
+
+
+def test_a_stop_after_the_switch_off_ends_stopped_and_not_failed_in_plate_walls(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """``StopRequested`` is an outcome of the runner, not a ``PluginRunError``: it is not given the sentence."""
+    stop = threading.Event()
+    _on_fake(fake_microscope, before=lambda n: stop.set() if n == 3 else None)
+    run_doc = tmp_path / "run.json"
+    _seed(run_doc, fake_microscope)
+    af = _engaged(fake_microscope)
+
+    record = _run(fake_microscope, run_doc, _refs("A1", "H12"), stop=stop)
+
+    assert record.status is StageStatus.stopped
+    assert af.engaged is False
+    assert "engage" not in af.calls

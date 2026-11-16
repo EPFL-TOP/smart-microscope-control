@@ -52,6 +52,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.hardware.errors import (
+    CoreError,
     HardwareError,
     MicroscopeHaltedError,
     MotionStoppedError,
@@ -1863,3 +1864,169 @@ def test_objective_offsets_on_a_stand_without_an_autofocus_switches_nothing_off(
     assert AUTOFOCUS_OFF_LINE not in result.assumed
     assert result.assumed[0] == NO_LIMITS_LINE
     assert _warnings(caplog) == []
+
+
+# ------------------- A failure after the switch-off says PFS was switched off (#497)
+
+#: What a failure after the switch-off ends with (m3 §5.7 D3): the page's strip
+#: shows the reason, and the switch-off's WARNING is only in the log.
+AUTOFOCUS_LEFT_OFF = (
+    "; the autofocus was switched off before anything moved and was not engaged "
+    "again: engage it again on the sample"
+)
+
+
+def _a_run_that_fails(
+    kind: str,
+    stand: Microscope,
+    run_doc: Path,
+    documents: Documents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[tuple[str, ...], tuple[Path, ...], dict[str, Any], str, str]:
+    """Targets, calibrations and parameters of a run that ends in a refusal after its switch-off, and what its reason starts and ends with.
+
+    The three come from three places: the turn the layer refuses (the first
+    thing the run does once PFS is off), the wells that disagree and the offset
+    beyond the profile's bound (the last things it does, after every frame).
+    """
+    if kind == "turn":
+        refusal = SafetyRefusedError("the stage is not clear")
+        _rig(stand, turret=lambda inner: _RefusingTurret(inner, refusal))
+        whole = f"the turn to {FORTY} was refused: the stage is not clear"
+        return (FORTY,), (documents.forty,), {}, whole, whole
+    if kind == "disagree":
+        _move_well_in_the_record(run_doc, "H12", (20.0, 0.0))
+        return (
+            (TWENTY,),
+            (documents.twenty,),
+            {},
+            "the wells do not agree on the offset, so it is not a translation or "
+            f"not measured well enough: {TWENTY}: A1 (",
+            "or give a larger max_spread_um if the stage's repeatability is larger",
+        )
+    assert kind == "bound"
+    monkeypatch.setattr(
+        "smc.plugins.objective_offsets.plugin.offsets_from_reference",
+        lambda origin, shifts, reference: (origin, ((FORTY, (-1500.0, 0.0)),)),
+    )
+    whole = (
+        f"the offset of {FORTY} would be (-1500.0, 0.0) µm, beyond the profile's "
+        "±1000 µm: a wrong well or a wrong calibration, not two parcentric objectives"
+    )
+    return (FORTY,), (documents.forty,), {"wells": ("A1", "H12")}, whole, whole
+
+
+@pytest.mark.parametrize("kind", ["turn", "disagree", "bound"])
+def test_a_run_that_fails_after_the_autofocus_switch_off_says_so_in_its_reason_in_objective_offsets(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """The reason the page shows ends with the sentence; the refusal's own words stay in front of it."""
+    stand = open_stand()
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+    targets, calibrations, params, start, end = _a_run_that_fails(
+        kind, stand, run_doc, documents, monkeypatch
+    )
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        refused = _refused(stand, run_doc, targets, calibrations, **params)
+
+    assert refused.reason.startswith(start)
+    assert refused.reason.endswith(end + AUTOFOCUS_LEFT_OFF)
+    assert refused.reason.count(AUTOFOCUS_LEFT_OFF) == 1
+    # The record carries it too: the reason, whole, after the plugin's name.
+    stored = _stored(run_doc)
+    assert stored.status is StageStatus.failed
+    assert stored.error == f"PluginRunError: objective-offsets: {refused.reason}"
+    # D1 is unchanged: switched off once, read back, and nothing engages it (FM-88).
+    # The layer's turns read the autofocus too, so the list is not asserted whole.
+    assert af.calls[:3] == ["is_engaged", "disengage", "is_engaged"]
+    assert af.calls.count("disengage") == 1
+    assert "engage" not in af.calls
+    assert af.engaged is False
+    assert AUTOFOCUS_OFF_WARNING in _warnings(caplog)
+
+
+@pytest.mark.parametrize("kind", ["turn", "disagree", "bound"])
+def test_a_failure_with_the_autofocus_already_off_says_nothing_of_it_in_objective_offsets(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """Nothing was switched off, so there is nothing to say (FM-165: a sentence about this run, not the stand)."""
+    stand = open_stand()
+    af = RecordingAutofocus(engaged=False)
+    stand.override(Autofocus, af)
+    targets, calibrations, params, start, end = _a_run_that_fails(
+        kind, stand, run_doc, documents, monkeypatch
+    )
+
+    refused = _refused(stand, run_doc, targets, calibrations, **params)
+
+    assert refused.reason.startswith(start)
+    assert refused.reason.endswith(end)
+    assert "autofocus" not in refused.reason
+    assert "disengage" not in af.calls
+
+
+def _a_fault() -> Exception:
+    return CoreError("the turret did not answer")
+
+
+@pytest.mark.parametrize(
+    "make_fault",
+    [MicroscopeHaltedError, lambda: MotionStoppedError("turret"), _a_fault],
+    ids=["halt", "motion-stopped", "hardware-error"],
+)
+def test_a_halt_a_motion_stop_or_a_hardware_error_after_the_switch_off_keeps_its_type_in_objective_offsets(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    make_fault: Callable[[], Exception],
+) -> None:
+    """FM-64: the CLI's exit code and the page's ``stopped by STOP`` read the type, so the sentence is not theirs."""
+    stand = open_stand()
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+    fault = make_fault()
+    _rig(stand, turret=lambda inner: _RefusingTurret(inner, fault))
+
+    with pytest.raises(type(fault)) as info:
+        _run(stand, run_doc, (FORTY,), (documents.forty,))
+
+    assert info.value is fault
+    assert AUTOFOCUS_LEFT_OFF not in str(info.value)
+    # Switched off, and still not engaged again.
+    assert af.engaged is False
+    assert "engage" not in af.calls
+    assert _stored(run_doc).status is StageStatus.failed
+
+
+def test_a_stop_after_the_switch_off_ends_stopped_and_not_failed_in_objective_offsets(
+    open_stand: Callable[..., Microscope], run_doc: Path, documents: Documents
+) -> None:
+    """``StopRequested`` is an outcome of the runner, not a ``PluginRunError``: it is not given the sentence."""
+    stop = threading.Event()
+    stand = open_stand()
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+    _rig(stand, before=lambda n: stop.set() if n == 5 else None)
+
+    record = _run(
+        stand,
+        run_doc,
+        (FORTY, TWENTY),
+        (documents.forty, documents.twenty),
+        stop=stop,
+    )
+
+    assert record.status is StageStatus.stopped
+    assert af.engaged is False
+    assert "engage" not in af.calls

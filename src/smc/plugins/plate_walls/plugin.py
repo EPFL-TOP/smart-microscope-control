@@ -62,6 +62,7 @@ from smc.plugins.plate_walls.algorithm import (
 )
 from smc.plugins.plate_walls.loop import (
     AUTOFOCUS_OFF_LINE,
+    SwitchOff,
     WallWalk,
     Where,
     check_calibration,
@@ -71,6 +72,7 @@ from smc.plugins.plate_walls.loop import (
     checked_search,
     measure_well,
     move,
+    run_saying_autofocus_left_off,
     switch_off_autofocus,
     warn_left,
 )
@@ -222,7 +224,23 @@ class PlateWallsPlugin:
             MicroscopeHaltedError, MotionStoppedError: The stand was stopped;
                 the stage is where it is.
             StopRequested: The operator stopped it; the stage is where it is.
+
+        A ``PluginRunError`` raised after the autofocus was switched off ends
+        with ``AUTOFOCUS_LEFT_OFF`` (m3 §5.7 D3): the page shows the reason, and
+        the switch-off's WARNING is only in the log. The others pass unchanged.
         """
+        return run_saying_autofocus_left_off(
+            lambda off: self._run(microscope, params, ctx, off)
+        )
+
+    def _run(
+        self,
+        microscope: Microscope,
+        params: PlateWallsParams,
+        ctx: RunContext,
+        off: SwitchOff,
+    ) -> PlateResult:
+        """``run``'s body; ``off`` records whether the switch-off was made, for a refusal after it."""
         xy = microscope.require(XYStage)
         camera = microscope.require(Camera)
         turret = microscope.get(ObjectiveTurret)
@@ -281,6 +299,7 @@ class PlateWallsPlugin:
         # left. A stop asked now keeps the lock (m3 §5.7 D1).
         ctx.raise_if_stopped()
         if switch_off_autofocus(_NAME, microscope.get(Autofocus), ctx):
+            off.switched = True
             assumed.insert(0, AUTOFOCUS_OFF_LINE)
 
         # A stage still travelling from an earlier move reads a fraction of it.
