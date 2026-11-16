@@ -4369,7 +4369,14 @@ class PlatePageView:
         self.layout_card.visible = bool(self.layout_command.object)
 
     def _draw_scan_command(self) -> None:
-        """The command of *Start the scan*, or of *Continue the scan* (``--resume``) over a checkpoint it continues (m5 §17.2 D8, §17.12 D17)."""
+        """The command of *Start the scan*, or of *Continue the scan* (``--resume``) over a checkpoint it continues (m5 §17.2 D8, §17.12 D17).
+
+        It is the command of the **last redraw**, and the tick does not redraw it (it reads the
+        run document, which the tick never does): after the click on *Continue the scan* it
+        still says ``--resume``, and a redraw while the continued scan runs says none, since no
+        scan end stands while the record is ``running``. Measured in m5 §17.12.11 and pinned by
+        a test; the code is as it was.
+        """
         view = self._view
         end = None if view is None else view.scan_end
         try:

@@ -153,8 +153,15 @@ class StubScan:
         kept = ctx.checkpoint(_Taken)
         StubScan.resumed.append(None if kept is None else kept.taken)
         start = 0 if kept is None else kept.taken
-        total = len(plan.fields)
-        for position, field in enumerate(plan.fields, start=1):
+        # The real scan counts the fields of the plan's wells only (`wells_to_scan` drops the
+        # others), which is what `counts_the_rest` stands for.
+        fields = (
+            [f for f in plan.fields if f.well in plan.wells]
+            if StubScan.counts_the_rest
+            else list(plan.fields)
+        )
+        total = len(fields)
+        for position, field in enumerate(fields, start=1):
             if position <= start:
                 continue
             hook = StubScan.before_report
@@ -2021,6 +2028,37 @@ def test_a_continued_scan_counts_and_draws_the_plans_fields_not_the_rests(
     assert page.join(BOUND_S)
     assert progress is not None
     assert (progress.done, progress.total) == (3, 8)
+
+
+def test_a_resumed_scan_counts_only_the_fields_of_the_plans_wells(
+    page: PlatePage, run_doc: Path
+) -> None:
+    """``wells_to_scan`` drops a field of a well the plan does not list; the plan's count must too (m5 §17.12.11)."""
+    plan = _scan_plan_result()
+    # An edited run document: one more field, of a well that `plan.wells` does not list.
+    orphan = plan.fields[-1].model_copy(
+        update={"well": "H12", "index": 0, "name": "H12_0000"}
+    )
+    assert orphan.well not in plan.wells
+    edited = plan.model_copy(update={"fields": (*plan.fields, orphan)})
+    view = _stopped_view(page, run_doc, plan=edited)
+    assert view._view is not None
+    assert view._view.scan_end is not None
+
+    # A resume that counts as the real scan does: over the fields of the wells still to scan
+    # (8 of the plan's 12, the first well being held by the checkpoint).
+    StubScan.counts_the_rest = True
+    StubScan.pause_at = 6
+    page.run("scan", [], resume=True)
+    assert StubScan.paused.wait(BOUND_S)
+    progress = page.status().progress
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+
+    assert StubScan.resumed == [None, 4]
+    # The fourth field is the checkpoint's last: the sixth is the second of the second well, over
+    # 12 fields, never offset to 13 by the field of a well that is not scanned.
+    assert progress == Progress("scan", 6, 12, plan.fields[5].name)
 
 
 def test_both_actions_wait_for_resume_while_the_stand_is_halted(

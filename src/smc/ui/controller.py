@@ -2950,11 +2950,26 @@ class PlatePage:
             # ``check_ready`` passed: a resume refuses a plan changed since the stop.
             record = doc.provider("scan-plan")
             plan = None if record is None else _scan_plan_of(record)
-            planned = None if plan is None else len(plan.fields)
+            # The fields of the plan's wells only: the scan's `wells_to_scan` drops a field of
+            # a well the plan does not list, and `_on_progress` adds `planned - total` back to
+            # a resumed run's counts, so a field of such a well (an edited run document) would
+            # offset every count by one (m5 §17.12.11).
+            if plan is not None:
+                scanned_wells = frozenset(plan.wells)
+                planned = sum(1 for field in plan.fields if field.well in scanned_wells)
         return _Prepared(entry, parsed, planned)
 
     def _halted(self) -> bool:
-        """Whether the stand is halted now (a STOP not yet cleared by ``resume()``), read inside a read a Disconnect waits for."""
+        """Whether the stand is halted now (a STOP not yet cleared by ``resume()``), read inside a read a Disconnect waits for.
+
+        It reads ``Microscope.state()``, which reads every device, for one executor flag, and
+        there is no ``halted`` on the facade to read instead (m5 §17.12.11, measured on
+        ``main`` at ``909db32``): ``Executor.halted`` is private to ``Microscope``, and a
+        property on the facade would be a public accessor in ``smc.hardware`` for 0.4 ms at an
+        idle click (FM-239). ``run()`` has refused a busy page before it gets here
+        (``_refuse_if_busy``), so no activity holds the camera and the read waits for nothing.
+        It runs only for a resume or a run afresh, once per click.
+        """
         with self._reading() as microscope:
             return microscope is not None and microscope.state().halted
 
