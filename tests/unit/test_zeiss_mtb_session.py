@@ -13,7 +13,10 @@ import pytest
 from smc.hardware import Microscope
 from smc.hardware.backends.zeiss_mtb import session
 from smc.hardware.backends.zeiss_mtb.api import MTBError, MTBSessionError
-from smc.testing.fake_mtb import FakeMTB
+from smc.hardware.core import close_core, open_core
+from smc.testing.fake_mtb import FakeMTB, fake_stand_config
+
+CFG = Path(__file__).resolve().parents[2] / "profiles" / "zeiss-observer7.cfg"
 
 
 def test_shared_logs_in_once_per_process() -> None:
@@ -185,6 +188,47 @@ def test_the_exit_handler_runs_every_darkener_even_when_one_fails_then_logs_out(
     assert max(switched_off) < logout
 
 
+def test_exit_closes_a_tl_shutter_left_open_through_its_own_darkener(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = FakeMTB()
+    with session.use_api_factory(lambda: fake):
+        core = open_core(fake_stand_config(CFG, tmp_path))
+        core.setShutterOpen("TLShutter", True)
+        core.setProperty("Colibri", "LED", "475nm")
+        core.setShutterOpen("Colibri", True)
+        with caplog.at_level(logging.ERROR, logger="smc.hardware.zeiss_mtb"):
+            session.shared()._close_at_exit()
+        assert fake.changers["MTBTLShutter"].position() == 2
+        assert fake.colibri.lit() == []
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    close_core(core)
+
+
+def test_a_ctrl_c_in_a_darkener_still_cuts_the_light_and_logs_out_then_goes_on() -> (
+    None
+):
+    fake = FakeMTB()
+    ran: list[str] = []
+
+    def interrupted() -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):  # noqa: PT012, SIM117 - the block's exit raises it
+        with session.use_api_factory(lambda: fake):
+            mtb = session.shared()
+            mtb.led_controller("MTBFLLEDController")
+            fake.colibri.led_list[3].on = True
+            mtb.register_darkener("A", interrupted)
+            mtb.register_darkener("B", lambda: ran.append("B"))
+    assert ran == ["B"]
+    assert fake.colibri.lit() == []
+    assert fake.logouts == 1
+    # The block's exit forgot the session even though it raised.
+    with session.use_api_factory(FakeMTB):
+        session.shared()
+
+
 def test_an_unregistered_darkener_does_not_run_at_exit() -> None:
     ran: list[str] = []
     with session.use_api_factory(FakeMTB):
@@ -224,7 +268,9 @@ mm = profile.micromanager.model_copy(update={"config": str(cfg)})
 stand = Microscope.open(profile.model_copy(update={"micromanager": mm}))
 stand.core.setProperty("Colibri", "LED", "475nm")
 stand.core.setShutterOpen("Colibri", True)
+stand.core.setShutterOpen("TLShutter", True)
 assert fake.colibri.lit() == [475], fake.colibri.lit()
+assert fake.changers["MTBTLShutter"].position() == 1  # "Open"
 """
 
 
@@ -257,3 +303,14 @@ def test_process_exit_darkens_the_light_then_logs_out(tmp_path: Path) -> None:
         assert any(lit < i < logout for i in offs), (
             f"LED {nm} not switched off before logout"
         )
+    opened = calls.index(("MTBTLShutter", "move", "1", "30000"))
+    closed = [
+        i for i, c in enumerate(calls) if c == ("MTBTLShutter", "move", "2", "30000")
+    ]
+    assert any(opened < i < logout for i in closed), (
+        "TL shutter not closed before logout"
+    )
+    # The darkeners worked: nothing says the light may still be on.
+    assert "LIGHT MAY STILL BE ON" not in stderr.read_text(
+        encoding="utf-8", errors="replace"
+    )

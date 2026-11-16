@@ -280,6 +280,30 @@ def test_a_set_on_off_that_every_form_refuses_names_the_signatures() -> None:
     assert isinstance(caught.value.__cause__, RuntimeError)
 
 
+def test_mtb_false_and_off_cross_the_seam_unchanged() -> None:
+    class Refuses(FakeContinual):
+        def SetPosition(self, pos: float, unit: str, mode: Any, timeout: int) -> bool:
+            return False  # a zero-distance move, or a refusal: the device judges it
+
+    class Stuck(FakeLightChanger):
+        def SetPosition(self, position: int, mode: Any, timeout: int) -> bool:
+            return False
+
+    class Dark(ReflectiveLED):
+        def GetOnOff(self) -> str:
+            return "MTBOnOff.Off"
+
+    ns = _namespace()
+    assert dotnet.DotNetAxis("MTBFocus", Refuses(), ns).move_um(1.0, 1000) is False
+    assert (
+        dotnet.DotNetChanger("MTBTLShutter", Stuck(1, ["Open", "Closed"]), ns).move(
+            2, 1000
+        )
+        is False
+    )
+    assert dotnet.DotNetLED("MTBFLLEDController", Dark(), ns, FakeEnum).is_on() is False
+
+
 def test_a_missing_component_is_an_mtb_error_naming_it() -> None:
     root = SimpleNamespace(GetComponent=lambda mtb_id: None)
     mtb = dotnet.DotNetMTB(_namespace(), FakeEnum)

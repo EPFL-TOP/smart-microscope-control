@@ -254,7 +254,8 @@ def _move_axis(axis: MTBAxis, info: AxisInfo, name: str, target_um: float) -> No
             "holding the axis"
         )
     bound = max(info.max_deviation_um, info.step_um, info.typical_deviation_um, 1e-6)
-    if abs(read_um - target_um) > bound:
+    # `not <=`: a readback of NaN is no arrival (FM-167).
+    if not abs(read_um - target_um) <= bound:
         raise MTBError(
             f"{name}: MTB moved to {target_um} µm but the axis reads {read_um} µm, "
             f"beyond its declared maximum deviation of {bound} µm"
@@ -287,7 +288,17 @@ def _refuse_stop(name: str) -> MTBError:
 
 
 def _shutdown_mover(name: str, mover: _Mover, timeout_ms: int) -> None:
-    """Wait for a move still running, up to its MTB timeout; log, never raise."""
+    """Wait for a move still running, up to its MTB timeout; log, never raise.
+
+    The light is darkened first when a move still runs: unicore unloads in
+    load order and the lights come last in the ``.cfg``, so they would stay
+    lit for the whole move MTB cannot stop (m4 §8).
+    """
+    if mover.running():
+        try:
+            mtb_session._darken_if_logged_in()
+        except Exception as exc:  # never raised out of an unload
+            log.error("%s: %s: %s", LIGHT_MAY_STILL_BE_ON, name, exc)
     if not mover.join(timeout_ms / 1000.0):
         log.error(
             "%s: a move still runs after %s ms; unloading without waiting for it",
@@ -715,6 +726,12 @@ def _darken_at_unload(
     unload must not log in, and a device that never initialised has nothing
     to darken.
     """
+    if session is not None and session._closed:
+        # The exit handler darkened and logged out; MTB can take no call now.
+        log.debug(
+            "%s: unloaded after the MTB logout; the exit handler darkened it", label
+        )
+        return
     if darken is not None:
         try:
             darken()

@@ -9,6 +9,7 @@ on the device's worker; a test that moves slowly waits for it
 from __future__ import annotations
 
 import logging
+import math
 import subprocess
 import sys
 import time
@@ -102,6 +103,7 @@ def test_a_read_does_not_wait_behind_a_move(core: CMMCorePlus, fake: FakeMTB) ->
     assert core.getPosition("Focus") == pytest.approx(1100.0)
 
 
+@pytest.mark.wallclock
 def test_busy_is_true_while_the_mtb_move_runs_and_false_after(
     core: CMMCorePlus, fake: FakeMTB
 ) -> None:
@@ -188,6 +190,7 @@ def test_a_target_outside_the_axis_range_is_refused_not_clamped(
     assert _moves(fake, "MTBStageAxisY") == []
 
 
+@pytest.mark.wallclock
 def test_a_move_while_moving_is_refused(core: CMMCorePlus, fake: FakeMTB) -> None:
     fake.axes["MTBPiezoFocusCan"].move_s = 0.5
     core.setPosition("Piezo", 300.0)
@@ -206,6 +209,8 @@ def test_xy_moves_x_then_y_and_skips_an_axis_already_there(
     core.waitForDevice("XYStage")
     legs = [(c[0], c[2]) for c in fake.calls if c[1] == "move_um"]
     assert legs == [("MTBStageAxisX", 120.0), ("MTBStageAxisY", -35.0)]
+    # A plate traverse, not the predecessor's 10 s (m4 §4, FM-10).
+    assert {c[3] for c in fake.calls if c[1] == "move_um"} == {60_000}
     core.setXYPosition("XYStage", 120.0, 400.0)
     core.waitForDevice("XYStage")
     legs = [(c[0], c[2]) for c in fake.calls if c[1] == "move_um"]
@@ -213,6 +218,7 @@ def test_xy_moves_x_then_y_and_skips_an_axis_already_there(
     assert core.getXYPosition("XYStage") == pytest.approx((120.0, 400.0))
 
 
+@pytest.mark.wallclock
 def test_stop_during_the_x_leg_cancels_the_y_leg(
     core: CMMCorePlus, fake: FakeMTB
 ) -> None:
@@ -481,6 +487,25 @@ def test_intensity_set_while_open_applies_to_the_lit_led(
         core.setProperty("Colibri", "Intensity", 101.0)
 
 
+def test_led_and_intensity_set_while_closed_light_nothing(
+    core: CMMCorePlus, fake: FakeMTB
+) -> None:
+    # Under auto-shutter a channel change comes between two exposures.
+    core.setProperty("Colibri", "LED", "475nm")
+    core.setShutterOpen("Colibri", True)
+    core.setShutterOpen("Colibri", False)
+    before = len(fake.calls)
+    core.setProperty("Colibri", "LED", "567nm")
+    core.setProperty("Colibri", "Intensity", 40.0)
+    assert fake.colibri.lit() == []
+    assert not [
+        c for c in fake.calls[before:] if c[1] in ("set_on", "set_intensity_pct")
+    ]
+    core.setShutterOpen("Colibri", True)
+    assert fake.colibri.lit() == [567]
+    assert fake.colibri.led_list[4].intensity == pytest.approx(40.0)
+
+
 def test_led_set_while_open_lights_the_new_led_and_none_closes(
     core: CMMCorePlus, fake: FakeMTB
 ) -> None:
@@ -535,9 +560,57 @@ def test_unload_darkens_the_light_and_never_raises(
     assert core.getLoadedDevices() == ("Core",)
 
 
+def test_unload_darkens_before_it_waits_for_a_move(
+    core: CMMCorePlus, fake: FakeMTB
+) -> None:
+    # unicore unloads in load order: XYStage first, the lights last.
+    core.setProperty("Colibri", "LED", "475nm")
+    core.setShutterOpen("Colibri", True)
+    core.setShutterOpen("TLShutter", True)
+    fake.axes["MTBStageAxisX"].move_s = 0.3
+    core.setXYPosition("XYStage", 50.0, 60.0)
+    core.unloadAllDevices()
+    calls = fake.calls
+    y_leg = calls.index(("MTBStageAxisY", "move_um", 60.0, 60_000))
+    led_off = calls.index(("LED475", "set_on", False))
+    tl_closed = calls.index(("MTBTLShutter", "move", 2, 30_000))
+    assert led_off < y_leg
+    assert tl_closed < y_leg
+    assert fake.colibri.lit() == []
+
+
+def test_a_nan_readback_is_no_arrival(core: CMMCorePlus, fake: FakeMTB) -> None:
+    fake.axes["MTBFocus"].deviation_um = math.nan
+    core.setPosition("Focus", 1100.0)
+    with pytest.raises(MTBError, match="reads nan"):
+        core.waitForDevice("Focus")
+
+
+def test_a_changer_move_to_another_state_while_moving_is_refused(
+    core: CMMCorePlus, fake: FakeMTB
+) -> None:
+    fake.changers["MTBReflectorChanger"].move_s = 0.5
+    core.setState("Reflector", 2)
+    try:
+        with pytest.raises(MTBError, match="is moving"):
+            core.setState("Reflector", 4)
+    finally:
+        core.waitForDevice("Reflector")
+    assert [c[2:] for c in _moves(fake, "MTBReflectorChanger")] == [(3, 30_000)]
+
+
+def test_an_x_target_outside_its_range_is_refused(
+    core: CMMCorePlus, fake: FakeMTB
+) -> None:
+    with pytest.raises(MTBError, match=r"XYStage X: 350001\.0"):
+        core.setXYPosition("XYStage", 350_001.0, 0.0)
+    assert _moves(fake, "MTBStageAxisX") == []
+
+
 def test_an_unloaded_light_leaves_no_darkener_for_the_exit(
     core: CMMCorePlus, fake: FakeMTB
 ) -> None:
+    assert set(session.shared()._darkeners) == {"TLShutter", "Colibri"}
     core.unloadAllDevices()
     assert session.shared()._darkeners == {}
 

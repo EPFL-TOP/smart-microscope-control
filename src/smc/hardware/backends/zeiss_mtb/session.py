@@ -83,6 +83,7 @@ class MTBSession:
         self._raw_controllers: dict[str, MTBLEDController] = {}
         self._darkeners: dict[str, Callable[[], None]] = {}
         self._closed = False
+        self._closing = False
 
     def _check(self) -> None:
         if self._closed:
@@ -127,34 +128,73 @@ class MTBSession:
         with self._lock:
             self._darkeners.pop(label, None)
 
-    def _close_at_exit(self) -> None:
-        """Darken, switch every LED off, then log out; each step tried, never raises.
+    def _run_darkeners(self) -> BaseException | None:
+        """Run every registered darkener, each tried; a failure is an ERROR.
 
-        Idempotent: ``use_api_factory`` runs it and unregisters it from
-        ``atexit``, and a second run finds the session closed.
+        Returns a ``KeyboardInterrupt`` (or other ``BaseException``) met on the
+        way, after every darkener has been tried, so that the caller still cuts
+        the light and then lets the operator's stop through (FM-49, FM-71).
         """
-        global _logged_out
         with self._lock:
-            if self._closed:
-                return
-            self._closed = True
             darkeners = list(self._darkeners.items())
-            self._darkeners.clear()
-            controllers = list(self._raw_controllers.items())
-        _logged_out = True
+        interrupted: BaseException | None = None
         for label, darken in darkeners:
             try:
                 darken()
             except Exception as exc:
                 log.error("%s: %s: %s", LIGHT_MAY_STILL_BE_ON, label, exc)
+            except BaseException as exc:
+                log.error("%s: %s: interrupted (%r)", LIGHT_MAY_STILL_BE_ON, label, exc)
+                interrupted = interrupted or exc
+        return interrupted
+
+    def _darken_now(self) -> None:
+        """Darken every lit device now, before an unload waits for a move (m4 §8).
+
+        An unload goes in load order, and an axis or a changer waits there for
+        a move MTB cannot stop, up to its timeout: the light must not wait with
+        it. Never raises a failure; an interrupt goes on once all were tried.
+        """
+        interrupted = self._run_darkeners()
+        if interrupted is not None:
+            raise interrupted
+
+    def _close_at_exit(self) -> None:
+        """Darken, switch every LED off, then log out; each step tried, no failure raised.
+
+        The darkeners run while the session still serves: they go through the
+        components it handed out, which refuse every call once it is closed.
+        Only then is it closed and logged out. A ``KeyboardInterrupt`` met on
+        the way is raised after the logout, so the light is still cut and the
+        operator's stop is not lost (FM-49, FM-71).
+
+        Idempotent: ``use_api_factory`` runs it and unregisters it from
+        ``atexit``, and a second run finds it already run.
+        """
+        global _logged_out
+        with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+            controllers = list(self._raw_controllers.items())
+        interrupted = self._run_darkeners()
         for mtb_id, controller in controllers:
-            _all_off(controller, mtb_id)
+            try:
+                _all_off(controller, mtb_id)
+            except BaseException as exc:
+                interrupted = interrupted or exc
+        with self._lock:
+            self._closed = True
+            self._darkeners.clear()
+        _logged_out = True
         try:
             self._api.logout()
         except Exception as exc:
             log.error("MTB logout failed at exit: %s", exc)
         else:
             log.info("MTB logged out")
+        if interrupted is not None:
+            raise interrupted
 
 
 def _all_off(controller: MTBLEDController, mtb_id: str) -> None:
@@ -278,6 +318,18 @@ class _GuardedController:
         self._raw.set_manual_mode(timeout_ms)
 
 
+def _darken_if_logged_in() -> None:
+    """Run the darkeners of the process's session, if it has one; never logs in.
+
+    For a device's unload, which must neither log in nor wait for a move
+    with the light on (m4 §8).
+    """
+    with _lock:
+        session = _session
+    if session is not None and not session._closing:
+        session._darken_now()
+
+
 def shared() -> MTBSession:
     """The process's session, logging in on the first call.
 
@@ -341,10 +393,12 @@ def _using(factory: Callable[[], MTBApi]) -> Iterator[None]:
     finally:
         with _lock:
             session = _session
-        if session is not None:
-            session._close_at_exit()
-            atexit.unregister(session._close_at_exit)
-        with _lock:
-            _session = None
-            _logged_out = False
-            _factory = None
+        try:
+            if session is not None:
+                atexit.unregister(session._close_at_exit)
+                session._close_at_exit()
+        finally:
+            with _lock:
+                _session = None
+                _logged_out = False
+                _factory = None
