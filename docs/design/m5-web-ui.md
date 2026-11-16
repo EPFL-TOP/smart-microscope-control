@@ -5907,6 +5907,164 @@ measures it and says so in its Report.
 - **Not here.** The strip (D25), the CLI, `Microscope.stop()` and the errors; the Plate
   and Stand screens; the strip's three lines on the Ti2-E's profile (#529).
 
+#### 17.12.11 Leftovers of #470: a single run and a stopped scan, the chain's name, the page's keys (#499, 2026-11-16)
+
+Fixed by #499's plan, from the two reviews of #496 and its develop Reports. None of it is a
+defect on the default path (STOP, *Resume*, *Continue the scan*): each point is a place where
+the page says less than it knows, or goes wrong one step off that path. Additive: nothing above
+is renamed or removed, D14's rule and D18's chain keep their tools, and the points that need no
+decision (the last bullet of the decisions) are built as the issue lists them.
+
+**What was measured** (2026-11-16, `main` at `909db32`, throwaway probes on the `demo`
+profile over `FakeCore`, with the tests' stub scan, which saves a checkpoint after field 4 of 12
+and is STOPped at field 5; not committed):
+
+- **One click on *Lay out the fields* with that scan stopped** took `reachable_checkpoint("scan")`
+  from `stopped` to `None` and `scan_end.resumable` from true to false. The Scan screen still said
+  `Stopped by STOP at field 5 of 12.`, with *Start the scan* enabled and no word of the checkpoint
+  that was gone.
+- **After a layout the page itself ran** (the plan's record then reads `{'plate': <attempt>,
+  'camera-calibration': None, 'timings': None}`), a lone `timing` run made `scan-plan` and `scan`
+  stale: `plan` was unusable and `resumable` false, from the expert view's *Run*. A
+  `camera-calibration` run does the same (an optional read that was absent and now has a provider),
+  and so does a run of any provider of `plate`. The slots `scan` reads, through the plugins'
+  `reads` and `reads_optional` and the providers' own, are `scan-plan`, `plate`,
+  `camera-calibration` and `timings`; the tools that feed it are `scan-plan`, `timing`,
+  `camera-calibration`, `plate-registration`, `plate-walls`, `plate-finding` and
+  `plate-orientation`. `_chain_drops_a_checkpoint` follows the first level only.
+- ***Measure the time* on a page served with `--dry-run`**: `blocked["timing"]` is `None`, and a
+  click that arrives (FM-169) ran `timing`, whose own refusal is a **failed record**
+  (`PluginRunError: timing: a dry run cannot time the stand ...`, written over any usable
+  `timings`). The strip said `Run all that are left: Timing failed: timing: a dry run cannot
+  time the stand ...; not run: Field layout`: the label is `RUN_ALL_LABEL` for every chain.
+- **A terminal's `scan` record** (`failed`, `OSError: disk full`, another attempt) written over
+  the stopped one: `scan_end` read `kind='stopped', done=5, total=12, text='OSError: disk full'`.
+  `_reported` and `_stopped_activity` are keyed by the tool's name, so the page said `Stopped by
+  STOP at field 5 of 12.` for a disk that was full.
+- **The Scan screen's *Command* disclosure**: after a redraw while a continued scan runs it says
+  `smc run scan ...` with no `--resume` (no scan end stands while the record is `running`). The
+  leftover's wording holds only between the click and the next redraw, which the tick does not
+  make (it reads the run document).
+- **`Microscope` has no `halted`.** `Executor.halted` is private to it; the issue's "the facade's
+  `halted`" is `state().halted`. `_halted()` runs after `_refuse_if_busy()`, so no activity holds
+  the camera, and `state()` costs 0.4 ms idle (FM-239).
+
+**Decisions** (the first is for the owner to overrule):
+
+- **D30 A single run of a tool that feeds a stopped scan says so before the click; it is not
+  refused.** The question was *refuse or warn*. A chain runs tools the operator did not name, so
+  FM-236 refuses it. A single run names its tool, and *Lay out the fields* is the one way the
+  operator changes the plan after a STOP: a refusal would leave *Start again* as the only way to
+  give the checkpoint up, and it runs the scan with the plan the operator wants to change. A way
+  to give a checkpoint up without running the scan does not exist (it is not designed here), so
+  the page **warns where the click is**:
+  - `PlateView.checkpoint_notes: Mapping[str, str]` (last field): for each registered tool whose
+    slot a stage with a reachable checkpoint reads, through the closure below, and that is not
+    that stage, the note of the first such stage in the registry's order (`CHECKPOINT_NOTE_SCAN`
+    for `scan`, else `CHECKPOINT_NOTE`, §17.12.11's texts). Empty with no such checkpoint, and
+    for a stage whose checkpoint `reachable_checkpoint` does not find. Built in `view()`, the
+    same rules as `_chain_drops_a_checkpoint` (profile, dry run, stale).
+  - It is drawn under *Lay out the fields* (the `layout_wait` text, after the stand, the plate,
+    the registration, the selection and the busy note: a wait comes first), and under the
+    expert view's *Run* of each tool in the map (`tool_notes`, on the line after the reason and
+    the replace note). *Calibrate the camera* and *Register the plate* run feeders as well and
+    keep their words: the same defect one click from the Stand and Plate screens, and a note
+    under each would teach the operator to read none (§11.4's reason).
+  - **The closure** is one rule for the chain's refusal and the notes: a stage's slots are its
+    plugin's `reads` and `reads_optional`, then those of every plugin that provides one of them,
+    and so on (a visited set; `RunDocument.is_stale` is transitive by the records' own reads, the
+    plugins' declared ones are what the page can know before a run). `_chain_drops_a_checkpoint`
+    uses it, so that a chain of `timing` alone is refused for a stopped scan (§17.12.11's
+    first measure); its reason is as it was.
+  - The run itself is unchanged: a click on a tool with a note runs it. FM-236's last sentence
+    becomes *a single tool's own Run is the operator's deliberate choice, is not refused, and
+    says what it puts out of date before the click*.
+- **D31 A chain names itself.** `run_chain(plugins, params, *, label: str = RUN_ALL_LABEL)`; the
+  label opens every outcome of the chain (each `RUN_ALL_LABEL` prefix of `run_chain`,
+  `_run_chain`'s bug line and `_chain_outcome`) and is kept in
+  `ChainStatus.label` (last field, default `RUN_ALL_LABEL`), so that a second tab draws the same
+  (FM-151). *Measure the time* passes `MEASURE_THE_TIME`: `Measure the time: done in 8.0 s
+  (Timing, Field layout)`. §17.12.4's rule *the Wells screen draws the chain's line when the
+  chain's first tool is `timing`* becomes **the chain's label names the screen**: Wells draws
+  `chain_line` when the label is `MEASURE_THE_TIME`, Results when it is `RUN_ALL_LABEL`, and a
+  chain with another label is drawn on neither (whoever adds a chain button names its screen
+  in `_draw_chain_line`). A chain whose first tool was not `timing` (`timing` already `ok`) is
+  drawn on Wells now.
+- **D32 A chain says what its tools assumed.** `ChainEnd.assumed: tuple[str, ...] = ()` (last
+  field) holds the card's `assumed` lines of a tool that ended `done` (the same flat, bounded,
+  plain-text lines the single run's tail is made of), and `()` for any other end; `_Ended`
+  carries them. The strip's all-done outcome ends as a single run's does (`; assumed: <first
+  line> (+n more, on the card)`), the first line being that of the first tool that has any and
+  `n` the lines left over all the chain's tools. The chain's line ends `Done: Timing, Field
+  layout. Assumed: <the same first line>.`, with no count: the guided screens have no card
+  (§17.12.1's finding on a row's `(+2 more, on the card)`). A chain that stopped or failed says
+  nothing of assumed lines. `timing` puts its autofocus statement first (m3 §12, #513), so that
+  *Measure the time* says on the Wells screen that PFS was left off (FM-165).
+- **D33 `timing` is refused on a dry-run page by the controller.** `_timing_refusal()` returns
+  `MEASURE_NOT_IN_A_DRY_RUN` while the page is a dry run, in `_prepare` (after `plate-walls`'
+  refusal, before the parameters, nothing written: `Timing: A dry run cannot time ...`) and in
+  `_blocked` (so that the expert view's *Run* waits with it too: its refusal was a `failed`
+  record that replaced a usable `timings`, §11.4). The view's `_draw_measure_time` takes the
+  reason from `blocked`; its own `status.dry_run` branch goes (one source, FM-169, FM-182).
+- **D34 The page's account of how a scan ended belongs to the record's attempt.** `PlatePage`
+  keeps, under `_lock`, the `attempt` of each plugin's record as its latest activity left it
+  (`_attempts`): read from the run document **outside** the lock when `run_plugin` returns or
+  raises (an unreadable document keeps none: nothing is raised, FM-98), dropped with
+  `_reported` and `_stopped_activity` at the start of an activity or a chain's tool. `_scan_end`
+  uses the kept count and the STOP flag only when the kept attempt is the scan record's
+  `attempt`; otherwise `done` and `total` are `None` and `kind` is the record's (`stopped` for a
+  `stopped` record, else `failed`): a terminal's later run says its own end, as a new page does.
+- **D35 *Start again* ignores a second click within a second of the first.** A double-click
+  delivers both clicks, and the second confirms. `SCAN_AGAIN_MIN_AGE_S = 1.0` (`plate_page.py`):
+  the arm records when the first click armed (the view's `_clock`, `time.monotonic`, so that a
+  test moves it), and a click younger than that is dropped: nothing runs, the arm stays and the
+  confirm line stays. A deliberate second click follows the reading of the confirm line, which
+  takes longer. No label change: the confirm line appears on the same click, beside the button.
+- **Points that need no decision**, built as the issue lists them: `planned` (`_prepare`) counts
+  the plan's fields whose well is in `plan.wells`, since `wells_to_scan` drops the others and
+  `_on_progress` adds `planned - total` back to a resumed scan's counts, so an edited run
+  document with a field of a well outside `plan.wells` no longer offsets them; `_halted()` keeps
+  `state()` and says why in its docstring (the measure above; a facade property would be a
+  public accessor in `smc.hardware` for 0.4 ms at an idle click); `_draw_scan_command`'s
+  docstring says that the command is the one of the last redraw and a test pins the measure.
+
+```python
+#: smc/ui/guide.py
+CHECKPOINT_NOTE_SCAN = (
+    "This puts the {status} scan out of date: Continue the scan will not be offered "
+    "any more, and Start the scan takes it from the first field."
+)
+CHECKPOINT_NOTE = (
+    "This puts the {status} {stage} out of date: smc run {stage} --resume cannot "
+    "continue it afterwards."
+)
+CHAIN_ASSUMED = "Assumed: {line}"
+```
+
+`{status}` is `stopped` or `failed`, `{stage}` the plugin's name (the command's). The functions are
+`guide.checkpoint_note(stage: str, status: str) -> str` (pure) and the change of `chain_line`
+(same signature; the `Assumed:` sentence ends the all-done line).
+
+- **Tests and failure modes.** `tests/unit/test_plate_page_run_chain.py` (the chain's label, the
+  refusals' words, `timing` on a dry run, the closure), `test_plate_page_wells_scan_view.py` (the
+  line's screen, the note under *Lay out the fields* and the expert *Run*, the assumed sentence,
+  *Start again*'s age, the command), `test_plate_page_scan_status.py` (the attempt's key, the
+  resumed counts) and `test_ui_guide.py` (`checkpoint_note`, `chain_line`). FM-169 (D33's refusal
+  is the controller's), FM-172 and FM-236 (the closure; a single run's note), FM-165 (D32), FM-151
+  (the label is in the status), FM-139 (every text from a plugin is plain), FM-98 (D34 keeps
+  text), FM-64 (a STOP in a move is still `failed`: the words are D34's), FM-44 (D35's tests move
+  a clock and never sleep), FM-239 (`_halted`). FM-236's last sentence is amended (D30). **New
+  entries**, named by their text: *a page's account of a record kept under the tool's name
+  outlives the record* (D34); *a confirm that a double-click answers* (D35).
+- **`/ui-check`.** The states are unchanged, and `ui_snap.py` is not edited: a dry-run scan ends
+  in 0.03 s, before a STOP can land (§17.12.4). The Wells screen's note and the Results chain
+  line with an assumed sentence are measured in a one-off session on `demo-sample` served
+  without `--dry-run` (STOP in a scan, *Resume*, the Wells screen at 1280 x 800), cited in the
+  Report and not committed.
+- **Not here.** A way to give a checkpoint up without running the scan; notes under *Calibrate
+  the camera* and *Register the plate* (above); `Left` per well (D23); the strip's three lines
+  on the Ti2-E's profile (#529).
+
 ## 18. The page measures the offsets between objectives (#382)
 
 Fixed by #382's plan (2026-11-14). M3 §20 (`objective-offsets`, #380) measures how far
