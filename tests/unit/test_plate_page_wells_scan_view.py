@@ -958,7 +958,7 @@ def test_the_scan_lead_says_a_move_in_flight_finishes_first_on_a_stand_that_refu
 
 
 def test_the_scan_lead_says_where_a_cut_move_ends_on_a_stand_that_cuts_its_moves(
-    make_page: Callable[..., PlatePage],
+    make_page: Callable[..., PlatePage], run_doc: Path
 ) -> None:
     both = Profile.model_validate(
         {
@@ -995,6 +995,15 @@ def test_the_scan_lead_says_where_a_cut_move_ends_on_a_stand_that_cuts_its_moves
     )
     assert PlatePageView(make_page(profile=xy_only)).scan_lead_text.object == (
         f"{first}{cut} (at most 5000 µm in XY)."
+    )
+    # With a plan, last, since the run document is shared by every page above: the state
+    # the operator reads when pressing *Start the scan*, the fields and the objective
+    # first and then the same sentence, drawn again by the redraw a run's end makes.
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    view.refresh()
+    assert view.scan_lead_text.object == (
+        f"12 fields at {TEN_X}. {first}{cut} (at most 5000 µm in XY, 100 µm in Z)."
     )
 
 
