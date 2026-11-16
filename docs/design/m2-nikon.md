@@ -6,7 +6,7 @@
   for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206
   (2026-10-28), §11.11 for #224 (2026-10-30); §12 for #205 (2026-10-28);
   §13 for #340 (2026-11-05); §8.11 D8 and §12.10's amendments for #407
-  (2026-11-10); §11.12 for #221 (2026-11-14).
+  (2026-11-10); §11.12 for #221 (2026-11-14), §11.12.8 for #508 (2026-11-16).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -3474,8 +3474,9 @@ about the rest of the move:
 
 `SafetySection` gains `max_segment_um: float | None = None` and
 `max_z_segment_um: float | None = None`. Each, when set, is not a boolean
-(`_no_boolean`), finite and `> 0`; a `ProfileError` names the key. A model
-validator refuses a key whose role `stop_refused_by` does not name:
+(`_no_boolean`), finite, `> 0` and at least `MIN_SEGMENT_CAP_UM` (§11.12.8
+D7); a `ProfileError` names the key. A model validator refuses a key whose
+role `stop_refused_by` does not name:
 `max_segment_um cuts a move on a stand that refuses its stop, but
 stop_refused_by does not name xy_stage, so a stop already ends its moves:
 remove max_segment_um, or declare the refusal the stand showed` (and the same
@@ -3493,7 +3494,11 @@ SEGMENT_END_TOLERANCE_UM = 1.0
 
 
 def segment_targets_um(
-    start: tuple[float, ...], target: tuple[float, ...], max_segment_um: float
+    start: tuple[float, ...],
+    target: tuple[float, ...],
+    max_segment_um: float,
+    *,
+    key: str = "max_segment_um",  # §11.12.8 D6: names the key in a refusal
 ) -> tuple[tuple[float, ...], ...]:
     """The end of each segment of a straight move, the last being ``target`` itself (D2)."""
 
@@ -3512,7 +3517,8 @@ class SegmentPlan(Generic[T]):
 ```
 
 - `Safety(..., max_segment_um: float | None = None, max_z_segment_um: float |
-  None = None)`: each finite and `> 0` or `ValueError`, and a `ValueError` when
+  None = None)`: each finite, `> 0` and at least `MIN_SEGMENT_CAP_UM` (§11.12.8
+  D7) or `ValueError`, and a `ValueError` when
   its role is not in `stop_refused_by`, as the profile validates (code that
   builds a `Safety` directly gets the same rule). Attributes of the same names.
 - `Executor.segmented(description: str, plan: Callable[[], SegmentPlan[T]], *,
@@ -3561,6 +3567,119 @@ class SegmentPlan(Generic[T]):
 - The time a long Z move takes in one call on the Ti2-E, against segments.
 - Whether the 1.0 µm of D3 holds at the 40× and with a plate: session 2 read
   it at the 10× with no sample.
+
+#### 11.12.8 Bounding a segmented move (#508)
+
+Found by the failure-modes review of #221 and again by the review of #507.
+**Merging this section decides it.** It extends D1 (the key), D2 (the cut) and
+D3 (the landing check); §11.12.3 and §11.12.4 are amended above where they
+differ.
+
+**What is known** (measured 2026-11-16, `main` 2171853; `segment_targets_um` is
+plain Python, so no vendor library is involved; the float behaviour below is the
+same on Python 3.10.10 and 3.13.0):
+- **The plan has no bound.** `segment_targets_um((0, 0), (1e10, 0), 5000)`
+  builds 2 000 000 targets in 7.7 s and 257 MB at peak (tracemalloc); 1e9 µm
+  gives 200 000 in 0.80 s and 26 MB, 1e8 µm gives 20 000 in 0.08 s and 3 MB:
+  about 4 µs and 130 bytes a segment, all inside the move's lock section and
+  before the first send.
+- **It is worse than the issue's bare `OverflowError`.** A finite ratio too
+  large to loop over never ends: `(0,) → (1e308,)` at 100 µm has `d / cap =
+  1e306`, and the list comprehension turns that many times (the call was still
+  running when it was killed after three minutes). `OverflowError` ("cannot convert float infinity
+  to integer", from `math.ceil`) is the case where the ratio overflows to `inf`
+  (`d = 1e308` at `cap = 0.005`) or the distance does: `math.dist((-1e308,),
+  (1e308,))` is `inf`, without an exception.
+- **The Ti2-E's largest plan, with its soft limits** (`profiles/nikon-ti2.toml`):
+  23 XY segments (the diagonal of [-49 000, 49 000] × [-29 000, 29 000] µm,
+  113.9 mm, at 5000 µm) and 44 Z segments (4340 µm at 100 µm).
+- **A segment costs** about 0.19 s + 0.044 s per mm in XY and 0.23-0.35 s in Z
+  (§11.12.1).
+- **What D3's check can see.** A segment that never moved reads at its start,
+  one segment's length from its target, and the check passes within 1 µm. With
+  `n = ceil(d / cap)` equal segments, `d > (n - 1) cap`, so every segment is
+  longer than `cap (n - 1) / n`, which is at least `cap / 2` for `n ≥ 2`. A cap
+  of 2 µm or more therefore makes every segment of every plan longer than 1 µm:
+  the check can fire. Below 2 µm there are plans it cannot fire on: at a cap of
+  1.99 µm, a move of 1.99 µm and a hair is two segments of 0.995 µm.
+
+**D6. A move has at most 200 segments, refused before anything is sent.**
+`MAX_SEGMENTS = 200`, a constant in `safety.py`. Chosen, not measured: 4.5
+times the Ti2-E's largest plan (44), and at the cost above 40 to 80 s of calls,
+long but a move whose every segment logs a line, not a stand that looks hung.
+- **Where.** In `segment_targets_um`, the one place the plans of both axes pass,
+  on the float `distance / max_segment_um`, before `math.ceil` and before any
+  list is built, written `not ratio <= MAX_SEGMENTS` (FM-74: a size derived from a
+  float is bounded on the float). 200 segments are allowed, 201 refused.
+- **What it raises.** `SafetyRefusedError` with no `how_to_force`, never
+  forceable, like a soft-limit refusal: the CLI exits 2 and prints the reason; a
+  plugin that skips a target on `except SafetyRefusedError` skips a move it cannot
+  make. Two
+  texts, both naming the key, neither printing a count (it can be 1e306 or
+  `inf`):
+  - the distance is finite and the ratio is above 200 (`inf` included): `a move of
+    <d:.4g> µm cut at <cap:g> µm ([safety] <key>) would be more than the 200
+    segments one move may have; nothing was sent. Move less far, or check <key>`;
+  - the distance itself is not finite (the subtraction overflowed): `a move from
+    <start> to <target> µm has no finite length, so it cannot be cut at <cap:g>
+    µm ([safety] <key>); nothing was sent`, the points written by `_coords`
+    without rounding, as the move lines write them.
+- **Signature.** `segment_targets_um(start, target, max_segment_um, *, key:
+  str = "max_segment_um")`: `key` is what the refusal names. `MMXYStage._plan`
+  passes `"max_segment_um"`, `MMZStage._plan` `"max_z_segment_um"`. The
+  `ValueError`s for points that are not finite or not of one length, and for a
+  cap that is not finite and `> 0`, are unchanged: the backends refuse a start
+  that is not finite (`_finite_start`) and a target that is not finite
+  (`check_*_target_um`) before it is called.
+- **Before anything is sent.** The plan is built inside the move's lock section,
+  where the start is read, before the first segment: the refusal leaves the lock
+  free and no `rest_not_sent` note (that note starts with the first segment). A Z
+  move under an autofocus builds its plan before the suspend (§11.12.5), so the
+  refusal never touches the autofocus. A dry run builds the plan, so it refuses
+  too.
+- Not chosen: *a profile key for the bound* (as D3's tolerance: one stand, one
+  measurement; a stand that needs another value makes it a key then). *A check
+  of the soft limits' span against the cap when the profile loads*: the limits
+  are optional and a move rarely spans them. *A second check in
+  `Executor.segmented`*: the targets exist by then, and the point is to refuse
+  before the allocation. *A bound in seconds*: a plan has no clock.
+
+**D7. A cap is at least 2 µm.** `MIN_SEGMENT_CAP_UM = 2 *
+SEGMENT_END_TOLERANCE_UM`, a constant in `safety.py`. `max_segment_um` and
+`max_z_segment_um` are finite, `> 0` and `≥ 2 µm`; exactly 2 is accepted. The
+profile (`SafetySection`) raises a `ProfileError` that names the key, `Safety`
+a `ValueError`, from one text, `segment_cap_below_floor(key, cap)`, next to
+`segment_without_refusal`: `<key> must be at least 2 µm, got <cap>: a segment no
+longer than the 1 µm landing tolerance reads as landed even if it never moved,
+so the check that bounds a stop (m2 §11.12 D3) could not fire; raise <key>, or
+remove it`, `<cap>` as the file wrote it (`str` of the float: `0.005`, `1.0`).
+The checks run in this order: a boolean, finite and `> 0` (their texts are
+unchanged), the floor, then D1's declared role.
+- **Why 2 µm and not the 1 µm of the issue's wording.** The derivation above: a
+  cap of 1 to 2 µm still admits plans with segments of 1 µm or less, so a floor
+  at the tolerance leaves the hole it is meant to close. 2 µm is the least cap
+  for which every segment is longer than the tolerance; the sensible cap stays
+  the owner's (`profiles/nikon-ti2.toml`: 5000 and 100, unchanged).
+- `segment_targets_um` does not enforce the floor: it takes the cap `Safety`
+  validated, and its arithmetic stays pure, so a test can show what a cap of
+  1.99 µm cuts.
+- Not chosen: *a floor with a margin* (10 µm, ten times the landing error): a
+  stand with a delicate Z may want 5 µm, and the floor is the least the check
+  can work with, not a recommendation. *A warning*: a cap is set once, by the
+  owner, in a file; a typo stops the load, as the other keys do.
+
+**D8. The words.** `profiles/README.md`'s two rows say "at least 2 µm" and that
+a move that would need more than 200 segments is refused. No other text changes:
+the D5 texts, the Ctrl-C line and the `!` line are as they were, and the plate
+page's wording is #509's.
+
+**Tests** (`tests/unit/test_segmented_move.py`, `tests/unit/test_profile.py`):
+one per decision, on a `FakeCore` and on the profile loader; the plan names them.
+
+**Not verified.** That 200 is the right bound for a stand whose moves are long
+and slow: it follows from the Ti2-E's 44, and the visit that times a long Z move
+in one call against segments (§11.12.7) may revise it. Nothing here needs the
+stand: a refusal sends nothing.
 
 ## 12. Engaging an autofocus that drives Z to its offset's plane (#205)
 
