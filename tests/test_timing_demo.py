@@ -32,6 +32,7 @@ from typing import Any, cast
 
 import pytest
 
+from recording_autofocus import RecordingAutofocus
 from smc.hardware import Microscope
 from smc.hardware.capabilities import (
     XY,
@@ -67,6 +68,20 @@ NO_LIMITS = (
 LEFT_OFF = (
     "the autofocus was switched off for the measurement and did not lock "
     "again; engage it again before the scan"
+)
+#: Written out and not imported (FM-124): the first ``assumed`` line of a run that
+#: switched an engaged autofocus off before its probe (m3 §12, #513).
+AUTOFOCUS_OFF_LINE = (
+    "the autofocus was switched off before anything moved, so that no lock crossed "
+    "a well's wall: engage it again on the sample"
+)
+AUTOFOCUS_OFF_WARNING = (
+    "timing: the autofocus was switched off before anything moved, so that no "
+    "lock crosses a well's wall (m2 §12.2 D2): engage it again after the run"
+)
+LEFT_OFF_BY_THIS_RUN = (
+    "the autofocus was switched off by this run and is left off, not engaged "
+    "again: engaging drives Z"
 )
 
 
@@ -337,8 +352,10 @@ def test_a_measured_run_fills_the_slot_on_the_demo(
     assert filling is not None
     assert filling.plugin == "timing"
     assert filling.result == record.result
-    # Locked again at the end: the stand is as it was found.
-    assert autofocus.is_engaged()
+    # The lock was timed, then switched off before the 9 mm probe and left off:
+    # the record says so first (m3 §12, #513).
+    assert not autofocus.is_engaged()
+    assert result.assumed[0] == AUTOFOCUS_OFF_LINE
 
 
 def test_every_given_channel_is_timed(
@@ -449,13 +466,14 @@ def test_progress_reports_each_step(
         channels=("FITC", "Cy5"),
     )
 
-    # Two distances, the autofocus (measured), the bare snap, two channels.
+    # The autofocus (measured) first, since the lock is timed before the stage
+    # moves (m3 §12, #513), then two distances, the bare snap, two channels.
     assert [p.total for p in seen] == [6] * 6
     assert [p.done for p in seen] == [1, 2, 3, 4, 5, 6]
     assert [p.message for p in seen] == [
+        "autofocus lock",
         "stage 100 µm",
         "stage 400 µm",
-        "autofocus lock",
         "snap",
         "channel FITC",
         "channel Cy5",
@@ -1058,21 +1076,18 @@ def test_each_autofocus_sample_starts_from_disengaged(
 
     result = _result(_run(fake_microscope, tmp_path, repeats=3, distances_um=SHORT))
 
-    assert (
-        _autofocus_calls(fake_core)
-        == [
-            "enableContinuousFocus(False)",
-            "enableContinuousFocus(True)",
-        ]
-        * 3
-    )
+    # Three timed samples, then the one switch-off before the probe.
+    assert _autofocus_calls(fake_core) == [
+        "enableContinuousFocus(False)",
+        "enableContinuousFocus(True)",
+    ] * 3 + ["enableContinuousFocus(False)"]
     assert result.refocus_ms is not None
-    # The fake's stage reports no soft limits, and nothing else was assumed.
-    assert result.assumed == (NO_LIMITS,)
+    # The fake's stage reports no soft limits; the switch-off is said first.
+    assert result.assumed == (AUTOFOCUS_OFF_LINE, NO_LIMITS)
     # 12 stage + 3 autofocus + 3 bare snaps.
     assert result.samples == 18
-    # Locked again: the stand is as it was found.
-    assert fake_microscope.require(Autofocus).is_engaged()
+    # Left off, never engaged again (m3 §12, FM-88).
+    assert not fake_microscope.require(Autofocus).is_engaged()
 
 
 class _LosesTheLock(FakeCore):
@@ -1146,27 +1161,30 @@ def test_an_autofocus_that_is_off_is_not_switched_on(
     ) in result.assumed
 
 
-def test_an_autofocus_on_but_not_locked_is_not_timed(
+def test_an_autofocus_on_but_not_locked_is_not_timed_and_is_switched_off(
     fake_core: FakeCore, fake_microscope: Microscope, tmp_path: Path
 ) -> None:
+    """PFS on and searching follows its reference over a wall too, and drives Z (m2 §12.11 D9)."""
     fake_core.enableContinuousFocus(True)
     fake_core.autofocus_lockable = False
     fake_core.log.clear()
 
     result = _result(_run(fake_microscope, tmp_path, repeats=2, distances_um=SHORT))
 
-    assert _autofocus_calls(fake_core) == []
+    assert _autofocus_calls(fake_core) == ["enableContinuousFocus(False)"]
     assert result.refocus_ms == ASSUMED_REFOCUS_MS
     assert (
         f"refocus {ASSUMED_REFOCUS_MS:.0f} ms is assumed: the autofocus was on "
         "but not locked on the sample"
     ) in result.assumed
-    assert fake_microscope.require(Autofocus).is_engaged()
+    assert result.assumed[0] == AUTOFOCUS_OFF_LINE
+    assert not fake_microscope.require(Autofocus).is_engaged()
 
 
-def test_with_autofocus_false_touches_nothing(
+def test_with_autofocus_false_times_no_lock_and_still_switches_an_engaged_autofocus_off(
     fake_core: FakeCore, fake_microscope: Microscope, tmp_path: Path
 ) -> None:
+    """Timed or not, an engaged PFS must not cross a well's wall locked (FM-223)."""
     _engaged(fake_core)
 
     result = _result(
@@ -1179,13 +1197,14 @@ def test_with_autofocus_false_touches_nothing(
         )
     )
 
-    assert _autofocus_calls(fake_core) == []
+    assert _autofocus_calls(fake_core) == ["enableContinuousFocus(False)"]
     assert result.refocus_ms == ASSUMED_REFOCUS_MS
     assert (
         f"refocus {ASSUMED_REFOCUS_MS:.0f} ms is assumed: with_autofocus is false"
         in result.assumed
     )
-    assert fake_microscope.require(Autofocus).is_engaged()
+    assert result.assumed[0] == AUTOFOCUS_OFF_LINE
+    assert not fake_microscope.require(Autofocus).is_engaged()
 
 
 def test_a_stand_without_autofocus_has_no_refocus(
@@ -1303,34 +1322,64 @@ def test_a_halt_during_the_engage_propagates(
     ]
 
 
-def test_a_stop_before_a_sample_does_not_switch_the_autofocus_off(
+def test_a_stop_before_the_first_sample_switches_nothing_off_and_moves_nothing(
     fake_core: FakeCore,
     fake_microscope: Microscope,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The stop that arrives between the stage and the first lock leaves the autofocus on."""
+    """The stop that arrives after the last read before the lock section leaves PFS locked and the stage still."""
     _engaged(fake_core)
     stop = threading.Event()
-    real = fake_microscope.require(XYStage)
-    seen = 0
+    real_is_locked = fake_microscope.require(Autofocus).is_locked
 
-    def on_move(n: int) -> None:
-        nonlocal seen
-        seen = n
-        if n == 4:  # the last move of a repeats=1 stage section
-            stop.set()
+    def is_locked() -> bool:
+        locked = real_is_locked()
+        stop.set()  # the last autofocus read before the first sample
+        return locked
 
-    stage = _CostedStage(real, _Clock(), on_move=on_move)
-    fake_microscope.override(XYStage, stage)
+    _patch_autofocus(fake_microscope, is_locked=is_locked)
+    stage = _costed(fake_microscope, _Clock())
 
     record = _run(fake_microscope, tmp_path, stop=stop, repeats=1, distances_um=SHORT)
 
     assert record.status is StageStatus.stopped
-    assert seen == 4
     assert _autofocus_calls(fake_core) == []
+    assert stage.moves == 0
     assert _warnings(caplog) == []
-    assert fake_microscope.require(Autofocus).is_engaged()
+    assert fake_core.isContinuousFocusEnabled()
+
+
+def test_a_stop_between_the_lock_section_and_the_switch_off_moves_and_switches_nothing(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stop asked before the switch-off sends nothing: the lock is kept, nothing moved (m3 §12)."""
+    _engaged(fake_core)
+    stop = threading.Event()
+    real_engage = fake_microscope.require(Autofocus).engage
+
+    def engage(timeout_s: float | None = None) -> bool:
+        locked = real_engage(timeout_s)
+        stop.set()  # after the last sample of the section, before the switch-off
+        return locked
+
+    _patch_autofocus(fake_microscope, engage=engage)
+    stage = _costed(fake_microscope, _Clock())
+
+    record = _run(fake_microscope, tmp_path, stop=stop, repeats=1, distances_um=SHORT)
+
+    assert record.status is StageStatus.stopped
+    # The one sample of the section, and no switch-off after it.
+    assert _autofocus_calls(fake_core) == [
+        "enableContinuousFocus(False)",
+        "enableContinuousFocus(True)",
+    ]
+    assert stage.moves == 0
+    assert _warnings(caplog) == []
+    assert fake_core.isContinuousFocusEnabled()
 
 
 def _patch_autofocus(
@@ -1617,29 +1666,42 @@ def test_the_start_is_read_after_the_stage_has_settled(
     assert stage.targets[:2] == [(1300.0, -250.0), (1000.0, -250.0)]
 
 
-def test_the_autofocus_is_read_before_the_stage_moves(
+def test_an_outside_switch_off_during_the_lock_section_is_not_undone_and_the_probe_still_runs(
     fake_core: FakeCore,
     fake_microscope: Microscope,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """m2 §12: the lock read before any move decides; the operator's switch-off during the probe is theirs."""
+    """FM-129: the operator's switch-off after the first sample is theirs; the switch-off finds PFS off and sends nothing."""
     clock = _with_clock(monkeypatch)
     _engaged(fake_core)
-    _costed(
-        fake_microscope,
-        clock,
-        on_move=lambda n: fake_core.enableContinuousFocus(False) if n == 1 else None,
-    )
+    real_engage = fake_microscope.require(Autofocus).engage
+
+    def engage(timeout_s: float | None = None) -> bool:
+        locked = real_engage(timeout_s)
+        fake_core.enableContinuousFocus(False)  # someone else, right after the lock
+        return locked
+
+    _patch_autofocus(fake_microscope, engage=engage)
+    stage = _costed(fake_microscope, clock)
 
     result = _result(_run(fake_microscope, tmp_path, repeats=2, distances_um=SHORT))
 
     assert (
         f"refocus {ASSUMED_REFOCUS_MS:.0f} ms is assumed: something else switched "
-        "the autofocus off during the measurement; no sample locked"
-    ) in result.assumed
-    # Only the operator's call: the plugin sent nothing.
-    assert _autofocus_calls(fake_core) == ["enableContinuousFocus(False)"]
+        "the autofocus off during the measurement; 1 of 2 samples locked, median "
+    ) in " ".join(result.assumed)
+    # The plugin's one disengage and engage, then the operator's call: no second
+    # engage, and the switch-off before the probe found it off and sent nothing.
+    assert _autofocus_calls(fake_core) == [
+        "enableContinuousFocus(False)",
+        "enableContinuousFocus(True)",
+        "enableContinuousFocus(False)",
+    ]
+    assert AUTOFOCUS_OFF_LINE not in result.assumed
+    assert LEFT_OFF not in result.assumed
+    # The probe ran whole: 2 distances x 2 repeats x (out, back).
+    assert stage.moves == 8
 
 
 def test_the_clock_is_perf_counter() -> None:
@@ -1713,3 +1775,202 @@ def test_the_medians_of_the_lock_the_snaps_and_the_switches_are_the_costs_given(
     # 12 stage + 3 autofocus + 3 bare snaps + 2 channels x 3 snaps + 2 switches.
     assert result.samples == 26
     assert (engage_ms, snap_ms, select_ms) == ([], [], [])
+
+
+# ------------------------- PFS across a well's wall: the switch-off (m3 §12, #513)
+
+
+def test_the_lock_is_timed_and_the_autofocus_switched_off_before_the_first_stage_move(
+    fake_core: FakeCore, fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The issue's reproduction: the 9 mm probe used to carry a locked PFS past a well's wall (FM-223)."""
+    _engaged(fake_core)
+
+    result = _result(
+        _run(fake_microscope, tmp_path, repeats=2, distances_um=(200.0, 9000.0))
+    )
+
+    lines = [
+        line
+        for line in fake_core.log
+        if line.startswith(("enableContinuousFocus", "setXYPosition"))
+    ]
+    autofocus_at = [
+        i for i, line in enumerate(lines) if line.startswith("enableContinuousFocus")
+    ]
+    moves_at = [i for i, line in enumerate(lines) if line.startswith("setXYPosition")]
+    # Two timed samples, then the one switch-off.
+    assert [lines[i] for i in autofocus_at] == [
+        "enableContinuousFocus(False)",
+        "enableContinuousFocus(True)",
+        "enableContinuousFocus(False)",
+        "enableContinuousFocus(True)",
+        "enableContinuousFocus(False)",
+    ]
+    assert moves_at
+    assert max(autofocus_at) < min(moves_at)
+    assert "setXYPosition('XY', 9000.0, 0.0)" in lines
+    assert result.refocus_ms is not None
+    assert not fake_microscope.require(Autofocus).is_engaged()
+    assert result.assumed[0] == AUTOFOCUS_OFF_LINE
+
+
+def test_a_normal_end_after_a_timed_lock_warns_once_that_the_autofocus_was_switched_off(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The lock came every time: the one WARNING is the switch-off's, and `did not lock again` is not said."""
+    _engaged(fake_core)
+
+    result = _result(_run(fake_microscope, tmp_path, repeats=2, distances_um=SHORT))
+
+    assert _warnings(caplog) == [AUTOFOCUS_OFF_WARNING]
+    assert LEFT_OFF not in result.assumed
+
+
+def test_a_stop_during_the_probe_says_the_autofocus_was_left_off(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stop after the switch-off leaves PFS off, and the stage's WARNING comes with the autofocus's."""
+    _engaged(fake_core)
+    stop = threading.Event()
+    stage = _costed(
+        fake_microscope,
+        _Clock(),
+        on_move=lambda n: stop.set() if n == 1 else None,
+    )
+
+    record = _run(fake_microscope, tmp_path, stop=stop, repeats=1, distances_um=SHORT)
+
+    assert record.status is StageStatus.stopped
+    assert stage.moves == 1
+    assert _autofocus_calls(fake_core)[-1] == "enableContinuousFocus(False)"
+    assert not fake_core.isContinuousFocusEnabled()
+    assert _warnings(caplog) == [
+        AUTOFOCUS_OFF_WARNING,
+        "the stage is left at (100.0, 0.0) µm, not returned to (0.0, 0.0) µm",
+        LEFT_OFF_BY_THIS_RUN,
+    ]
+
+
+_NOT_SWITCHED_OFF = (
+    "the autofocus could not be switched off before anything moved ({cause}): "
+    "nothing moved, and PFS may still be on: switch it off at the stand, then run "
+    "timing again"
+)
+_STILL_READS_ON = (
+    "the autofocus still reads on after it was switched off: nothing moved: switch "
+    "it off at the stand, then run timing again"
+)
+
+
+@pytest.mark.parametrize(
+    ("options", "reason", "calls"),
+    [
+        (
+            {"fails": "disengage"},
+            _NOT_SWITCHED_OFF.format(cause="CoreError: disengage failed on the fake"),
+            ["is_engaged", "disengage"],
+        ),
+        (
+            {"stays_on": True},
+            _STILL_READS_ON,
+            ["is_engaged", "disengage", "is_engaged"],
+        ),
+        (
+            {"read_fails_after_off": True},
+            _NOT_SWITCHED_OFF.format(
+                cause="CoreError: is_engaged failed on the fake after the switch-off"
+            ),
+            ["is_engaged", "disengage", "is_engaged"],
+        ),
+    ],
+    ids=["disengage-raises", "still-on", "read-back-raises"],
+)
+def test_a_switch_off_that_fails_ends_timing_before_the_stage_moves(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    options: dict[str, Any],
+    reason: str,
+    calls: list[str],
+) -> None:
+    """Unknown counts as on (FM-19): §5.7's text, whole, and the stage did not move."""
+    af = RecordingAutofocus(engaged=True, **options)
+    fake_microscope.override(Autofocus, af)
+    stage = _costed(fake_microscope, _Clock())
+
+    with pytest.raises(PluginRunError) as caught:
+        _run(
+            fake_microscope,
+            tmp_path,
+            repeats=1,
+            distances_um=SHORT,
+            with_autofocus=False,
+        )
+
+    assert caught.value.reason == reason
+    assert af.calls == calls
+    assert stage.moves == 0
+    # Nothing was switched off by a lock section and nothing moved: nothing to say.
+    assert _warnings(caplog) == []
+    assert _stored(tmp_path).status is StageStatus.failed
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    ["limits", "channel"],
+)
+def test_a_refusal_before_anything_moves_leaves_an_engaged_autofocus_on(
+    fake_microscope: Microscope, tmp_path: Path, refusal: str
+) -> None:
+    """A refusal after the switch-off would have switched PFS off for a run that never moves."""
+    af = RecordingAutofocus(engaged=True)
+    fake_microscope.override(Autofocus, af)
+    limits = (
+        (Limits(-5000.0, 5000.0), Limits(-5000.0, 5000.0))
+        if refusal == "limits"
+        else None
+    )
+    stage = _costed(fake_microscope, _Clock(), limits=limits)
+    params: dict[str, Any] = (
+        {"distances_um": (200.0, 9000.0)}
+        if refusal == "limits"
+        else {"distances_um": SHORT, "channels": ("NOT-A-CHANNEL",)}
+    )
+
+    with pytest.raises(PluginRunError):
+        _run(fake_microscope, tmp_path, repeats=1, **params)
+
+    assert "disengage" not in af.calls
+    assert af.engaged is True
+    assert stage.moves == 0
+
+
+def test_a_searching_autofocus_is_switched_off_before_the_probe_and_not_timed(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """PFS on and not locked drives Z the moment it finds its reference: `is_engaged()` decides."""
+    af = RecordingAutofocus(engaged=True, locked=False)
+    fake_microscope.override(Autofocus, af)
+
+    result = _result(_run(fake_microscope, tmp_path, repeats=2, distances_um=SHORT))
+
+    assert af.calls == [
+        "is_engaged",
+        "is_locked",
+        "is_engaged",
+        "disengage",
+        "is_engaged",
+    ]
+    assert af.engaged is False
+    assert result.assumed[0] == AUTOFOCUS_OFF_LINE
+    assert (
+        f"refocus {ASSUMED_REFOCUS_MS:.0f} ms is assumed: the autofocus was on "
+        "but not locked on the sample"
+    ) in result.assumed

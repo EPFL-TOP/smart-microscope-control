@@ -15,6 +15,15 @@ measurement may do to the stand:
   and never what something else switched off. A refocus it could not measure
   is assumed, and says so (``assumed``), rather than recorded as the five
   seconds a timeout took.
+* **The lock is timed first, then an engaged autofocus is switched off before the
+  stage moves, and it stays off** (FM-223, m3 §12, #513). The probe goes 9 mm
+  along X, past a 24-well well's radius, and a PFS locked while it does follows
+  its reference over the wall with no guard (m2 §12.2 D2). So the lock is timed
+  at the start with the stage where it was found, and whatever is still engaged
+  (the lock section's own, one that was not timed, one that is searching) is
+  switched off through the one function the wall walks use, before the first
+  move. Nothing engages it again (FM-88): ``assumed`` says first that it was
+  switched off, so that the operator engages it again before the scan.
 * **A distance is the one the stage read back** (FM-142): a stage that stops
   short of a probe is not a measurement of that distance, and the run fails
   after it is back, naming how far it went.
@@ -38,6 +47,7 @@ from smc.hardware.capabilities import XY, Autofocus, Camera, Channels, XYStage
 from smc.hardware.errors import SafetyRefusedError
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.errors import PluginRunError
+from smc.plugins.plate_walls.loop import AUTOFOCUS_OFF_LINE, switch_off_autofocus
 from smc.plugins.slots import TimingsResult
 from smc.plugins.timing.algorithm import (
     ASSUMED_REFOCUS_MS,
@@ -89,7 +99,9 @@ class TimingParams(PluginParams):
         True,
         description=(
             "Time the autofocus lock: it is switched off and on again `repeats` "
-            "times, so it must be on and locked on the sample."
+            "times, so it must be on and locked on the sample. Either way, an "
+            "engaged autofocus is then switched off before the stage moves and "
+            "left off, so that no lock crosses a well's wall."
         ),
     )
     channels: tuple[str, ...] = Field(
@@ -198,17 +210,21 @@ class TimingPlugin:
         params: TimingParams,
         ctx: RunContext,
     ) -> TimingsResult:
-        """Move the stage, time the autofocus and the camera; raise when the stage did not go.
+        """Time the autofocus, then move the stage and time it and the camera; raise when the stage did not go.
 
-        The stage moves by up to ``distances_um[1]`` along X from where it
-        stands and comes back; the autofocus is switched off and on again
-        ``repeats`` times; a channel is selected and the one found selected
-        back. After a stop, a halt or a fault none of that is undone.
+        The autofocus is switched off and on again ``repeats`` times with the
+        stage where it was found, and an autofocus still engaged is then
+        switched off and left off before the stage moves (FM-223, m3 §12). The
+        stage moves by up to ``distances_um[1]`` along X from where it stands
+        and comes back; a channel is selected and the one found selected back.
+        After a stop, a halt or a fault none of that is undone.
 
         Raises:
             PluginRunError: A dry run, a channel the stand does not have, a start
-                that is not a position, soft limits that fit no probe, or a stage
-                that did not go the distance asked (after it is back).
+                that is not a position, soft limits that fit no probe, an
+                autofocus that could not be switched off before the stage moved
+                (nothing moved), or a stage that did not go the distance asked
+                (after it is back).
             StopRequested: The operator stopped it; the stand is as it was left.
         """
         xy = microscope.require(XYStage)
@@ -249,11 +265,11 @@ class TimingPlugin:
         left = _Left()
         refocus_ms: float | None = None
         samples = 0
+        # Whether the lock section left the autofocus off (it did not lock again):
+        # read before the switch-off below, which sets `left.autofocus_off` for a
+        # different reason. This one alone decides the normal end's warning.
+        lock_left_off = False
         try:
-            points, stage_samples = _probe_stage(
-                xy, start, sign, params, ctx, left, step
-            )
-            samples += stage_samples
             if autofocus is None:
                 pass
             elif skipped is not None:
@@ -270,6 +286,23 @@ class TimingPlugin:
                     refocus_ms = measured.ms
                 if left.autofocus_off:
                     assumed.append(_LEFT_OFF)
+            lock_left_off = left.autofocus_off
+
+            # The lock is timed with the stage where it was found, then PFS is
+            # switched off before the 9 mm probe: a lock carried over a well's wall
+            # follows its reference with no guard (m3 §12, FM-223). A stop asked
+            # before it sends nothing. A switch-off that fails ends the run with
+            # the stage still: the handler below reads `left`, which says that
+            # nothing is away, and the error passes through it unchanged (FM-98).
+            ctx.raise_if_stopped()
+            if switch_off_autofocus(_NAME, autofocus, ctx):
+                left.autofocus_off = True
+                assumed.insert(0, AUTOFOCUS_OFF_LINE)
+
+            points, stage_samples = _probe_stage(
+                xy, start, sign, params, ctx, left, step
+            )
+            samples += stage_samples
 
             snap_ms = _median_snap_ms(camera, params.repeats, ctx)
             samples += params.repeats
@@ -302,7 +335,7 @@ class TimingPlugin:
             _warn_left(ctx, left, xy, start, autofocus, channels, found)
             raise
 
-        if left.autofocus_off:
+        if lock_left_off:
             # A normal end that leaves the autofocus off: the result says so too.
             ctx.logger.warning(_LEFT_OFF)
         overhead_ms, ms_per_mm = fit_line(points)
