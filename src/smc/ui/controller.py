@@ -131,6 +131,7 @@ from smc.plugins.slots.plate import (
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 from smc.ui.frames import Frame
 from smc.ui.guide import (
+    ASSUMED_LINE_CHARS,
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     GOTO_ESTIMATED,
@@ -305,7 +306,7 @@ _OFFSETS_ERROR_CHARS = 2000
 
 #: The strip says a finished run's first assumption, cut here: a pointer to the card, which
 #: holds every line at ``_CARD_TEXT_CHARS`` (m5 §8.8.2).
-_STRIP_ASSUMED_CHARS = 160
+_STRIP_ASSUMED_CHARS = ASSUMED_LINE_CHARS
 
 #: Two reference centres are the same when they differ by at most this: a JSON dump
 #: rounds, and a capture made by hand is never within a hundredth of a micrometre of the
@@ -810,13 +811,16 @@ class _Ended(NamedTuple):
     true when STOP was pressed during the run and a move it stopped ended it ``failed``
     (FM-64: the record stays ``failed``, the words say stopped). ``detail`` is the
     one line of a ``stopped`` or ``failed`` end **without the tool's title**, for the
-    Plate row that a *Go to* was sent from (m5 §17.12 D20).
+    Plate row that a *Go to* was sent from (m5 §17.12 D20). ``assumed`` are the card's
+    ``assumed`` lines of a record that ended ``done``, ``()`` for any other end: a chain
+    copies them into its ``ChainEnd`` (m5 §17.12.11 D32).
     """
 
     outcome: str
     status: Literal["done", "stopped", "failed"]
     stopped_by_stop: bool = False
     detail: str = ""
+    assumed: tuple[str, ...] = ()
 
 
 class _LatestShown:
@@ -944,12 +948,15 @@ class ChainEnd:
     ``how`` is ``done`` (its record ended ``done``), ``failed`` (the run raised: its record
     is ``failed``), ``stopped`` (its record is ``stopped``) or ``refused`` (the checks of
     ``run`` said no, and nothing was written). ``outcome`` is the text a single run of that
-    tool would have left.
+    tool would have left. ``assumed`` are the card's ``assumed`` lines of a tool that ended
+    ``done`` (flat, bounded, plain text) and ``()`` for any other end: the chain's strip and
+    line say the first one, as a single run's strip does (m5 §17.12.11 D32, FM-165).
     """
 
     plugin: str
     how: Literal["done", "failed", "stopped", "refused"]
     outcome: str
+    assumed: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1105,7 +1112,10 @@ def _chain_outcome(
 ) -> str:
     """The strip's text for a chain that ran to its end without a bug of its own (m5 §17.11.2).
 
-    ``<label>: done in <s> s (<titles>)`` when every tool ended ``done``; else ``<label>:
+    ``<label>: done in <s> s (<titles>)`` when every tool ended ``done``, then ``; assumed:
+    <the first line of the first tool that has some> (+n more, on the card)`` with ``n`` over
+    all the chain's tools (m5 §17.12.11 D32: *Measure the time* dropped ``left the autofocus
+    off``, FM-165); else ``<label>:
     <the outcome of the tool that stopped it>``, or ``<label>: stopped before <tool>`` after
     a STOP between two tools, then ``; done: <titles>`` and ``; not run: <titles>`` (the
     tools after the one it stopped at or before) when there are some. The label is the
@@ -1116,9 +1126,10 @@ def _chain_outcome(
     """
     done = [end.plugin for end in ended if end.how == "done"]
     if stopped_before is None and len(done) == len(tools):
+        assumed = [line for end in ended for line in end.assumed]
         return (
             f"{label}: done in {seconds:.1f} s "
-            f"({', '.join(tool_title(tool) for tool in tools)})"
+            f"({', '.join(tool_title(tool) for tool in tools)}){_assumed_tail_of(assumed)}"
         )
     if stopped_before is not None:
         head = f"{label}: stopped before {tool_title(stopped_before)}"
@@ -1555,12 +1566,20 @@ def _assumed_tail(record: StageRecord) -> str:
     lines are the card's, so they are flat, bounded and never markup (FM-125,
     FM-139), and empty unless the record ended ``done`` (FM-154).
     """
-    assumed = _card(record).assumed
-    if not assumed:
+    return _assumed_tail_of(_card(record).assumed)
+
+
+def _assumed_tail_of(lines: Sequence[str]) -> str:
+    """``; assumed: <the first line, cut>`` and ``(+n more, on the card)`` for the rest; ``""`` for no line.
+
+    One place for a single run's strip and a chain's (m5 §17.12.11 D32): the chain's lines
+    are those of all its tools, in its order, so ``n`` counts every line but the first.
+    """
+    if not lines:
         return ""
-    tail = f"; assumed: {_cut(assumed[0], _STRIP_ASSUMED_CHARS)}"
-    if len(assumed) > 1:
-        tail += f" (+{len(assumed) - 1} more, on the card)"
+    tail = f"; assumed: {_cut(lines[0], _STRIP_ASSUMED_CHARS)}"
+    if len(lines) > 1:
+        tail += f" (+{len(lines) - 1} more, on the card)"
     return tail
 
 
@@ -3199,6 +3218,8 @@ class PlatePage:
                         tool,
                         "stopped" if result.stopped_by_stop else result.status,
                         result.outcome,
+                        # Only a tool that ended `done` has an assumption to say (FM-154).
+                        result.assumed if result.status == "done" else (),
                     )
                 ended.append(end)
                 following = tools[len(ended)] if len(ended) < len(tools) else None
@@ -3500,9 +3521,12 @@ class PlatePage:
             note = ""
             if record.provides == "plate":
                 note = self._follow_plate(turned_from)
+            # The card's lines, read once: the strip's tail and a chain's both say them.
+            assumed = _card(record).assumed
             return _Ended(
-                f"{title} done in {seconds:.1f} s{_assumed_tail(record)}{note}",
+                f"{title} done in {seconds:.1f} s{_assumed_tail_of(assumed)}{note}",
                 "done",
+                assumed=assumed,
             )
         return _Ended(f"{title} stopped", "stopped", detail="Stopped.")
 

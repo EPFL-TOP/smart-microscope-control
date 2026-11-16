@@ -233,6 +233,7 @@ def _fresh_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     StubScan.before_report = None
     Slow.started = threading.Event()
     Slow.release = threading.Event()
+    StubTiming.assumed = ()
     # Presets are read from the working directory's `profiles/presets`.
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("SMC_PROFILES", raising=False)
@@ -2151,12 +2152,15 @@ class StubTiming:
     reads: tuple[str, ...] = ()
     reads_optional: tuple[str, ...] = ()
     repeats: ClassVar[list[int]] = []
+    #: What the stub says it assumed, as the real one says it left the autofocus off.
+    assumed: ClassVar[tuple[str, ...]] = ()
 
     def run(
         self, microscope: Any, params: StubTimingParams, ctx: RunContext
     ) -> TimingsResult:
         StubTiming.repeats.append(params.repeats)
         return TimingsResult(
+            assumed=StubTiming.assumed,
             move_overhead_ms=100.0,
             move_ms_per_mm=10.0,
             refocus_ms=None,
@@ -2212,7 +2216,8 @@ def test_the_chain_line_is_drawn_on_the_screen_of_the_button_that_started_it(
     assert page.join(BOUND_S)
     view.tick()
     # Measure the time's chain: on the Wells screen, never under Run all that are left.
-    assert view.wells_chain_text.object == "Done: Timing, Field layout."
+    # (The layout of this plate says what it assumed after the full stop: D32's own test.)
+    assert view.wells_chain_text.object.startswith("Done: Timing, Field layout.")
     assert view.chain_text.visible is False
     # A chain whose label is the Results button's is drawn on Results only.
     page._chain = ChainStatus(("cells", "density"), (), "cells")
@@ -2237,6 +2242,71 @@ def test_the_chain_line_is_drawn_on_the_screen_of_the_button_that_started_it(
     assert view.wells_chain_text.visible is False
 
 
+def test_measure_the_time_says_what_timing_assumed_on_the_wells_screen(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """The real ``timing`` says first that PFS was left off; only the expert view's card showed it (FM-165)."""
+    StubTiming.repeats = []
+    StubTiming.assumed = ("left the autofocus off",)
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    page.select_text("B11, B2")
+    view = PlatePageView(page)
+    view.refresh()
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    view.tick()
+
+    assert view.wells_chain_text.object == (
+        "Done: Timing, Field layout. Assumed: left the autofocus off."
+    )
+    # The strip ends as a single run's does, the count being what the records hold.
+    stages = RunDocument.load(run_doc).stages
+    held = [
+        line
+        for tool in ("timing", "scan-plan")
+        for line in controller_module._card(stages[tool]).assumed
+    ]
+    assert held[0] == "left the autofocus off"
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert "; assumed: left the autofocus off" in outcome
+    if len(held) > 1:
+        assert outcome.endswith(f" (+{len(held) - 1} more, on the card)")
+    else:
+        assert outcome.endswith("; assumed: left the autofocus off")
+
+
+def test_the_chain_says_the_first_assumption_of_the_first_tool_that_has_one(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """``timing`` assumed nothing here: the line and the strip say the layout's own first line (the plate records no objective)."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    page.select_text("B11, B2")
+    view = PlatePageView(page)
+    view.refresh()
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    view.tick()
+
+    stages = RunDocument.load(run_doc).stages
+    assert controller_module._card(stages["timing"]).assumed == ()
+    layout = controller_module._card(stages["scan-plan"]).assumed
+    assert len(layout) > 1
+    assert view.wells_chain_text.object == (
+        f"Done: Timing, Field layout. Assumed: {layout[0]}."
+    )
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.endswith(
+        f" s (Timing, Field layout); assumed: {layout[0]} "
+        f"(+{len(layout) - 1} more, on the card)"
+    )
+
+
 def test_measure_the_time_says_its_own_name_on_the_strip(
     make_page: Callable[..., PlatePage], run_doc: Path
 ) -> None:
@@ -2253,7 +2323,7 @@ def test_measure_the_time_says_its_own_name_on_the_strip(
     outcome = page.status().outcome
     assert outcome is not None
     assert outcome.startswith("Measure the time: done in ")
-    assert outcome.endswith(" s (Timing, Field layout)")
+    assert " s (Timing, Field layout)" in outcome
     chain = page.status().chain
     assert chain is not None
     assert chain.label == MEASURE_THE_TIME

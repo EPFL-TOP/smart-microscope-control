@@ -56,6 +56,7 @@ from smc.ui.controller import (
 )
 from smc.ui.guide import (
     AGAIN_NOTE,
+    ASSUMED_LINE_CHARS,
     AUTOFOCUS_WORDS,
     CAMERA_NOT_CALIBRATED_NOTE,
     CAPTURE_FAR,
@@ -3709,6 +3710,80 @@ def test_the_chain_line_names_a_tool_outside_results_by_its_plain_title() -> Non
         None,
     )
     assert chain_line(done) == "Done: Timing, Field layout."
+
+
+def test_chain_line_ends_an_all_done_chain_with_its_first_assumed_line() -> None:
+    """*Measure the time* dropped the ``left the autofocus off`` warning, which only a card showed (m5 §17.12.11 D32, FM-165)."""
+    done = ChainStatus(
+        ("timing", "scan-plan"),
+        (
+            ChainEnd(
+                "timing", "done", "Timing done in 3.0 s", ("left the autofocus off",)
+            ),
+            ChainEnd("scan-plan", "done", "Field layout done in 0.1 s"),
+        ),
+        None,
+    )
+    assert chain_line(done) == (
+        "Done: Timing, Field layout. Assumed: left the autofocus off."
+    )
+    # The first line of the first tool that has some; no count (the guided screens have no card).
+    several = ChainStatus(
+        ("timing", "scan-plan"),
+        (
+            ChainEnd("timing", "done", "Timing done in 3.0 s"),
+            ChainEnd(
+                "scan-plan",
+                "done",
+                "Field layout done in 0.1 s",
+                ("pixel size from the profile", "a second line"),
+            ),
+        ),
+        None,
+    )
+    assert chain_line(several) == (
+        "Done: Timing, Field layout. Assumed: pixel size from the profile."
+    )
+    # A line that already ends with a full stop gets no second one; line breaks are spaces.
+    stopped_at_a_dot = ChainStatus(
+        ("timing",),
+        (ChainEnd("timing", "done", "x", ("left it as it was.\nand more",)),),
+        None,
+    )
+    assert chain_line(stopped_at_a_dot) == (
+        "Done: Timing. Assumed: left it as it was. and more."
+    )
+    # A long line is cut as the strip cuts the first assumption: the card holds the whole.
+    long = "x" * (ASSUMED_LINE_CHARS + 40)
+    cut = chain_line(
+        ChainStatus(("timing",), (ChainEnd("timing", "done", "x", (long,)),), None)
+    )
+    assert cut == f"Done: Timing. Assumed: {'x' * ASSUMED_LINE_CHARS}…."
+    # A chain that stopped or failed says nothing of what a tool assumed, and a chain still
+    # going names the tool.
+    stopped = ChainStatus(
+        ("timing", "scan-plan"),
+        (ChainEnd("timing", "done", "x", ("left the autofocus off",)),),
+        None,
+    )
+    assert "Assumed" not in chain_line(stopped)
+    failed = ChainStatus(
+        ("timing", "scan-plan"),
+        (
+            ChainEnd("timing", "done", "x", ("left the autofocus off",)),
+            ChainEnd("scan-plan", "failed", "Field layout failed: no"),
+        ),
+        None,
+    )
+    assert "Assumed" not in chain_line(failed)
+    going = ChainStatus(
+        ("timing", "scan-plan"),
+        (ChainEnd("timing", "done", "x", ("left the autofocus off",)),),
+        "scan-plan",
+    )
+    assert chain_line(going) == "Running Field layout (2 of 2)."
+    # ChainEnd of three arguments still builds: the default is no assumed line.
+    assert ChainEnd("timing", "done", "x").assumed == ()
 
 
 def test_checkpoint_note_names_the_status_and_the_way_for_scan_and_for_any_other_stage() -> (
