@@ -196,6 +196,18 @@ def test_the_default_margin_is_a_thousand_micrometres() -> None:
     assert REACH_MARGIN_UM == 1000.0
 
 
+def test_the_default_margin_is_the_one_that_ships() -> None:
+    """A1 sits at (0, 0): 1 000 µm inside the first travel (reachable), 999 µm inside the second (not).
+
+    A default that drifts to another margin between 0 and 5 000 µm would change one of the two.
+    """
+    plan = _pinned_at_the_origin("96-well")
+    exactly = ((-1000.0, 1e6), (-1e6, 1000.0))
+    one_short = ((-999.0, 1e6), (-1e6, 999.0))
+    assert reachable_refs(plan, exactly) == ("A1", "A12", "H1")
+    assert reachable_refs(plan, one_short) == ("B2", "B12", "H2")
+
+
 @pytest.mark.parametrize(
     ("plate", "corners"),
     [

@@ -1781,6 +1781,31 @@ def test_the_reach_note_names_the_corners_of_another_plate() -> None:
     )
 
 
+def test_a_turn_gives_its_own_rows_on_a_travel_that_is_not_symmetric() -> None:
+    # On the Ti2-E's travel a turn only renames wells in place and the block keeps its
+    # names, so no test there can see the orientation. A 96-well centred on the origin in
+    # a travel that holds its left half only: not turned, the left half is columns 1 to 6;
+    # turned 180 degrees about the holder, those wells are named by the other half, 7 to
+    # 12. Typed out from the geometry (9 mm pitch, A1 at (-49 500, 31 500) not turned and
+    # at (49 500, -31 500) turned).
+    left_half = ((-60000.0, 0.0), (-40000.0, 40000.0))
+    kwargs = {"holder_centre_um": (0.0, 0.0), "xy_limits_um": left_half}
+    assert suggested_centres("96-well", orientation="not-turned", **kwargs) == (
+        "A1",
+        "A6",
+        "H1",
+    )
+    assert suggested_centres("96-well", orientation="turned-180", **kwargs) == (
+        "A7",
+        "A12",
+        "H7",
+    )
+    assert centres_reach_note("96-well", orientation="turned-180", **kwargs) == (
+        "Not the plate's far corners (A1, A12 and H1): the stage's soft limits cut them, "
+        "as the holder places this plate."
+    )
+
+
 def test_the_corners_are_joined_in_words() -> None:
     assert _join_names(("A1",)) == "A1"
     assert _join_names(("A1", "A4")) == "A1 and A4"

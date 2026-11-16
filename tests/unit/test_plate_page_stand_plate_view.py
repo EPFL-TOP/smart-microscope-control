@@ -1806,6 +1806,52 @@ def test_the_rows_keep_their_wells_after_a_capture_and_a_registered_plate(
     assert view.reach_note.object == GREINER_CORNERS_NOTE
 
 
+def test_the_page_gives_the_holders_estimate_the_orientation_it_shows(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    # On the Ti2-E's travel a turn keeps the names, so the orientation cannot be seen there.
+    # A 96-well centred on the origin in a travel that holds the left half only: the left
+    # half is columns 1 to 6 not turned and 7 to 12 turned (the geometry's, typed out).
+    base = Profile.demo()
+    profile = base.model_copy(
+        update={
+            "holder": HolderSection(
+                plate_centre_xy_um=(0.0, 0.0), measured="a test's own centre"
+            ),
+            "safety": base.safety.model_copy(
+                update={"xy_soft_limits_um": ((-60000.0, 0.0), (-40000.0, 40000.0))}
+            ),
+        }
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", fake_core), profile)
+    page = PlatePage(microscope, run_doc, entry_points=_entry_points(StubGoto, Slow))
+    try:
+        view = PlatePageView(page)
+        view.show_step("plate")
+        page.choose_plate("96-well")
+        view.refresh()
+        assert page.suggested_centres() == ("A1", "A6", "H1")
+        assert [slot.goto_button.label for slot in view.centre_slots] == [
+            "Go to A1",
+            "Go to A6",
+            "Go to H1",
+        ]
+        page.choose_orientation("turned-180")
+        view.refresh()
+        assert page.suggested_centres() == ("A7", "A12", "H7")
+        assert [slot.goto_button.label for slot in view.centre_slots] == [
+            "Go to A7",
+            "Go to A12",
+            "Go to H7",
+        ]
+        assert page.centres_reach_note().startswith(
+            "Not the plate's far corners (A1, A12 and H1)"
+        )
+    finally:
+        page.close()
+        microscope.close()
+
+
 def test_the_reach_note_takes_no_height_where_nothing_is_cut(
     page: PlatePage, ti2e_page: PlatePage
 ) -> None:
