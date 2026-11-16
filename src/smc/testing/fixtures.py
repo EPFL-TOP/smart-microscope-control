@@ -28,14 +28,17 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Iterator
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
 import pytest
 
+from smc.hardware.backends.zeiss_mtb import session as mtb_session
 from smc.hardware.capabilities import Camera
 from smc.hardware.core import close_core, find_install, open_core
 from smc.hardware.microscope import Microscope
 from smc.hardware.profile import Profile
+from smc.testing.fake_mtb import FakeMTB, fake_stand_config
 from smc.testing.fakes import FakeCore
 from smc.testing.synthetic import PlateSample, SampleCamera
 
@@ -49,15 +52,21 @@ __all__ = [
     "demo_microscope_with_sample",
     "fake_core",
     "fake_microscope",
+    "fake_mtb",
     "hardware_microscope",
     "mm_available",
     "pytest_addoption",
+    "zeiss_fake_microscope",
 ]
 
 #: Why a hardware test was skipped: it is the line a user sees at the stand.
 NO_PROFILE = (
     "hardware tests need --profile <name>; run them only at the microscope (ADR-0005)"
 )
+#: The Zeiss profile the fake MTB stand opens (m4 §9.2).
+ZEISS_PROFILE = "zeiss-observer7"
+#: The LED the fake Zeiss stand opens with (one of the Colibri's six).
+ZEISS_FAKE_LED = "475nm"
 #: Why a test that reaches for the stand without the marker fails.
 NOT_MARKED = "hardware_microscope is only for tests marked @pytest.mark.hardware"
 
@@ -214,6 +223,43 @@ def fake_microscope(fake_core: FakeCore) -> Iterator[Microscope]:
         yield microscope
     finally:
         microscope.close()
+
+
+@pytest.fixture
+def fake_mtb() -> FakeMTB:
+    """The Observer 7's MTB in Python, for ``zeiss_fake_microscope`` (m4 §9.1)."""
+    return FakeMTB()
+
+
+@pytest.fixture
+def zeiss_fake_microscope(fake_mtb: FakeMTB, tmp_path: Path) -> Iterator[Microscope]:
+    """The ``zeiss-observer7`` profile on ``FakeMTB``, opened as a tool opens it (m4 §9.2).
+
+    The profile's own ``.cfg`` runs, without its PVCAM camera
+    (``fake_stand_config``), inside ``session.use_api_factory``, so the stand
+    needs neither pythonnet nor a Micro-Manager adapter and leaves no MTB
+    session behind (FM-46). It has no camera and no autofocus.
+    """
+    profile = Profile.load(ZEISS_PROFILE)
+    cfg = profile.config_path()
+    assert cfg is not None, f"{ZEISS_PROFILE} names no .cfg"
+    stand_cfg = fake_stand_config(cfg, tmp_path)
+    fake_profile = profile.model_copy(
+        update={
+            "micromanager": profile.micromanager.model_copy(
+                update={"config": str(stand_cfg)}
+            )
+        }
+    )
+    with mtb_session.use_api_factory(lambda: fake_mtb):
+        microscope = Microscope.open(fake_profile, dry_run=False)
+        try:
+            # The Colibri lights nothing until an LED is chosen (m4 §7.6), as
+            # an operator does before imaging; the contracts open the shutter.
+            microscope.core.setProperty("Colibri", "LED", ZEISS_FAKE_LED)
+            yield microscope
+        finally:
+            microscope.close()
 
 
 @pytest.fixture

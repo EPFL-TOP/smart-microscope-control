@@ -174,6 +174,10 @@ New findings arrive as *Hardware session report* issues and land here.
 - PC: HP Z840, Windows 10 LTSB 2015 (unsupported), Zeiss `MicoIf` FPGA
   card with proprietary `MicoIfDrv` — replacement risk documented in the
   tracking tool's `docs/pc_replacement.md`.
+- smc profile: [`profiles/zeiss-observer7.toml`](../../profiles/zeiss-observer7.toml)
+  and its `.cfg`, the MTB components as unicore Python devices
+  (`smc.hardware.backends.zeiss_mtb`, design [m4](../design/m4-zeiss.md));
+  built and tested on `FakeMTB` only, never loaded at the stand (#27).
 
 ## Viventis LS1 (×2)
 

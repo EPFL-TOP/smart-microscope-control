@@ -1,7 +1,8 @@
 """Contract fixtures: one stand per backend, its envelope, and the put-back (design §8).
 
-Every contract runs on three backends: ``fake`` (``FakeCore``), ``demo``
-(Micro-Manager's demo devices) and ``hardware`` (the stand ``--profile``
+Every contract runs on four backends: ``fake`` (``FakeCore``), ``demo``
+(Micro-Manager's demo devices), ``zeiss-fake`` (the Zeiss profile's unicore
+devices over ``FakeMTB``, m4 §9.2) and ``hardware`` (the stand ``--profile``
 names; deselected unless ``-m hardware``). The tests never import a
 backend class: they only go through ``Microscope``.
 
@@ -57,6 +58,7 @@ T = TypeVar("T")
 _STANDS = {
     "fake": "whole_unit_fake_microscope",
     "demo": "demo_microscope",
+    "zeiss-fake": "zeiss_fake_microscope",
     "hardware": "hardware_microscope",
 }
 
@@ -170,6 +172,7 @@ def _require_inside(
     params=[
         pytest.param("fake", id="fake"),
         pytest.param("demo", id="demo", marks=pytest.mark.demo),
+        pytest.param("zeiss-fake", id="zeiss-fake"),
         pytest.param("hardware", id="hardware", marks=pytest.mark.hardware),
     ]
 )
@@ -272,13 +275,18 @@ def dry_microscope(stand: Microscope, envelope: Envelope) -> Microscope:
     )
 
 
+#: The backends whose stand may lack a capability: a real one, and the Zeiss
+#: fake stand, which has no camera and no autofocus (m4 §9.2).
+_SKIPS_WHAT_IT_LACKS = frozenset({"hardware", "zeiss-fake"})
+
+
 def _capability(facade: Microscope, backend: str, capability: type[T]) -> T:
-    """``require(capability)``; on ``hardware`` only, a stand without it skips.
+    """``require(capability)``; on ``hardware`` and ``zeiss-fake``, a stand without it skips.
 
     On ``fake`` and ``demo`` a missing capability is a broken role
     resolution, which must fail the test rather than skip it.
     """
-    if backend == "hardware" and not facade.has(capability):
+    if backend in _SKIPS_WHAT_IT_LACKS and not facade.has(capability):
         pytest.skip(f"this stand has no {capability.__name__}")
     return facade.require(capability)
 
