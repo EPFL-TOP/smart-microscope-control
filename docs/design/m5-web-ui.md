@@ -6184,6 +6184,12 @@ of `profiles/nikon-ti2.toml`, against its `xy_soft_limits_um = [[-49000, 49000],
   click in the expert view stays the one way to capture another well, and a capture of
   another well is listed after the three (§17.4.2). Revisit it when a stand's travel holds
   fewer than three wells of a plate.
+- **D7 A profile whose `[sample]` is of the page's plate keeps the corners.** The sample's
+  own references are the plate's corners (§8.2) and a row then says `known from the
+  profile's sample`: the rows must name the wells the references name. The test is the
+  profile's (`sample_plate == plate`), never `registers_from_sample`, which turns false at
+  the first capture and would reshuffle the rows then (D2). No profile has both a
+  `[sample]` and soft limits today; this keeps the two sources of truth one.
 
 ### 19.3 The interface
 
@@ -6242,7 +6248,8 @@ own `suggested_centres(plate)`, as before); every other line of it is unchanged.
 `smc/ui/controller.py`: `PlatePage.suggested_centres()` and `PlatePage.centres_reach_note()`
 call the two with the page's plate, `profile.holder.plate_centre_xy_um`, `self.orientation`
 and `profile.safety.xy_soft_limits_um`: the profile is the page's for its whole life, and the
-limits are the ones `Microscope` builds its `Safety` from.
+limits are the ones `Microscope` builds its `Safety` from. With `sample_plate == plate`
+(D7) they pass no holder and no limits, so the rows are the corners and the note is empty.
 
 `smc/ui/plate_page.py`: `_draw_plate_screen` passes `suggested=page.suggested_centres()` to
 `centre_rows` and says `page.centres_reach_note()` in a new `self.reach_note` pane
@@ -6262,7 +6269,8 @@ three rows and before `other_captures` (FM-171's guard walks `screens`).
   well and refuses A6 and D1.
 - `tests/unit/test_plate_page_stand_plate_view.py`: the rows, the buttons and the note on a
   page whose profile has the Ti2-E's limits and holder; the rows after a capture and after
-  a registered plate; the note hidden on a stand with no limits.
+  a registered plate; the note hidden on a stand with no limits; the corners kept with a
+  `[sample]` of the plate (D7).
 - A demo test (`@pytest.mark.demo`): the real `goto-well` drives to each suggested well on
   such a stand, and `A6` is refused with the layer's text.
 - **Failure modes**: FM-169 (the layer's refusal stays the guard; the suggestion is a
