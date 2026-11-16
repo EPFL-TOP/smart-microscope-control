@@ -85,6 +85,7 @@ __all__ = [
     "GOTO_UNPLACED",
     "GOTO_WALL_NEEDS_REGISTRATION",
     "LAY_OUT_FIRST",
+    "LEFT_NOT_KNOWN_NO_TIMING",
     "MAP_FIELDS_UP_TO",
     "MEASURE_AFTER_THE_SCAN",
     "MEASURE_NOT_IN_A_DRY_RUN",
@@ -409,6 +410,10 @@ SAMPLE_REGISTERS = (
 
 #: The Wells screen's plan line while no timing was measured (part B replaces it with a button).
 TIME_NOT_KNOWN = "Time: not known (no timing measured yet)"
+
+#: The Scan screen's *Left* while the plan has no timing (#514): the pace of the fields in a well
+#: knows nothing of the stage's travel between two wells, and the plan has no figure for it either.
+LEFT_NOT_KNOWN_NO_TIMING = "Left: not known (no timing measured yet)"
 
 #: The Wells screen's two fields, in plain words, above each (D20): the fields are the tools'
 #: own and keep their names in the expert view.
@@ -1705,7 +1710,12 @@ def scan_wait(*, connected: bool, blocked: str | None, plan_usable: bool) -> str
 
 
 def scan_progress_lines(
-    done: int, total: int, clock: RunClock | None, *, running: bool
+    done: int,
+    total: int,
+    clock: RunClock | None,
+    *,
+    running: bool,
+    timing_known: bool = True,
 ) -> tuple[str, ...]:
     """The Scan screen's lines under the bar: the field, the time so far and the time left (m5 §17.4.4, §17.10.3).
 
@@ -1716,11 +1726,19 @@ def scan_progress_lines(
     has fields left, and says it is not known until there are two reports a clock tick
     apart (FM-197: Windows below Python 3.13 ticks every 15.6 ms, so two reports can carry
     one stamp): never a division by zero, never a negative time.
+
+    ``timing_known`` is whether the plan carries a timing (``estimate_s``). Without one *Left*
+    says it is not known, and gives no number: the pace of the fields inside a well says
+    nothing of the stage's travel between two wells, and on the Ti2-E's rehearsal it said
+    ``about 1 s`` for the 8 s that travel took (#514). The Wells screen says ``Time: not
+    known`` for the same plan, and the two now agree (FM-170: an unknown is not a number).
     """
     lines = [f"Field {done} of {total}"]
     if clock is not None:
         lines.append(f"Elapsed {duration_text(max(0.0, clock.elapsed_s))}")
-    if running and done < total:
+    if running and done < total and not timing_known:
+        lines.append(LEFT_NOT_KNOWN_NO_TIMING)
+    elif running and done < total:
         first, last = (None, None) if clock is None else (clock.first, clock.last)
         if (
             first is not None
@@ -1838,21 +1856,30 @@ def replace_note(
     run leaves no plate where the older one stood. The page does not refuse: the
     registration is a pure function of the captures, which stay, so the plate is
     had again by the same command minus the capture that was wrong. The time is
-    the record's start in the PC's local time, to the minute, and the method and
-    the count are the result's own.
+    the record's start in UTC, to the minute, and says so: this note sits in the expert
+    view, under a tool's *Run*, beside the card that says ``done <time> UTC``, and a local
+    time with no zone next to it read as a second, different time (m5 §17.12 D20: the
+    guided screens say local time, the expert view UTC; #514). The method and the count
+    are the result's own.
 
     ``keeps_captures`` is whether the tool runs from the page's captures
     (``plate-registration``, ``plate-walls``): under a tool that has none
     (``plate-finding``) the sentence about forgetting one is false, and the note
     ends after the failed run (m5 §12.7). It is required, so no call forgets it.
     """
+    # A naive start is UTC, as the run document's times are: ``astimezone`` would read it as
+    # the PC's own.
+    aware = (
+        started_utc
+        if started_utc.tzinfo is not None
+        else started_utc.replace(tzinfo=timezone.utc)
+    )
     try:
-        when = started_utc.astimezone().strftime("%Y-%m-%d %H:%M")
+        when = aware.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     except (OSError, OverflowError, ValueError):
-        # A start the PC cannot show in its own zone (Windows before 1970 or after
-        # year 3000; any system at year 1 or 9999 under an offset): the record's own
-        # value, as it is, not an exception that ends the page's redraw. A run
-        # document is data (FM-125) and ``view()`` raises nothing for it.
+        # A start UTC cannot hold (year 1 under a positive offset): the record's own value,
+        # as it is, not an exception that ends the page's redraw. A run document is data
+        # (FM-125) and ``view()`` raises nothing for it.
         when = started_utc.isoformat(timespec="minutes")
     wells = "1 well" if result.n_refs == 1 else f"{result.n_refs} wells"
     note = (
@@ -2775,8 +2802,12 @@ def offsets_card_lines(result: ObjectiveOffsetsResult) -> tuple[str, ...]:
 
 
 def _xy(value: tuple[float, float]) -> str:
-    """``(+x, +y)`` to two decimals; ``+ 0.0`` keeps a ``-0.0`` from showing as ``-0.00``."""
-    x_um, y_um = (number + 0.0 for number in value)
+    """``(+x, +y)`` to two decimals; a value that rounds to zero is ``+0.00``, never ``-0.00``.
+
+    Rounded first, then ``+ 0.0``: the sum turns a ``-0.0`` into ``0.0``, but ``-0.001``
+    is not ``-0.0`` and printed ``-0.00`` (#514, the CLI's preview had the same fault).
+    """
+    x_um, y_um = (round(number, 2) + 0.0 for number in value)
     return f"({x_um:+.2f}, {y_um:+.2f})"
 
 

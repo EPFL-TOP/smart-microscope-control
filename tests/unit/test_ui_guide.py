@@ -653,21 +653,21 @@ def _plate_result(method: str, n_refs: int) -> PlateResult:
     )
 
 
-def test_replace_note_names_the_time_the_method_and_the_wells() -> None:
+def test_replace_note_names_the_time_in_utc_the_method_and_the_wells() -> None:
     started = datetime(2026, 11, 3, 14, 20, 41, tzinfo=timezone.utc)
-    # The record's start in the PC's local time, to the minute: computed here the
-    # way a reader's clock would show it, never a literal that depends on the zone.
-    local = started.astimezone().strftime("%Y-%m-%d %H:%M")
+    # The expert view's note sits beside a card that says `done <time> UTC`: one zone, said
+    # (m5 §17.12 D20; #514 point 4). A literal is right here, since it depends on no zone.
+    when = "2026-11-03 14:20 UTC"
     tail = (
         "A failed run leaves no plate; the captures stay, so Forget the wrong one "
         "and Run again to get a plate back."
     )
 
     one = replace_note(_plate_result("seed", 1), started, keeps_captures=True)
-    assert one == f"Run replaces the plate registered {local} (seed, 1 well). {tail}"
+    assert one == f"Run replaces the plate registered {when} (seed, 1 well). {tail}"
     two = replace_note(_plate_result("references", 2), started, keeps_captures=True)
     assert two == (
-        f"Run replaces the plate registered {local} (references, 2 wells). {tail}"
+        f"Run replaces the plate registered {when} (references, 2 wells). {tail}"
     )
     # A method the registration names is the result's own, never a paraphrase.
     assert "(wall-images, 3 wells)" in replace_note(
@@ -675,17 +675,19 @@ def test_replace_note_names_the_time_the_method_and_the_wells() -> None:
     )
 
 
-def test_replace_note_converts_a_start_that_is_not_in_utc_to_the_pcs_time() -> None:
-    # A start with an offset that is not zero: 14:20 at +05:00 is 09:20 UTC. On a PC
-    # whose zone is UTC (a CI runner's) a note that skips the conversion says 14:20,
-    # so the test fails there, where a UTC start could not (it reads the same either
-    # way). The expected text is the PC's own conversion of this instant.
+def test_replace_note_converts_a_start_that_is_not_in_utc_to_utc() -> None:
+    # A start with an offset that is not zero: 14:20 at +05:00 is 09:20 UTC. A note that
+    # skips the conversion says 14:20 UTC, which is wrong by the offset on every PC, so
+    # the literal fails wherever it runs.
     started = datetime(2026, 11, 3, 14, 20, tzinfo=timezone(timedelta(hours=5)))
-    assert started.astimezone(timezone.utc).strftime("%H:%M") == "09:20"
-    local = started.astimezone().strftime("%Y-%m-%d %H:%M")
     note = replace_note(_plate_result("seed", 1), started, keeps_captures=True)
     assert note.startswith(
-        f"Run replaces the plate registered {local} (seed, 1 well). "
+        "Run replaces the plate registered 2026-11-03 09:20 UTC (seed, 1 well). "
+    )
+    # A start across midnight changes the day too, not only the hour.
+    late = datetime(2026, 11, 3, 1, 5, tzinfo=timezone(timedelta(hours=2)))
+    assert "registered 2026-11-02 23:05 UTC (" in replace_note(
+        _plate_result("seed", 1), late, keeps_captures=True
     )
 
 
@@ -726,10 +728,9 @@ def test_replace_note_without_captures_does_not_tell_to_forget_them() -> None:
     # plate-finding fills the plate from the image and has no capture to forget: the
     # sentence about the captures is false under it (m5 §12.7, #367 item 3).
     started = datetime(2026, 11, 3, 14, 20, 41, tzinfo=timezone.utc)
-    local = started.astimezone().strftime("%Y-%m-%d %H:%M")
     note = replace_note(_plate_result("references", 3), started, keeps_captures=False)
     assert note == (
-        f"Run replaces the plate registered {local} (references, 3 wells). "
+        "Run replaces the plate registered 2026-11-03 14:20 UTC (references, 3 wells). "
         "A failed run leaves no plate."
     )
     assert "captures" not in note
@@ -2424,6 +2425,39 @@ def test_scan_progress_lines_estimate_from_the_first_report_and_not_from_the_cli
     )
 
 
+def test_scan_progress_lines_say_the_time_is_not_known_when_the_plan_has_no_timing() -> (
+    None
+):
+    # The Ti2-E rehearsal (#514 point 1): fields of one well come at 0.19 s, so 9 left said
+    # `Left about 1 s` for the 8 s the stage took to the next well. A plan with no timing
+    # has no figure for that travel (the Wells screen says `Time: not known`), so *Left* says
+    # it is not known and gives no number, whatever the clock holds.
+    clock = RunClock(elapsed_s=12.0, first=(4.0, 1), last=(6.0, 9))
+    assert scan_progress_lines(9, 18, clock, running=True, timing_known=True)[-1] == (
+        "Left about 2 s (estimated from the fields so far)"
+    )
+    untimed = scan_progress_lines(9, 18, clock, running=True, timing_known=False)
+    assert untimed == (
+        "Field 9 of 18",
+        "Elapsed 12 s",
+        "Left: not known (no timing measured yet)",
+    )
+    assert all("about" not in line for line in untimed)
+    # A run that ended, and a scan whose last field is done, draw no *Left* at all.
+    assert scan_progress_lines(9, 18, clock, running=False, timing_known=False) == (
+        "Field 9 of 18",
+        "Elapsed 12 s",
+    )
+    assert scan_progress_lines(18, 18, clock, running=True, timing_known=False) == (
+        "Field 18 of 18",
+        "Elapsed 12 s",
+    )
+    # The timing is the default's assumption: the unknown is said only when it is passed.
+    assert scan_progress_lines(9, 18, clock, running=True) == scan_progress_lines(
+        9, 18, clock, running=True, timing_known=True
+    )
+
+
 def test_scan_progress_lines_leave_the_time_unknown_with_one_report_or_a_clock_that_did_not_move() -> (
     None
 ):
@@ -3772,6 +3806,20 @@ def test_the_offsets_card_lines_name_each_target_its_shift_spread_wells_and_boun
         f"offsets to write: {_FOUR_X} (-12.34, +6.79) µm, {_FORTY_X} (+0.00, +19.04) µm",
         f"the turret is left at {_FORTY_X}",
     )
+
+
+def test_a_shift_that_rounds_to_zero_prints_no_minus_sign_on_the_offsets_card() -> None:
+    # -0.001 is not -0.0: `+ 0.0` alone left it as "-0.00" (#514 point 5, the CLI's twin).
+    # -0.005 rounds to -0.01 and keeps its sign: only a value that prints as zero loses it.
+    result = _offsets_result(
+        (_offsets_measure(_FOUR_X, (-0.001, -0.004)),),
+        (MeasuredOffset(objective=_FOUR_X, xy_offset_um=(-0.001, -0.006)),),
+    )
+
+    lines = offsets_card_lines(result)
+
+    assert lines[0].startswith(f"{_FOUR_X}: shift from {_TEN_X} (+0.00, +0.00) µm, ")
+    assert lines[1] == f"offsets to write: {_FOUR_X} (+0.00, -0.01) µm"
 
 
 def test_the_offsets_card_lines_are_one_line_each_for_a_label_with_a_line_break_and_700_characters() -> (
