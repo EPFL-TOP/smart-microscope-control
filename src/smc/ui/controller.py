@@ -951,12 +951,16 @@ class ChainStatus:
 
     ``plugins`` are the tools it runs, in order; ``ended`` is how each of the first ones
     ended; ``current`` is the tool going, or the one about to start between two, and
-    ``None`` once the chain ended.
+    ``None`` once the chain ended. ``label`` is the name of the button that started it
+    (``RUN_ALL_LABEL``, or *Measure the time*'s): it opens every outcome of the chain and
+    names the screen that draws the chain's line, so that a second tab draws the same
+    (m5 §17.12.11 D31, FM-151).
     """
 
     plugins: tuple[str, ...]
     ended: tuple[ChainEnd, ...]
     current: str | None
+    label: str = RUN_ALL_LABEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -1089,28 +1093,32 @@ def _chain_outcome(
     ended: tuple[ChainEnd, ...],
     stopped_before: str | None,
     seconds: float,
+    *,
+    label: str = RUN_ALL_LABEL,
 ) -> str:
     """The strip's text for a chain that ran to its end without a bug of its own (m5 §17.11.2).
 
-    ``Run all that are left: done in <s> s (<titles>)`` when every tool ended ``done``;
-    else ``Run all that are left: <the outcome of the tool that stopped it>``, or
-    ``Run all that are left: stopped before <tool>`` after a STOP between two tools, then
-    ``; done: <titles>`` and ``; not run: <titles>`` (the tools after the one it stopped at
-    or before) when there are some. The tools are named by their plain title, never their
-    plugin name (m5 §17.12 D20); the tool that stopped it names itself in its own outcome.
+    ``<label>: done in <s> s (<titles>)`` when every tool ended ``done``; else ``<label>:
+    <the outcome of the tool that stopped it>``, or ``<label>: stopped before <tool>`` after
+    a STOP between two tools, then ``; done: <titles>`` and ``; not run: <titles>`` (the
+    tools after the one it stopped at or before) when there are some. The label is the
+    button's own (*Run all that are left*, *Measure the time*: m5 §17.12.11 D31): the strip
+    said ``Run all that are left`` for a chain *Measure the time* had started. The tools
+    are named by their plain title, never their plugin name (m5 §17.12 D20); the tool that
+    stopped it names itself in its own outcome.
     """
     done = [end.plugin for end in ended if end.how == "done"]
     if stopped_before is None and len(done) == len(tools):
         return (
-            f"{RUN_ALL_LABEL}: done in {seconds:.1f} s "
+            f"{label}: done in {seconds:.1f} s "
             f"({', '.join(tool_title(tool) for tool in tools)})"
         )
     if stopped_before is not None:
-        head = f"{RUN_ALL_LABEL}: stopped before {tool_title(stopped_before)}"
+        head = f"{label}: stopped before {tool_title(stopped_before)}"
         not_run = tools[len(ended) + 1 :]
     else:
         last = ended[-1]
-        head = f"{RUN_ALL_LABEL}: {last.outcome}"
+        head = f"{label}: {last.outcome}"
         not_run = tools[len(ended) :]
     text = head
     if done:
@@ -2936,7 +2944,11 @@ class PlatePage:
             return self._objective_in_place(microscope, log_failure=log_failure)
 
     def run_chain(
-        self, plugins: Sequence[str], params: Mapping[str, Sequence[str]]
+        self,
+        plugins: Sequence[str],
+        params: Mapping[str, Sequence[str]],
+        *,
+        label: str = RUN_ALL_LABEL,
     ) -> None:
         """Run the tools of ``plugins`` that are not done, in order, as one activity (m5 §17.11.2).
 
@@ -2952,9 +2964,14 @@ class PlatePage:
 
         It is one activity, named after the tool that goes, so that a second run, a snap
         or a close is refused or stops it the whole time, between two tools too. What it
-        came to is the outcome: ``Run all that are left: done in <s> s (<titles>)``, or
-        where it stopped. With the stand closed, no step asked for, a run document that
-        cannot be read, or nothing left, the outcome says so and nothing starts.
+        came to is the outcome: ``<label>: done in <s> s (<titles>)``, or where it stopped.
+        With the stand closed, no step asked for, a run document that cannot be read, a
+        checkpoint it would drop, or nothing left, the outcome says so and nothing starts.
+
+        ``label`` is the name of the button that started the chain (``RUN_ALL_LABEL`` for
+        *Run all that are left*, *Measure the time*'s for its chain): every outcome begins with
+        it and ``ChainStatus.label`` keeps it, so that the strip names the right button and the
+        screen of that button draws the chain's line (m5 §17.12.11 D31, FM-151).
 
         Raises:
             RuntimeError: An activity is going (``<name> is running``), or the page is
@@ -2962,12 +2979,12 @@ class PlatePage:
         """
         self._refuse_if_busy()
         if self._microscope is None:
-            self._set_outcome(f"{RUN_ALL_LABEL}: {NOT_CONNECTED}")
+            self._set_outcome(f"{label}: {NOT_CONNECTED}")
             return
         if not plugins:
             # The view passes none when no Results tool loaded, and a click on its disabled
             # button still arrives here (FM-169): "every step is done" would be false.
-            self._set_outcome(f"{RUN_ALL_LABEL}: no step was asked for")
+            self._set_outcome(f"{label}: no step was asked for")
             return
         # Read now and not from a view's list, which a second tab may have made stale: a tool
         # that is `ok` here is never run again by the chain.
@@ -2977,17 +2994,17 @@ class PlatePage:
             # tool as `not run` and run the ones that are `ok` again over a lock that is gone by
             # the time `_prepare` reads it (FM-24). `_prepare` refuses such a document at the
             # first tool; the chain refuses it before it decides what is left.
-            self._set_outcome(f"{RUN_ALL_LABEL}: {_flat(unreadable)}")
+            self._set_outcome(f"{label}: {_flat(unreadable)}")
             return
         left = self._chain_left(plugins, doc)
         if not left:
-            self._set_outcome(f"{RUN_ALL_LABEL}: nothing is left: every step is done")
+            self._set_outcome(f"{label}: nothing is left: every step is done")
             return
         if (dropped := self._chain_drops_a_checkpoint(left, doc)) is not None:
             # A chain is one click: it never makes out of date a checkpoint that `--resume`
             # (or *Continue the scan*) could still continue (FM-172, adversarial review of
             # #470: *Measure the time* lays the fields out again, and the stopped scan read them).
-            self._set_outcome(f"{RUN_ALL_LABEL}: {dropped}")
+            self._set_outcome(f"{label}: {dropped}")
             return
         # Read at the click, as `run` reads it: every record of the chain names the preset
         # the operator saw loaded (m5 §10.5).
@@ -2995,7 +3012,7 @@ class PlatePage:
         preset = None if loaded is None else loaded.file.name
         pairs = {tool: tuple(given) for tool, given in params.items()}
         self._start_activity(
-            left[0], lambda event: self._run_chain(left, pairs, preset, event)
+            left[0], lambda event: self._run_chain(left, pairs, preset, event, label)
         )
 
     def _chain_left(self, plugins: Sequence[str], doc: RunDocument) -> tuple[str, ...]:
@@ -3074,6 +3091,7 @@ class PlatePage:
         params: Mapping[str, Sequence[str]],
         preset: str | None,
         event: threading.Event,
+        label: str = RUN_ALL_LABEL,
     ) -> str:
         """The chain's worker body: each tool through ``_prepare`` and ``_run_plugin``; the outcome as text.
 
@@ -3082,10 +3100,11 @@ class PlatePage:
         tools, or on a tool that ignores it and ends ``done``, would otherwise be lost
         and the next tool would start (FM-226's entry). ``_lock`` is never held across
         ``_prepare``, a run or a device call (FM-70). Whatever this code itself raises is
-        the outcome ``Run all that are left: <message>``, the text and never the exception
+        the outcome ``<label>: <message>``, the text and never the exception
         (FM-98), and the tool whose turn it was ends ``failed``, so that the Results screen
         says which tool the chain stopped at and not that a STOP nobody pressed ended it; the
-        chain's status is closed in ``finally``, so no tool is left ``current``.
+        chain's status is closed in ``finally``, so no tool is left ``current``. Every status
+        it builds carries ``label``, the button's name (m5 §17.12.11 D31).
         """
         started = time.monotonic()
         ended: list[ChainEnd] = []
@@ -3093,7 +3112,7 @@ class PlatePage:
         turn: str | None = None
         try:
             with self._lock:
-                self._chain = ChainStatus(tools, (), tools[0])
+                self._chain = ChainStatus(tools, (), tools[0], label)
             for tool in tools:
                 if event.is_set():
                     stopped_before = tool
@@ -3120,7 +3139,10 @@ class PlatePage:
                     # The tool about to start stays `current` through the gap, so that
                     # a tick there does not read the chain as stopped.
                     self._chain = ChainStatus(
-                        tools, tuple(ended), following if end.how == "done" else None
+                        tools,
+                        tuple(ended),
+                        following if end.how == "done" else None,
+                        label,
                     )
                 if end.how != "done":
                     break
@@ -3132,12 +3154,16 @@ class PlatePage:
                 ended.append(
                     ChainEnd(turn, "failed", f"{tool_title(turn)} failed: {text}")
                 )
-            return f"{RUN_ALL_LABEL}: {text}"
+            return f"{label}: {text}"
         finally:
             with self._lock:
-                self._chain = ChainStatus(tools, tuple(ended), None)
+                self._chain = ChainStatus(tools, tuple(ended), None, label)
         return _chain_outcome(
-            tools, tuple(ended), stopped_before, time.monotonic() - started
+            tools,
+            tuple(ended),
+            stopped_before,
+            time.monotonic() - started,
+            label=label,
         )
 
     def _begin_tool(self, tool: str, event: threading.Event) -> None:

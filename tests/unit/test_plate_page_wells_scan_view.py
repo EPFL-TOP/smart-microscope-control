@@ -57,6 +57,7 @@ from smc.ui.controller import NOT_CONNECTED, ChainStatus, PlatePage
 from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     LAY_OUT_FIRST,
+    MEASURE_THE_TIME,
     PLATE_NOT_CHOSEN,
     REGISTER_FIRST,
     SCREEN_LEADS,
@@ -2195,7 +2196,7 @@ def test_measure_the_time_runs_timing_then_the_layout_as_one_chain(
     assert "Time: about" in view.wells_known_block.object
 
 
-def test_the_chain_line_is_drawn_on_the_screen_of_its_first_tool(
+def test_the_chain_line_is_drawn_on_the_screen_of_the_button_that_started_it(
     make_page: Callable[..., PlatePage], run_doc: Path
 ) -> None:
     page = make_page(stubs=(StubScan, Slow, StubTiming))
@@ -2210,11 +2211,49 @@ def test_the_chain_line_is_drawn_on_the_screen_of_its_first_tool(
     # Measure the time's chain: on the Wells screen, never under Run all that are left.
     assert view.wells_chain_text.object == "Done: Timing, Field layout."
     assert view.chain_text.visible is False
-    # A chain whose first tool is a Results tool is drawn on Results only.
+    # A chain whose label is the Results button's is drawn on Results only.
     page._chain = ChainStatus(("cells", "density"), (), "cells")
     view._draw_chain_line(page.status())
     assert view.chain_text.object == "Running Count the cells (1 of 2)."
     assert view.wells_chain_text.visible is False
+    # The button names the screen, not the chain's first tool: *Measure the time* with `timing`
+    # already `ok` runs the layout alone, and its `Running ... (1 of 1)` line was drawn nowhere.
+    page._chain = ChainStatus(("scan-plan",), (), "scan-plan", label=MEASURE_THE_TIME)
+    view._draw_chain_line(page.status())
+    assert view.wells_chain_text.object == "Running Field layout (1 of 1)."
+    assert view.chain_text.visible is False
+    # A Results chain that starts with a tool outside RESULT_TOOLS is the Results button's.
+    page._chain = ChainStatus(("timing", "cells"), (), "timing")
+    view._draw_chain_line(page.status())
+    assert view.chain_text.object == "Running Timing (1 of 2)."
+    assert view.wells_chain_text.visible is False
+    # A label no screen knows is drawn on neither: whoever adds a chain button names its screen.
+    page._chain = ChainStatus(("cells",), (), "cells", label="A button nobody drew")
+    view._draw_chain_line(page.status())
+    assert view.chain_text.visible is False
+    assert view.wells_chain_text.visible is False
+
+
+def test_measure_the_time_says_its_own_name_on_the_strip(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    StubTiming.repeats = []
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    page.select_text("B11, B2")
+    view = PlatePageView(page)
+    view.refresh()
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    view.tick()
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("Measure the time: done in ")
+    assert outcome.endswith(" s (Timing, Field layout)")
+    chain = page.status().chain
+    assert chain is not None
+    assert chain.label == MEASURE_THE_TIME
 
 
 def test_on_a_dry_run_page_measure_waits_and_a_dry_scan_replaces_nothing_said(
@@ -2331,7 +2370,7 @@ def test_measure_the_time_never_drops_a_stopped_scans_checkpoint(
     _click(view.measure_time_button)
     assert page.join(BOUND_S)
     assert page.status().outcome == (
-        "Run all that are left: Field layout would put the checkpoint of the stopped "
+        "Measure the time: Field layout would put the checkpoint of the stopped "
         "Scan out of date: Continue the scan or Start again, on the Scan screen, first"
     )
     assert StubTiming.repeats == []

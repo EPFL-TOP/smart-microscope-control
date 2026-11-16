@@ -2597,7 +2597,10 @@ class PlatePageView:
 
         Each tool with the pairs its own *Run* sends: the profile's suggestions are the
         fields' starting values, as *Calibrate the camera* sends ``camera-calibration``'s. The
-        chain's rule (D14) runs ``scan-plan`` after ``timing``, since it reads the timings.
+        chain's rule (D14) runs ``scan-plan`` after ``timing``, since it reads the timings. The
+        chain carries this button's name, so that the strip opens with *Measure the time* and not
+        *Run all that are left*, and its line is drawn on this screen whichever tool comes
+        first (m5 §17.12.11 D31).
         """
         tools = ("timing", "scan-plan")
 
@@ -2606,7 +2609,7 @@ class PlatePageView:
                 tool: [*self.page.page_params(tool), *self._typed(tool)]
                 for tool in tools
             }
-            self.page.run_chain(tools, params)
+            self.page.run_chain(tools, params, label=MEASURE_THE_TIME)
 
         self._try(measure)
         self.tick()
@@ -4419,11 +4422,17 @@ class PlatePageView:
         called last by the tick and by ``refresh()``.
         """
         chain = None if status is None else status.chain
-        first = None if chain is None or not chain.plugins else chain.plugins[0]
-        # Each screen draws the chains its own button starts (m5 §17.12.4): *Measure the
-        # time*'s on Wells, *Run all that are left*'s on Results.
-        self._say(self.chain_text, chain_line(chain) if first in RESULT_TOOLS else "")
-        self._say(self.wells_chain_text, chain_line(chain) if first == "timing" else "")
+        label = None if chain is None or not chain.plugins else chain.label
+        # Each screen draws the chains its own button starts (m5 §17.12.4): the chain's label
+        # is that button's name, so *Measure the time*'s is on Wells, *Run all that are left*'s
+        # on Results, and a chain of another name on neither (§17.12.11 D31: the first tool
+        # was the key, and a chain whose first tool was not `timing` was drawn nowhere). Whoever
+        # adds a chain button names its screen here.
+        self._say(self.chain_text, chain_line(chain) if label == RUN_ALL_LABEL else "")
+        self._say(
+            self.wells_chain_text,
+            chain_line(chain) if label == MEASURE_THE_TIME else "",
+        )
 
     def _draw_results_buttons(self) -> None:
         """Which of *Run all that are left* and the five rows' buttons is disabled, and the reason beside each (m5 §11.2, §17.11.2).
