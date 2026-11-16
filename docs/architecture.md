@@ -25,7 +25,7 @@ from.
  ┌──────────────▼───────────────────────────────────────────────────────────┐
  │  Micro-Manager core via pymmcore-plus (ADR-0002)                          │
  │   CMMCorePlus  ── C++ adapters: NikonTi2 · NikonTI · PVCAM · Hamamatsu …  │
- │   UniMMCore    ── Python devices (ADR-0007): Zeiss MTB · Viventis PyMCS   │
+ │   UniMMCore    ── Python devices (ADR-0007): Zeiss MTB · LS1 components   │
  │   DemoCamera   ── the simulator: regression bed for everything above      │
  └──────────────────────────────────────────────────────────────────────────┘
         profiles/<microscope>.toml : config, role overrides, limits, quirks
@@ -68,7 +68,8 @@ src/smc/
     roles.py              role resolution                       (M1)
     microscope.py         the facade + safety                   (M1)
     profile.py            TOML profiles                         (M1)
-    backends/             mm.py (over CMMCorePlus), zeiss_mtb/, viventis/
+    backends/             mm.py (over CMMCorePlus; UniMMCore when the .cfg has
+                          #py lines, ADR-0007), zeiss_mtb/, viventis/
   plugins/                api.py, registry.py, params.py, runner.py   (M3)
                           stage_report.py (the built-in plugin)
                           geometry.py   the camera matrix: pixels <-> stage um
