@@ -3124,9 +3124,23 @@ class PlatePage:
             )
             return (
                 f"{tool_title(tool)} would put the checkpoint of the "
-                f"{status.value} {tool_title(stage)} out of date: {way}"
+                f"{self._end_word(stage, status, doc)} {tool_title(stage)} out of date: {way}"
             )
         return None
+
+    def _end_word(self, stage: str, status: StageStatus, doc: RunDocument) -> str:
+        """The word for how ``stage`` ended: the Scan screen's for the scan, else the record's status (found on the one-off session of #499).
+
+        A STOP that lands in a move ends the scan's record ``failed`` (FM-64) and the Scan screen
+        says ``Stopped by STOP``: a note that said ``the failed scan`` beside it would name one
+        state two ways. The scan's ``ScanEnd.kind`` is the word the screen uses; any other stage
+        has only its record.
+        """
+        if stage == "scan":
+            end = self._scan_end(doc)
+            if end is not None:
+                return end.kind
+        return status.value
 
     def _slot_closure(self, stage: str) -> frozenset[str]:
         """The slots ``stage`` reads, directly or through the tools that provide them (m5 §17.12.11 D30).
@@ -5120,7 +5134,7 @@ class PlatePage:
             scan_end=self._scan_end(doc),
             offsets=(None if plate_record is None else _offsets_offer_of(registered)),
             checkpoint_notes={
-                tool: checkpoint_note(stage, status.value)
+                tool: checkpoint_note(stage, self._end_word(stage, status, doc))
                 for tool, (stage, status) in self._checkpoint_feeders(doc).items()
             },
         )

@@ -39,6 +39,7 @@ from bokeh.models import Line, Rect
 import smc.ui.controller as controller_module
 import smc.ui.plate_page as plate_page
 from smc.hardware import Microscope
+from smc.hardware.errors import MotionStoppedError
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, Progress, RunContext
 from smc.plugins.registry import GROUP
@@ -144,6 +145,10 @@ class StubScan:
     checkpoint_at: ClassVar[int] = 0
     resumed: ClassVar[list[int | None]] = []
     counts_the_rest: ClassVar[bool] = False
+    #: How the run ends at its pause when it is told to stop: ``stop`` (a ``stopped`` record), ``move``
+    #: (the stop lands in a move, the record is ``failed``: FM-64) or, whether or not STOP was
+    #: pressed, ``fail`` (a plain error).
+    ending: ClassVar[str] = "stop"
 
     def run(
         self, microscope: Any, params: StubScanParams, ctx: RunContext
@@ -176,6 +181,10 @@ class StubScan:
             if position == StubScan.pause_at:
                 StubScan.paused.set()
                 StubScan.release.wait(BOUND_S)
+            if StubScan.ending == "fail" and position == StubScan.pause_at:
+                raise RuntimeError("the camera timed out")
+            if StubScan.ending == "move" and ctx.should_stop():
+                raise MotionStoppedError("xy_stage XY")
             # A STOP ends the run `stopped`, as the real scan's does.
             ctx.raise_if_stopped()
         return _scan_result(plan)
@@ -247,6 +256,7 @@ def _fresh_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     StubScan.paused = threading.Event()
     StubScan.release = threading.Event()
     StubScan.before_report = None
+    StubScan.ending = "stop"
     Slow.started = threading.Event()
     Slow.release = threading.Event()
     StubTiming.assumed = ()
@@ -2773,6 +2783,50 @@ def test_the_view_has_no_checkpoint_note_without_a_reachable_checkpoint(
         _seed(run_doc, "scan-plan", _scan_plan_result(), minute=9)
 
     assert page.view().checkpoint_notes == {}
+
+
+def test_a_stop_that_landed_in_a_move_is_said_stopped_by_the_notes_as_the_scan_screen_says(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """Found on the one-off session of #499: the note said ``the failed scan`` beside ``Stopped by STOP`` (FM-64)."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    StubTiming.repeats = []
+    StubScan.ending = "move"
+    view = _stopped_view(page, run_doc)
+    # The record is `failed` (the move raised), and the Scan screen says the stop.
+    assert RunDocument.load(run_doc).stages["scan"].status is StageStatus.failed
+    assert view.scan_end_text.object == "Stopped by STOP at field 5 of 12."
+
+    assert page.view().checkpoint_notes["timing"] == checkpoint_note("scan", "stopped")
+    page.run_chain(("timing",), {})
+    assert page.status().outcome == (
+        "Run all that are left: Timing would put the checkpoint of the stopped "
+        "Scan out of date: Continue the scan or Start again, on the Scan screen, first"
+    )
+    assert StubTiming.repeats == []
+
+
+def test_a_scan_that_failed_with_no_stop_is_said_failed_by_the_notes(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    StubScan.ending = "fail"
+    StubScan.checkpoint_at = 4
+    StubScan.pause_at = 5
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    view = PlatePageView(page)
+    view.show_step("scan")
+    view.refresh()
+    _click(view.scan_button)
+    assert StubScan.paused.wait(BOUND_S)
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+
+    assert page.view().checkpoint_notes["timing"] == checkpoint_note("scan", "failed")
+    page.run_chain(("timing",), {})
+    assert page.status().outcome is not None
+    assert "of the failed Scan out of date" in page.status().outcome  # type: ignore[operator]
 
 
 def test_a_single_run_of_a_tool_that_feeds_a_stopped_scan_still_runs(
