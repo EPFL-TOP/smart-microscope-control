@@ -206,6 +206,12 @@ FRAME_TICK_MS = 100
 #: How long ``serve`` waits for Panel's server to stop, in seconds.
 SERVER_STOP_WAIT_S = 10.0
 
+#: How old the arm of *Start again* must be before a second click confirms it, in seconds
+#: (m5 §17.12.11 D35): a double-click delivers both clicks within a fraction of a second, and the
+#: second used to confirm the drop of a checkpoint the operator had not yet read about. Reading the
+#: confirm line takes longer than this; a click younger than it is ignored and the arm stays.
+SCAN_AGAIN_MIN_AGE_S = 1.0
+
 DRIVE_TEXT = "DRIVE: the next click on a well moves the stage there"
 
 #: What the drive line says after an armed click that fell on no well (#514 point 3): the click
@@ -718,8 +724,12 @@ class PlatePageView:
         # for, per view (D6: a second tab never inherits it). The second click runs the scan
         # afresh only while the view's ``scan_end`` is still this one; a change of screen, of
         # the scan end or any other button drops it (FM-172: one click never drops a
-        # checkpoint).
+        # checkpoint). ``_again_armed_at`` is when the first click armed, on ``_clock``
+        # (``time.monotonic``; a plain attribute so that a test moves it): a second click
+        # younger than ``SCAN_AGAIN_MIN_AGE_S`` is a double-click and is ignored (D35).
         self._again_armed: ScanEnd | None = None
+        self._again_armed_at: float | None = None
+        self._clock: Callable[[], float] = time.monotonic
         # The Plate screen (m5 §17.4.2): the centre rows and the registration the last
         # redraw drew. A button runs what was drawn, never what would be computed at the
         # click (#287, FM-177). The drive's answer is the controller's, on the row of the well
@@ -2579,13 +2589,21 @@ class PlatePageView:
         The arm is the scan end the first click saw; the second click runs only while the
         view's scan end is still that one, and arms again otherwise (another tab continued
         the scan, a new end was drawn). ``afresh=True`` is passed here and nowhere else.
+
+        A second click younger than ``SCAN_AGAIN_MIN_AGE_S`` is ignored: nothing runs, nothing
+        is redrawn and the arm stays as the first click made it, so that the age is counted from
+        that click (m5 §17.12.11 D35: a double-click delivered both).
         """
         view = self._view
         end = None if view is None else view.scan_end
         armed = self._again_armed
         if armed is None or end is None or armed != end:
             self._again_armed = end if end is not None and end.resumable else None
+            self._again_armed_at = None if self._again_armed is None else self._clock()
             self._draw_wells_scan_buttons()
+            return
+        armed_at = self._again_armed_at
+        if armed_at is not None and self._clock() - armed_at < SCAN_AGAIN_MIN_AGE_S:
             return
         self._again_armed = None
         self._try(lambda: self.page.run("scan", self._scan_pairs(), afresh=True))

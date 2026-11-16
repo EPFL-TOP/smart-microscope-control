@@ -222,6 +222,15 @@ def _entry_points(
 
 
 @pytest.fixture(autouse=True)
+def _no_minimum_age_for_start_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tests that click *Start again* twice in a row mean a deliberate second click: no age is asked.
+
+    The guard itself (m5 §17.12.11 D35) has its own test, which sets the constant back.
+    """
+    monkeypatch.setattr(plate_page, "SCAN_AGAIN_MIN_AGE_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     StubScan.ran = 0
     StubScan.pause_at = 0
@@ -2076,6 +2085,67 @@ def test_the_second_click_on_start_again_runs_the_scan_afresh(
     assert view.scan_end_text.visible is False
     assert view.scan_actions_text.visible is False
     assert RunDocument.load(run_doc).stages["scan"].status is StageStatus.done
+
+
+@pytest.mark.parametrize(
+    ("second_click_at", "runs"),
+    [(0.5, False), (0.75, False), (1.0, True), (1.25, True)],
+)
+def test_start_again_ignores_a_second_click_younger_than_the_minimum_age(
+    page: PlatePage,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_click_at: float,
+    runs: bool,
+) -> None:
+    """A double-click delivers both clicks, and the second confirmed the drop of the checkpoint (m5 §17.12.11 D35, FM-172)."""
+    monkeypatch.setattr(plate_page, "SCAN_AGAIN_MIN_AGE_S", 1.0)
+    view = _stopped_view(page, run_doc)
+    # The clock the view reads, which the test moves: the first click arms whatever it says,
+    # 0.0 included (a falsy time is a time).
+    now = [0.0]
+    view._clock = lambda: now[0]
+    before = run_doc.read_bytes()
+    confirm = "Start again drops the 5 fields already taken: press again to drop them."
+
+    _click(view.scan_again_button)
+    assert view.scan_actions_text.object == confirm
+
+    now[0] = second_click_at
+    _click(view.scan_again_button)
+    if not runs:
+        # Nothing ran and nothing was written; the confirm line and the arm stay.
+        assert page.status().running is None
+        assert run_doc.read_bytes() == before
+        assert StubScan.resumed == [None]
+        assert view.scan_actions_text.object == confirm
+        assert view._again_armed is not None
+        # The ignored click did not re-arm: a click a second after the *first* confirms.
+        now[0] = 1.0
+        _click(view.scan_again_button)
+    assert page.join(BOUND_S)
+    assert StubScan.resumed == [None, None]
+    assert RunDocument.load(run_doc).stages["scan"].status is StageStatus.done
+
+
+def test_the_scan_command_has_no_resume_once_a_continued_scan_runs_and_the_screen_is_redrawn(
+    page: PlatePage, run_doc: Path
+) -> None:
+    """Pins a measure of m5 §17.12.11: the *Command* is the one of the last redraw, and the tick does not redraw it."""
+    view = _stopped_view(page, run_doc)
+    assert "--resume" in _words(view.scan_command.object)
+    StubScan.pause_at = 8
+    _click(view.scan_continue_button)
+    assert StubScan.paused.wait(BOUND_S)
+    # Between the click and the next redraw the command still says what the click did.
+    assert "--resume" in _words(view.scan_command.object)
+    view.tick()
+    assert "--resume" in _words(view.scan_command.object)
+    # A redraw while the continued scan runs: no scan end stands (its record is `running`).
+    view.refresh()
+    assert "--resume" not in _words(view.scan_command.object)
+    StubScan.release.set()
+    assert page.join(BOUND_S)
 
 
 def test_the_start_again_arm_is_dropped_when_the_screen_changes(
