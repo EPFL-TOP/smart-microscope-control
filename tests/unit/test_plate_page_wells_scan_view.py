@@ -957,6 +957,56 @@ def test_the_scan_lead_says_a_move_in_flight_finishes_first_on_a_stand_that_refu
     )
 
 
+def test_the_scan_lead_says_where_a_cut_move_ends_on_a_stand_that_cuts_its_moves(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    both = Profile.model_validate(
+        {
+            "microscope": {"name": "demo"},
+            "safety": {
+                "stop_refused_by": ["xy_stage", "focus"],
+                "max_segment_um": 5000.0,
+                "max_z_segment_um": 100.0,
+            },
+        }
+    )
+    first = f"{SCREEN_LEADS['scan']} A move already sent finishes first on this stand"
+    cut = "; a long one ends at the end of its current segment"
+    view = PlatePageView(make_page(profile=both))
+    assert (
+        view.scan_lead_text.object
+        == f"{first}{cut} (at most 5000 µm in XY, 100 µm in Z)."
+    )
+    # The stand closed: the lead is the profile's words, drawn from the status all the same.
+    closed = PlatePageView(make_page(profile=both, connect=False))
+    assert closed.scan_lead_text.object == (
+        f"{first}{cut} (at most 5000 µm in XY, 100 µm in Z)."
+    )
+    # One key alone: only that axis is named; a Z move of a stand that refuses it and
+    # does not cut it is still the first half's.
+    xy_only = Profile.model_validate(
+        {
+            "microscope": {"name": "demo"},
+            "safety": {
+                "stop_refused_by": ["xy_stage", "focus"],
+                "max_segment_um": 5000.0,
+            },
+        }
+    )
+    assert PlatePageView(make_page(profile=xy_only)).scan_lead_text.object == (
+        f"{first}{cut} (at most 5000 µm in XY)."
+    )
+    # With a plan, last, since the run document is shared by every page above: the state
+    # the operator reads when pressing *Start the scan*, the fields and the objective
+    # first and then the same sentence, drawn again by the redraw a run's end makes.
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    view.refresh()
+    assert view.scan_lead_text.object == (
+        f"12 fields at {TEN_X}. {first}{cut} (at most 5000 µm in XY, 100 µm in Z)."
+    )
+
+
 def test_start_the_scan_waits_for_the_plan_and_says_so(
     make_page: Callable[..., PlatePage], run_doc: Path
 ) -> None:

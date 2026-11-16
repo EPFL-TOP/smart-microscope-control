@@ -491,7 +491,13 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
 while there is no plan; `Scan the selected wells` while there is neither), and the sentence
 under it says the plan's size and where STOP is: `72 fields at Nikon 10X S Fluor. STOP, at the
 top right, stops the scan.` On a stand whose profile says a stop is refused, it adds that **a
-move already sent finishes first**. From the top:
+move already sent finishes first**; where the profile also cuts that role's moves into segments
+(`[safety] max_segment_um`, `max_z_segment_um`, the Ti2-E's), it adds that **a long one ends at
+the end of its current segment**, with the sizes the profile gives: `A move already sent
+finishes first on this stand; a long one ends at the end of its current segment (at most 5000
+µm in XY, 100 µm in Z).` (`XY` for the stage, `Z` for the focus; only the axes the profile cuts
+are named; a stand with no refusal says none of it). The strip says the same cut in the
+engineer's words (see *STOP says what it did*). From the top:
 
 - **Start the scan**: `scan`, with the autofocus field. It waits, the first that holds, for the
   stand, for a plan (`lay out the fields first: step 3, Wells`), for the tool's own reason, and
@@ -1518,7 +1524,8 @@ plate in a browser.
 [#431](https://github.com/EPFL-TOP/smart-microscope-control/issues/431)); *Left* against the
 real time of a scan on the Ti2-E (the pace was measured on the demo's simulated stage, 0.19 s
 a field); **STOP during a scan on a stand whose profile says `stop_refused_by`** and what the
-Scan screen's sentence says there (a move already sent finishes first); the green fields at
+Scan screen's sentence says there (a move already sent finishes first; a long one ends at the
+end of its current segment, with the profile's sizes, [#509](https://github.com/EPFL-TOP/smart-microscope-control/issues/509)); the green fields at
 the stand's screen and zoom, and over RDP; and the layout of both screens at the stand PC's
 window (the Wells screen's known block may be a scroll of the panel down at 1280 x 800).
 

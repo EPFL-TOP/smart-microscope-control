@@ -19,6 +19,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timezone
 from pathlib import Path, PurePath
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
 
@@ -138,6 +139,7 @@ __all__ = [
     "STEPS",
     "STEP_OF_SLOT",
     "STEP_TITLES",
+    "STOP_SEGMENT_AXES",
     "TIME_NOT_KNOWN",
     "TOOL_TITLES",
     "WALLS_DRY_RUN",
@@ -229,6 +231,7 @@ __all__ = [
     "stage_label",
     "step_button_label",
     "step_states",
+    "stop_segments_clause",
     "suggested_centres",
     "tool_title",
     "wall_touches_note",
@@ -1555,16 +1558,56 @@ def scan_title(plan_wells: Sequence[str], selection: Sequence[str]) -> str:
     return SCREEN_TITLES["scan"]
 
 
-def scan_lead(plan: PlanLayer | None, *, stop_refused: bool) -> str:
-    """The Scan screen's lead: the plan's count and objective, where STOP is, and what it does not stop (m5 §17.10.3).
+#: The axis the Scan lead names for each role whose moves a ``[safety]`` key cuts into
+#: segments: the operator reads ``XY`` and ``Z`` (the status line's words), never the
+#: role names the strip uses (m5 §17.12.10 D29).
+STOP_SEGMENT_AXES: Mapping[str, str] = MappingProxyType(
+    {"xy_stage": "XY", "focus": "Z"}
+)
+
+
+def stop_segments_clause(segments_um: Sequence[tuple[str, float]]) -> str:
+    """The clause the Scan lead adds on a stand that cuts its moves into segments: ``"; a long one ends at … (at most 5000 µm in XY, 100 µm in Z)"``, ``""`` if none (m5 §17.12.10 D29).
+
+    A stop the device refuses ends a move only at the end of the segment under way when the
+    profile cuts the move (``[safety] max_segment_um``, ``max_z_segment_um``, m2 §11.12,
+    #507), and the clause says so with the profile's own size, never one typed here (written
+    ``:g``, as the strip and the CLI write it). The pairs come in the profile's order and a
+    role the page has no axis for is skipped, so a profile that cuts nothing the page names
+    gets ``""`` and the lead is the unsegmented text. It includes its leading ``"; "``.
+    """
+    sizes = [
+        f"{size_um:g} µm in {STOP_SEGMENT_AXES[role]}"
+        for role, size_um in segments_um
+        if role in STOP_SEGMENT_AXES
+    ]
+    if not sizes:
+        return ""
+    return f"; a long one ends at the end of its current segment (at most {', '.join(sizes)})"
+
+
+def scan_lead(
+    plan: PlanLayer | None,
+    *,
+    stop_refused: bool,
+    stop_segments_um: Sequence[tuple[str, float]] = (),
+) -> str:
+    """The Scan screen's lead: the plan's count and objective, where STOP is, and what it does not stop (m5 §17.10.3, §17.12.10).
 
     On a stand whose profile says a role refuses its stop (``stop_refused_by``) a move
     already sent runs to its target, and the lead says so (FM-117): STOP is offered, never
-    promised more than it does. Without a plan the static lead stands, with the same addition.
+    promised more than it does. When the profile also cuts that role's moves into segments,
+    a long move ends at the end of its current segment, as the CLI has said since #507 and
+    the strip since #527: ``stop_segments_um`` are the profile's ``(role, size)`` pairs, the
+    sizes are its own, and they are ignored on a stand with no refusal. Without a plan the
+    static lead stands, with the same addition.
     """
     stop = SCREEN_LEADS["scan"]
     if stop_refused:
-        stop += " A move already sent finishes first on this stand."
+        stop += (
+            " A move already sent finishes first on this stand"
+            f"{stop_segments_clause(stop_segments_um)}."
+        )
     if plan is None:
         return stop
     fields = _count(plan.count, "field")

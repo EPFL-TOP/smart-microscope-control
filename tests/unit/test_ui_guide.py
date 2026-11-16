@@ -107,6 +107,7 @@ from smc.ui.guide import (
     STEP_OF_SLOT,
     STEP_TITLES,
     STEPS,
+    STOP_SEGMENT_AXES,
     TIME_NOT_KNOWN,
     TOOL_TITLES,
     WALLS_DRY_RUN,
@@ -197,6 +198,7 @@ from smc.ui.guide import (
     stage_label,
     step_button_label,
     step_states,
+    stop_segments_clause,
     suggested_centres,
     tool_title,
     wall_touches_note,
@@ -2232,6 +2234,66 @@ def test_scan_lead_says_the_fields_the_objective_and_the_move_in_flight_a_stop_l
     assert scan_lead(None, stop_refused=False) == SCREEN_LEADS["scan"] == stop
     assert scan_lead(None, stop_refused=True) == (
         f"{stop} A move already sent finishes first on this stand."
+    )
+
+
+def test_stop_segments_clause_names_each_cut_axis_with_its_size() -> None:
+    both = (
+        "; a long one ends at the end of its current segment "
+        "(at most 5000 µm in XY, 100 µm in Z)"
+    )
+    assert stop_segments_clause((("xy_stage", 5000.0), ("focus", 100.0))) == both
+    # `:g`, as the strip and the CLI write a size: 25 µm, never 25.0 µm.
+    assert stop_segments_clause((("focus", 25.0),)) == (
+        "; a long one ends at the end of its current segment (at most 25 µm in Z)"
+    )
+    assert stop_segments_clause((("xy_stage", 500.5),)) == (
+        "; a long one ends at the end of its current segment (at most 500.5 µm in XY)"
+    )
+    # The profile's order is kept, not the order of the axes.
+    assert stop_segments_clause((("focus", 100.0), ("xy_stage", 5000.0))) == (
+        "; a long one ends at the end of its current segment "
+        "(at most 100 µm in Z, 5000 µm in XY)"
+    )
+    # A role that is not one of the two is skipped, the others stay.
+    assert stop_segments_clause((("autofocus_offset", 3.0), ("xy_stage", 5000.0))) == (
+        "; a long one ends at the end of its current segment (at most 5000 µm in XY)"
+    )
+    # Nothing to say: no clause, so the sentence is today's.
+    assert stop_segments_clause(()) == ""
+    assert stop_segments_clause((("autofocus_offset", 3.0),)) == ""
+    assert dict(STOP_SEGMENT_AXES) == {"xy_stage": "XY", "focus": "Z"}
+
+
+def test_scan_lead_says_where_a_cut_move_ends_on_a_stand_that_cuts_its_moves() -> None:
+    stop = "STOP, at the top right, stops the scan."
+    segments = (("xy_stage", 5000.0), ("focus", 100.0))
+    sentence = (
+        "A move already sent finishes first on this stand; a long one ends at the "
+        "end of its current segment (at most 5000 µm in XY, 100 µm in Z)."
+    )
+    # With a plan: the fields and the objective, then STOP, then the cut.
+    assert scan_lead(_plan(), stop_refused=True, stop_segments_um=segments) == (
+        f"72 fields at Nikon 10X S Fluor. {stop} {sentence}"
+    )
+    # Without a plan: the static lead, with the same sentence.
+    assert scan_lead(None, stop_refused=True, stop_segments_um=segments) == (
+        f"{SCREEN_LEADS['scan']} {sentence}"
+    )
+    # A stand with no refusal says nothing about a stop it does not refuse, whatever
+    # the segments hold: the lead is the stop alone.
+    assert scan_lead(None, stop_refused=False, stop_segments_um=segments) == stop
+    assert scan_lead(_plan(), stop_refused=False, stop_segments_um=segments) == (
+        f"72 fields at Nikon 10X S Fluor. {stop}"
+    )
+    # A refusal with no segment, or with only a role the page does not name: today's text.
+    today = f"{stop} A move already sent finishes first on this stand."
+    assert scan_lead(None, stop_refused=True, stop_segments_um=()) == today
+    assert (
+        scan_lead(
+            None, stop_refused=True, stop_segments_um=(("autofocus_offset", 3.0),)
+        )
+        == today
     )
 
 
