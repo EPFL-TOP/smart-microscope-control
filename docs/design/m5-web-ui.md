@@ -4473,7 +4473,9 @@ Run.
   placeholder.
 - The centres list, new: one row per **suggested well**, `guide.suggested_centres`
   (three wells far apart: A1, the last column of row A, the last row of column 1,
-  as printed on the plate whatever its orientation), each with its state (`captured
+  as printed on the plate whatever its orientation; the corners of the wells the
+  stand can reach instead, where its soft limits cut the plate's: §19, #512), each
+  with its state (`captured
   at (x, y) µm with <objective>` / `go there, centre it, capture`) and *Go to
   <well>* or *Redo*. A capture of another well (clicked on the map) is listed too;
   the suggestion is not a rule.
@@ -6096,3 +6098,204 @@ container, never a figure (FM-174).
 **Not verified (for the owner)**: the block at the Ti2-E (a turn at the plate's height, what the
 turret reads during it, the run's time, the offsets 4× → 10× and 4× → 40×: M3 §20.10) and read by a
 newcomer; the profile written from the page on the stand PC.
+
+## 19. The Plate screen suggests wells the stand can reach (#512)
+
+Fixed by #512's plan (2026-11-16). §17.4.2's centres list names "A1, the last column of
+row A and the last row of column 1". On the Ti2-E, whose `[safety] xy_soft_limits_um`
+are narrower than a plate in its holder, two of those three wells lie outside the travel,
+and *Go to* is refused for them (found in the hardware-session prep of Ti2-E session 5, #512). This
+section decides which wells the rows suggest then. It adds no plugin, slot or command and
+changes no guard: the layer's refusal of a target outside the soft limits stays, and stays
+unforceable. **Merging this section decides it.**
+
+### 19.1 What was measured (2026-11-16, planning #512)
+
+Throwaway scripts that are not committed, on `main` at `dd1b473`, Python 3.13.0,
+useq-schema 0.9.2: `holder_estimate(plate, (400, -325), orientation)` for the `[holder]`
+of `profiles/nikon-ti2.toml`, against its `xy_soft_limits_um = [[-49000, 49000],
+[-29000, 29000]]` (the estimate is the one `goto-well` drives to, M3 §5.5 D2).
+
+- **The issue's positions, reproduced.** `greiner-24-well`, not turned: A1 (−48 225,
+  28 850), A6 (49 025, 28 850), D1 (−48 225, −29 500) µm. A1 is inside by 775 µm in X and
+  150 µm in Y, A6 outside by 25 µm, D1 by 500 µm. B2 (−28 775, 9 400), B5 (29 575, 9 400)
+  and C2 (−28 775, −10 050) are inside by 18 950 µm or more.
+- **The wells that are inside, by how far inside.** Margin 0 to 150 µm: A1, A5, C1 (15 wells
+  of 24). 151 to 775 µm: B1, B5, C1. 776 to 18 950 µm: B2, B5, C2, the eight wells of rows
+  B and C, columns 2 to 5. The same at 1 000 µm turned
+  by 180°. The plate's grid is centred on the holder, so a turn renames the wells but
+  keeps the block.
+- **Other plates on this stand** (margin 1 000 µm): `96-well` B2, B11, G2 (its A1 at
+  −49 100 and its A12 at 49 900 µm are outside too), `384-well` C2, C23, N2; `6-well` and
+  `12-well` keep their corners (every well is inside). A margin of one well's radius
+  would leave `6-well` no well at all (its radius is 17.4 mm, the Y travel 29 mm each way).
+- **Cost.** The reach of every well of a plate: 0.1 ms for 24 wells, 4 ms for 1536. The
+  Plate screen redraws on an event, never on the tick (FM-145), so there is no cache to
+  build.
+- **`suggested_refs` has two callers**: `guide.suggested_centres` and
+  `sample_refs` (the demo sample's own references, M5 §8.2). No command calls it: the CLI
+  takes the operator's wells and says nothing about which to take, except in the plugin
+  docs.
+
+### 19.2 Decisions
+
+- **D1 The rows suggest the far corners of the wells the stand can reach.** A well is
+  *reachable* when its estimated centre lies `REACH_MARGIN_UM` or more inside the soft limits
+  on both axes (the edge counts, as `WellGeometry.contains` counts it). Over the plate's grid
+  of names (`all_well_names`, rows by columns) the rows are, in this order, **a** the
+  reachable well with the smallest (row, column); **b** the reachable well of a's row with
+  the largest column; **c** the reachable well of a's column with the largest row; a well
+  named twice is listed once. When every well is reachable this is A1, the last well of row
+  A and the last well of column 1, §17.4.2's list as it was: a stand with no soft limits,
+  the demo ones included, sees no change. The Ti2-E's `greiner-24-well` gets B2, B5, C2
+  (58 mm apart in X, 19 mm in Y, not in a line) and its `96-well` B2, B11, G2.
+- **D2 The estimate is the holder's, whatever the pose.** The plan is
+  `holder_estimate(plate, [holder] plate_centre_xy_um, orientation)`, never the registered
+  plate's: the rows do not move under the operator's hands when a capture or a registration
+  changes the page's idea of A1 by hundreds of µm, and a turn renames them by the same rule
+  (the block is symmetric about the holder's centre on a plate that is). Without
+  `[holder] plate_centre_xy_um` (the *unplaced* map) nothing is placed, and without
+  `[safety] xy_soft_limits_um` nothing is cut: the rows are the plate's corners, as they
+  were.
+- **D3 The margin is a constant, 1 000 µm: `REACH_MARGIN_UM`.** It is the room the
+  operator needs after *Go to*: the holder's centre has been 285 µm apart between two
+  seatings of the same plate (`[holder] measured`, sessions 2 and 3), and the arrows that
+  centre the well by eye are bound by the same limits. 1 000 µm is three and a half times
+  that spread, and it puts A1 of the greiner (775 µm inside in X) out of the list. It is
+  not the well's radius: that would leave a 6-well nothing, and the wall search is the
+  expert view's `plate-walls`, which checks its own walk against the limits before it moves
+  and refuses with the well and the side (M3 §5.7); the rows promise a centre, not a wall.
+  It is not a profile key: nobody has yet measured a need to tune it, and a key added
+  before a session shows one is a number to explain.
+- **D4 A plate no well of which is reachable keeps the corners, and says so.** The rows are
+  built once (§17.2 D5): an empty list would leave a screen with nothing to press. The
+  corners stay, *Go to* is refused on its row with the layer's own words, and the note
+  below the rows says why (D5).
+- **D5 One line says why the corners are not the rows.** A plain-text pane under the three
+  rows, hidden and taking no height while it has nothing to say (§17.3, D12):
+  - some wells reachable and the rows are not the corners: `Not the plate's far corners
+    (A1, A6 and D1): the stage's soft limits cut them, as the holder places this plate.`
+    (the corners are `suggested_refs`, joined with commas and `and`: `A1 and A4` for two,
+    `A1` for one);
+  - no well reachable: `No well of this plate lies inside the stage's soft limits as the
+    holder places it, so Go to will be refused: check the profile's [holder] and [safety].`
+  - otherwise, and whenever D2 says nothing is cut, the pane is empty.
+- **D6 The operator naming the wells is not built.** A choice of three wells on the guided
+  screen would be one more control on a screen kept to a few, and the three that are
+  suggested are far apart on every plate the Ti2-E takes (D1). The map's
+  click in the expert view stays the one way to capture another well, and a capture of
+  another well is listed after the three (§17.4.2). Revisit it when a stand's travel holds
+  fewer than three wells of a plate.
+- **D7 A profile whose `[sample]` is of the page's plate keeps the corners.** The sample's
+  own references are the plate's corners (§8.2) and a row then says `known from the
+  profile's sample`: the rows must name the wells the references name. The test is the
+  profile's (`sample_plate == plate`), never `registers_from_sample`, which turns false at
+  the first capture and would reshuffle the rows then (D2). No profile has both a
+  `[sample]` and soft limits today; this keeps the two sources of truth one.
+
+### 19.3 The interface
+
+`smc/plugins/plate_registration/algorithm.py`, beside `suggested_refs`, whose behaviour
+does not change:
+
+```python
+REACH_MARGIN_UM = 1000.0
+
+
+def reachable_refs(
+    plan: useq.WellPlatePlan,
+    xy_limits_um: tuple[tuple[float, float], tuple[float, float]],
+    *,
+    margin_um: float = REACH_MARGIN_UM,
+) -> tuple[str, ...]: ...
+```
+
+`xy_limits_um` is `((x_low, x_high), (y_low, y_high))`, as `[safety]` has it. The result is
+D1's rule over the wells whose `plan` position is inside both ranges, shrunk by
+`margin_um`; `()` when there is none. Raises `ValueError` for a `margin_um` that is
+negative or not finite, as `WellGeometry.contains` does. Positions come from one
+`plan.all_well_positions` call, as `nominal_offsets` does (never one `well_geometry` per
+well, FM-145).
+
+`smc/ui/guide.py` (pure):
+
+```python
+def suggested_centres(
+    plate: str,
+    *,
+    holder_centre_um: tuple[float, float] | None = None,
+    orientation: PlateOrientation = "not-turned",
+    xy_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None,
+) -> tuple[str, ...]: ...
+
+
+def centres_reach_note(
+    plate: str,
+    *,
+    holder_centre_um: tuple[float, float] | None = None,
+    orientation: PlateOrientation = "not-turned",
+    xy_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None,
+) -> str: ...
+```
+
+With a `holder_centre_um` and `xy_limits_um` both given, `suggested_centres` is
+`reachable_refs(holder_estimate(plate, holder_centre_um, orientation), xy_limits_um)`, and
+`suggested_refs(plate)` when that is empty or when either is `None` (D2, D4).
+`centres_reach_note` is D5's text for the same arguments, `""` when nothing is cut. Both
+raise `ValueError` for a plate `useq` does not know, as today. The two texts are the
+constants `CENTRES_CUT_NOTE` (with `{corners}`) and `CENTRES_UNREACHABLE_NOTE`.
+`centre_rows` gains `suggested: Sequence[str] | None = None` (`None` means the plate's
+own `suggested_centres(plate)`, as before); every other line of it is unchanged.
+
+`smc/ui/controller.py`: `PlatePage.suggested_centres()` and `PlatePage.centres_reach_note()`
+call the two with the page's plate, `profile.holder.plate_centre_xy_um`, `self.orientation`
+and `profile.safety.xy_soft_limits_um`: the profile is the page's for its whole life, and the
+limits are the ones `Microscope` builds its `Safety` from. With `sample_plate == plate`
+(D7) they pass no holder and no limits, so the rows are the corners and the note is empty.
+
+`smc/ui/plate_page.py`: `_draw_plate_screen` passes `suggested=page.suggested_centres()` to
+`centre_rows` and says `page.centres_reach_note()` in a new `self.reach_note` pane
+(`_wrapped_text()`, hidden, drawn with `_say`), listed in `screens["plate"]` right after the
+three rows and before `other_captures` (FM-171's guard walks `screens`).
+
+### 19.4 Tests and failure modes
+
+- `tests/unit/test_plate_registration.py`: `reachable_refs` on the Ti2-E's numbers (D1, typed
+  out), the margin (700 µm against A1's 775: B1, B5, C1; 1 000 µm: B2, B5, C2), the edge, a
+  travel that holds the plate (the corners, for several plates), a travel that holds no
+  well (`()`), the margin's refusals, and a `hypothesis` property: every well returned has
+  its centre inside the limits by the margin.
+- `tests/unit/test_ui_guide.py`: `suggested_centres` and `centres_reach_note` (the three
+  states, both orientations, no holder, no limits), `centre_rows` with `suggested`, and the
+  layer's own test: `Safety(...).check_xy_target_um` accepts the centre of every suggested
+  well and refuses A6 and D1.
+- `tests/unit/test_plate_page_stand_plate_view.py`: the rows, the buttons and the note on a
+  page whose profile has the Ti2-E's limits and holder; the rows after a capture and after
+  a registered plate; the note hidden on a stand with no limits; the corners kept with a
+  `[sample]` of the plate (D7).
+- A demo test (`@pytest.mark.demo`): the real `goto-well` drives to each suggested well on
+  such a stand, and `A6` is refused with the layer's text.
+- **Failure modes**: FM-169 (the layer's refusal stays the guard; the suggestion is a
+  courtesy), FM-206 (the page foresees a refusal from the state it holds: the profile's
+  limits and holder), FM-217 (the rows are suggestions from an estimate, and the note says
+  what it was estimated from), FM-145 (no `well_geometry` per well), FM-151 (the plate and
+  the orientation are in the shared state, and the profile does not change), FM-139 (plain
+  text). **New entry**, named by its text: *a list of suggested targets built without the
+  guard those targets must pass* (§17.4.2's A6 and D1).
+
+### 19.5 What this does not do
+
+- It does not change a soft limit, `suggested_refs`, `sample_refs`, `goto-well` or a guard,
+  and does not make a refusal forceable.
+- It does not cut the Wells screen's choice or `scan-plan`'s fields by the soft limits: a
+  well the operator clicks outside the travel is refused at the move, as it is today. That is
+  its own question, and the owner has not asked it.
+- It does not make the guided path reach the offsets step: *Register the plate* runs
+  `plate-registration`, while §18 needs a plate from `plate-walls` (the issue's last
+  paragraph). That is §17.4.2's other-ways line and §18's D2, not this change.
+- It does not look at the wall search of `plate-walls` (D3), nor at a well's fields.
+
+**Not verified (for the owner)**: the rows at the Ti2-E with the plate in its holder (that
+B2, B5 and C2 are reachable by *Go to* and that a well centred there by eye stays inside
+the travel); the 1 000 µm margin against a seating that is further off than the two
+measured; the note read by a newcomer.
