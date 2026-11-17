@@ -28,7 +28,7 @@ import queue
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
@@ -131,12 +131,14 @@ from smc.plugins.slots.plate import (
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 from smc.ui.frames import Frame
 from smc.ui.guide import (
+    ASSUMED_LINE_CHARS,
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     GOTO_ESTIMATED,
     GOTO_UNPLACED,
     GOTO_WALL_NEEDS_REGISTRATION,
     MAP_FIELDS_UP_TO,
+    MEASURE_NOT_IN_A_DRY_RUN,
     NO_CALIBRATION_FOR_SIDES,
     NOT_CONNECTED,
     OFFSETS_DRY_RUN,
@@ -162,6 +164,7 @@ from smc.ui.guide import (
     busy_note,
     calibration_paths,
     centres_reach_note,
+    checkpoint_note,
     command_line,
     local_time,
     next_slot,
@@ -303,7 +306,7 @@ _OFFSETS_ERROR_CHARS = 2000
 
 #: The strip says a finished run's first assumption, cut here: a pointer to the card, which
 #: holds every line at ``_CARD_TEXT_CHARS`` (m5 §8.8.2).
-_STRIP_ASSUMED_CHARS = 160
+_STRIP_ASSUMED_CHARS = ASSUMED_LINE_CHARS
 
 #: Two reference centres are the same when they differ by at most this: a JSON dump
 #: rounds, and a capture made by hand is never within a hundredth of a micrometre of the
@@ -695,7 +698,11 @@ class PlateView:
     *Start again*; ``None`` for no record, one that goes or one that ended ``done``.
     ``offsets`` is the offsets block's offer (m5 §18.2 D2): the usable ``plate`` slot is the
     page's plate, was registered from images (``walls``) and records the objective it was
-    registered with; ``None`` otherwise, and the block is hidden.
+    registered with; ``None`` otherwise, and the block is hidden. ``checkpoint_notes`` maps each
+    registered tool whose single run would put a stopped or failed stage's reachable checkpoint
+    out of date to the note that says so (m5 §17.12.11 D30): the page draws it under *Lay out
+    the fields* and under the expert view's *Run* of that tool. The run is not refused (FM-236);
+    the map is empty when no stage holds a checkpoint ``--resume`` can continue.
     """
 
     plate: str
@@ -722,6 +729,7 @@ class PlateView:
     frame_wells: tuple[str, ...] = ()
     scan_end: ScanEnd | None = None
     offsets: OffsetsOffer | None = None
+    checkpoint_notes: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -803,13 +811,16 @@ class _Ended(NamedTuple):
     true when STOP was pressed during the run and a move it stopped ended it ``failed``
     (FM-64: the record stays ``failed``, the words say stopped). ``detail`` is the
     one line of a ``stopped`` or ``failed`` end **without the tool's title**, for the
-    Plate row that a *Go to* was sent from (m5 §17.12 D20).
+    Plate row that a *Go to* was sent from (m5 §17.12 D20). ``assumed`` are the card's
+    ``assumed`` lines of a record that ended ``done``, ``()`` for any other end: a chain
+    copies them into its ``ChainEnd`` (m5 §17.12.11 D32).
     """
 
     outcome: str
     status: Literal["done", "stopped", "failed"]
     stopped_by_stop: bool = False
     detail: str = ""
+    assumed: tuple[str, ...] = ()
 
 
 class _LatestShown:
@@ -937,12 +948,15 @@ class ChainEnd:
     ``how`` is ``done`` (its record ended ``done``), ``failed`` (the run raised: its record
     is ``failed``), ``stopped`` (its record is ``stopped``) or ``refused`` (the checks of
     ``run`` said no, and nothing was written). ``outcome`` is the text a single run of that
-    tool would have left.
+    tool would have left. ``assumed`` are the card's ``assumed`` lines of a tool that ended
+    ``done`` (flat, bounded, plain text) and ``()`` for any other end: the chain's strip and
+    line say the first one, as a single run's strip does (m5 §17.12.11 D32, FM-165).
     """
 
     plugin: str
     how: Literal["done", "failed", "stopped", "refused"]
     outcome: str
+    assumed: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -951,12 +965,16 @@ class ChainStatus:
 
     ``plugins`` are the tools it runs, in order; ``ended`` is how each of the first ones
     ended; ``current`` is the tool going, or the one about to start between two, and
-    ``None`` once the chain ended.
+    ``None`` once the chain ended. ``label`` is the name of the button that started it
+    (``RUN_ALL_LABEL``, or *Measure the time*'s): it opens every outcome of the chain and
+    names the screen that draws the chain's line, so that a second tab draws the same
+    (m5 §17.12.11 D31, FM-151).
     """
 
     plugins: tuple[str, ...]
     ended: tuple[ChainEnd, ...]
     current: str | None
+    label: str = RUN_ALL_LABEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -1089,28 +1107,36 @@ def _chain_outcome(
     ended: tuple[ChainEnd, ...],
     stopped_before: str | None,
     seconds: float,
+    *,
+    label: str = RUN_ALL_LABEL,
 ) -> str:
     """The strip's text for a chain that ran to its end without a bug of its own (m5 §17.11.2).
 
-    ``Run all that are left: done in <s> s (<titles>)`` when every tool ended ``done``;
-    else ``Run all that are left: <the outcome of the tool that stopped it>``, or
-    ``Run all that are left: stopped before <tool>`` after a STOP between two tools, then
-    ``; done: <titles>`` and ``; not run: <titles>`` (the tools after the one it stopped at
-    or before) when there are some. The tools are named by their plain title, never their
-    plugin name (m5 §17.12 D20); the tool that stopped it names itself in its own outcome.
+    ``<label>: done in <s> s (<titles>)`` when every tool ended ``done``, then ``; assumed:
+    <the first line of the first tool that has some> (+n more, on the card)`` with ``n`` over
+    all the chain's tools (m5 §17.12.11 D32: *Measure the time* dropped ``left the autofocus
+    off``, FM-165); else ``<label>:
+    <the outcome of the tool that stopped it>``, or ``<label>: stopped before <tool>`` after
+    a STOP between two tools, then ``; done: <titles>`` and ``; not run: <titles>`` (the
+    tools after the one it stopped at or before) when there are some. The label is the
+    button's own (*Run all that are left*, *Measure the time*: m5 §17.12.11 D31): the strip
+    said ``Run all that are left`` for a chain *Measure the time* had started. The tools
+    are named by their plain title, never their plugin name (m5 §17.12 D20); the tool that
+    stopped it names itself in its own outcome.
     """
     done = [end.plugin for end in ended if end.how == "done"]
     if stopped_before is None and len(done) == len(tools):
+        assumed = [line for end in ended for line in end.assumed]
         return (
-            f"{RUN_ALL_LABEL}: done in {seconds:.1f} s "
-            f"({', '.join(tool_title(tool) for tool in tools)})"
+            f"{label}: done in {seconds:.1f} s "
+            f"({', '.join(tool_title(tool) for tool in tools)}){_assumed_tail_of(assumed)}"
         )
     if stopped_before is not None:
-        head = f"{RUN_ALL_LABEL}: stopped before {tool_title(stopped_before)}"
+        head = f"{label}: stopped before {tool_title(stopped_before)}"
         not_run = tools[len(ended) + 1 :]
     else:
         last = ended[-1]
-        head = f"{RUN_ALL_LABEL}: {last.outcome}"
+        head = f"{label}: {last.outcome}"
         not_run = tools[len(ended) :]
     text = head
     if done:
@@ -1540,12 +1566,20 @@ def _assumed_tail(record: StageRecord) -> str:
     lines are the card's, so they are flat, bounded and never markup (FM-125,
     FM-139), and empty unless the record ended ``done`` (FM-154).
     """
-    assumed = _card(record).assumed
-    if not assumed:
+    return _assumed_tail_of(_card(record).assumed)
+
+
+def _assumed_tail_of(lines: Sequence[str]) -> str:
+    """``; assumed: <the first line, cut>`` and ``(+n more, on the card)`` for the rest; ``""`` for no line.
+
+    One place for a single run's strip and a chain's (m5 §17.12.11 D32): the chain's lines
+    are those of all its tools, in its order, so ``n`` counts every line but the first.
+    """
+    if not lines:
         return ""
-    tail = f"; assumed: {_cut(assumed[0], _STRIP_ASSUMED_CHARS)}"
-    if len(assumed) > 1:
-        tail += f" (+{len(assumed) - 1} more, on the card)"
+    tail = f"; assumed: {_cut(lines[0], _STRIP_ASSUMED_CHARS)}"
+    if len(lines) > 1:
+        tail += f" (+{len(lines) - 1} more, on the card)"
     return tail
 
 
@@ -1761,6 +1795,13 @@ class PlatePage:
         # event set (``stop()`` sets it and takes no lock, FM-70); the next activity of that
         # name removes it, so a later run says its own end.
         self._stopped_activity: set[str] = set()
+        # The ``attempt`` of each plugin's record as that plugin's latest activity of this page
+        # left it, under ``_lock`` (m5 §17.12.11 D34): ``_reported`` and ``_stopped_activity``
+        # describe *that* record and no other. A later record of the same tool that this page
+        # did not run (``smc run scan --resume`` in a terminal, another attempt that failed
+        # for another reason) has another attempt, and the Scan screen then says its own end.
+        # Dropped with them at an activity's start, set by ``_note_attempt``.
+        self._attempts: dict[str, str] = {}
         # What this page wrote into a profile's file, under ``_lock``: the ``finished_utc`` of the
         # ``objective-offsets`` result and the file (m5 §18.2 D7). The block says *Written* while
         # the usable result is that one, and no longer once the tool has run again.
@@ -2844,6 +2885,13 @@ class PlatePage:
             # §11.4): a usable plate would be replaced by a failure. The page refuses
             # first, nothing written, before the parameters are read (FM-169, m5 §12.3).
             return f"{plugin}: {refusal}"
+        if plugin == "timing" and (refusal := self._timing_refusal()) is not None:
+            # `timing` refuses a dry run too, and its refusal is a `failed` record that
+            # replaces any usable `timings` (§11.4): *Measure the time*'s view waits for it,
+            # but a click that arrives anyway (FM-169) or a tab on another page's state would
+            # write one. Refused here first, nothing written, before the parameters are read
+            # (m5 §17.12.11 D33). It says the tool by its title, as the outcome line does (D20).
+            return f"{tool_title(plugin)}: {refusal}"
         if plugin == "objective-offsets" and (
             refusal := self._offsets_refusal(self._document()[0])
         ):
@@ -2902,11 +2950,26 @@ class PlatePage:
             # ``check_ready`` passed: a resume refuses a plan changed since the stop.
             record = doc.provider("scan-plan")
             plan = None if record is None else _scan_plan_of(record)
-            planned = None if plan is None else len(plan.fields)
+            # The fields of the plan's wells only: the scan's `wells_to_scan` drops a field of
+            # a well the plan does not list, and `_on_progress` adds `planned - total` back to
+            # a resumed run's counts, so a field of such a well (an edited run document) would
+            # offset every count by one (m5 §17.12.11).
+            if plan is not None:
+                scanned_wells = frozenset(plan.wells)
+                planned = sum(1 for field in plan.fields if field.well in scanned_wells)
         return _Prepared(entry, parsed, planned)
 
     def _halted(self) -> bool:
-        """Whether the stand is halted now (a STOP not yet cleared by ``resume()``), read inside a read a Disconnect waits for."""
+        """Whether the stand is halted now (a STOP not yet cleared by ``resume()``), read inside a read a Disconnect waits for.
+
+        It reads ``Microscope.state()``, which reads every device, for one executor flag, and
+        there is no ``halted`` on the facade to read instead (m5 §17.12.11, measured on
+        ``main`` at ``909db32``): ``Executor.halted`` is private to ``Microscope``, and a
+        property on the facade would be a public accessor in ``smc.hardware`` for 0.4 ms at an
+        idle click (FM-239). ``run()`` has refused a busy page before it gets here
+        (``_refuse_if_busy``), so no activity holds the camera and the read waits for nothing.
+        It runs only for a resume or a run afresh, once per click.
+        """
         with self._reading() as microscope:
             return microscope is not None and microscope.state().halted
 
@@ -2936,7 +2999,11 @@ class PlatePage:
             return self._objective_in_place(microscope, log_failure=log_failure)
 
     def run_chain(
-        self, plugins: Sequence[str], params: Mapping[str, Sequence[str]]
+        self,
+        plugins: Sequence[str],
+        params: Mapping[str, Sequence[str]],
+        *,
+        label: str = RUN_ALL_LABEL,
     ) -> None:
         """Run the tools of ``plugins`` that are not done, in order, as one activity (m5 §17.11.2).
 
@@ -2952,9 +3019,14 @@ class PlatePage:
 
         It is one activity, named after the tool that goes, so that a second run, a snap
         or a close is refused or stops it the whole time, between two tools too. What it
-        came to is the outcome: ``Run all that are left: done in <s> s (<titles>)``, or
-        where it stopped. With the stand closed, no step asked for, a run document that
-        cannot be read, or nothing left, the outcome says so and nothing starts.
+        came to is the outcome: ``<label>: done in <s> s (<titles>)``, or where it stopped.
+        With the stand closed, no step asked for, a run document that cannot be read, a
+        checkpoint it would drop, or nothing left, the outcome says so and nothing starts.
+
+        ``label`` is the name of the button that started the chain (``RUN_ALL_LABEL`` for
+        *Run all that are left*, *Measure the time*'s for its chain): every outcome begins with
+        it and ``ChainStatus.label`` keeps it, so that the strip names the right button and the
+        screen of that button draws the chain's line (m5 §17.12.11 D31, FM-151).
 
         Raises:
             RuntimeError: An activity is going (``<name> is running``), or the page is
@@ -2962,12 +3034,12 @@ class PlatePage:
         """
         self._refuse_if_busy()
         if self._microscope is None:
-            self._set_outcome(f"{RUN_ALL_LABEL}: {NOT_CONNECTED}")
+            self._set_outcome(f"{label}: {NOT_CONNECTED}")
             return
         if not plugins:
             # The view passes none when no Results tool loaded, and a click on its disabled
             # button still arrives here (FM-169): "every step is done" would be false.
-            self._set_outcome(f"{RUN_ALL_LABEL}: no step was asked for")
+            self._set_outcome(f"{label}: no step was asked for")
             return
         # Read now and not from a view's list, which a second tab may have made stale: a tool
         # that is `ok` here is never run again by the chain.
@@ -2977,17 +3049,17 @@ class PlatePage:
             # tool as `not run` and run the ones that are `ok` again over a lock that is gone by
             # the time `_prepare` reads it (FM-24). `_prepare` refuses such a document at the
             # first tool; the chain refuses it before it decides what is left.
-            self._set_outcome(f"{RUN_ALL_LABEL}: {_flat(unreadable)}")
+            self._set_outcome(f"{label}: {_flat(unreadable)}")
             return
         left = self._chain_left(plugins, doc)
         if not left:
-            self._set_outcome(f"{RUN_ALL_LABEL}: nothing is left: every step is done")
+            self._set_outcome(f"{label}: nothing is left: every step is done")
             return
         if (dropped := self._chain_drops_a_checkpoint(left, doc)) is not None:
             # A chain is one click: it never makes out of date a checkpoint that `--resume`
             # (or *Continue the scan*) could still continue (FM-172, adversarial review of
             # #470: *Measure the time* lays the fields out again, and the stopped scan read them).
-            self._set_outcome(f"{RUN_ALL_LABEL}: {dropped}")
+            self._set_outcome(f"{label}: {dropped}")
             return
         # Read at the click, as `run` reads it: every record of the chain names the preset
         # the operator saw loaded (m5 §10.5).
@@ -2995,7 +3067,7 @@ class PlatePage:
         preset = None if loaded is None else loaded.file.name
         pairs = {tool: tuple(given) for tool, given in params.items()}
         self._start_activity(
-            left[0], lambda event: self._run_chain(left, pairs, preset, event)
+            left[0], lambda event: self._run_chain(left, pairs, preset, event, label)
         )
 
     def _chain_left(self, plugins: Sequence[str], doc: RunDocument) -> tuple[str, ...]:
@@ -3031,42 +3103,109 @@ class PlatePage:
     ) -> str | None:
         """Why running ``left`` would put a stopped or failed stage's reachable checkpoint out of date, or ``None``.
 
-        A stage reads what a tool of ``left`` provides (``reads`` or ``reads_optional``, the
-        rule of ``RunDocument.is_stale``) and holds a checkpoint ``reachable_checkpoint`` finds,
-        and the chain does not run that stage itself: the chain's end would leave it stale, and
-        its checkpoint lost to ``--resume`` (FM-172). The first such pair, in the chain's order.
+        A stage that holds a checkpoint ``reachable_checkpoint`` finds reads, through the
+        closure of ``_slot_closure``, what a tool of ``left`` provides, and the chain does not
+        run that stage itself: the chain's end would leave it stale, and its checkpoint lost to
+        ``--resume`` (FM-172). The first such tool, in the chain's order. The closure is the
+        same rule the notes use (``_checkpoint_feeders``): a chain of ``timing`` alone is
+        refused over a stopped scan, which reads the plan that reads the timings (m5 §17.12.11
+        D30).
+        """
+        feeders = self._checkpoint_feeders(doc, running=left)
+        for tool in left:
+            found = feeders.get(tool)
+            if found is None:
+                continue
+            stage, status = found
+            way = (
+                "Continue the scan or Start again, on the Scan screen, first"
+                if stage == "scan"
+                else f"continue it first (smc run {stage} --resume)"
+            )
+            return (
+                f"{tool_title(tool)} would put the checkpoint of the "
+                f"{self._end_word(stage, status, doc)} {tool_title(stage)} out of date: {way}"
+            )
+        return None
+
+    def _end_word(self, stage: str, status: StageStatus, doc: RunDocument) -> str:
+        """The word for how ``stage`` ended: the Scan screen's for the scan, else the record's status (found on the one-off session of #499).
+
+        A STOP that lands in a move ends the scan's record ``failed`` (FM-64) and the Scan screen
+        says ``Stopped by STOP``: a note that said ``the failed scan`` beside it would name one
+        state two ways. The scan's ``ScanEnd.kind`` is the word the screen uses; any other stage
+        has only its record.
+        """
+        if stage == "scan":
+            end = self._scan_end(doc)
+            if end is not None:
+                return end.kind
+        return status.value
+
+    def _slot_closure(self, stage: str) -> frozenset[str]:
+        """The slots ``stage`` reads, directly or through the tools that provide them (m5 §17.12.11 D30).
+
+        The stage's plugin's ``reads`` and ``reads_optional``, then those of every registered
+        plugin that provides one of the slots found, and so on, with a visited set (the
+        declared reads can loop). ``RunDocument.is_stale`` is transitive by the records' own
+        reads; the plugins' declared ones are what the page can know before a run, so a run of
+        any tool that provides a slot of the closure makes the stage's record stale. A slot no
+        registered plugin provides stays in the set. A stage that is not registered reads nothing.
+        """
+        plugins = self._registry().plugins
+        entry = plugins.get(stage)
+        if entry is None:
+            return frozenset()
+        providers: dict[str, list[str]] = {}
+        for name, other in plugins.items():
+            providers.setdefault(other.plugin.provides, []).append(name)
+        found: set[str] = set()
+        todo = [*entry.plugin.reads, *entry.plugin.reads_optional]
+        while todo:
+            slot = todo.pop()
+            if slot in found:
+                continue
+            found.add(slot)
+            for name in providers.get(slot, ()):
+                provider = plugins[name].plugin
+                todo.extend((*provider.reads, *provider.reads_optional))
+        return frozenset(found)
+
+    def _checkpoint_feeders(
+        self, doc: RunDocument, *, running: Collection[str] = ()
+    ) -> dict[str, tuple[str, StageStatus]]:
+        """For each registered tool whose run puts a reachable checkpoint out of date: the first such stage and its status (m5 §17.12.11 D30).
+
+        A stage counts when ``reachable_checkpoint`` finds a checkpoint ``--resume`` can still
+        continue (the profile, a dry run's, a stale record) and the tool's ``provides`` is in
+        the stage's ``_slot_closure``. The stage that is first in the registry's order names the
+        tool; the tool itself and the stages in ``running`` (a chain runs those itself, and they
+        are made again) are never the stage. The one rule of the chain's refusal
+        (``_chain_drops_a_checkpoint``) and of the notes under the buttons (``view()``). A
+        closure is built only for a stage that holds a checkpoint, so that a page with none
+        pays what ``_blocked``'s own loop pays.
         """
         registry = self._registry().plugins
         profile = self._profile.microscope.name
-        kept: dict[str, StageStatus] = {}
-        for name in registry:
-            if name in left:
+        kept: dict[str, tuple[StageStatus, frozenset[str]]] = {}
+        for stage in registry:
+            if stage in running:
                 continue
             status = reachable_checkpoint(
-                name, doc, profile=profile, dry_run=self._dry_run
+                stage, doc, profile=profile, dry_run=self._dry_run
             )
             if status is not None:
-                kept[name] = status
+                kept[stage] = (status, self._slot_closure(stage))
+        feeders: dict[str, tuple[str, StageStatus]] = {}
         if not kept:
-            return None
-        for tool in left:
-            entry = registry.get(tool)
-            if entry is None:
-                continue
+            return feeders
+        for tool, entry in registry.items():
             slot = entry.plugin.provides
-            for stage, status in kept.items():
-                reader = registry[stage].plugin
-                if slot in (*reader.reads, *reader.reads_optional):
-                    way = (
-                        "Continue the scan or Start again, on the Scan screen, first"
-                        if stage == "scan"
-                        else f"continue it first (smc run {stage} --resume)"
-                    )
-                    return (
-                        f"{tool_title(tool)} would put the checkpoint of the "
-                        f"{status.value} {tool_title(stage)} out of date: {way}"
-                    )
-        return None
+            for stage, (status, closure) in kept.items():
+                if stage != tool and slot in closure:
+                    feeders[tool] = (stage, status)
+                    break
+        return feeders
 
     def _run_chain(
         self,
@@ -3074,6 +3213,7 @@ class PlatePage:
         params: Mapping[str, Sequence[str]],
         preset: str | None,
         event: threading.Event,
+        label: str = RUN_ALL_LABEL,
     ) -> str:
         """The chain's worker body: each tool through ``_prepare`` and ``_run_plugin``; the outcome as text.
 
@@ -3082,10 +3222,11 @@ class PlatePage:
         tools, or on a tool that ignores it and ends ``done``, would otherwise be lost
         and the next tool would start (FM-226's entry). ``_lock`` is never held across
         ``_prepare``, a run or a device call (FM-70). Whatever this code itself raises is
-        the outcome ``Run all that are left: <message>``, the text and never the exception
+        the outcome ``<label>: <message>``, the text and never the exception
         (FM-98), and the tool whose turn it was ends ``failed``, so that the Results screen
         says which tool the chain stopped at and not that a STOP nobody pressed ended it; the
-        chain's status is closed in ``finally``, so no tool is left ``current``.
+        chain's status is closed in ``finally``, so no tool is left ``current``. Every status
+        it builds carries ``label``, the button's name (m5 §17.12.11 D31).
         """
         started = time.monotonic()
         ended: list[ChainEnd] = []
@@ -3093,7 +3234,7 @@ class PlatePage:
         turn: str | None = None
         try:
             with self._lock:
-                self._chain = ChainStatus(tools, (), tools[0])
+                self._chain = ChainStatus(tools, (), tools[0], label)
             for tool in tools:
                 if event.is_set():
                     stopped_before = tool
@@ -3113,6 +3254,8 @@ class PlatePage:
                         tool,
                         "stopped" if result.stopped_by_stop else result.status,
                         result.outcome,
+                        # Only a tool that ended `done` has an assumption to say (FM-154).
+                        result.assumed if result.status == "done" else (),
                     )
                 ended.append(end)
                 following = tools[len(ended)] if len(ended) < len(tools) else None
@@ -3120,7 +3263,10 @@ class PlatePage:
                     # The tool about to start stays `current` through the gap, so that
                     # a tick there does not read the chain as stopped.
                     self._chain = ChainStatus(
-                        tools, tuple(ended), following if end.how == "done" else None
+                        tools,
+                        tuple(ended),
+                        following if end.how == "done" else None,
+                        label,
                     )
                 if end.how != "done":
                     break
@@ -3132,12 +3278,16 @@ class PlatePage:
                 ended.append(
                     ChainEnd(turn, "failed", f"{tool_title(turn)} failed: {text}")
                 )
-            return f"{RUN_ALL_LABEL}: {text}"
+            return f"{label}: {text}"
         finally:
             with self._lock:
-                self._chain = ChainStatus(tools, tuple(ended), None)
+                self._chain = ChainStatus(tools, tuple(ended), None, label)
         return _chain_outcome(
-            tools, tuple(ended), stopped_before, time.monotonic() - started
+            tools,
+            tuple(ended),
+            stopped_before,
+            time.monotonic() - started,
+            label=label,
         )
 
     def _begin_tool(self, tool: str, event: threading.Event) -> None:
@@ -3155,6 +3305,7 @@ class PlatePage:
             self._progress = None
             self._reported.pop(tool, None)
             self._stopped_activity.discard(tool)
+            self._attempts.pop(tool, None)
             self._first_report = self._last_report = None
             while True:
                 try:
@@ -3193,6 +3344,7 @@ class PlatePage:
             self._progress = None
             self._reported.pop(name, None)
             self._stopped_activity.discard(name)
+            self._attempts.pop(name, None)
             self._counted_over = None
             self._clock_of = name
             self._clock_start = time.monotonic()
@@ -3340,12 +3492,36 @@ class PlatePage:
         ended = self._run_plugin_once(
             plugin, entry, parsed, event, preset, resume, planned
         )
+        self._note_attempt(plugin)
         self._last_ended = ended
         if entry.plugin.provides == "plate":
             with self._lock:
                 self._goto = ""
                 self._goto_answer = None
         return ended
+
+    def _note_attempt(self, plugin: str) -> None:
+        """Keep the ``attempt`` of ``plugin``'s record, the one the run that just ended wrote (m5 §17.12.11 D34).
+
+        ``_scan_end`` uses the count and the STOP flag this page kept only for the record they
+        describe. The document is read **outside** ``_lock`` (the tick takes it, and I/O under
+        it would stall every tab) and the attempt is stored under it. An unreadable document or a
+        missing record stores nothing: then the page says the record's own words, without a count
+        (FM-98: nothing is raised, and no exception is kept).
+        """
+        # Any error of the read: a note of the end must never cost the run its outcome.
+        try:
+            doc, unreadable = self._document()
+            record = None if unreadable is not None else doc.stages.get(plugin)
+        except Exception as exc:
+            log.info(
+                "%s: its record's attempt was not read: %s", plugin, type(exc).__name__
+            )
+            return
+        if record is None:
+            return
+        with self._lock:
+            self._attempts[plugin] = record.attempt
 
     def _run_plugin_once(
         self,
@@ -3407,9 +3583,12 @@ class PlatePage:
             note = ""
             if record.provides == "plate":
                 note = self._follow_plate(turned_from)
+            # The card's lines, read once: the strip's tail and a chain's both say them.
+            assumed = _card(record).assumed
             return _Ended(
-                f"{title} done in {seconds:.1f} s{_assumed_tail(record)}{note}",
+                f"{title} done in {seconds:.1f} s{_assumed_tail_of(assumed)}{note}",
                 "done",
+                assumed=assumed,
             )
         return _Ended(f"{title} stopped", "stopped", detail="Stopped.")
 
@@ -4953,6 +5132,10 @@ class PlatePage:
             frame_wells=self._frame_wells(doc),
             scan_end=self._scan_end(doc),
             offsets=(None if plate_record is None else _offsets_offer_of(registered)),
+            checkpoint_notes={
+                tool: checkpoint_note(stage, self._end_word(stage, status, doc))
+                for tool, (stage, status) in self._checkpoint_feeders(doc).items()
+            },
         )
 
     def _scan_end(self, doc: RunDocument) -> ScanEnd | None:
@@ -4961,8 +5144,12 @@ class PlatePage:
         The record says the status and the error; this page says whether STOP was pressed in
         that scan (``_stopped_activity``: a STOP in a move is a ``failed`` record, FM-64) and
         how far it got (the last report it kept of it, ``_reported``). Both are read in one
-        section under ``_lock`` (FM-151). Whether the checkpoint can be continued is
-        ``reachable_checkpoint``'s, the test the runner's resume passes from the document.
+        section under ``_lock`` with the attempt they belong to (FM-151), and are used only
+        when that attempt is this record's (m5 §17.12.11 D34): a later record of the scan that
+        this page did not run (a terminal's ``smc run scan --resume`` that failed for another
+        reason) says its own end, as a new page does, with no count and its status's words.
+        Whether the checkpoint can be continued is ``reachable_checkpoint``'s, the test the
+        runner's resume passes from the document.
         """
         record = doc.stages.get("scan")
         if record is None or record.status not in (
@@ -4973,6 +5160,10 @@ class PlatePage:
         with self._lock:
             reported = self._reported.get("scan")
             stopped_here = "scan" in self._stopped_activity
+            ours = self._attempts.get("scan") == record.attempt
+        if not ours:
+            reported = None
+            stopped_here = False
         kind: Literal["stopped", "failed"] = (
             "stopped"
             if record.status is StageStatus.stopped or stopped_here
@@ -5352,6 +5543,17 @@ class PlatePage:
             command=command,
             blocked=blocked.get(tool.name) or stuck,
         )
+
+    def _timing_refusal(self) -> str | None:
+        """Why the page does not run ``timing`` on this page, or ``None``: a dry run has no time to measure (m5 §17.12.11 D33).
+
+        The tool refuses a dry run itself, before it moves anything, but the refusal is a
+        ``failed`` record, and the latest attempt decides the ``timings`` slot (m5 §11.4): a
+        usable measurement would be replaced by a failure. One source for ``_prepare``, for
+        ``_blocked`` (the expert view's *Run* and *Measure the time* wait with it) and so for
+        the button's wait (FM-169, FM-182).
+        """
+        return MEASURE_NOT_IN_A_DRY_RUN if self._dry_run else None
 
     def _walls_refusal(self) -> str | None:
         """Why the page does not run ``plate-walls`` in this mode or on this plate, or ``None`` (m5 §12.3, #375).
@@ -5881,6 +6083,8 @@ class PlatePage:
             )
             if reason is None and name == "plate-walls":
                 reason = self._walls_refusal()
+            if reason is None and name == "timing":
+                reason = self._timing_refusal()
             if reason is None and name == "objective-offsets":
                 reason = self._offsets_refusal(doc)
             if reason is None:

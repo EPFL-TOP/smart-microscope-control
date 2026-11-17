@@ -88,7 +88,6 @@ from smc.ui.guide import (
     END_LIVE_LABEL,
     FILES_HEADING,
     MEASURE_AFTER_THE_SCAN,
-    MEASURE_NOT_IN_A_DRY_RUN,
     MEASURE_THE_TIME,
     NO_FILES_YET,
     OFFSETS_NOT_TURNED_BACK,
@@ -206,6 +205,12 @@ FRAME_TICK_MS = 100
 
 #: How long ``serve`` waits for Panel's server to stop, in seconds.
 SERVER_STOP_WAIT_S = 10.0
+
+#: How old the arm of *Start again* must be before a second click confirms it, in seconds
+#: (m5 §17.12.11 D35): a double-click delivers both clicks within a fraction of a second, and the
+#: second used to confirm the drop of a checkpoint the operator had not yet read about. Reading the
+#: confirm line takes longer than this; a click younger than it is ignored and the arm stays.
+SCAN_AGAIN_MIN_AGE_S = 1.0
 
 DRIVE_TEXT = "DRIVE: the next click on a well moves the stage there"
 
@@ -719,8 +724,12 @@ class PlatePageView:
         # for, per view (D6: a second tab never inherits it). The second click runs the scan
         # afresh only while the view's ``scan_end`` is still this one; a change of screen, of
         # the scan end or any other button drops it (FM-172: one click never drops a
-        # checkpoint).
+        # checkpoint). ``_again_armed_at`` is when the first click armed, on ``_clock``
+        # (``time.monotonic``; a plain attribute so that a test moves it): a second click
+        # younger than ``SCAN_AGAIN_MIN_AGE_S`` is a double-click and is ignored (D35).
         self._again_armed: ScanEnd | None = None
+        self._again_armed_at: float | None = None
+        self._clock: Callable[[], float] = time.monotonic
         # The Plate screen (m5 §17.4.2): the centre rows and the registration the last
         # redraw drew. A button runs what was drawn, never what would be computed at the
         # click (#287, FM-177). The drive's answer is the controller's, on the row of the well
@@ -2580,13 +2589,21 @@ class PlatePageView:
         The arm is the scan end the first click saw; the second click runs only while the
         view's scan end is still that one, and arms again otherwise (another tab continued
         the scan, a new end was drawn). ``afresh=True`` is passed here and nowhere else.
+
+        A second click younger than ``SCAN_AGAIN_MIN_AGE_S`` is ignored: nothing runs, nothing
+        is redrawn and the arm stays as the first click made it, so that the age is counted from
+        that click (m5 §17.12.11 D35: a double-click delivered both).
         """
         view = self._view
         end = None if view is None else view.scan_end
         armed = self._again_armed
         if armed is None or end is None or armed != end:
             self._again_armed = end if end is not None and end.resumable else None
+            self._again_armed_at = None if self._again_armed is None else self._clock()
             self._draw_wells_scan_buttons()
+            return
+        armed_at = self._again_armed_at
+        if armed_at is not None and self._clock() - armed_at < SCAN_AGAIN_MIN_AGE_S:
             return
         self._again_armed = None
         self._try(lambda: self.page.run("scan", self._scan_pairs(), afresh=True))
@@ -2597,7 +2614,10 @@ class PlatePageView:
 
         Each tool with the pairs its own *Run* sends: the profile's suggestions are the
         fields' starting values, as *Calibrate the camera* sends ``camera-calibration``'s. The
-        chain's rule (D14) runs ``scan-plan`` after ``timing``, since it reads the timings.
+        chain's rule (D14) runs ``scan-plan`` after ``timing``, since it reads the timings. The
+        chain carries this button's name, so that the strip opens with *Measure the time* and not
+        *Run all that are left*, and its line is drawn on this screen whichever tool comes
+        first (m5 §17.12.11 D31).
         """
         tools = ("timing", "scan-plan")
 
@@ -2606,7 +2626,7 @@ class PlatePageView:
                 tool: [*self.page.page_params(tool), *self._typed(tool)]
                 for tool in tools
             }
-            self.page.run_chain(tools, params)
+            self.page.run_chain(tools, params, label=MEASURE_THE_TIME)
 
         self._try(measure)
         self.tick()
@@ -3592,10 +3612,20 @@ class PlatePageView:
         live = self.page.is_live
         busy = None if running is None else busy_note(running, live=live)
         replaces = {} if self._view is None else self._view.replaces
+        kept = {} if self._view is None else self._view.checkpoint_notes
         for name, button in self.tool_runs.items():
             reason = self._blocked.get(name)
             button.disabled = running is not None or reason is not None
-            lines = (reason or busy, replaces.get(name))
+            # Last: what a click on a tool that feeds a stopped scan would put out of date
+            # (m5 §17.12.11 D30); the run is not refused for it, so the button is not disabled
+            # for it. A tool that has a reason of its own cannot run (a dry-run page's `timing`,
+            # the stand closed...): the click puts nothing out of date, and the note would claim
+            # it beside a refusal (the Wells screen's wait drops it the same way, review of #499).
+            lines = (
+                reason or busy,
+                replaces.get(name),
+                None if reason else kept.get(name),
+            )
             self.tool_notes[name].object = "\n".join(line for line in lines if line)
         # The next step's button: while an activity goes, or when the step says why not.
         blocked = None if self._next_drawn is None else self._next_drawn.blocked
@@ -4239,7 +4269,11 @@ class PlatePageView:
         if "scan-plan" not in self.tool_runs:
             lay_out = "scan-plan did not load: the problems line says why"
         self.layout_button.disabled = running is not None or lay_out is not None
-        self._say(self.layout_wait, lay_out or busy or "")
+        # The last text: a wait or the busy note comes first. With nothing in the way, a stopped
+        # scan's checkpoint that this click would put out of date says so (m5 §17.12.11 D30);
+        # the button stays enabled, since a single run is the operator's deliberate choice.
+        kept = None if view is None else view.checkpoint_notes.get("scan-plan")
+        self._say(self.layout_wait, lay_out or busy or kept or "")
         start = scan_wait(
             connected=connected,
             blocked=self._blocked.get("scan"),
@@ -4293,9 +4327,10 @@ class PlatePageView:
         """*Measure the time* and its wait: offered while the usable plan has no time and both tools loaded (m5 §17.12 D18).
 
         Disabled while an activity goes or a tool of the chain cannot run (the controller's
-        reason, ``timing``'s first), and on a page served with ``--dry-run``, which ``timing``
-        refuses (its calls take no time to measure). The controller's chain refuses on its own
-        (FM-169), and ``timing`` refuses a dry run before it moves anything.
+        reason, ``timing``'s first). That includes a page served with ``--dry-run``, which
+        ``timing`` refuses (its calls take no time to measure): the controller's
+        ``_timing_refusal`` is the one source, in ``blocked`` for this wait and in ``_prepare``
+        for a click that arrives anyway (m5 §17.12.11 D33, FM-169, FM-182).
         """
         view = self._view
         plan = None if view is None else view.plan
@@ -4309,15 +4344,9 @@ class PlatePageView:
         if not shown:
             self._say(self.measure_time_wait, "")
             return
-        status = self._status
         reason = (
             self._blocked.get("timing")
             or self._blocked.get("scan-plan")
-            or (
-                MEASURE_NOT_IN_A_DRY_RUN
-                if status is not None and status.dry_run
-                else None
-            )
             or (
                 MEASURE_AFTER_THE_SCAN
                 if view is not None
@@ -4347,7 +4376,14 @@ class PlatePageView:
         self.layout_card.visible = bool(self.layout_command.object)
 
     def _draw_scan_command(self) -> None:
-        """The command of *Start the scan*, or of *Continue the scan* (``--resume``) over a checkpoint it continues (m5 §17.2 D8, §17.12 D17)."""
+        """The command of *Start the scan*, or of *Continue the scan* (``--resume``) over a checkpoint it continues (m5 §17.2 D8, §17.12 D17).
+
+        It is the command of the **last redraw**, and the tick does not redraw it (it reads the
+        run document, which the tick never does): after the click on *Continue the scan* it
+        still says ``--resume``, and a redraw while the continued scan runs says none, since no
+        scan end stands while the record is ``running``. Measured in m5 §17.12.11 and pinned by
+        a test; the code is as it was.
+        """
         view = self._view
         end = None if view is None else view.scan_end
         try:
@@ -4419,11 +4455,17 @@ class PlatePageView:
         called last by the tick and by ``refresh()``.
         """
         chain = None if status is None else status.chain
-        first = None if chain is None or not chain.plugins else chain.plugins[0]
-        # Each screen draws the chains its own button starts (m5 §17.12.4): *Measure the
-        # time*'s on Wells, *Run all that are left*'s on Results.
-        self._say(self.chain_text, chain_line(chain) if first in RESULT_TOOLS else "")
-        self._say(self.wells_chain_text, chain_line(chain) if first == "timing" else "")
+        label = None if chain is None or not chain.plugins else chain.label
+        # Each screen draws the chains its own button starts (m5 §17.12.4): the chain's label
+        # is that button's name, so *Measure the time*'s is on Wells, *Run all that are left*'s
+        # on Results, and a chain of another name on neither (§17.12.11 D31: the first tool
+        # was the key, and a chain whose first tool was not `timing` was drawn nowhere). Whoever
+        # adds a chain button names its screen here.
+        self._say(self.chain_text, chain_line(chain) if label == RUN_ALL_LABEL else "")
+        self._say(
+            self.wells_chain_text,
+            chain_line(chain) if label == MEASURE_THE_TIME else "",
+        )
 
     def _draw_results_buttons(self) -> None:
         """Which of *Run all that are left* and the five rows' buttons is disabled, and the reason beside each (m5 §11.2, §17.11.2).

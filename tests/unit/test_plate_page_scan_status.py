@@ -1062,6 +1062,112 @@ def test_a_later_scan_that_fails_without_a_stop_says_its_own_end(
     assert (end.kind, end.done, end.total) == ("failed", None, None)
 
 
+def test_a_terminals_later_failure_replaces_the_stop_the_page_remembered(
+    scan_page: PlatePage, run_doc: Path
+) -> None:
+    """``_reported`` and ``_stopped_activity`` were keyed by the tool's name: a later record of the scan inherited them (m5 §17.12.11 D34)."""
+    _stop_the_scan(scan_page)
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert (end.kind, end.done, end.total) == ("stopped", 1, 3)
+
+    # `smc run scan --resume` in a terminal while this page is open: another attempt, that
+    # failed for another reason. The page never ran it, and says its own end.
+    record = RunDocument.load(run_doc).stages["scan"]
+    later = (record.finished_utc or record.started_utc) + timedelta(minutes=5)
+    write_stage(
+        run_doc,
+        record.model_copy(
+            update={
+                "attempt": "terminal",
+                "status": StageStatus.failed,
+                "error": "OSError: disk full",
+                "started_utc": later,
+                "finished_utc": later,
+            }
+        ),
+    )
+
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert (end.kind, end.done, end.total, end.text) == (
+        "failed",
+        None,
+        None,
+        "OSError: disk full",
+    )
+
+
+def test_a_scan_the_page_ran_keeps_its_count_and_its_stop_through_other_activities(
+    scan_page: PlatePage,
+) -> None:
+    """The attempt is the page's own run's: another tool's run in between changes neither it nor the words."""
+    CheckpointScan.ending = "move"
+    _stop_the_scan(scan_page)
+    scan_page.run("quick", [])
+    assert scan_page.join(BOUND_S)
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert (end.kind, end.done, end.total) == ("stopped", 1, 3)
+    # A second look gives the same: the kept attempt is the record's, not consumed by a read.
+    again = scan_page.view().scan_end
+    assert again == end
+
+
+def test_a_document_that_cannot_be_read_at_the_end_of_a_run_keeps_no_attempt_and_raises_nothing(
+    scan_page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The attempt of an earlier run is dropped when a new run starts; an unreadable end keeps none (FM-98)."""
+    _stop_the_scan(scan_page)
+    assert "scan" in scan_page._attempts
+
+    CheckpointScan.paused = threading.Event()
+    CheckpointScan.release = threading.Event()
+    # `_document()` answers an unreadable file with a new document and the reason, as it does
+    # for a lock another program holds for a moment (FM-24).
+    monkeypatch.setattr(
+        scan_page,
+        "_document",
+        lambda: (RunDocument.new(), "the file is locked by another program"),
+    )
+    scan_page.run("scan", [], afresh=True)
+    assert CheckpointScan.paused.wait(BOUND_S)
+    scan_page.stop()
+    CheckpointScan.release.set()
+    assert scan_page.join(BOUND_S)
+    scan_page.resume()
+    monkeypatch.undo()
+
+    # The new run's end is a stop all the same, and the page raised nothing for the read.
+    assert scan_page.status().outcome == "Scan stopped"
+    assert "scan" not in scan_page._attempts
+    end = scan_page.view().scan_end
+    assert end is not None
+    # No attempt kept: the record's own words, with no count.
+    assert (end.kind, end.done, end.total) == ("stopped", None, None)
+
+
+def test_a_read_that_raises_at_the_end_of_a_run_costs_the_run_nothing(
+    scan_page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_note_attempt`` never raises (FM-98): an error of any kind from the read is no reason to lose the outcome."""
+
+    def refused(self: Any) -> Any:
+        raise OSError("the disk went away")
+
+    monkeypatch.setattr(PlatePage, "_document", refused)
+    scan_page.run("scan", [])
+    assert CheckpointScan.paused.wait(BOUND_S)
+    scan_page.stop()
+    CheckpointScan.release.set()
+    assert scan_page.join(BOUND_S)
+    monkeypatch.undo()
+    scan_page.resume()
+
+    assert scan_page.status().outcome == "Scan stopped"
+    assert "scan" not in scan_page._attempts
+
+
 def test_a_stop_in_another_tool_does_not_make_a_scan_failure_a_stop(
     scan_page: PlatePage,
 ) -> None:

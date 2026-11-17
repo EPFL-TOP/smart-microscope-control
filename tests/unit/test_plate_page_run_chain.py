@@ -962,3 +962,143 @@ def test_another_activity_clears_the_chain_when_it_starts(page: PlatePage) -> No
     _Stub.release["cells"].set()
     _ended(page)
     assert page.status().chain is None
+
+
+# --- a chain names itself (m5 §17.12.11 D31, #499) ----------------------------------------
+
+
+def test_a_chain_names_itself_in_its_outcome_and_its_status(page: PlatePage) -> None:
+    """*Measure the time* said ``Run all that are left: done in ...``: the label was one for every chain."""
+    _Stub.behaviour["cells"] = "wait"
+
+    page.run_chain(("cells", "density"), {}, label="Measure the time")
+    assert _Stub.started["cells"].wait(WAIT_S)
+    # The status carries it while the chain goes, so that a second tab draws the same (FM-151).
+    during = page.status().chain
+    assert during is not None
+    assert during.label == "Measure the time"
+    _Stub.release["cells"].set()
+    _ended(page)
+
+    assert _outcome(page).startswith("Measure the time: done in ")
+    assert _outcome(page).endswith(" s (Count the cells, Density per well)")
+    after = page.status().chain
+    assert after is not None
+    assert after.label == "Measure the time"
+    assert after.current is None
+
+    # Without a label the chain is *Run all that are left*, as every existing call is.
+    page.run_chain(("route",), {})
+    _ended(page)
+    assert _outcome(page).startswith("Run all that are left: done in ")
+    default = page.status().chain
+    assert default is not None
+    assert default.label == "Run all that are left"
+
+
+def test_the_chain_status_between_two_tools_carries_the_label(page: PlatePage) -> None:
+    """The status built when a tool ends and the next one starts is the one a second tab reads while that tool runs (FM-151)."""
+    _Stub.behaviour["density"] = "wait"
+
+    page.run_chain(("cells", "density"), {}, label="Measure the time")
+    assert _Stub.started["density"].wait(WAIT_S)
+    chain = page.status().chain
+    assert chain is not None
+    # `cells` ended and `density` goes: the label is still the button's, not the default.
+    assert [end.plugin for end in chain.ended] == ["cells"]
+    assert chain.current == "density"
+    assert chain.label == "Measure the time"
+    _Stub.release["density"].set()
+    _ended(page)
+
+
+@pytest.mark.parametrize("how", ["fail", "wait", "wait_ignoring_stop"])
+def test_a_chain_that_does_not_end_done_says_its_own_name_too(
+    page: PlatePage, how: str
+) -> None:
+    _Stub.behaviour["cells"] = how
+    page.run_chain(("cells", "density"), {}, label="Measure the time")
+    if how != "fail":
+        assert _Stub.started["cells"].wait(WAIT_S)
+        page.stop()
+        _Stub.release["cells"].set()
+    _ended(page)
+
+    outcome = _outcome(page)
+    assert outcome.startswith("Measure the time: ")
+    assert "Run all that are left" not in outcome
+    chain = page.status().chain
+    assert chain is not None
+    assert chain.label == "Measure the time"
+
+
+def test_every_refusal_of_a_chain_says_the_chains_own_name(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    label = "Measure the time"
+    _seed_scan(run_doc)
+
+    # The stand closed.
+    closed = make_page(connect=False)
+    closed.run_chain(TOOLS, {}, label=label)
+    assert closed.status().outcome == f"{label}: {NOT_CONNECTED}"
+
+    connected = make_page()
+    # No step asked for.
+    connected.run_chain([], {}, label=label)
+    assert _outcome(connected) == f"{label}: no step was asked for"
+
+    # Nothing left: every tool of the chain is done.
+    connected.run_chain(("cells", "density"), {})
+    _ended(connected)
+    connected.run_chain(("cells", "density"), {}, label=label)
+    assert _outcome(connected) == f"{label}: nothing is left: every step is done"
+
+    # An unreadable run document.
+    real = controller_module.RunDocument.load_or_new
+    calls: list[int] = []
+
+    def refused_once(path: Path) -> RunDocument:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RunDocumentError(path, "the file is locked by another program")
+        return real(path)
+
+    monkeypatch.setattr(
+        controller_module.RunDocument, "load_or_new", staticmethod(refused_once)
+    )
+    connected.run_chain(("route",), {}, label=label)
+    assert _outcome(connected).startswith(f"{label}: ")
+    assert "the file is locked by another program" in _outcome(connected)
+    monkeypatch.undo()
+
+    # A checkpoint the chain would drop: `nis-export` stopped with one, and `route` (which it
+    # reads) not run yet.
+    _seed(
+        run_doc,
+        "nis-export",
+        minute=10,
+        status=StageStatus.stopped,
+        checkpoint={"done": 1},
+    )
+    _Stub.ran.clear()
+    connected.run_chain(("route",), {}, label=label)
+    dropped = _outcome(connected)
+    assert dropped.startswith(f"{label}: Route would put the checkpoint of ")
+    # Nothing started: no activity, and the chain the page kept is still the earlier one.
+    assert connected.status().running is None
+    kept = connected.status().chain
+    assert kept is not None
+    assert kept.label == "Run all that are left"
+    assert _Stub.ran == []
+
+    # The chain's own bug.
+    def broken(plugin: str, params: Any) -> Any:
+        raise ValueError("a bug\nin the chain")
+
+    monkeypatch.setattr(connected, "_prepare", broken)
+    connected.run_chain(("report",), {}, label=label)
+    _ended(connected)
+    assert _outcome(connected) == f"{label}: ValueError: a bug in the chain"

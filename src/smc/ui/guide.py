@@ -63,6 +63,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AGAIN_NOTE",
+    "ASSUMED_LINE_CHARS",
     "AUTOFOCUS_WORDS",
     "CALIBRATION_HOW_WINDOWS_NOTE",
     "CAMERA_NOT_CALIBRATED_NOTE",
@@ -71,6 +72,9 @@ __all__ = [
     "CAPTURE_WELLS",
     "CENTRES_CUT_NOTE",
     "CENTRES_UNREACHABLE_NOTE",
+    "CHAIN_ASSUMED",
+    "CHECKPOINT_NOTE",
+    "CHECKPOINT_NOTE_SCAN",
     "COVERAGE_WORDS",
     "DISCONNECT_RELEASES",
     "DRY_RUN_NO_FRAME",
@@ -166,6 +170,7 @@ __all__ = [
     "centres_reach_note",
     "centres_text",
     "chain_line",
+    "checkpoint_note",
     "colour_bar_title",
     "command_line",
     "continue_label",
@@ -453,6 +458,18 @@ SCAN_REPLACES = "Starting the scan again replaces this one ({frames} frames)."
 SCAN_CHECKPOINT_KEPT = (
     "{status} with a checkpoint: Continue the scan, on the Scan screen, takes it up; "
     "Start again there drops it"
+)
+#: What a single run of a tool that feeds a stopped or failed stage's checkpoint says **before**
+#: the click (m5 §17.12.11 D30): the run is not refused (it is the operator's deliberate choice,
+#: FM-236), but it makes the checkpoint out of date in one click. ``{status}`` is ``stopped`` or
+#: ``failed``, ``{stage}`` the stage's plugin name (the command's).
+CHECKPOINT_NOTE_SCAN = (
+    "This puts the {status} scan out of date: Continue the scan will not be offered "
+    "any more, and Start the scan takes it from the first field."
+)
+CHECKPOINT_NOTE = (
+    "This puts the {status} {stage} out of date: smc run {stage} --resume cannot "
+    "continue it afterwards."
 )
 #: The Wells screen's button while the plan has no time (m5 §17.12 D18), and its wait on a page
 #: served with ``--dry-run``: ``timing`` refuses a dry run, whose calls take no time to measure.
@@ -2104,6 +2121,13 @@ SCAN_FIRST = "scan first: step 4, Scan"
 #: The label of the chain's button and what it says when there is none to run.
 RUN_ALL_LABEL = "Run all that are left"
 NOTHING_LEFT = "Nothing is left: every step is done."
+#: What a chain that ended ``done`` adds to its line: the first assumption any of its tools
+#: made (m5 §17.12.11 D32, FM-165). The strip says the same line, cut at the same length, with
+#: a count that points to the card; the guided screens have no card, so no count here.
+CHAIN_ASSUMED = "Assumed: {line}"
+#: An assumption is a diagnosis whose end often says what to do; the strip and the chain's line
+#: show the first one cut here (the card holds every line).
+ASSUMED_LINE_CHARS = 160
 
 #: The heading of the files block, and what it says before any step wrote one.
 FILES_HEADING = "Where the files are"
@@ -2289,6 +2313,17 @@ def _sentence(text: str) -> str:
     return flat if flat.endswith(".") else flat + "."
 
 
+def checkpoint_note(stage: str, status: str) -> str:
+    """What running a tool that feeds ``stage`` does to its ``status`` checkpoint, said before the click (m5 §17.12.11 D30).
+
+    ``scan`` is continued from the Scan screen, so its note names the buttons; any other
+    stage is continued with ``smc run <stage> --resume``. Both take strings, not the
+    controller's types: this module imports nothing from the controller at run time.
+    """
+    template = CHECKPOINT_NOTE_SCAN if stage == "scan" else CHECKPOINT_NOTE
+    return template.format(status=status, stage=stage)
+
+
 def chain_line(chain: ChainStatus | None) -> str:
     """The one line that says what *Run all that are left* is doing or did (m5 §17.11.3).
 
@@ -2309,7 +2344,16 @@ def chain_line(chain: ChainStatus | None) -> str:
     after = chain.plugins[len(chain.ended) :]
     last = chain.ended[-1] if chain.ended else None
     if last is not None and last.how == "done" and not after:
-        return f"Done: {_names(done)}."
+        # What a tool assumed is said only when the chain ended `done`: a stopped or failed
+        # chain says where it stopped, and the tool's own card says the rest (D32).
+        text = f"Done: {_names(done)}."
+        first = next((line for end in chain.ended for line in end.assumed), None)
+        if first is None:
+            return text
+        line = _flat(first)
+        if len(line) > ASSUMED_LINE_CHARS:
+            line = line[:ASSUMED_LINE_CHARS] + "…"
+        return f"{text} {_sentence(CHAIN_ASSUMED.format(line=line))}"
     if last is None or last.how == "done":
         # A STOP between two tools (or before the first): nothing was refused or failed.
         head = f"Stopped before {_result_name(after[0])} by STOP."

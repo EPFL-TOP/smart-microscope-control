@@ -19,6 +19,7 @@ import dataclasses
 import os
 import shlex
 import threading
+import time
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
@@ -39,9 +40,11 @@ from bokeh.models import Line, Rect
 import smc.ui.controller as controller_module
 import smc.ui.plate_page as plate_page
 from smc.hardware import Microscope
+from smc.hardware.errors import MotionStoppedError
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, Progress, RunContext
 from smc.plugins.registry import GROUP
+from smc.plugins.runner import reachable_checkpoint
 from smc.plugins.scan_plan.algorithm import plan_fields
 from smc.plugins.slots import (
     FailedField,
@@ -57,12 +60,15 @@ from smc.ui.controller import NOT_CONNECTED, ChainStatus, PlatePage
 from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     LAY_OUT_FIRST,
+    MEASURE_NOT_IN_A_DRY_RUN,
+    MEASURE_THE_TIME,
     PLATE_NOT_CHOSEN,
     REGISTER_FIRST,
     SCREEN_LEADS,
     SCREEN_TITLES,
     SELECT_WELLS,
     busy_note,
+    checkpoint_note,
     plain_default,
 )
 from smc.ui.plate_page import PlatePageView, posix_quoting_note
@@ -73,6 +79,11 @@ pytestmark = [
     ),
     pytest.mark.usefixtures("handler_failures"),
 ]
+
+#: *Start again*'s shipped minimum age, read at import, before the autouse fixture below sets it to 0.0
+#: for the tests that click twice in a row on purpose (m5 §17.12.11 D35): the guard's test and the pin
+#: of the shipped value both use it.
+SHIPPED_SCAN_AGAIN_MIN_AGE_S = plate_page.SCAN_AGAIN_MIN_AGE_S
 
 T0 = datetime(2026, 11, 12, 9, 0, tzinfo=timezone.utc)
 TEN_X = "Nikon 10X S Fluor"
@@ -140,6 +151,10 @@ class StubScan:
     checkpoint_at: ClassVar[int] = 0
     resumed: ClassVar[list[int | None]] = []
     counts_the_rest: ClassVar[bool] = False
+    #: How the run ends at its pause when it is told to stop: ``stop`` (a ``stopped`` record), ``move``
+    #: (the stop lands in a move, the record is ``failed``: FM-64) or, whether or not STOP was
+    #: pressed, ``fail`` (a plain error).
+    ending: ClassVar[str] = "stop"
 
     def run(
         self, microscope: Any, params: StubScanParams, ctx: RunContext
@@ -149,8 +164,15 @@ class StubScan:
         kept = ctx.checkpoint(_Taken)
         StubScan.resumed.append(None if kept is None else kept.taken)
         start = 0 if kept is None else kept.taken
-        total = len(plan.fields)
-        for position, field in enumerate(plan.fields, start=1):
+        # The real scan counts the fields of the plan's wells only (`wells_to_scan` drops the
+        # others), which is what `counts_the_rest` stands for.
+        fields = (
+            [f for f in plan.fields if f.well in plan.wells]
+            if StubScan.counts_the_rest
+            else list(plan.fields)
+        )
+        total = len(fields)
+        for position, field in enumerate(fields, start=1):
             if position <= start:
                 continue
             hook = StubScan.before_report
@@ -165,6 +187,10 @@ class StubScan:
             if position == StubScan.pause_at:
                 StubScan.paused.set()
                 StubScan.release.wait(BOUND_S)
+            if StubScan.ending == "fail" and position == StubScan.pause_at:
+                raise RuntimeError("the camera timed out")
+            if StubScan.ending == "move" and ctx.should_stop():
+                raise MotionStoppedError("xy_stage XY")
             # A STOP ends the run `stopped`, as the real scan's does.
             ctx.raise_if_stopped()
         return _scan_result(plan)
@@ -197,7 +223,6 @@ class Clock:
 
     def namespace(self) -> SimpleNamespace:
         # Only `monotonic` is the test's: the controller's waits sleep for real.
-        import time
 
         return SimpleNamespace(monotonic=lambda: self.now, sleep=time.sleep)
 
@@ -218,6 +243,15 @@ def _entry_points(
 
 
 @pytest.fixture(autouse=True)
+def _no_minimum_age_for_start_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The tests that click *Start again* twice in a row mean a deliberate second click: no age is asked.
+
+    The guard itself (m5 §17.12.11 D35) has its own test, which sets the constant back.
+    """
+    monkeypatch.setattr(plate_page, "SCAN_AGAIN_MIN_AGE_S", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _fresh_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     StubScan.ran = 0
     StubScan.pause_at = 0
@@ -227,8 +261,10 @@ def _fresh_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     StubScan.paused = threading.Event()
     StubScan.release = threading.Event()
     StubScan.before_report = None
+    StubScan.ending = "stop"
     Slow.started = threading.Event()
     Slow.release = threading.Event()
+    StubTiming.assumed = ()
     # Presets are read from the working directory's `profiles/presets`.
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("SMC_PROFILES", raising=False)
@@ -2009,6 +2045,37 @@ def test_a_continued_scan_counts_and_draws_the_plans_fields_not_the_rests(
     assert (progress.done, progress.total) == (3, 8)
 
 
+def test_a_resumed_scan_counts_only_the_fields_of_the_plans_wells(
+    page: PlatePage, run_doc: Path
+) -> None:
+    """``wells_to_scan`` drops a field of a well the plan does not list; the plan's count must too (m5 §17.12.11)."""
+    plan = _scan_plan_result()
+    # An edited run document: one more field, of a well that `plan.wells` does not list.
+    orphan = plan.fields[-1].model_copy(
+        update={"well": "H12", "index": 0, "name": "H12_0000"}
+    )
+    assert orphan.well not in plan.wells
+    edited = plan.model_copy(update={"fields": (*plan.fields, orphan)})
+    view = _stopped_view(page, run_doc, plan=edited)
+    assert view._view is not None
+    assert view._view.scan_end is not None
+
+    # A resume that counts as the real scan does: over the fields of the wells still to scan
+    # (8 of the plan's 12, the first well being held by the checkpoint).
+    StubScan.counts_the_rest = True
+    StubScan.pause_at = 6
+    page.run("scan", [], resume=True)
+    assert StubScan.paused.wait(BOUND_S)
+    progress = page.status().progress
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+
+    assert StubScan.resumed == [None, 4]
+    # The fourth field is the checkpoint's last: the sixth is the second of the second well, over
+    # 12 fields, never offset to 13 by the field of a well that is not scanned.
+    assert progress == Progress("scan", 6, 12, plan.fields[5].name)
+
+
 def test_both_actions_wait_for_resume_while_the_stand_is_halted(
     page: PlatePage, run_doc: Path
 ) -> None:
@@ -2071,6 +2138,77 @@ def test_the_second_click_on_start_again_runs_the_scan_afresh(
     assert view.scan_end_text.visible is False
     assert view.scan_actions_text.visible is False
     assert RunDocument.load(run_doc).stages["scan"].status is StageStatus.done
+
+
+@pytest.mark.parametrize(
+    ("second_click_at", "runs"),
+    [(0.5, False), (0.75, False), (1.0, True), (1.25, True)],
+)
+def test_start_again_ignores_a_second_click_younger_than_the_minimum_age(
+    page: PlatePage,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    second_click_at: float,
+    runs: bool,
+) -> None:
+    """A double-click delivers both clicks, and the second confirmed the drop of the checkpoint (m5 §17.12.11 D35, FM-172)."""
+    monkeypatch.setattr(
+        plate_page, "SCAN_AGAIN_MIN_AGE_S", SHIPPED_SCAN_AGAIN_MIN_AGE_S
+    )
+    view = _stopped_view(page, run_doc)
+    # The clock the view reads, which the test moves: the first click arms whatever it says,
+    # 0.0 included (a falsy time is a time).
+    now = [0.0]
+    view._clock = lambda: now[0]
+    before = run_doc.read_bytes()
+    confirm = "Start again drops the 5 fields already taken: press again to drop them."
+
+    _click(view.scan_again_button)
+    assert view.scan_actions_text.object == confirm
+
+    now[0] = second_click_at
+    _click(view.scan_again_button)
+    if not runs:
+        # Nothing ran and nothing was written; the confirm line and the arm stay.
+        assert page.status().running is None
+        assert run_doc.read_bytes() == before
+        assert StubScan.resumed == [None]
+        assert view.scan_actions_text.object == confirm
+        assert view._again_armed is not None
+        # The ignored click did not re-arm: a click a second after the *first* confirms.
+        now[0] = 1.0
+        _click(view.scan_again_button)
+    assert page.join(BOUND_S)
+    assert StubScan.resumed == [None, None]
+    assert RunDocument.load(run_doc).stages["scan"].status is StageStatus.done
+
+
+def test_start_again_ships_with_a_one_second_age_counted_on_the_monotonic_clock(
+    page: PlatePage,
+) -> None:
+    """The guard's test moves its own clock and sets the age: what is shipped is pinned here (D35)."""
+    assert SHIPPED_SCAN_AGAIN_MIN_AGE_S == 1.0
+    assert PlatePageView(page)._clock is time.monotonic
+
+
+def test_the_scan_command_has_no_resume_once_a_continued_scan_runs_and_the_screen_is_redrawn(
+    page: PlatePage, run_doc: Path
+) -> None:
+    """Pins a measure of m5 §17.12.11: the *Command* is the one of the last redraw, and the tick does not redraw it."""
+    view = _stopped_view(page, run_doc)
+    assert "--resume" in _words(view.scan_command.object)
+    StubScan.pause_at = 8
+    _click(view.scan_continue_button)
+    assert StubScan.paused.wait(BOUND_S)
+    # Between the click and the next redraw the command still says what the click did.
+    assert "--resume" in _words(view.scan_command.object)
+    view.tick()
+    assert "--resume" in _words(view.scan_command.object)
+    # A redraw while the continued scan runs: no scan end stands (its record is `running`).
+    view.refresh()
+    assert "--resume" not in _words(view.scan_command.object)
+    StubScan.release.set()
+    assert page.join(BOUND_S)
 
 
 def test_the_start_again_arm_is_dropped_when_the_screen_changes(
@@ -2147,12 +2285,15 @@ class StubTiming:
     reads: tuple[str, ...] = ()
     reads_optional: tuple[str, ...] = ()
     repeats: ClassVar[list[int]] = []
+    #: What the stub says it assumed, as the real one says it left the autofocus off.
+    assumed: ClassVar[tuple[str, ...]] = ()
 
     def run(
         self, microscope: Any, params: StubTimingParams, ctx: RunContext
     ) -> TimingsResult:
         StubTiming.repeats.append(params.repeats)
         return TimingsResult(
+            assumed=StubTiming.assumed,
             move_overhead_ms=100.0,
             move_ms_per_mm=10.0,
             refocus_ms=None,
@@ -2195,7 +2336,7 @@ def test_measure_the_time_runs_timing_then_the_layout_as_one_chain(
     assert "Time: about" in view.wells_known_block.object
 
 
-def test_the_chain_line_is_drawn_on_the_screen_of_its_first_tool(
+def test_the_chain_line_is_drawn_on_the_screen_of_the_button_that_started_it(
     make_page: Callable[..., PlatePage], run_doc: Path
 ) -> None:
     page = make_page(stubs=(StubScan, Slow, StubTiming))
@@ -2208,13 +2349,117 @@ def test_the_chain_line_is_drawn_on_the_screen_of_its_first_tool(
     assert page.join(BOUND_S)
     view.tick()
     # Measure the time's chain: on the Wells screen, never under Run all that are left.
-    assert view.wells_chain_text.object == "Done: Timing, Field layout."
+    # (The layout of this plate says what it assumed after the full stop: D32's own test.)
+    assert view.wells_chain_text.object.startswith("Done: Timing, Field layout.")
     assert view.chain_text.visible is False
-    # A chain whose first tool is a Results tool is drawn on Results only.
+    # A chain whose label is the Results button's is drawn on Results only.
     page._chain = ChainStatus(("cells", "density"), (), "cells")
     view._draw_chain_line(page.status())
     assert view.chain_text.object == "Running Count the cells (1 of 2)."
     assert view.wells_chain_text.visible is False
+    # The button names the screen, not the chain's first tool: *Measure the time* with `timing`
+    # already `ok` runs the layout alone, and its `Running ... (1 of 1)` line was drawn nowhere.
+    page._chain = ChainStatus(("scan-plan",), (), "scan-plan", label=MEASURE_THE_TIME)
+    view._draw_chain_line(page.status())
+    assert view.wells_chain_text.object == "Running Field layout (1 of 1)."
+    assert view.chain_text.visible is False
+    # A Results chain that starts with a tool outside RESULT_TOOLS is the Results button's.
+    page._chain = ChainStatus(("timing", "cells"), (), "timing")
+    view._draw_chain_line(page.status())
+    assert view.chain_text.object == "Running Timing (1 of 2)."
+    assert view.wells_chain_text.visible is False
+    # A label no screen knows is drawn on neither: whoever adds a chain button names its screen.
+    page._chain = ChainStatus(("cells",), (), "cells", label="A button nobody drew")
+    view._draw_chain_line(page.status())
+    assert view.chain_text.visible is False
+    assert view.wells_chain_text.visible is False
+
+
+def test_measure_the_time_says_what_timing_assumed_on_the_wells_screen(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """The real ``timing`` says first that PFS was left off; only the expert view's card showed it (FM-165)."""
+    StubTiming.repeats = []
+    StubTiming.assumed = ("left the autofocus off",)
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    page.select_text("B11, B2")
+    view = PlatePageView(page)
+    view.refresh()
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    view.tick()
+
+    assert view.wells_chain_text.object == (
+        "Done: Timing, Field layout. Assumed: left the autofocus off."
+    )
+    # The strip ends as a single run's does, the count being what the records hold.
+    stages = RunDocument.load(run_doc).stages
+    held = [
+        line
+        for tool in ("timing", "scan-plan")
+        for line in controller_module._card(stages[tool]).assumed
+    ]
+    assert held[0] == "left the autofocus off"
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert "; assumed: left the autofocus off" in outcome
+    if len(held) > 1:
+        assert outcome.endswith(f" (+{len(held) - 1} more, on the card)")
+    else:
+        assert outcome.endswith("; assumed: left the autofocus off")
+
+
+def test_the_chain_says_the_first_assumption_of_the_first_tool_that_has_one(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """``timing`` assumed nothing here: the line and the strip say the layout's own first line (the plate records no objective)."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    page.select_text("B11, B2")
+    view = PlatePageView(page)
+    view.refresh()
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    view.tick()
+
+    stages = RunDocument.load(run_doc).stages
+    assert controller_module._card(stages["timing"]).assumed == ()
+    layout = controller_module._card(stages["scan-plan"]).assumed
+    assert len(layout) > 1
+    assert view.wells_chain_text.object == (
+        f"Done: Timing, Field layout. Assumed: {layout[0]}."
+    )
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.endswith(
+        f" s (Timing, Field layout); assumed: {layout[0]} "
+        f"(+{len(layout) - 1} more, on the card)"
+    )
+
+
+def test_measure_the_time_says_its_own_name_on_the_strip(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    StubTiming.repeats = []
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    page.select_text("B11, B2")
+    view = PlatePageView(page)
+    view.refresh()
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    view.tick()
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("Measure the time: done in ")
+    assert " s (Timing, Field layout)" in outcome
+    chain = page.status().chain
+    assert chain is not None
+    assert chain.label == MEASURE_THE_TIME
 
 
 def test_on_a_dry_run_page_measure_waits_and_a_dry_scan_replaces_nothing_said(
@@ -2243,6 +2488,55 @@ def test_on_a_dry_run_page_measure_waits_and_a_dry_scan_replaces_nothing_said(
     )
     assert view.scanned_block.object.startswith("Scanned in a dry run")
     assert view.scan_replaces_text.visible is False
+
+
+def test_a_chain_with_timing_on_a_dry_run_page_is_refused_before_anything_is_written(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """``timing`` refuses a dry run too, but its refusal is a ``failed`` record over any usable timings (m5 §17.12.11 D33)."""
+    page = make_page(dry_run=True, real=("scan-plan", "timing"), stubs=(StubScan, Slow))
+    _seed_plate(run_doc, dry_run=True)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None), dry_run=True)
+    page.select_text("B11, B2")
+    before = run_doc.read_bytes()
+    reason = "A dry run cannot time the stand: serve the page without --dry-run to measure it."
+
+    # The view's wait says it from `blocked`: one source for the button and the controller.
+    assert page.view().blocked["timing"] == reason == MEASURE_NOT_IN_A_DRY_RUN
+
+    page.run_chain(
+        ("timing", "scan-plan"),
+        {"timing": [], "scan-plan": page.page_params("scan-plan")},
+        label=MEASURE_THE_TIME,
+    )
+    assert page.join(BOUND_S)
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith(
+        "Measure the time: Timing: A dry run cannot time the stand"
+    )
+    assert outcome.endswith("; not run: Field layout")
+    chain = page.status().chain
+    assert chain is not None
+    assert [(end.plugin, end.how) for end in chain.ended] == [("timing", "refused")]
+    # Nothing written: no `timing` record, and the run document is the bytes it was.
+    assert "timing" not in RunDocument.load(run_doc).stages
+    assert run_doc.read_bytes() == before
+
+    # A single run is refused with the same words and writes nothing either.
+    page.run("timing", [])
+    assert page.status().outcome == f"Timing: {reason}"
+    assert "timing" not in RunDocument.load(run_doc).stages
+    assert run_doc.read_bytes() == before
+
+
+def test_a_page_that_is_not_a_dry_run_does_not_refuse_timing(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(real=("scan-plan", "timing"), stubs=(StubScan, Slow))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    assert "timing" not in page.view().blocked
 
 
 def test_a_stop_with_no_checkpoint_says_it_and_keeps_start_the_scan(
@@ -2330,8 +2624,10 @@ def test_measure_the_time_never_drops_a_stopped_scans_checkpoint(
     before = run_doc.read_bytes()
     _click(view.measure_time_button)
     assert page.join(BOUND_S)
+    # The first tool of the chain that feeds the scan through its closure (the scan reads the
+    # plan, the plan reads the timings): `timing`, not only the layout the scan reads directly.
     assert page.status().outcome == (
-        "Run all that are left: Field layout would put the checkpoint of the stopped "
+        "Measure the time: Timing would put the checkpoint of the stopped "
         "Scan out of date: Continue the scan or Start again, on the Scan screen, first"
     )
     assert StubTiming.repeats == []
@@ -2340,3 +2636,405 @@ def test_measure_the_time_never_drops_a_stopped_scans_checkpoint(
     view.refresh()
     assert view._view.scan_end is not None
     assert view._view.scan_end.resumable
+
+
+# --- a single run over a stopped scan, and the closure (m5 §17.12.11 D30, #499) --------------
+
+
+def test_a_chain_of_timing_alone_is_refused_over_a_stopped_scan_through_the_plan_it_feeds(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """The scan reads the plan, and the plan reads the timings optionally: one level was not enough."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    StubTiming.repeats = []
+    _stopped_view(page, run_doc)
+    before = run_doc.read_bytes()
+    ran = page.activities_ended
+
+    page.run_chain(("timing",), {})
+
+    assert page.status().outcome == (
+        "Run all that are left: Timing would put the checkpoint of the stopped "
+        "Scan out of date: Continue the scan or Start again, on the Scan screen, first"
+    )
+    assert page.status().running is None
+    assert page.activities_ended == ran
+    assert StubTiming.repeats == []
+    assert run_doc.read_bytes() == before
+
+
+def test_a_chain_that_runs_the_stopped_stage_itself_is_not_refused_for_feeding_it(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """A stage the chain runs is made again by the chain: the refusal is for the stages it leaves behind."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    StubTiming.repeats = []
+    _stopped_view(page, run_doc)
+
+    page.run_chain(("timing", "scan"), {})
+    assert page.join(BOUND_S)
+
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert "would put the checkpoint" not in outcome
+    assert StubTiming.repeats == [3]  # it started: `timing` ran
+    chain = page.status().chain
+    assert chain is not None
+    # The scan's own checks at its turn are `_prepare`'s: the checkpoint is still reachable.
+    assert [(end.plugin, end.how) for end in chain.ended] == [
+        ("timing", "done"),
+        ("scan", "refused"),
+    ]
+
+
+def test_a_chain_of_timing_alone_runs_when_the_stopped_scan_kept_no_checkpoint(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    StubTiming.repeats = []
+    _stopped_view(page, run_doc, checkpoint_at=0)
+
+    page.run_chain(("timing",), {})
+    assert page.join(BOUND_S)
+
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("Run all that are left: done in ")
+    assert StubTiming.repeats == [3]
+
+
+def test_the_view_names_each_tool_whose_run_puts_a_stopped_scans_checkpoint_out_of_date(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(
+        stubs=(StubScan, Slow, StubTiming), real=("scan-plan", "camera-calibration")
+    )
+    _stopped_view(page, run_doc)
+
+    notes = page.view().checkpoint_notes
+
+    note = checkpoint_note("scan", "stopped")
+    # The three loaded feeders, each with the stopped scan's note; the scan itself and a tool no
+    # stage reads (`slow`) have none.
+    assert notes == {"scan-plan": note, "timing": note, "camera-calibration": note}
+    assert "scan" not in notes
+    assert "slow" not in notes
+
+
+class CycleA:
+    """One of two tools that read each other's slot optionally: the registry refuses only a direct self-read."""
+
+    name = provides = "cycle-a"
+    summary = "A test tool in a loop of declared reads."
+    Params = NoParams
+    Result = NoResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ("cycle-b",)
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> NoResult:
+        return NoResult()
+
+
+class CycleB(CycleA):
+    name = provides = "cycle-b"
+    reads_optional: tuple[str, ...] = ("cycle-a",)
+
+
+def test_a_stage_in_a_loop_of_declared_reads_is_not_its_own_feeder(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """The closure of ``cycle-a`` holds its own slot, through ``cycle-b``: a click on it is its own run."""
+    page = make_page(stubs=(StubScan, Slow, CycleA, CycleB))
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="cycle-a",
+            provides="cycle-a",
+            attempt="r1",
+            status=StageStatus.stopped,
+            started_utc=T0,
+            finished_utc=T0,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=None,
+            reads={},
+            checkpoint={"done": 1},
+        ),
+    )
+    doc = RunDocument.load(run_doc)
+    profile = Profile.demo().microscope.name
+    assert reachable_checkpoint("cycle-a", doc, profile=profile, dry_run=False)
+    # The loop ends: a visited set, and both slots are in the closure.
+    assert page._slot_closure("cycle-a") == {"cycle-a", "cycle-b"}
+
+    # `cycle-b` feeds the stopped stage; the stage is not its own feeder.
+    assert page.view().checkpoint_notes == {
+        "cycle-b": checkpoint_note("cycle-a", "stopped")
+    }
+    assert page._chain_drops_a_checkpoint(("cycle-a",), doc) is None
+    assert page._chain_drops_a_checkpoint(("cycle-b",), doc) == (
+        "cycle-b would put the checkpoint of the stopped cycle-a out of date: "
+        "continue it first (smc run cycle-a --resume)"
+    )
+
+
+@pytest.mark.parametrize("scenario", ["no checkpoint", "done", "stale"])
+def test_the_view_has_no_checkpoint_note_without_a_reachable_checkpoint(
+    make_page: Callable[..., PlatePage], run_doc: Path, scenario: str
+) -> None:
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    if scenario == "no checkpoint":
+        _stopped_view(page, run_doc, checkpoint_at=0)
+    elif scenario == "done":
+        _seed_plate(run_doc)
+        _seed_scan(run_doc, _seed_plan(run_doc))
+    else:
+        _stopped_view(page, run_doc)
+        assert page.view().checkpoint_notes
+        # The plan laid out again since the stop: the record is stale and `--resume` refuses it.
+        _seed(run_doc, "scan-plan", _scan_plan_result(), minute=9)
+
+    assert page.view().checkpoint_notes == {}
+
+
+def test_a_stop_that_landed_in_a_move_is_said_stopped_by_the_notes_as_the_scan_screen_says(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """Found on the one-off session of #499: the note said ``the failed scan`` beside ``Stopped by STOP`` (FM-64)."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    StubTiming.repeats = []
+    StubScan.ending = "move"
+    view = _stopped_view(page, run_doc)
+    # The record is `failed` (the move raised), and the Scan screen says the stop.
+    assert RunDocument.load(run_doc).stages["scan"].status is StageStatus.failed
+    assert view.scan_end_text.object == "Stopped by STOP at field 5 of 12."
+
+    assert page.view().checkpoint_notes["timing"] == checkpoint_note("scan", "stopped")
+    page.run_chain(("timing",), {})
+    assert page.status().outcome == (
+        "Run all that are left: Timing would put the checkpoint of the stopped "
+        "Scan out of date: Continue the scan or Start again, on the Scan screen, first"
+    )
+    assert StubTiming.repeats == []
+
+
+def test_a_scan_that_failed_with_no_stop_is_said_failed_by_the_notes(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    StubScan.ending = "fail"
+    StubScan.checkpoint_at = 4
+    StubScan.pause_at = 5
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    view = PlatePageView(page)
+    view.show_step("scan")
+    view.refresh()
+    _click(view.scan_button)
+    assert StubScan.paused.wait(BOUND_S)
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+
+    assert page.view().checkpoint_notes["timing"] == checkpoint_note("scan", "failed")
+    page.run_chain(("timing",), {})
+    assert page.status().outcome is not None
+    assert "of the failed Scan out of date" in page.status().outcome  # type: ignore[operator]
+
+
+class EarlyStage(CycleA):
+    """A stage that sorts before ``scan`` in the registry and reads the plan, as the scan does."""
+
+    name = provides = "aaa-stage"
+    reads: tuple[str, ...] = ("scan-plan",)
+    reads_optional: tuple[str, ...] = ()
+
+
+class StubPlate(CycleA):
+    """A provider of the ``plate`` slot with nothing to read: a tool with a *replaces* note."""
+
+    name = "stub-plate"
+    provides = "plate"
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+
+def test_the_first_stage_in_the_registrys_order_names_the_note_and_the_refusal(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """Two stages hold a reachable checkpoint and both read the plan: the registry's order (by name) picks the first."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming, EarlyStage))
+    _stopped_view(page, run_doc)
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="aaa-stage",
+            provides="aaa-stage",
+            attempt="e1",
+            status=StageStatus.stopped,
+            started_utc=T0,
+            finished_utc=T0,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=None,
+            reads={},
+            checkpoint={"done": 1},
+        ),
+    )
+    doc = RunDocument.load(run_doc)
+    profile = Profile.demo().microscope.name
+    assert reachable_checkpoint("scan", doc, profile=profile, dry_run=False)
+    assert reachable_checkpoint("aaa-stage", doc, profile=profile, dry_run=False)
+    assert list(page._registry().plugins).index("aaa-stage") < list(
+        page._registry().plugins
+    ).index("scan")
+
+    assert page.view().checkpoint_notes["timing"] == checkpoint_note(
+        "aaa-stage", "stopped"
+    )
+    assert page._chain_drops_a_checkpoint(("timing",), doc) == (
+        "Timing would put the checkpoint of the stopped aaa-stage out of date: "
+        "continue it first (smc run aaa-stage --resume)"
+    )
+
+
+def test_the_checkpoint_note_comes_after_the_reason_and_the_replace_note_and_never_beside_a_refusal(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(stubs=(StubScan, Slow, StubTiming, StubPlate))
+    view = _stopped_view(page, run_doc)
+    view.refresh()
+    assert view._view is not None
+    replace = view._view.replaces["stub-plate"]
+    note = checkpoint_note("scan", "stopped")
+    # The replace note, then the checkpoint note: the order the plan fixes.
+    assert view.tool_notes["stub-plate"].object == f"{replace}\n{note}"
+
+    # A tool that cannot run says its reason and no note: the click puts nothing out of date.
+    reason = "this tool waits for something"
+    view._blocked = {**view._blocked, "timing": reason}
+    view._draw_buttons()
+    assert view.tool_notes["timing"].object == reason
+
+
+def test_a_dry_run_pages_timing_says_its_refusal_and_not_a_note_beside_it(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """Found by the review of #499: the expert *Run* of ``timing`` said the refusal and then that it puts the scan out of date."""
+    page = make_page(dry_run=True, real=("scan-plan", "timing"), stubs=(StubScan, Slow))
+    view = _stopped_view(page, run_doc)
+    view.refresh()
+
+    assert page.view().blocked["timing"] == MEASURE_NOT_IN_A_DRY_RUN
+    assert view.tool_notes["timing"].object == MEASURE_NOT_IN_A_DRY_RUN
+    # The layout is not refused on a dry-run page, so its note stands.
+    assert view.tool_notes["scan-plan"].object == checkpoint_note("scan", "stopped")
+
+
+def test_a_single_run_of_a_tool_that_feeds_a_stopped_scan_still_runs(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """FM-236: a single tool's own Run is the operator's deliberate choice; the note is the warning, not a guard."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    StubTiming.repeats = []
+    _seed_plate(run_doc)
+    # The plan is laid out by the page, so that its record reads the slots it declares
+    # (`_seed_plan`'s record reads nothing, and a lone `timing` would not make it stale).
+    page.choose_plate("96-well")
+    page.select_text("B11, B2, A1")
+    page.run("scan-plan", page.page_params("scan-plan"))
+    assert page.join(BOUND_S)
+    view = PlatePageView(page)
+    view.show_step("scan")
+    view.refresh()
+    StubScan.checkpoint_at = 4
+    StubScan.pause_at = 5
+    _click(view.scan_button)
+    assert StubScan.paused.wait(BOUND_S)
+    page.stop()
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    page.resume()
+    doc = RunDocument.load(run_doc)
+    profile = Profile.demo().microscope.name
+    assert reachable_checkpoint("scan", doc, profile=profile, dry_run=False) is not None
+
+    page.run("timing", [])
+    assert page.join(BOUND_S)
+
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("Timing done in ")
+    assert StubTiming.repeats == [3]
+    # Not refused, and the checkpoint is gone: the note said so before the click.
+    doc = RunDocument.load(run_doc)
+    assert reachable_checkpoint("scan", doc, profile=profile, dry_run=False) is None
+
+
+def test_lay_out_the_fields_says_what_it_puts_out_of_date_over_a_stopped_scan(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    view = _stopped_view(page, run_doc)
+    view.show_step("wells")
+    note = checkpoint_note("scan", "stopped")
+
+    # A wait comes first: nothing named the plate, then no wells chosen.
+    view.refresh()
+    assert view.layout_wait.object == PLATE_NOT_CHOSEN
+    page.choose_plate("96-well")
+    view.refresh()
+    assert view.layout_wait.object == SELECT_WELLS
+    assert view.layout_button.disabled is True
+
+    # Nothing waits: the note stands under the button, which stays enabled (the click is allowed).
+    view.select_input.value = "B11, B2, A1"
+    assert view.layout_wait.object == note
+    assert view.layout_wait.visible is True
+    assert view.layout_button.disabled is False
+
+    # While another activity runs, the busy note wins.
+    page.run("slow", [])
+    assert Slow.started.wait(BOUND_S)
+    view.tick()
+    assert view.layout_wait.object == busy_note("slow", live=False)
+    Slow.release.set()
+    assert page.join(BOUND_S)
+    view.tick()
+    assert view.layout_wait.object == note
+
+    # The scan continued to its end: no checkpoint stands, and the text is empty.
+    page.run("scan", [], resume=True)
+    assert page.join(BOUND_S)
+    view.refresh()
+    assert view.layout_wait.object == ""
+    assert view.layout_button.disabled is False
+
+
+def test_the_expert_run_of_a_tool_that_feeds_a_stopped_scan_carries_the_note_under_it(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    view = _stopped_view(page, run_doc)
+    view.refresh()
+    note = checkpoint_note("scan", "stopped")
+
+    assert view.tool_notes["timing"].object == note
+    assert view.tool_notes["scan-plan"].object == note
+    # The scan's own Run says the checkpoint is kept, and is not a feeder of itself.
+    assert note not in view.tool_notes["scan"].object
+    assert view.tool_notes["slow"].object == ""
+
+    # After the reason: while another activity runs, the busy note, then the note.
+    page.run("slow", [])
+    assert Slow.started.wait(BOUND_S)
+    view.tick()
+    assert (
+        view.tool_notes["timing"].object == f"{busy_note('slow', live=False)}\n{note}"
+    )
+    Slow.release.set()
+    assert page.join(BOUND_S)

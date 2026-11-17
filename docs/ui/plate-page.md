@@ -461,7 +461,12 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   tool's own *Run* does. While it waits it says for what, the first that holds: the stand is
   closed, the plate is not chosen (`choose the plate on the stage first ...`), **register the
   plate first: step 2, Plate**, the tool's own reason, **select the wells to scan**; and while
-  something runs, what runs and how to end it;
+  something runs, what runs and how to end it. With nothing in the way and a **stopped scan
+  whose checkpoint stands**, it says what the click would do: `This puts the stopped scan out of
+  date: Continue the scan will not be offered any more, and Start the scan takes it from the
+  first field.` The button stays enabled: laying the fields out again is the way to change a
+  plan after a STOP, and it is your choice (`Start again` would run the scan with the plan you
+  want to change);
 - **what is known**, under the button: `Objective: <label>, in place`; `Fields: 72 in 2 wells`
   (or `Fields: not laid out yet`, or `Fields: out of date (<why>)` when the plate or the timings
   were produced again since, so the plan is stale); `Time: about 42 s`, or, for a plan made with
@@ -476,12 +481,17 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   probe and **left off**, so that no lock crosses a well's wall (m3 §12, #513): **engage it
   again before the scan**, and the plan's assumptions carry the line that says it was switched
   off (`timings: ...`). Every guard of the
-  layer applies, as to the expert view's own tool. The chain's
-  line is drawn under it (`Running Timing (1 of 2).`, `Done: Timing, Field layout.`, or where
-  it stopped), and the plan's time follows. On a page served with `--dry-run` it waits (`A dry
-  run cannot time the stand: ...`): `timing` refuses a dry run. It also waits while a stopped
-  scan's checkpoint stands (`Continue the scan or Start again first: ...`): laying the fields
-  out again would put that checkpoint out of `--resume`'s reach;
+  layer applies, as to the expert view's own tool. The strip names the chain by this button
+  (`Measure the time: done in 8.0 s (Timing, Field layout)`, not *Run all that are left*), and
+  the chain's line is drawn under it whichever tool comes first (`Running Timing (1 of 2).`,
+  `Done: Timing, Field layout.`, or where it stopped); a chain that ended done adds the first
+  thing its tools **assumed**: `Done: Timing, Field layout. Assumed: left the autofocus off.`
+  (the strip ends `; assumed: left the autofocus off (+1 more, on the card)`), and the plan's
+  time follows. On a page served with `--dry-run` it waits (`A dry run cannot time the stand:
+  ...`): `timing` refuses a dry run, and the page refuses it before anything is written, for a
+  click that arrives anyway too. It also waits while a stopped scan's checkpoint stands
+  (`Continue the scan or Start again first: ...`): laying the fields out again would put that
+  checkpoint out of `--resume`'s reach;
 - when the wells selected are **not** the plan's wells, a note says which wells the plan is for
   and to lay the fields out again to scan the others: the plan is what `scan` does, and a
   selection made since has not changed it.
@@ -520,8 +530,14 @@ engineer's words (see *STOP says what it did*). From the top:
     field. Its **Command** disclosure says `--resume`;
   - **Start again** drops the checkpoint and starts afresh, and **asks a second click**: the
     first says `Start again drops the 45 fields already taken: press again to drop them.`
-    Changing screen, any other button, or a new end of the scan asks again; another tab does
-    not inherit the question.
+    A second click **within a second** of the first is ignored (a double-click delivers both,
+    and the second would confirm what you had not read yet): nothing runs and the question
+    stays. Changing screen, any other button, or a new end of the scan asks again; another tab
+    does not inherit the question.
+
+  What ended the scan is the page's own account of **that** record: a later run of the scan
+  that this page did not start (`smc run scan --resume` in a terminal, which failed for another
+  reason) says its own end, `Failed: <line>`, and not the stop the page remembered.
 
   Both wait with `Press Resume (top right) first: the stand is halted.` until you press
   *Resume*: a run on a halted stand fails at its first move, and one started afresh would
@@ -583,7 +599,9 @@ all that are left.` From the top:
   when that is an input still missing (`scan first: step 4, Scan`, `after Count the cells`),
   or that step's own reason; while a step runs, which one and how to end it;
 - **one line** once a chain has run, which says what it did: `Running Density per well (2 of
-  5).`; `Done: Count the cells, Density per well, ... .`; `Stopped at Route through the densest
+  5).`; `Done: Count the cells, Density per well, ... .` (when a tool of the chain **assumed**
+  something, the first such line follows: `Done: ... Assumed: <the line>.`, the strip ending
+  `; assumed: <the line> (+1 more, on the card)`); `Stopped at Route through the densest
   fields, which failed: <the tool's words>. Done: ... Not run: ... .`; `... which cannot run:
   <why>` when the step was refused before it started (a value it does not accept, a stage
   stopped with a checkpoint: the page never starts one afresh, so the row says the command that
@@ -1123,6 +1141,23 @@ another value does not lift the refusal. A stage with no checkpoint, or whose ch
 `--resume` would refuse for what the document tells (another stand, a dry run's, a stale
 one), is started from the beginning by the button, as it always was. What the first
 attempt wrote to disk (a scan's frames) is kept either way.
+
+**A tool that feeds a stopped stage says so before you click it.** Running a tool that the
+stage reads, directly or through the tools that provide what it reads (the scan reads the
+plan, the plan reads the timings, the camera calibration and the plate), makes the stage's
+record out of date, and its checkpoint is lost to `--resume` in one click. A **single run** of
+such a tool is your deliberate choice and is **not refused**, but the page says what it
+does before the click: under *Lay out the fields* on the Wells screen, and under the *Run*
+of each such tool in the expert view, `This puts the stopped scan out of date: Continue the
+scan will not be offered any more, and Start the scan takes it from the first field.` (for
+another stage: `This puts the stopped plate-finding out of date: smc run plate-finding
+--resume cannot continue it afterwards.`). The word for the scan is the one the Scan screen
+says: a STOP that landed in a move leaves a `failed` record, and both say `stopped`. A tool
+that cannot run (the stand closed, a dry-run page's `timing`) says its own reason and no
+note. *Calibrate the camera* and *Register the plate* keep their own words. A **chain** (*Run all that are left*, *Measure the time*) is one click
+that runs tools you did not each name, so it **refuses** instead, by the same rule: a chain of
+`timing` alone over a stopped scan says `Timing would put the checkpoint of the stopped Scan
+out of date: Continue the scan or Start again, on the Scan screen, first`, and nothing runs.
 
 **Calibrating the plate.** Under `plate-registration`: centre a well under the objective
 by hand, click it on the map, press **Capture centre**; for a wall, put the objective on
