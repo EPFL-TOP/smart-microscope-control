@@ -279,9 +279,13 @@ def test_the_block_is_on_the_plate_screen_and_in_the_expert_view_and_drawn_once(
     assert view.calibration_how_card.collapsed is True
     assert view.calibrations_input.rows == 3
     assert view.calibrations_input.label == (
-        "Camera calibrations, one run document per objective, one path per line"
+        "Other calibration documents (optional), one path per line, in the order the "
+        "turret turns"
     )
-    assert view.calibrations_input.placeholder == "cal-10x.json\ncal-40x.json"
+    assert view.calibrations_input.placeholder == (
+        "leave empty to measure with the calibrations listed above"
+    )
+    assert view.calibration_how_card.title == "Or make a document in a terminal"
     assert view.offsets_session_input.label == (
         "Session (goes into each offset's measured text; optional)"
     )

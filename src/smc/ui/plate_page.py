@@ -68,6 +68,7 @@ from smc.plugins.slots import IMAGE_SIDES
 from smc.plugins.slots.plate import ORIENTATION_DEG, PlateOrientation
 from smc.ui.controller import (
     NOT_CONNECTED,
+    HeldCalibration,
     LoadedPreset,
     OffsetsStep,
     PageServerError,
@@ -82,6 +83,7 @@ from smc.ui.controller import (
 from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
     AUTOFOCUS_WORDS,
+    CALIBRATE_LEAD,
     CALIBRATION_HOW_WINDOWS_NOTE,
     COVERAGE_WORDS,
     DRY_RUN_NO_FRAME,
@@ -112,8 +114,17 @@ from smc.ui.guide import (
     StepName,
     again_note,
     busy_note,
+    calibrate_label,
+    calibrate_replaces,
+    calibrate_replaces_plate,
+    calibrate_wait,
+    calibration_held_line,
     calibration_how_text,
+    calibration_missing_line,
+    calibration_note_line,
+    calibration_paths,
     calibration_read_line,
+    calibrations_held_heading,
     capture_centre_label,
     capture_note,
     capture_wall_label,
@@ -169,6 +180,7 @@ from smc.ui.guide import (
     stage_label,
     step_button_label,
     step_states,
+    turret_position,
     wall_touches_note,
     wells_from_line,
     wells_known_lines,
@@ -300,12 +312,14 @@ _SCREEN_TOOLS: Mapping[StepName, tuple[str, ...]] = {
     "results": (),
 }
 
-#: The offsets block's two fields, in the words of m5 §18.2 D3 and D7. A multi-line placeholder
-#: shows the two lines an operator types for two objectives.
-_OFFSETS_CALIBRATIONS_LABEL = (
-    "Camera calibrations, one run document per objective, one path per line"
+#: The offsets block's two fields, in the words of m5 §18.2 D3 and D7 and, for the first, §18.6.3:
+#: the page's own calibrations are listed above it, so the field is for the others and is optional.
+_OFFSETS_CALIBRATIONS_LABEL = "Other calibration documents (optional), one path per line, in the order the turret turns"
+_OFFSETS_CALIBRATIONS_PLACEHOLDER = (
+    "leave empty to measure with the calibrations listed above"
 )
-_OFFSETS_CALIBRATIONS_PLACEHOLDER = "cal-10x.json\ncal-40x.json"
+#: The title of the how-to card (m5 §18.6.3): the block's button is the way, a terminal the other.
+_OFFSETS_HOW_TITLE = "Or make a document in a terminal"
 _OFFSETS_SESSION_LABEL = "Session (goes into each offset's measured text; optional)"
 _OFFSETS_SESSION_PLACEHOLDER = "session 3 (#NNN)"
 
@@ -759,6 +773,9 @@ class PlatePageView:
         # wait that came from the documents and the turret, which the tick cannot redraw because
         # it reads nothing (FM-145); and how the latest result ended, for the line after a run.
         self._offsets_armed: tuple[str, ...] | None = None
+        # The objective the *Calibrate the camera* button names, per view (m5 §18.6 D12, FM-151:
+        # another tab draws its own, FM-177: the click sends this label, drawn with the button's).
+        self._calibrate_for: str | None = None
         self._offsets_step_drawn: OffsetsStep | None = None
         self._offsets_shown: tuple[str, ...] = ()
         self._offsets_wait = ""
@@ -1473,6 +1490,17 @@ class PlatePageView:
         """
         self.offsets_lead_text = _wrapped_text()
         self.objective_in_place_text = _wrapped_text()
+        # The page's own calibrations (m5 §18.6): the documents it holds, what the operator does
+        # before the button (said once), the button that names the objective in place and what
+        # it waits for. All text and flags from the status and the last view (FM-145).
+        self.calibrations_held_text = _wrapped_text()
+        self.calibrations_held_text.visible = False
+        self.calibrate_lead_text = _wrapped_text(CALIBRATE_LEAD)
+        self.offsets_calibrate_button = pn.widgets.Button(
+            label="Calibrate the camera at another objective"
+        )
+        self.offsets_calibrate_wait = _wrapped_text()
+        self.offsets_calibrate_wait.visible = False
         self.calibrations_input = pn.widgets.TextAreaInput(
             label=_OFFSETS_CALIBRATIONS_LABEL,
             placeholder=_OFFSETS_CALIBRATIONS_PLACEHOLDER,
@@ -1484,7 +1512,7 @@ class PlatePageView:
         self.calibration_how_text = _wrapped_text()
         self.calibration_how_card = pn.Card(
             self.calibration_how_text,
-            title="How to make a calibration document",
+            title=_OFFSETS_HOW_TITLE,
             collapsed=True,
             sizing_mode="stretch_width",
         )
@@ -1529,6 +1557,10 @@ class PlatePageView:
         self.offsets_box = pn.Card(
             self.offsets_lead_text,
             self.objective_in_place_text,
+            self.calibrations_held_text,
+            self.calibrate_lead_text,
+            self.offsets_calibrate_button,
+            self.offsets_calibrate_wait,
             self.calibrations_input,
             self.calibration_reads_text,
             self.calibration_how_card,
@@ -1545,6 +1577,9 @@ class PlatePageView:
             collapsed=False,
             sizing_mode="stretch_width",
             visible=False,
+        )
+        self.offsets_calibrate_button.on_click(
+            self._handler(lambda event: self.on_offsets_calibrate())
         )
         self.offsets_measure_button.on_click(
             self._handler(lambda event: self.on_offsets_measure())
@@ -2763,6 +2798,24 @@ class PlatePageView:
 
     # --- the offsets block (m5 §18) -----------------------------------------------------
 
+    def on_offsets_calibrate(self) -> None:
+        """*Calibrate the camera at <objective>*: the objective the button named, with the fields of the tool's form typed now (m5 §18.6 D12, D13).
+
+        The click sends **the label the button showed** (``_calibrate_for``, drawn with the
+        button's label), and the controller reads the turret again and runs only if it still
+        reads it: the label was drawn up to a second ago, and another tab or the operator at the
+        turret may have turned it since (FM-177). A button that named none sends an empty label,
+        which the controller refuses. The fields are the Stand screen's button's (``step_um``,
+        ``settle_ms``), so that a stand that needs a settle has it here too. Nothing here turns
+        the turret and nothing asks to confirm: the tool moves the stage a probe in X, one in Y
+        and back (FM-14 is about turns). A disabled button still arrives here (FM-169); the
+        controller's refusal is the message or the strip's outcome.
+        """
+        expected = self._calibrate_for or ""
+        pairs = self._typed("camera-calibration")
+        self._try(lambda: self.page.calibrate_objective(expected, pairs))
+        self.tick()
+
     def on_offsets_measure(self) -> None:
         """*Measure the offsets*: read the documents and, when nothing waits, ask the question; nothing turns (m5 §18.2 D4, FM-14).
 
@@ -2838,15 +2891,21 @@ class PlatePageView:
         from the stand, the mode, the plate or an activity is the live reason of the button
         (``_draw_offsets_buttons``) and would be stale at the next tick.
         """
-        step = self.page.offsets_step(str(self.calibrations_input.value))
+        text = str(self.calibrations_input.value)
+        step = self.page.offsets_step(text)
         self._offsets_step_drawn = step
+        # Under the field: the typed documents only. With an empty field the step's reads are the
+        # page's own documents, which the list above the button already says (m5 §18.6 D16).
+        typed = bool(calibration_paths(text))
         self._say(
             self.calibration_reads_text,
             "\n".join(
                 read.problem
                 or calibration_read_line(read.path, read.objective, read.measured)
                 for read in step.reads
-            ),
+            )
+            if typed
+            else "",
         )
         live = self._blocked.get("objective-offsets") or self._running
         self._offsets_wait = "" if live else (step.wait or "")
@@ -3853,7 +3912,16 @@ class PlatePageView:
         busy = None if running is None else busy_note(running, live=live)
         blocked = self._blocked.get("camera-calibration")
         self.calibrate_button.disabled = running is not None or blocked is not None
-        self._say(self.calibrate_note, blocked or busy or "")
+        # After the tool's own reason and the busy note: what this button replaces when the
+        # plate was registered with another objective than the one in place (m5 §18.6 D17).
+        self._say(
+            self.calibrate_note,
+            "\n".join(
+                line
+                for line in (blocked or busy, self._calibrate_replaces_plate_note())
+                if line
+            ),
+        )
         stage_off = not connected or (running is not None and not live)
         self._say(
             self.rows_note,
@@ -3889,6 +3957,30 @@ class PlatePageView:
             reason = "plate-registration did not load: the problems line says why"
         self.register_button.disabled = running is not None or reason is not None
         self._say(self.register_wait, reason or "")
+
+    def _calibrate_replaces_plate_note(self) -> str:
+        """What the Stand screen's *Calibrate the camera* would do to the registration, or ``""`` (m5 §18.6 D17, FM-216).
+
+        That button runs into the run document, and the calibration the plate was registered with
+        is there: a calibration at another objective replaces it and the plate goes out of date
+        (measured on ``main``, §18.6.1). Said when the offsets block is offered (the plate was
+        registered from its walls, with an objective) and the objective in place is known and is
+        not the plate's. Text only, from the status the tick read and the view the last redraw
+        read (FM-145).
+        """
+        view = self._view
+        status = self._status
+        offer = None if view is None else view.offsets
+        if offer is None or status is None:
+            return ""
+        objective = status.objective
+        if (
+            objective is None
+            or not objective.strip()
+            or objective == offer.plate_objective
+        ):
+            return ""
+        return calibrate_replaces_plate(offer.plate_objective, objective)
 
     def _field_line(self, field: tuple[str, str]) -> str:
         """The line under one of the Wells screen's two tool fields: where its value comes from (m5 §17.2 D7, §17.10.3).
@@ -3948,8 +4040,58 @@ class PlatePageView:
             self.offsets_run_text,
             offsets_run_line(status.progress) if running else "",
         )
+        self._draw_calibrate(status)
         if status.running is not None or not status.connected:
             self._offsets_disarm()
+
+    def _draw_calibrate(self, status: PageStatus) -> None:
+        """The *Calibrate the camera* button: its label, whether it waits, and the line beside it (m5 §18.6 D12, D13).
+
+        From the status the tick read and the view the last redraw read, and nothing else
+        (FM-145): the turret's labels are the page's own copy and the held documents are the
+        view's, so no file and no stand is read here. The label names the objective in place
+        and **is the one the click sends** (``_calibrate_for`` is written in this draw, with the
+        label): the controller reads the turret again at the click (FM-177). ``calibrate_wait`` is
+        the same function the controller refuses with, so the reason beside the button is the
+        refusal's (FM-169, FM-206). With nothing to wait for and a usable document held at the
+        objective's position, the label says ``again`` and the line says what a new calibration
+        replaces, before the click (FM-172).
+        """
+        view = self._view
+        offer = None if view is None else view.offsets
+        if view is None or offer is None:
+            return
+        objective = status.objective
+        plate = offer.plate_objective
+        named = (
+            objective
+            if objective is not None and objective.strip() and objective != plate
+            else None
+        )
+        self._calibrate_for = named
+        position = turret_position(self._objective_labels, objective)
+        held = next(
+            (item for item in view.calibrations if item.position == position), None
+        )
+        usable = held is not None and held.read.problem is None
+        wait = calibrate_wait(
+            connected=status.connected,
+            running=status.running,
+            live=self.page.is_live,
+            dry_run=status.dry_run,
+            objective=objective,
+            plate_objective=plate,
+        )
+        self.offsets_calibrate_button.label = calibrate_label(
+            objective, plate, again=usable
+        )
+        self.offsets_calibrate_button.disabled = wait is not None
+        replaces = (
+            calibrate_replaces(named, held.read.measured)
+            if usable and named is not None and held is not None
+            else ""
+        )
+        self._say(self.offsets_calibrate_wait, wait or replaces)
 
     def _draw_offsets_buttons(self) -> None:
         """Which buttons of the block are disabled, and the one wait beside the first (m5 §18.2 D1, D8).
@@ -3988,7 +4130,10 @@ class PlatePageView:
             self._offsets_wait = ""
             self.offsets_lead_text.object = ""
             self.objective_in_place_text.object = ""
+            self._calibrate_for = None
             for pane in (
+                self.calibrations_held_text,
+                self.offsets_calibrate_wait,
                 self.calibration_reads_text,
                 self.offsets_wait_text,
                 self.offsets_run_text,
@@ -4006,6 +4151,10 @@ class PlatePageView:
             if self._objective_labels
             else offsets_lead_unread(offer.plate_objective)
         )
+        self._say(
+            self.calibrations_held_text,
+            self._calibrations_held_lines(view.calibrations, offer.plate_objective),
+        )
         card = view.cards.get("objective-offsets")
         self._offsets_card_status = None if card is None else card.status
         self._say(self.offsets_result_text, self._offsets_result(card))
@@ -4019,6 +4168,55 @@ class PlatePageView:
         # The card's status decides the line after a run, and the tick that ended the run drew
         # the line before this redraw: say it now, from the status already read.
         self._draw_offsets(self._status)
+
+    def _calibrations_held_lines(
+        self, held: Sequence[HeldCalibration], plate_objective: str
+    ) -> str:
+        """The list of the calibrations the page holds, and of the objectives that have none, as plain text (m5 §18.6 D15).
+
+        A line for each document in position order (its objective and date, or its position and why
+        it cannot be used, and why a usable one is left out of the empty field's default), the
+        calibration's own ``assumed`` lines under it, then ``<label>: no calibration yet`` for each
+        other objective of the turret that no usable document names. The turret's labels are the
+        page's own copy, read at the connection (FM-145): with none read, whether a document's
+        objective is on the turret is not said and no objective is listed as missing. Nothing is
+        drawn when there is nothing to list. A label, a path and a tool's words come from outside:
+        every line is plain text (FM-139).
+        """
+        labels = self._objective_labels
+        lines: list[str] = []
+        named: set[str] = set()
+        for item in held:
+            read = item.read
+            index = item.position - 1
+            lines.append(
+                calibration_held_line(
+                    item.position,
+                    labels[index] if 0 <= index < len(labels) else None,
+                    read.objective,
+                    read.measured,
+                    read.problem,
+                    plate_objective=plate_objective,
+                    on_turret=(
+                        None
+                        if not labels or read.objective is None
+                        else read.objective in labels
+                    ),
+                )
+            )
+            if read.problem is None and read.objective is not None:
+                named.add(read.objective)
+                lines.extend(
+                    calibration_note_line(read.objective, note) for note in read.notes
+                )
+        missing = dict.fromkeys(offsets_others(labels, plate_objective))
+        lines.extend(
+            calibration_missing_line(label) for label in missing if label not in named
+        )
+        if not lines:
+            return ""
+        folder = str(self.page.calibrations_folder)
+        return "\n".join([calibrations_held_heading(folder), *lines])
 
     @staticmethod
     def _offsets_result(card: ResultCard | None) -> str:
