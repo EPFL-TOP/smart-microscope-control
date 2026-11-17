@@ -795,3 +795,137 @@ nothing.
 - The page's STOP during a drive and during Live (#333), the chain on a
   registered plate (scan, cells, route), the objective offsets (#380),
   the NIS export (#198); a plate with cells at the 40× (#342).
+
+## Session 5 — segments at the stand, a 10× scan with PFS, the 40× in water
+
+2026-11-17, the owner at the stand, commit `405590c`, a guide session on a
+laptop beside them. Report: #550, with the raw excerpts; the folders stay in
+`local/surveys/nikon-ti2/session5/` and `local/scans/2026-11-17/`. Three
+**Greiner 24 Well SensoPlates, glass bottom** (662892 / 662896), A1 at the
+back left: a dry empty one, one with water and debris, and one with **water
+and 10 µm polystyrene beads** in B2, C2, B3, C3 (B5 dry), used from the
+registration on. No cells. The 10× and 40×, the lever at 1.0×.
+
+### Moves and segments (#221, m2 §11.12)
+
+- Z is sent in segments of at most 100 µm and XY in segments of at most
+  5000 µm. **A Ctrl-C ends a move at the end of its current segment**: a
+  12 mm jog stopped at X 8000.3, the end of segment 1. No `beyond 1 µm`
+  read-back line all day, at the 10× or the 40×.
+- Timed with `cmd /v:on /c "echo !time! & … & echo !time!"` (a plain
+  `%time%` on one line is expanded once and prints the same time twice):
+  8000 µm of XY in 2 segments, 5.53 s; 2720 µm of Z in 28 segments, 15.37 s;
+  `smc z get` alone, 4.81 s. So roughly 0.7 s for the XY move and 0.38 s per
+  97 µm Z segment (rough: the load time varies).
+- Over SSH and in `cmd`, `<` and `>` are redirections: a checklist line
+  with a placeholder such as `<Z − 200>` fails with a syntax error, and
+  could write a file.
+
+### The plate and the holder
+
+- **The stand's stage frame is turned 180° from useq's for a plate with A1
+  at the back left**. A drive to the estimated C5 landed on B2, and the
+  reverse; the joystick moves the field towards row A (the back) at −Y and
+  towards column 6 (the operator's right) at −X. Measured: `back = "-Y"`,
+  `right = "-X"`, the reverse of the profile (#540). Session 3's raw
+  centres agree, so its plate also lay A1 at the back left. With today's
+  profile the page's `Turned 180°: A1 at the front right` gives the right
+  geometry with the wrong words.
+- The page draws the map in stage terms, so the operator sees it turned
+  from the plate in front of them (#547).
+- `plate-walls` at the 10× on B2, B5, C3: **residual 90.7 µm** against its
+  100 µm bound, rotation −179.96°; pitch 19.509 mm between columns and
+  19.496 mm between rows (`greiner-24-well` says 19.45, the maker 19.5:
+  #541). Wells 15 520–15 643 µm across.
+- **A plate lifted and put back moved −0.056° and about (−5, +1) µm**, and
+  nothing noticed until `objective-offsets` refused (#542). A `plate-walls`
+  recheck on the same captures measured it, with residuals ≤ 1.5 µm.
+
+### First locks from the floor at the 10× in water
+
+| Well | By-eye focus | Z after `engage` from 0 | Z sharp under lock | Offset | Units/µm |
+|---|---|---|---|---|---|
+| C3 | 4244 µm | 2977.52 µm | 4220.98 µm | 7849 | 6.31 |
+| C2 | 4229.06 µm | 2995.10 µm | 4233.98 µm | 7808 | 6.30 |
+| C2, again | — | 2995.66 µm | 4238.10 µm | 7850 | 6.32 |
+
+- Z goes about 1240 µm away from the sample. The floor's plane follows the
+  sample from well to well (sharp minus floor 1243.5 and 1238.9 µm), and
+  repeats within 0.6 µm at C2.
+- A console `smc autofocus engage` at a non-floor offset is always refused:
+  the offsets seen locked live in the process that opened the stand, and
+  each command opens it anew (D12; #546).
+
+### The 40×
+
+- The 40× focused by eye in C3 at 4161.14 µm, **about 60 µm under the 10×'s
+  sharp plane** (4220.98).
+- **The first lock from the floor did not lock** in C3, with water:
+  `no lock within 5 s …; in range: no; switched off`, nothing moved
+  (#539). Session 3 locked it at C4 on a plate without water, as far as is
+  known.
+- With PFS off, Z drifted −1.8 µm in about 10 minutes.
+- `camera-calibration` refused a field with two beads ("parallel shifts:
+  did the stage move?", #545) and passed on a field with more.
+
+### Turns
+
+- 10× → 40× moves Z by −47.32 to −47.52 µm, and 40× → 10× by +47.12 to
+  +47.30 µm (5 console turns, 16 from the page). The stand restores 9370
+  for the 10× and 17794 for the 40× on every turn, whatever offset was
+  locked before.
+- The page's turns were made near the 10×'s focus, without a drop, and the
+  stand drops Z to 500 µm during the turn by itself. A turn to the 40× from
+  the 10×'s focus lands about 12 µm closer to the sample than the 40×'s
+  focus. The highest landing was about 84 µm above C3's 40× focus, in
+  another well. Inferred: the turn is safe while the 10× is within about
+  100 µm of its focus, since the working distance is 0.17–0.25 mm. The
+  checklist keeps its 500 µm drop.
+
+### The camera
+
+| Objective | Pixel size | Step | Residual | Rotation |
+|---|---|---|---|---|
+| 10× | 1.12494 µm | (page) | 0.440 µm | 177.418° |
+| 40× | 0.275748 µm | 100 µm | 1.38 µm | 177.499° |
+
+Within 0.05 % (10×) and 0.14 % (40×) of session 3's.
+
+### Scans and the page
+
+- **A 10× scan with PFS (`required`), 218 of 218 fields in 116.3 s**, on
+  C3 and C2, with one relock per well (#495). A 40× scan of C3 with PFS off,
+  25 of 25 in 10.2 s; its records carry `well_dx_um` and `well_dy_um`.
+- The time estimate was 2.7–3.3 times the real one: it charges the timed
+  lock (1.02 s) at every field (#549).
+- `objective-offsets` found every wall at the 40× with PFS off, twice. On a
+  fresh registration it read B2 (+17.51, −37.97), B5 (+9.39, −31.64) and
+  C3 (+14.51, −41.25) µm. The spread of 10.89 µm is over the 2.25 µm
+  bound, so it was refused and nothing was written. The two wells with
+  water agree within 4.4 µm, and the dry one is the odd one (#548).
+- STOP on the page shows the facade's text (#544). STOP between two fields
+  of a scan, then *Resume* and *Continue the scan*, finished it (#537).
+  The chain on the page ran end to end. The NIS export's positions load in
+  NIS-Elements.
+- Two `Ti2-E__0 (-10)` load failures in a row at the page's *Connect*,
+  right after a console command; the third loaded (#411).
+
+### SSH (read-only)
+
+OpenSSH Server on the stand's PC, key login only (the smc account has no
+password), the inbound rule `OpenSSH-Server-In-TCP` set to `Profile Any`
+and limited to the guide's laptop address. `sshd` is started and the rule
+enabled at a session's start, and both are switched off at its end.
+**`smc doctor` over SSH exits 0: PVCAM and the Ti2 hub load from an SSH
+session.** Prefix smc with `set PYTHONUTF8=1&&` there, or `✓` and `µ`
+arrive in the console's code page. `scp -r` copied the session's folders
+(1.3 GB, 374 files) in 95 s.
+
+### Not settled by session 5
+
+- Why the 40× does not lock from the floor in water, and how to lock it
+  (#539); then the 40× scan of two wells with PFS, a Z-stack, and the
+  contracts with autofocus.
+- A plate with cells at the 40× (#342, #343).
+- The objective offsets on another day, on wells of one kind (#548).
+- Whether beads were in view at the NIS export's points.
