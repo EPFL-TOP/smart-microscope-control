@@ -1029,3 +1029,66 @@ def test_a_failing_unload_does_not_skip_the_detach_in_microscope_close(
     finally:
         armed[0] = None
         microscope.close()
+
+
+# -- a core left open at exit (#538) ------------------------------------------
+
+# A core nobody released was freed while the interpreter finalized, and its
+# destructor waited for a notification whose thread could no longer take the
+# GIL: the process never ended, on Linux and Windows CI only. The exit hook of
+# smc.hardware.core detaches it from atexit instead, where that wait ends when
+# the handler returns. The child makes the wait certain on every OS: a handler
+# that sleeps 1 s is in flight when the hook runs (the trigger is registered
+# after smc's import, so it runs first, as the MTB session's logout does), and
+# the probe, registered before smc's import, runs last and says whether the
+# hook waited for the handler.
+_IN_FLIGHT_AT_EXIT = """
+import atexit
+import faulthandler
+import threading
+import time
+
+faulthandler.dump_traceback_later(45, exit=True)
+done = threading.Event()
+started = threading.Event()
+atexit.register(lambda: print("finished before the last handler:", done.is_set()))
+
+from smc.hardware.core import open_core
+
+core = open_core(None)
+
+
+def slow(*_args):
+    started.set()
+    time.sleep(1.0)
+    done.set()
+
+
+core.events.exposureChanged.connect(slow)
+
+
+def trigger():
+    core.setExposure(15)
+    started.wait(5)
+
+
+atexit.register(trigger)
+"""
+
+
+@pytest.mark.usefixtures("need_mm")
+def test_a_core_left_open_waits_at_exit_for_the_notification_in_flight() -> None:
+    done = subprocess.run(
+        [sys.executable, "-c", _IN_FLIGHT_AT_EXIT],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    why = (
+        f"the child ended with exit code {done.returncode}; "
+        f"stderr ends: {done.stderr[-800:]!r}"
+    )
+    assert done.returncode == 0, why
+    assert done.stdout.splitlines() == ["finished before the last handler: True"], why

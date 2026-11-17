@@ -800,7 +800,13 @@ Linux with the detach). Registered at import, so before any MTB login: `atexit`
 runs last in, first out, and the MTB session's handler (darken, LEDs off,
 logout, m4 §8) runs before it. Only a detach: the C++ destructor still unloads
 the devices, as before. A core built elsewhere (`status()`'s throwaway core,
-the discovery children, which end with `os._exit`) is not tracked.
+the discovery children, which end with `os._exit`) is not tracked. Each
+core is tried whatever the others do; a Ctrl-C that lands during one wait is
+raised after the last (FM-49). Not verified at a stand: on the Zeiss PC,
+pythonnet registers its own `unload` at `atexit` when MTB connects, after this
+module's import, so the CLR shuts down before the detach runs; the detach is a
+pymmcore call and touches no device, but an exit of an `smc` command that ends
+with the stand open is to be watched at the next Zeiss session.
 
 **A failed load leaves nothing loaded (#132).** `open_core` does not call
 `unloadAllDevices()` when `loadSystemConfiguration` raises, because MMCore

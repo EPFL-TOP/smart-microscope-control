@@ -103,6 +103,31 @@ def test_a_released_core_is_forgotten_and_the_exit_hook_detaches_the_live_ones(
         close_core(kept)
 
 
+def test_an_interrupt_during_one_detach_still_detaches_every_other_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A Ctrl-C that lands as the first wait ends is no `Exception`: the cores
+    # after it must still be detached, or they hang the finalization (FM-49).
+    first, second = new_core(), new_core()
+    tried: list[object] = []
+
+    def detach(core: object) -> None:
+        tried.append(core)
+        if len(tried) == 1:
+            raise KeyboardInterrupt
+
+    try:
+        monkeypatch.setattr(core_module, "detach_callbacks", detach)
+        with pytest.raises(KeyboardInterrupt):
+            core_module._detach_live_cores_at_exit()
+        assert any(c is first for c in tried)
+        assert any(c is second for c in tried)
+    finally:
+        monkeypatch.undo()
+        close_core(first)
+        close_core(second)
+
+
 # The fake MTB stand of the session's own exit test, with the detach recorded
 # in the fake's call list, which the first handler registered dumps last.
 _MTB_THEN_DETACH = (
@@ -144,6 +169,17 @@ cfg = fake_stand_config(profile.config_path(), out.parent)
 mm = profile.micromanager.model_copy(update={"config": str(cfg)})
 stand = Microscope.open(profile.model_copy(update={"micromanager": mm}))
 stand.core.setShutterOpen("TLShutter", True)
+# The hook detaches and never releases: an unload at exit would act on the
+# stand after the logout. (A SWIG class refuses a spy on unloadAllDevices.)
+release = core_module.close_core
+
+
+def recorded_release(core):
+    fake._calls.add("core", "release")
+    release(core)
+
+
+core_module.close_core = recorded_release
 """
 )
 
@@ -159,5 +195,6 @@ def test_the_exit_detach_runs_after_the_mtb_session_s_exit_handler(
     why = f"exit code {done.returncode}; stderr ends: {done.stderr[-800:]!r}"
     assert done.returncode == 0, why
     calls = [tuple(c) for c in json.loads(calls_file.read_text(encoding="utf-8"))]
-    assert ("core", "detach") in calls, why
+    assert calls.count(("core", "detach")) == 1, why
     assert calls.index(("FakeMTB", "logout")) < calls.index(("core", "detach"))
+    assert ("core", "release") not in calls

@@ -500,8 +500,17 @@ def _detach_live_cores_at_exit() -> None:
     Only a detach: the devices are unloaded later by the C++ destructor, as
     before, now with no relay into Python.
     """
+    # Each core tried whatever the others do: a Ctrl-C that lands as one wait
+    # ends is no `Exception`, and the cores after it would be left to hang the
+    # finalization; it is raised once every core is detached (FM-49).
+    interrupted: BaseException | None = None
     for core in list(_live_cores):
-        detach_callbacks(core)
+        try:
+            detach_callbacks(core)
+        except BaseException as exc:
+            interrupted = interrupted or exc
+    if interrupted is not None:
+        raise interrupted
 
 
 atexit.register(_detach_live_cores_at_exit)
