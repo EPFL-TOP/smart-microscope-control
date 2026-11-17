@@ -6231,10 +6231,11 @@ turned as M3 §20.1 did (camera 30° and mirrored, plate 1.2°, shifts 10X `(5.0
   depends on the stand or on a document alone (a calibration of another frame, a Z that moves) is
   the tool's, after the click; D3's reading of documents serves the block's own click only, and
   the accordion's form is as `smc run` is: the tool's refusals are a failed record.
-- **D9 Where the page does not go.** It does not make the calibration documents (#501: a run into a
-  document other than `run.json`, with its own card); the block's closed *How to make a
-  calibration document* says how, in words (the commands of M3 §20), and that the terminal needs
-  the stand: *Disconnect* on the Stand screen, the commands, *Connect* again. It offers no `wells`,
+- **D9 Where the page does not go.** It does not make the calibration documents in this section's
+  build (#501 makes them, a run into a document other than `run.json`: §18.6); the block's closed
+  *How to make a calibration document* says how, in words (the commands of M3 §20), and that the
+  terminal needs the stand: *Disconnect* on the Stand screen, the commands, *Connect* again (after
+  #501 it is titled *Or make a document in a terminal*, §18.6.3). It offers no `wells`,
   `search_um`, `max_spread_um` or `settle_ms` field (the accordion's form has them), does not turn
   back, does not write a Z offset, and keeps no preset for the block (`NOT_IN_PARAMS` is
   unchanged).
@@ -6388,8 +6389,8 @@ container, never a figure (FM-174).
 
 ### 18.5 What this does not do
 
-- It does not make the calibration documents (#501), turn the turret back, write a Z offset, or
-  reload the profile of a connected page.
+- It does not make the calibration documents (#501: §18.6), turn the turret back, write a Z offset,
+  or reload the profile of a connected page.
 - It does not measure from a plate registered by eye, by `plate-finding` or before the objective
   was recorded; it says so by hiding the block (D2), and the accordion's section gives the tool's
   own refusal.
@@ -6400,6 +6401,362 @@ container, never a figure (FM-174).
 **Not verified (for the owner)**: the block at the Ti2-E (a turn at the plate's height, what the
 turret reads during it, the run's time, the offsets 4× → 10× and 4× → 40×: M3 §20.10) and read by a
 newcomer; the profile written from the page on the stand PC.
+
+### 18.6 The page makes the camera calibration of each objective (#501)
+
+Fixed by #501's plan (2026-11-17). §18's block measures the offsets from **one camera-calibration
+run document per objective** (M3 §20, "A calibration per target") and D9 left making them to a
+terminal: *Disconnect*, two commands per objective, *Connect* again. This section lets the block
+make them: with an objective in place and the stage on a well's wall, one button runs
+`camera-calibration` into a document of its own, the block lists what it holds, and *Measure the
+offsets* uses it without a typed path. It changes no tool and none of §18's checks: D3's field, D4's
+two clicks and D7's write stand as they were. Its decisions are numbered on from §18.2's.
+
+#### 18.6.1 What was measured (2026-11-17, planning #501)
+
+Throwaway scripts that are not committed, on `main` at `405590c`, pymmcore-plus 0.18.1, Python
+3.13.0, Panel 1.10.0: `demo-sample` turned as §18.1, the 10X's calibration and `plate-walls` on A1,
+H12 and A12 in `run.json`, the controller connected.
+
+- **The Stand screen's *Calibrate the camera* breaks the registration, today.** `PlatePage.run
+  ("camera-calibration", [])` with the 40X in place after the registration under the 10X, which is
+  what that button sends and what `needs_calibration` offers for every objective but the
+  calibration's: `Camera calibration done in 0.1 s`, and then `view().registered` is `None`, the
+  checklist's `plate` reads `unusable` (`plate-walls read its inputs from an earlier run; run it
+  again`), `blocked["objective-offsets"]` says the same and `view().offsets` is `None`: the block is
+  gone with the plate. It is FM-216 on the page, one screen before the block: the operator who has
+  just turned the turret on the Stand screen is shown that button.
+- **A calibration into a document of its own.** `run_plugin` of `camera-calibration` with the 20X
+  and with the 40X in place into `<folder>/calibrations/position-4.json` and `position-1.json`
+  (the index of the label in `Microscope.require(ObjectiveTurret).labels()` plus one: the demo's
+  turret reads `Nikon 40X Plan Fluor ELWD`, `Nikon 10X S Fluor`, `Objective-2`, `Nikon 20X Plan
+  Fluor ELWD`, `Objective-4`, `Objective-5`): 0.15 s and 0.13 s, 0.4995 and 0.2498 µm per pixel
+  (the ratio of the two objectives, read from the documents), and **no `run.json` is made or
+  touched**. `calibration_from` (M3 §20.3) read both back with their objective and date.
+- **The folder must exist.** Into `calibrations/` before it exists the run raises `RunDocumentError:
+  <path>: could not be written (No such file or directory…)`: `write_stage` makes no parents (a
+  mistyped `--run-doc` folder is refused, not created), so the page makes the folder itself.
+- **A failed attempt replaces the document's usable calibration.** A dry-run stand's refusal (`a dry
+  run cannot measure the camera; run it without --dry-run`) written into `position-4.json` left
+  `calibration_from` saying `in <path>: the last run of camera-calibration ended failed; run it
+  again` and the objective unknown: the latest attempt decides a document's slot (§11.4) in its own
+  document as in `run.json`. A dry-run **page** reads a real document without complaint.
+- **A folder named like a document** reads `<path>: is a folder, not a run document; name a file`.
+- **The generic card** of a `camera-calibration` record is `image_shape_px: 2 items`,
+  `matrix_um_per_px: 2 items`, `… 3 more`: nothing an operator reads.
+- **What the read costs.** `Path.exists` for positions 1 to 12 and `_read_calibration` of the three
+  that exist: 0.08 to 0.23 ms, warm (the first read of a file was not timed apart).
+- **Not measured**: the run at the Ti2-E (a quarter field at the 4×, 10× and 40× on a well's wall at
+  the plate's height), what the turret reads between two positions, any Windows path.
+
+#### 18.6.2 Decisions
+
+- **D11 Where the documents are, and what names them.** `<the run document's folder>/calibrations/
+  position-<n>.json`, **beside `run.json` and never inside it** (FM-216: a calibration run into
+  `run.json` replaces the one the plate was registered with and makes `plate` stale; §18.6.1 measured
+  it). `<n>` is the objective's **turret position**, the index of its label in `objective_labels()`
+  plus one, from the layer's `ObjectiveTurret.labels()` ("every position's label, in position order,
+  empty positions included", M2 §8.3), and not the device's own numbering. A label is free text that
+  an operator or a configuration renames, and a path is built from none of it (FM-24, FM-77): the
+  file name is a small integer the page writes itself. The objective to measure is still the one
+  **inside** the document (D3), so a label renamed since is a document whose objective is no longer
+  on the turret (D16 says so and leaves it out), never a silent mislabel. The page reads positions 1
+  to `MAX_POSITIONS = 12` and no others (the Ti2-E's `Nosepiece` has 6 positions,
+  `docs/hardware/nikon-ti2.md`, and the demo's turret 6; that no other nosepiece the lab uses has
+  more than 7 is assumed, not measured; the bound is a read's, so that a folder with 10 000 files
+  costs nothing). A path is the page's own `run_doc.parent / "calibrations" /
+  "position-<n>.json"`, **as the page was given the run document**, never resolved (FM-24, FM-50): a
+  relative `run.json` gives a relative `calibrations/position-<n>.json`, read from where `smc ui` was
+  started, as the tool reads it.
+- **D12 The button, where it waits and what it says.** One button in the block, *Calibrate the
+  camera at `<objective>`* (`calibrate_label`), over a line that says why it waits (`calibrate_wait`,
+  one pure function the view draws and the controller refuses with: FM-169, FM-206). The label names
+  the **objective in place** from the tick's `PageStatus.objective`, and **the click carries that
+  label** (`calibrate_objective(expected)`): the controller reads the turret again and runs only if it
+  still reads the label the button showed, because a label drawn up to a second ago is not what the
+  turret says now (FM-177: another tab, or the operator at the turret, changed it). The first that
+  holds, in this order: the stand is closed (`NOT_CONNECTED`); an activity goes (`busy_note`); the page
+  is a dry run (`CALIBRATE_DRY_RUN`, the tool's own words, pinned to its raise by a test); the objective
+  is not known (`CALIBRATE_NOT_KNOWN`); the objective is the plate's (`calibrate_is_the_plates`: its
+  calibration is `run.json`'s, and the block asks for the others). The label is `Calibrate the camera
+  at another objective` while it waits for the last two, `Calibrate the camera again at <objective>`
+  when the position holds a usable document (D13), else `Calibrate the camera at <objective>`. Under
+  the block's lead, `CALIBRATE_LEAD` says what the operator does: turn the turret to the objective
+  (Stand screen, *Change objective*), bring a well's wall into the image, press the button, and that
+  the stage moves by about a quarter of the field in X, then in Y, and comes back. The button is
+  **shown whenever the block is** (a newcomer sees what is missing before it is possible), disabled
+  with its reason.
+- **D13 What the click runs.** `camera-calibration` with the fields the operator typed in its form
+  (`step_um`, `settle_ms`: what the Stand screen's button sends, so that a stand that needs a settle
+  has it here too) into `calibrations/position-<n>.json`, as an activity named `camera-calibration`
+  (the strip, STOP, a second run refused, the clock: as any run). **Nothing in it turns the
+  turret**: the tool reads the label and moves the stage a probe in +X, a probe in +Y and back (FM-88:
+  the return only after a normal end; after STOP the stage stays where it is, as for the Stand
+  screen's button), so there is **no confirmation** (FM-14 is about turns; the stage's own guards are
+  the layer's). The controller refuses, as the outcome `Camera calibration: <text>` and with nothing
+  written, in this order: the stand is closed; **the run document cannot be read** (its error as the
+  words, `run document: <text>`, as `offsets_step` says it: an unreadable document is not an empty one,
+  FM-229); **the plate is not registered from its walls** (no offer, D2:
+  `CALIBRATE_NO_OFFER`, which sends the operator to the Stand screen's button, the run document's
+  own calibration); then `calibrate_wait`'s dry run, unknown objective and the plate's; the
+  button named none (`CALIBRATE_NAMES_NONE`) or another objective than the turret reads
+  (`calibrate_changed`); **the position is not known** (`calibrate_position_unknown`: the labels could
+  not be read, two positions carry the label, or it is past position 12); **the stand is halted**
+  (`SCAN_HALTED`, read now by `_halted()`: a click is a place where that read is allowed, FM-145; the
+  tool would switch the autofocus off and fail at its first move, and the failed record would replace
+  the position's usable document). **A new calibration replaces the position's document**, and a
+  failed or stopped one leaves it with none (§18.6.1, §11.4): the button says `again` and the line
+  beside it `calibrate_replaces` (`A new calibration replaces the one of <date>: if it fails or is
+  stopped, <objective> has none until one succeeds.`), so that the replacement is read before the
+  click (FM-172). Rejected: running into a scratch file and moving it over the document on success,
+  which keeps the old one through a failure but needs a replace the page cannot make atomic on a
+  Windows share while another program holds the document open, for a 5 s run that is cheap to repeat.
+- **D14 The run into another document.** The controller's run machinery takes the document's path
+  as an argument (`doc_path`, default `self._run_doc`): `_prepare` loads that document and runs
+  `check_ready` against it, `_run_plugin` and `_run_plugin_once` hand it to `run_plugin`. What a
+  run does to **the page's own document** is skipped for it: `_note_attempt` (the Scan screen's
+  account of a record, FM-244, is `run.json`'s), and the main document is neither read nor written by
+  it. The worker makes the folder first (`mkdir(exist_ok=True)`, in the worker because a folder on a
+  share that does not answer must not hold the loop that handles STOP, FM-238; an `OSError` is the
+  outcome `Camera calibration failed: could not make <folder>: <one line>`, FM-98, and a folder left
+  behind is no harm: the next click finds it, FM-210). A document that cannot be read is the
+  outcome and is left as it is (the runner's rule). The strip's outcome is the tool's own
+  (`Camera calibration done in 0.1 s`, `... failed: <reason>`, `... stopped by STOP`), and the
+  block's own account of the run is the list of D15, read from the document the run wrote: **its
+  own outcome and card, which the main document's view never reads**.
+- **D15 What the page holds, and how it says it.** `PlateView.calibrations`: for each position 1 to 12
+  whose file exists, a `HeldCalibration(position, read)`, `read` being §18.3's `CalibrationRead` of the
+  document (the page's path, its objective and date, or the tool's reason) with **the calibration's
+  own `assumed` lines** (`notes`: each one line, cut at `_CARD_TEXT_CHARS`, at most `_CARD_LINES`),
+  and, for a record that ended **`failed`**, `problem` is the record's own words (`the last
+  calibration failed: <the tool's words>`, from the record's `error` through `error_words`) and not
+  the generic `ended failed; run it again`, because the reason (the light path, a field with no
+  texture, a step that wrapped) is what the operator acts on and the strip's outcome is gone at the
+  next activity. It is `()` unless the block is offered, and is read in `view()` as the run document
+  is, which is beside it (the tick reads nothing new: FM-145); a file that cannot be read, a folder
+  named like one, a document of another stand are a `problem`, never an exception (FM-98, FM-113,
+  FM-125). The block draws, under its second line, `calibrations_held_text`: `Camera calibrations the
+  page holds, one document per objective, in <folder>:`, then one line per document and, for each of
+  the turret's other objectives that no usable document names, `<label>: no calibration yet` (from
+  the page's own copy of the labels, as the lead's are). A usable document is `<objective>:
+  calibrated on <date>` (`, at an unknown time` for no date), with `; the plate's objective, not
+  measured from itself` when it is the plate's and `; not on the turret now: calibrate its position
+  again, or type the documents to use` when its objective is no label of the turret now; a document
+  with a problem is `position <n> (<label of that position, when known>): <problem>`; each note is
+  `<objective>: <note>`, indented two spaces, under its document. All plain text (FM-139: labels,
+  paths and a tool's words come from outside).
+- **D16 The empty field measures with them.** `calibrations_input` (D3) is **optional**: when it
+  holds no path, `offsets_step` takes the documents the page holds that are **usable, not the plate's
+  objective's, and on the turret now**, in position order, as if their paths were typed (the same
+  reads, waits, refusals, `MAX_TARGETS` and the same `targets` and `calibrations` pairs: the
+  armed-objectives comparison of D4 is untouched, and `measure_offsets` reads the same default
+  again). A document left out is **said in D15's list, never silently** (its line says why). A
+  non-empty field is used as in D3 and the list is shown anyway; the two are never merged (a path
+  typed that is also a held document is D3's `in two documents`, with nothing to merge). Nothing
+  writes into the field (it is the view's, per tab: FM-151, and a refill would overwrite what an
+  operator typed). The lines under the field are the typed ones: with an empty field they are empty
+  (the list above is what is read). With nothing held and nothing typed the wait is
+  `OFFSETS_NO_DOCUMENT`, whose words change (§18.6.3). More usable documents than `MAX_TARGETS` is
+  `OFFSETS_TOO_MANY`, as for lines.
+- **D17 The Stand screen's button says what it replaces.** Its run into `run.json` stays (it is the
+  way to register the plate with another objective, which needs that objective's calibration in the
+  run document), but when the block is offered and the objective in place is known and is not the
+  plate's, `calibrate_note` carries `calibrate_replaces_plate` (`The plate was registered with <O>
+  using this calibration: a calibration at <X> here replaces it, and the plate goes out of date. To
+  measure the offsets, calibrate at <X> in Measure the offsets between objectives (Plate screen): it
+  keeps a document of its own.`), after the tool's own reason and the busy note. Text only, from the
+  status and the last view (FM-145). Not done: routing the Stand screen's button into the position's
+  document (re-registering at another objective would lose its calibration), hiding it, or refusing it
+  in `_prepare` (a refusal there is a deadlock for that re-registration: the plate is unusable only
+  once the calibration has run), or the same note on the expert view's *Run camera-calibration*,
+  whose `replaces` note is a plate tool's (§11.4).
+- **D18 `/ui-check`.** §18.2 D10's one-off session gains the page's own calibrations: the scratch
+  run folder holds **only** the 10X's calibration and `plate-walls` in `run.json` (no calibration
+  document), the page served without `--dry-run`, the turret turned on the Stand screen to the 40X
+  and to the 20X (*Change objective*, confirmed), *Calibrate the camera at …* pressed for each, the
+  list photographed, the field left empty, *Measure the offsets* through its confirmation, the card
+  and the written profile read as §18.1's numbers. The dry-run states of `ui_snap.py` still show the
+  block hidden. `SKILL.md`'s paragraph says so.
+
+#### 18.6.3 Interface
+
+`smc/ui/guide.py` (pure, no Panel). Constants, with the texts character for character:
+
+```python
+CALIBRATIONS_FOLDER = "calibrations"
+MAX_POSITIONS = 12
+CALIBRATE_DRY_RUN = "a dry run cannot measure the camera; run it without --dry-run"
+CALIBRATE_NOT_KNOWN = "the objective in place is not known: wait for the turret to stop turning, or check the stand"
+CALIBRATE_NO_OFFER = "the plate is not registered from its walls: calibrate with the Stand screen's button, into the run document"
+CALIBRATE_NAMES_NONE = (
+    "the button names no objective: wait until it does, then press it again"
+)
+CALIBRATE_LEAD = "To calibrate the camera at an objective: turn the turret to it (Stand screen, Change objective), bring a well's wall into the image (the arrows, Live), then press the button. The stage moves by about a quarter of the field in X, then in Y, and comes back."
+```
+
+```python
+def calibration_file(position: int) -> str: ...
+def turret_position(labels: Sequence[str], objective: str | None) -> int | None: ...
+def calibrate_wait(
+    *,
+    connected: bool,
+    running: str | None,
+    live: bool,
+    dry_run: bool,
+    objective: str | None,
+    plate_objective: str,
+) -> str | None: ...
+def calibrate_label(
+    objective: str | None, plate_objective: str, *, again: bool
+) -> str: ...
+def calibrate_is_the_plates(objective: str) -> str: ...
+def calibrate_changed(expected: str, now: str) -> str: ...
+def calibrate_position_unknown(label: str) -> str: ...
+def calibrate_replaces(objective: str, measured: str) -> str: ...
+def calibrate_replaces_plate(plate_objective: str, objective: str) -> str: ...
+def calibrations_held_heading(folder: str) -> str: ...
+def calibration_held_line(
+    position: int,
+    label: str | None,
+    objective: str | None,
+    measured: str,
+    problem: str | None,
+    *,
+    plate_objective: str,
+    on_turret: bool | None,
+) -> str: ...
+def calibration_missing_line(label: str) -> str: ...
+def calibration_note_line(objective: str, note: str) -> str: ...
+def calibration_failed(words: str) -> str: ...
+```
+
+- `calibration_file(n)` is `position-<n>.json`; `ValueError` outside `1..MAX_POSITIONS`.
+  `turret_position` is the index plus one of the **one** label equal to `objective`, `None` for no
+  objective, a blank one, no such label, **two** such labels, or a position past `MAX_POSITIONS`.
+- `calibrate_wait`: D12's order, `NOT_CONNECTED`, `busy_note(running, live=live)`, `CALIBRATE_DRY_RUN`,
+  `CALIBRATE_NOT_KNOWN` (a blank label is not known), `calibrate_is_the_plates`, else `None`.
+- `calibrate_label`: `Calibrate the camera at another objective` for no objective, a blank one or the
+  plate's; `Calibrate the camera again at <objective>` with `again`; else `Calibrate the camera at
+  <objective>`.
+- `calibrate_is_the_plates(O)`: `<O> is the objective the plate was registered with: its calibration
+  is the run document's (Stand screen, Calibrate the camera); turn the turret to an objective to
+  measure`. `calibrate_changed(e, n)`: `the objective in place is <n>, not <e> as the button said:
+  press it again`. `calibrate_position_unknown(L)`: `the turret position of <L> is not known: its
+  labels could not be read, two positions carry that label, or it is past position 12`.
+- `calibrate_replaces(O, m)`: `A new calibration replaces the one of <date>: if it fails or is
+  stopped, <O> has none until one succeeds.`, `<date>` the first ten characters of `m` when it is an
+  ISO time and `an unknown time` otherwise (as `calibration_read_line` shows a date).
+  `calibrate_replaces_plate`: D17's text.
+- `calibrations_held_heading(f)`: `Camera calibrations the page holds, one document per objective, in
+  <f>:`. `calibration_held_line`, `calibration_missing_line`, `calibration_note_line` and
+  `calibration_failed(w)` (`the last calibration failed: <w>`): D15's lines. Every text is one line
+  (`_flat`).
+- Changed, text for text: `OFFSETS_NO_DOCUMENT` is `Calibrate the camera at each objective to measure
+  (the button above), or give one run document per line.`; `offsets_lead`'s last sentence says `each
+  objective of the calibrations below` for `of the documents below`; `error_words` also drops a
+  leading `camera-calibration:` and the space after it; the field's label is `Other calibration
+  documents (optional), one path per line, in the order the turret turns`, its placeholder `leave empty to measure with the
+  calibrations listed above`; the how-to card is titled `Or make a document in a terminal`, its text
+  unchanged.
+
+`smc/ui/controller.py`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class CalibrationRead:
+    path: str
+    objective: str | None
+    measured: str
+    problem: str | None
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HeldCalibration:
+    position: int
+    read: CalibrationRead
+```
+
+```python
+PlateView.calibrations: tuple[HeldCalibration, ...] = ()  # a new field with a default
+
+
+@property
+def calibrations_folder(self) -> Path: ...
+def calibrate_objective(self, expected: str, pairs: Sequence[str] = ()) -> None: ...
+def _held_calibrations(self) -> tuple[HeldCalibration, ...]: ...
+def _prepare(..., doc_path: Path | None = None) -> _Prepared | str: ...
+def _run_plugin(..., doc_path: Path | None = None) -> _Ended: ...
+```
+
+- `calibrations_folder` is `self._run_doc.parent / CALIBRATIONS_FOLDER`, not resolved.
+  `_held_calibrations` reads positions 1 to `MAX_POSITIONS` in order, each in a `try` of its own
+  (D15), and is called by `view()` (only with an offer) and by `offsets_step`.
+- `calibrate_objective`: D13. It raises `RuntimeError` as `run` does (an activity goes, the page is
+  closed); every other refusal is the outcome `Camera calibration: <text>` and starts nothing; the
+  run is `_prepare("camera-calibration", pairs, doc_path=<the position's path>)` and `_start_activity
+  ("camera-calibration", …)`, whose body makes the folder and calls `_run_plugin(…, doc_path=…)`.
+- `_read_calibration` fills `notes` from the calibration's `assumed`; nothing else of §18.3 changes,
+  and `CalibrationRead`'s default keeps every existing construction valid.
+- `offsets_step`: with `calibration_paths(text)` empty it takes D16's default (the held reads, which
+  are its `reads`; it reads the turret's labels once for the filter), and with a non-empty one it is
+  as before. It still opens nothing while an activity goes (FM-238).
+
+`smc/ui/plate_page.py` (`PlatePageView`): in the block, between `objective_in_place_text` and
+`calibrations_input`, `calibrations_held_text`, `calibrate_lead_text` (the constant's text, once),
+`offsets_calibrate_button` and `offsets_calibrate_wait`; `_calibrate_for: str | None` (the label the
+button names, per tab: FM-151, FM-177); handler `on_offsets_calibrate`, registered through `_handler`
+(FM-171), which sends `self._calibrate_for or ""` and `self._typed("camera-calibration")` to
+`calibrate_objective` and ticks; drawers: the tick's `_draw_offsets` also sets the button's label,
+`disabled` and the wait line (text and flags only, from the status and the last view: FM-145), and
+`_draw_offsets_view` draws the list. `calibration_reads_text` is empty while the field is. The
+Stand screen's `calibrate_note` adds D17's line. The button carries `label=` (FM-147); every text goes
+through `_say`.
+
+#### 18.6.4 Tests and failure modes
+
+- `tests/unit/test_ui_guide.py` gains the pure tests of §18.6.3 (names in the plan);
+  `tests/unit/test_plate_page_calibrations.py` (new) holds the controller's part on a stub
+  `camera-calibration` and the refusals; `tests/unit/test_plate_page_calibrations_view.py` (new, Panel)
+  the block's widgets and handlers; `tests/test_plate_page_calibrations_demo.py` (new,
+  `@pytest.mark.demo`) the whole chain on `demo-sample` with the shifts: two calibrations made by the
+  page, `run.json` byte-identical, the offsets measured with an empty field.
+- **Failure modes**: FM-216 (a document of its own per objective; the registration's document
+  never holds two objectives' values, and the page's own Stand-screen button is the second instance
+  found), FM-206 (one pure function for what the page foresees: a failed record replaces a usable
+  one), FM-177 (the click acts on the label it shows: the turret changes without a tick), FM-169
+  (every refusal in the controller), FM-64 and FM-88 (a STOP in the run leaves the stage where it is
+  and the other documents alone), FM-14 (nothing here turns the turret: said, and the plan's tests
+  assert the turret is where it was), FM-24, FM-50, FM-77 (a file name that is an integer, a path as
+  the page was given it, never resolved), FM-98, FM-113, FM-125 (a held document is data; a failure
+  is a line), FM-139 (plain text), FM-145 (the tick draws from the status and the last view; the
+  read of the documents is `view()`'s and the click's), FM-151 (`_calibrate_for` is the view's), FM-171
+  (the handler through `_handler`), FM-172 (what a new calibration replaces is said first), FM-182
+  (the block walked on a dry-run page that holds a real registration), FM-229 (an unreadable run
+  document is said, not taken for a plate that is not registered), FM-205 (the lines that carry
+  a label or a tool's words through the card's bound), FM-210 (a folder that cannot be made, or is
+  left behind), FM-238 (the click's read opens nothing while an activity goes), FM-244 (the Scan
+  screen's account is `run.json`'s: a calibration run does not write it). **FM-216 gets a line**
+  for the Stand screen's button (§18.6.1, D17); a new entry only if a review confirms a kind the
+  tests miss.
+
+#### 18.6.5 What this does not do
+
+- It does not calibrate the plate's own objective from the block (the run document's calibration is
+  made on the Stand screen, before the registration), turn the turret (the operator does, on the
+  Stand screen), delete or move a document, or keep a document per stand: a folder shared by two
+  stands holds one position's document of whichever ran last, and the other's reads as `camera-
+  calibration was run on <stand>, this is <stand>`.
+- It does not give `scan-plan` the document of the scan's objective (its `calibration` parameter,
+  M3 §23, is the expert's; a pair the page fills from the held document is a later issue) or write
+  the position's calibration anywhere but its own file.
+- It does not route, hide or refuse the Stand screen's *Calibrate the camera* (D17: a note), and does
+  not guard the expert view's *Run camera-calibration*.
+
+**Not verified (for the owner)**: the block's calibrations at the Ti2-E (a well's wall in the image
+at the 10× and the 40× at the plate's height, the run's time, the stage's return), the offsets 4× →
+10× and 4× → 40× measured with them, a Windows PC's `calibrations\position-<n>.json` and the
+block read by a newcomer.
 
 ## 19. The Plate screen suggests wells the stand can reach (#512)
 
