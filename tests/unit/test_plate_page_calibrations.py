@@ -60,6 +60,7 @@ from smc.ui.guide import (
     CALIBRATE_NOT_KNOWN,
     OFFSETS_NO_DOCUMENT,
     OFFSETS_TOO_MANY,
+    OFFSETS_TURRET_UNREAD,
     SCAN_HALTED,
     busy_note,
     calibrate_changed,
@@ -250,12 +251,17 @@ def _fresh_state() -> Iterator[None]:
 class Turret:
     """A turret the test sets: the label in place and the positions' labels, or a read that fails."""
 
-    def __init__(self, labels: list[str], now: str | None) -> None:
+    def __init__(
+        self, labels: list[str], now: str | None, *, labels_fail: bool = False
+    ) -> None:
         self.labels_ = labels
         self.now = now
+        self.labels_fail = labels_fail
         self.moves: list[str] = []
 
     def labels(self) -> list[str]:
+        if self.labels_fail:
+            raise HardwareError("the turret's positions cannot be read")
         return list(self.labels_)
 
     def current(self) -> str:
@@ -550,7 +556,7 @@ def test_a_folder_that_cannot_be_made_is_the_outcome_and_no_record_is_written(
     assert view.registered is not None
 
 
-def test_a_file_named_like_the_folder_is_refused_before_anything_starts_in_the_documents_words(
+def test_a_file_named_like_the_folder_is_refused_in_one_line_and_nothing_is_written(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
     _seed_plate(run_doc)
@@ -561,18 +567,24 @@ def test_a_file_named_like_the_folder_is_refused_before_anything_starts_in_the_d
     try:
         before = run_doc.read_bytes()
         page.calibrate_objective(FORTY)
+        # Where it is refused depends on what the OS says for a file used as a folder: POSIX says
+        # `Not a directory` and `_prepare` refuses it before a thread starts; Windows may say the
+        # path was not found, `_prepare` then lets the run start and the worker's `mkdir` fails.
+        # Either way the outcome is one line and nothing is written, so the test joins first.
+        assert page.join(10.0)
         outcome = page.status().outcome
         running = page.status().running
         view = page.view()
     finally:
         page.close()
 
-    # The run's own document is read before a thread starts (`_prepare`), so the file in the
-    # folder's place is refused there, with the OS's words, and nothing is written into it.
     assert outcome is not None
     assert outcome.startswith(
-        f"camera-calibration: RunDocumentError: {blocker / 'position-1.json'}: "
-        "could not be read"
+        (
+            f"camera-calibration: RunDocumentError: {blocker / 'position-1.json'}: "
+            "could not be read",
+            f"Camera calibration failed: could not make {blocker}: ",
+        )
     )
     assert "\n" not in outcome
     assert running is None
@@ -1208,3 +1220,150 @@ def test_offsets_step_with_the_default_opens_no_file_while_an_activity_goes(
     # The spy can fail: the same call with nothing going reads both documents.
     assert idle.wait is None
     assert len(opened) == 2
+
+
+def test_with_the_turrets_labels_unread_the_default_waits_for_them_and_does_not_say_nothing_is_held(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A turret whose positions cannot be read: no document can be checked against it, so none is
+    # filtered out for it, and the step's own wait says the turret is the trouble (a list that
+    # looked empty would send the operator to calibrate what the page already holds).
+    _seed_plate(run_doc)
+    _hold(run_doc, position_1=FORTY, position_4=TWENTY)
+    labels = _labels(fake_microscope)
+    fake_microscope.override(ObjectiveTurret, Turret(labels, FORTY, labels_fail=True))
+    page = _page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step("")
+    finally:
+        page.close()
+
+    assert step.wait == OFFSETS_TURRET_UNREAD
+    assert step.pairs == ()
+    assert [read.objective for read in step.reads] == [FORTY, TWENTY]
+
+
+def test_the_tools_words_of_a_failed_calibration_are_one_line_and_cut_at_the_cards_bound(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-205: the longest form of a line that carries a tool's words, through the bound.
+    words = "the frame is dark\nor flat " + "x" * 700
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    StubCalibration.fails = words
+    page = _page(fake_microscope, run_doc)
+    try:
+        _calibrate(page, FORTY)
+        held = page.view().calibrations
+    finally:
+        page.close()
+
+    problem = held[0].read.problem
+    assert problem is not None
+    assert "\n" not in problem
+    shown = problem.removeprefix(calibration_failed(""))
+    assert shown.startswith("the frame is dark or flat xxx")
+    assert len(shown) == 601
+    assert shown.endswith("…")
+
+
+def test_a_position_that_cannot_be_looked_at_is_a_line_and_the_others_are_read(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The look at a position is a `stat`, so that a folder the account may not list is said the
+    # same way on every Python (`Path.exists` raised it up to 3.13 and hid it from 3.14).
+    _seed_plate(run_doc)
+    held = _hold(run_doc, position_1=FORTY, position_4=TWENTY)
+    real = Path.stat
+
+    def stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.name == "position-2.json":
+            raise PermissionError(13, "Access is denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    page = _page(fake_microscope, run_doc)
+    try:
+        found = page.view().calibrations
+    finally:
+        page.close()
+
+    assert [h.position for h in found] == [1, 2, 4]
+    assert found[0].read.path == str(held["position_1"])
+    problem = found[1].read.problem
+    assert problem is not None
+    assert problem.startswith(
+        f"{_folder(run_doc) / 'position-2.json'}: PermissionError: "
+        "[Errno 13] Access is denied"
+    )
+    assert found[2].read.objective == TWENTY
+
+
+class StubPlateParams(PluginParams):
+    pass
+
+
+class StubPlate:
+    """A tool that provides ``plate``, to see what a run into another document leaves alone."""
+
+    name = "stub-plate"
+    provides = "plate"
+    summary = "A test tool."
+    Params = StubPlateParams
+    Result = PlateResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> PlateResult:
+        return _walls_plate()
+
+
+def test_a_run_into_another_document_leaves_the_plate_follow_up_and_the_drives_text_alone(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No caller of `doc_path` provides `plate` today (a calibration provides its own slot), so the
+    # gates are tried through the run machinery with a stub that does: the follow-up reads the
+    # page's own document, and the drive's text belongs to the plate that document registers.
+    followed: list[object] = []
+
+    def follow(self: PlatePage, turned_from: object) -> str:
+        followed.append(turned_from)
+        return ""
+
+    monkeypatch.setattr(PlatePage, "_follow_plate", follow)
+    other = tmp_path / "other" / "document.json"
+    other.parent.mkdir()
+    page = PlatePage(
+        fake_microscope,
+        run_doc,
+        entry_points=[
+            EntryPoint(name="stub-plate", value=f"{__name__}:StubPlate", group=GROUP)
+        ],
+    )
+    try:
+        for target, expect_follow in ((other, False), (None, True)):
+            prepared = page._prepare("stub-plate", [], doc_path=target)
+            assert not isinstance(prepared, str), prepared
+            entry, parsed, _planned = prepared
+            page._goto = "the drive's text"
+            followed.clear()
+            ended = page._run_plugin(
+                "stub-plate",
+                entry,
+                parsed,
+                threading.Event(),
+                None,
+                doc_path=target,
+            )
+            assert ended.status == "done", ended
+            assert bool(followed) is expect_follow
+            assert (page._goto == "") is expect_follow
+    finally:
+        page.close()
+
+    assert sorted(RunDocument.load(other).stages) == ["stub-plate"]
+    assert sorted(RunDocument.load(run_doc).stages) == ["stub-plate"]

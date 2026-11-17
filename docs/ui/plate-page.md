@@ -400,9 +400,12 @@ It waits with its reason beside it: the stand is not connected, an activity goes
 tool refuses it), the objective is not known, or it is the plate's own (its calibration is the run
 document's: Stand screen, *Calibrate the camera*). A new calibration **replaces** the position's
 document, and a failed or stopped one leaves it with none until one succeeds: when the position
-holds a usable one, the button says `Calibrate the camera again at <objective>` and the line
-beside it says `A new calibration replaces the one of <date>: if it fails or is stopped, <objective>
-has none until one succeeds.`
+holds a usable one of that objective, the button says `Calibrate the camera again at <objective>`
+and the line beside it says `A new calibration replaces the one of <date>: if it fails or is
+stopped, <objective> has none until one succeeds.` When the usable document at the position is
+another objective's (the turret was relabelled since), the button does not say `again` and the
+line names **that** objective as the one that loses its calibration. The button sends the camera
+calibration's `step_um` and `settle_ms` as typed in its form, and not its advanced `from_run_doc`.
 
 Above the button, the block lists **the documents the page holds**, `Camera calibrations the page
 holds, one document per objective, in <folder>:` and one line each: `<objective>: calibrated on

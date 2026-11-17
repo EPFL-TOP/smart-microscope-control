@@ -318,6 +318,8 @@ _OFFSETS_CALIBRATIONS_LABEL = "Other calibration documents (optional), one path 
 _OFFSETS_CALIBRATIONS_PLACEHOLDER = (
     "leave empty to measure with the calibrations listed above"
 )
+#: The fields of the camera-calibration form that the block's button sends (m5 §18.6 D13).
+_CALIBRATE_FIELDS = ("step_um", "settle_ms")
 #: The title of the how-to card (m5 §18.6.3): the block's button is the way, a terminal the other.
 _OFFSETS_HOW_TITLE = "Or make a document in a terminal"
 _OFFSETS_SESSION_LABEL = "Session (goes into each offset's measured text; optional)"
@@ -779,6 +781,9 @@ class PlatePageView:
         # The objective the *Calibrate the camera* button names, per view (m5 §18.6 D12, FM-151:
         # another tab draws its own, FM-177: the click sends this label, drawn with the button's).
         self._calibrate_for: str | None = None
+        # The documents the page held at the last redraw of the block: the wait beside *Measure
+        # the offsets* was read for them, and says nothing true once they change.
+        self._held_drawn: tuple[HeldCalibration, ...] = ()
         self._offsets_step_drawn: OffsetsStep | None = None
         self._offsets_shown: tuple[str, ...] = ()
         self._offsets_wait = ""
@@ -2812,14 +2817,20 @@ class PlatePageView:
         button's label), and the controller reads the turret again and runs only if it still
         reads it: the label was drawn up to a second ago, and another tab or the operator at the
         turret may have turned it since (FM-177). A button that named none sends an empty label,
-        which the controller refuses. The fields are the Stand screen's button's (``step_um``,
-        ``settle_ms``), so that a stand that needs a settle has it here too. Nothing here turns
-        the turret and nothing asks to confirm: the tool moves the stage a probe in X, one in Y
-        and back (FM-14 is about turns). A disabled button still arrives here (FM-169); the
-        controller's refusal is the message or the strip's outcome.
+        which the controller refuses. The fields are the Stand screen's button's **two** (``step_um``,
+        ``settle_ms``), so that a stand that needs a settle has it here too: the form's advanced
+        ``from_run_doc`` is not sent, since a reuse that the tool refuses (another objective's
+        document) would already have replaced the position's usable document with a failed record
+        (the review of #501). Nothing here turns the turret and nothing asks to confirm: the tool
+        moves the stage a probe in X, one in Y and back (FM-14 is about turns). A disabled button
+        still arrives here (FM-169); the controller's refusal is the message or the strip's outcome.
         """
         expected = self._calibrate_for or ""
-        pairs = self._typed("camera-calibration")
+        pairs = [
+            pair
+            for pair in self._typed("camera-calibration")
+            if pair.partition("=")[0] in _CALIBRATE_FIELDS
+        ]
         self._try(lambda: self.page.calibrate_objective(expected, pairs))
         self.tick()
 
@@ -4080,7 +4091,12 @@ class PlatePageView:
         held = next(
             (item for item in view.calibrations if item.position == position), None
         )
+        # A usable document at the position: the one a new calibration replaces. It is `again`
+        # only when it is this objective's own: a position whose label was changed since holds
+        # another objective's calibration, and the line names that one as the one that is lost
+        # (FM-216: a per-objective value in a per-position file, found by the review of #501).
         usable = held is not None and held.read.problem is None
+        same = usable and held is not None and held.read.objective == named
         wait = calibrate_wait(
             connected=status.connected,
             running=status.running,
@@ -4090,11 +4106,11 @@ class PlatePageView:
             plate_objective=plate,
         )
         self.offsets_calibrate_button.label = calibrate_label(
-            objective, plate, again=usable
+            objective, plate, again=same
         )
         self.offsets_calibrate_button.disabled = wait is not None
         replaces = (
-            calibrate_replaces(named, held.read.measured)
+            calibrate_replaces(held.read.objective or "", held.read.measured)
             if usable and named is not None and held is not None
             else ""
         )
@@ -4139,6 +4155,7 @@ class PlatePageView:
             self.objective_in_place_text.object = ""
             self.calibrate_lead_text.object = ""
             self._calibrate_for = None
+            self._held_drawn = ()
             for pane in (
                 self.calibrations_held_text,
                 self.offsets_calibrate_wait,
@@ -4160,6 +4177,13 @@ class PlatePageView:
             else offsets_lead_unread(offer.plate_objective)
         )
         self.calibrate_lead_text.object = CALIBRATE_LEAD
+        if view.calibrations != self._held_drawn:
+            # A calibration was made (or a document changed): the wait that the last read of the
+            # documents drew, `Calibrate the camera at each objective ...`, is not true any more.
+            # Nothing is read for it here; the next click on *Measure* reads again (the review of
+            # #501).
+            self._held_drawn = view.calibrations
+            self._offsets_wait = ""
         self._say(
             self.calibrations_held_text,
             self._calibrations_held_lines(view.calibrations, offer.plate_objective),

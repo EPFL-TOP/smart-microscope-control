@@ -5915,7 +5915,13 @@ class PlatePage:
         for position in range(1, MAX_POSITIONS + 1):
             path = folder / calibration_file(position)
             try:
-                if not path.exists():
+                try:
+                    path.stat()
+                except (FileNotFoundError, NotADirectoryError):
+                    # Nothing held at this position (or a file where the folder should be:
+                    # ``calibrate_objective`` says that one). Any other failure of the look, a
+                    # folder the account may not list, is a line: ``Path.exists`` raised it up to
+                    # Python 3.13 and hid it from 3.14, and the list must not depend on that.
                     continue
                 read = _read_calibration(
                     str(path), profile=profile, dry_run=self._dry_run

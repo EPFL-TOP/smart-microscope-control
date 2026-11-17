@@ -146,8 +146,11 @@ class StubOffsets:
 
 
 class StubCalibrationParams(PluginParams):
+    """The real tool's three fields, so that the form offers the advanced one too."""
+
     step_um: float | None = None
     settle_ms: float = 0.0
+    from_run_doc: Path | None = None
 
 
 class StubCalibration:
@@ -574,12 +577,16 @@ def test_the_calibrate_click_sends_the_label_the_button_showed_and_the_forms_typ
         sent.append((expected, tuple(pairs)))
 
     monkeypatch.setattr(view.page, "calibrate_objective", spy)
-    # The expert form's own field, typed: what the Stand screen's button sends too.
+    # The expert form's own fields, typed: what the Stand screen's button sends too.
     view.tool_fields["camera-calibration"]["step_um"].value = "40"
+    view.tool_fields["camera-calibration"]["settle_ms"].value = "250"
+    # Not the form's advanced `from_run_doc`: a reuse that the tool refuses would already have
+    # replaced the position's usable document with a failed record (the review of #501).
+    view.tool_fields["camera-calibration"]["from_run_doc"].value = "cal-10x.json"
 
     _click(view.offsets_calibrate_button)
 
-    assert sent == [(FORTY, ("step_um=40",))]
+    assert sent == [(FORTY, ("step_um=40", "settle_ms=250"))]
 
 
 def test_a_click_on_a_stale_calibrate_button_calibrates_nothing(
@@ -660,6 +667,27 @@ def test_the_again_button_says_what_it_replaces_before_the_click(
     assert view.offsets_calibrate_button.label == f"Calibrate the camera at {TWENTY}"
     assert view.offsets_calibrate_wait.object == ""
     assert view.offsets_calibrate_wait.visible is False
+
+
+def test_a_position_that_holds_another_objectives_calibration_says_whose_it_replaces(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # FM-216, found by the review of #501: position 1 holds the 20X's calibration (made when the
+    # 20X sat there; the turret has been relabelled since) and the 40X is now at position 1. A
+    # new calibration replaces that document, so the line names the objective that loses its
+    # calibration, and the button does not say `again` for an objective that has none.
+    _hold(run_doc, 1, TWENTY)
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+
+    assert view.offsets_calibrate_button.label == f"Calibrate the camera at {FORTY}"
+    assert view.offsets_calibrate_wait.object == calibrate_replaces(TWENTY, SEEDED)
+    assert FORTY not in view.offsets_calibrate_wait.object
+    # The list says the same before the click: the 20X is calibrated, the 40X is not.
+    lines = view.calibrations_held_text.object.splitlines()
+    assert f"{TWENTY}: calibrated on 2026-11-17" in lines
+    assert f"{FORTY}: no calibration yet" in lines
 
 
 def test_a_calibration_from_the_page_is_listed_with_its_objective_and_date(
@@ -760,9 +788,29 @@ def test_a_failed_calibration_is_in_the_list_in_the_tools_words(
 
     lines = view.calibrations_held_text.object.splitlines()
     assert lines[1] == f"position 1 ({FORTY}): {calibration_failed(words)}"
-    # A failed record leaves the position with no usable document: no `again`.
+    # A failed record leaves the position with no usable document: no `again`, and nothing left
+    # to replace, so nothing is said beside the button (FM-172).
     assert view.offsets_calibrate_button.label == f"Calibrate the camera at {FORTY}"
+    assert view.offsets_calibrate_wait.object == ""
+    assert view.offsets_calibrate_wait.visible is False
     assert f"{FORTY}: no calibration yet" in lines
+
+
+def test_the_live_view_is_the_activity_the_calibrate_button_waits_for(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+
+    view.page.live(True)
+    try:
+        view.tick()
+        assert view.offsets_calibrate_button.disabled is True
+        assert view.offsets_calibrate_wait.object == busy_note("live", live=True)
+    finally:
+        view.page.live(False)
+        assert view.page.join(10.0)
 
 
 def test_the_list_is_text_and_not_markup(
@@ -851,6 +899,64 @@ def test_with_nothing_held_and_nothing_typed_the_wait_says_how_to_make_one(
     assert "the button above" in OFFSETS_NO_DOCUMENT
 
 
+def test_a_calibration_made_after_the_wait_was_drawn_takes_the_stale_wait_back(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # The review of #501: the wait beside *Measure the offsets* is read at a click; once the page
+    # has made the calibration it asked for, it must not go on saying that none is held.
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+    _click(view.offsets_measure_button)
+    assert view.offsets_wait_text.object == OFFSETS_NO_DOCUMENT
+
+    _click(view.offsets_calibrate_button)
+    assert view.page.join(10.0)
+    view.tick()
+
+    assert view.calibrations_held_text.object.splitlines()[1].startswith(
+        f"{FORTY}: calibrated on "
+    )
+    assert view.offsets_wait_text.object == ""
+    assert view.offsets_wait_text.visible is False
+    # The next click reads again, and says the objective that is still to calibrate is not
+    # a document: the 40X alone is held and is a target, so Measure now arms it.
+    _click(view.offsets_measure_button)
+    assert view._offsets_armed == (FORTY,)
+
+
+def test_a_closed_stand_lists_the_documents_it_holds_without_the_turrets_labels(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # FM-98, FM-125: a page reopened with documents from an earlier session and the stand closed has
+    # no labels (a closed stand has no turret); the block is offered and its list is drawn, and a
+    # document on a position past the labels read is no exception.
+    _seed_plate(run_doc)
+    _hold(run_doc, 1, FORTY)
+    _hold(run_doc, 9, "Nikon 60X Plan Apo")
+    closed = PlatePage.closed(
+        fake_microscope.profile, run_doc, entry_points=_entry_points()
+    )
+    try:
+        view = PlatePageView(closed)
+        view.show_step("plate")
+        view.refresh()
+        view.tick()
+        lines = view.calibrations_held_text.object.splitlines()
+        assert view.offsets_box.visible is True
+    finally:
+        closed.close()
+
+    # Whether an objective is on the turret is not said: the turret is not read. Nothing is
+    # listed as missing either, since the page does not know the turret's other objectives.
+    assert lines[1:] == [
+        f"{FORTY}: calibrated on 2026-11-17",
+        "Nikon 60X Plan Apo: calibrated on 2026-11-17",
+    ]
+
+
 # --- where the widgets are, and that every handler is guarded (FM-171, FM-202) -------------
 
 
@@ -937,13 +1043,55 @@ def test_the_tick_reads_no_document_and_no_stand_for_the_calibrate_button(
     # FM-145: the label and the wait come from the status and the last view.
     view = _ready(make_view, fake_microscope, run_doc, FORTY)
     calls: list[str] = []
-    for name in ("view", "_held_calibrations", "offsets_step", "_halted"):
+    for name in (
+        "view",
+        "_held_calibrations",
+        "offsets_step",
+        "_halted",
+        "objective_labels",
+        "_turret_label",
+        "_turret_reading",
+    ):
         monkeypatch.setattr(view.page, name, lambda *a, _n=name: calls.append(_n) or ())
     for label in (TWENTY, FORTY, TEN):
         _turn(fake_microscope, label)
         view.tick()
 
     assert calls == []
+    assert view.offsets_calibrate_button.label == ANOTHER
+
+
+def test_the_tick_makes_no_read_of_the_turret_of_its_own_for_the_calibrate_button(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # FM-145: the status reads the turret once at a tick; the button's draw adds none of its
+    # own (a drawer that read `labels()` or `current()` would take the core's lock at every tick
+    # of every tab, while a scan runs). Counted on a turret double, whatever route the read took.
+    reads: list[str] = []
+
+    class Counting(Turret):
+        def labels(self) -> list[str]:
+            reads.append("labels")
+            return super().labels()
+
+        def current(self) -> str:
+            reads.append("current")
+            return super().current()
+
+    labels = fake_microscope.require(ObjectiveTurret).labels()
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+    fake_microscope.override(ObjectiveTurret, Counting(labels, FORTY))
+    view.tick()
+    baseline = list(reads)
+    for label in (TWENTY, FORTY, TEN):
+        fake_microscope.require(ObjectiveTurret).select(label, confirm=True)
+        reads.clear()
+        view.tick()
+        assert reads == baseline, reads
+    assert "labels" not in baseline
+    assert baseline.count("current") <= 1
     assert view.offsets_calibrate_button.label == ANOTHER
 
 
