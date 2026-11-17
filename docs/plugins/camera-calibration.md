@@ -267,6 +267,24 @@ objective with the lever and the camera setting as they were, and measure again
 after changing either (the profile's pixel sizes are for a fixed value of both:
 FM-103).
 
+## The page's own documents, one per turret position
+
+The plate page's offsets block (*Measure the offsets between objectives*, [the plate
+page](../ui/plate-page.md#measure-the-offsets-between-objectives), #501) makes one calibration
+document per objective, **each in a run document of its own** and never in `run.json`: a run
+document holds one `camera-calibration`, the latest attempt, and the plate registered with the
+10X was registered with the 10X's. Written into `run.json`, a calibration at the 40X replaces
+it and the plate goes out of date (FM-216; the Stand screen's *Calibrate the camera* does exactly
+that, and says so when the plate was registered from its walls). The page's button runs this
+tool as `smc run camera-calibration --run-doc calibrations/position-<n>.json` would, with the
+objective in place and the form's `step_um` and `settle_ms`, in a `calibrations` folder it makes
+beside the run document. `<n>` is the objective's turret position, its label's index plus one,
+and the file's name is that number and never the label (a label is free text, and the document
+holds the objective). A new calibration at the same position replaces its document, and a
+failed or stopped one leaves it with no usable calibration until one succeeds: the page says
+so before the click. `objective-offsets` reads these documents with `calibration_from`, one per
+objective, as it reads any typed path; a terminal makes the same documents with any name.
+
 ## What reads it
 
 The scan plan, the cells stage and the route read the matrix as the sections above
