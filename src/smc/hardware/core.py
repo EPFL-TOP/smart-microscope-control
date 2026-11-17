@@ -36,6 +36,11 @@ Hardware behaviour encoded here (#77):
   throws out of a callback and aborts the process. Both ways of releasing a core
   (``close_core``, ``Microscope.close()``) end with ``detach_callbacks``, which
   waits for the handler in flight (#311, design §7).
+* **A core nobody released must not be freed while the interpreter finalizes.**
+  Its destructor then waits for a notification whose thread can no longer take
+  the GIL, and the process never ends (#538: about 1 exit in 25 on Linux CI,
+  1 in 100 on Windows CI). Every core built here is detached from ``atexit``,
+  while a handler in flight can still finish (design §7).
 * **A stand reached through Python devices needs a ``UniMMCore``.** A plain
   ``CMMCorePlus`` reads a ``.cfg``'s ``#py`` lines as comments, without a word,
   and loads nothing but ``Core``; so the opener reads the file's bytes for one
@@ -47,8 +52,10 @@ Hardware behaviour encoded here (#77):
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import weakref
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -75,6 +82,10 @@ __all__ = [
 ]
 
 log = logging.getLogger("smc.hardware.core")
+
+#: Every core :func:`_new_core` built that is still alive, for the exit (#538).
+#: Weak, so that tracking a core never keeps a released one alive.
+_live_cores: weakref.WeakSet[CMMCorePlus] = weakref.WeakSet()
 
 #: What to run when the device adapters are missing. Kept in one place so every
 #: error message and every doc says the same thing.
@@ -292,6 +303,7 @@ def _new_core(
         core: CMMCorePlus = UniMMCore()
     else:
         core = CMMCorePlus()
+    _live_cores.add(core)
     # Done on every open, with or without extras, so that the log and PATH
     # look the same everywhere. It replaces the core's list, hence the merge.
     effective = _merge_search_paths(extras, core.getDeviceAdapterSearchPaths())
@@ -466,6 +478,33 @@ def detach_callbacks(core: object) -> None:
             "freed now",
             str(exc),
         )
+
+
+def _detach_live_cores_at_exit() -> None:
+    """Detach every core still alive, before the interpreter finalizes (#538).
+
+    A core left open at exit (an ``smc`` command, ``smc ui`` quit while
+    connected, the MTB session's exit test) is otherwise freed during the
+    interpreter's finalization, and ``CMMCorePlus.__del__`` calls
+    ``registerCallback(None)``, which waits for the notification MMCore's own
+    thread is delivering. That thread can no longer take the GIL once
+    finalization has begun, so neither ends: on CI, 15 and 10 children in 300
+    on Linux and 3 in 300 on Windows hung there, never one on macOS, every one
+    after its last ``atexit`` handler had run. From ``atexit`` the delivering
+    thread can still run, so the wait ends when its handler returns
+    (:func:`detach_callbacks`), and afterwards MMCore calls no Python at all.
+
+    Registered when this module is imported, so before any MTB login: ``atexit``
+    runs last in, first out, and the MTB session's own handler (darken, every
+    LED off, logout) runs first; the light never waits for a detach (m4 §8).
+    Only a detach: the devices are unloaded later by the C++ destructor, as
+    before, now with no relay into Python.
+    """
+    for core in list(_live_cores):
+        detach_callbacks(core)
+
+
+atexit.register(_detach_live_cores_at_exit)
 
 
 def close_core(core: CMMCorePlus) -> None:
