@@ -6494,9 +6494,11 @@ H12 and A12 in `run.json`, the controller connected.
   the return only after a normal end; after STOP the stage stays where it is, as for the Stand
   screen's button), so there is **no confirmation** (FM-14 is about turns; the stage's own guards are
   the layer's). The controller refuses, as the outcome `Camera calibration: <text>` and with nothing
-  written, in this order: the stand is closed; **the plate is not registered from its walls** (no
-  offer, D2: `CALIBRATE_NO_OFFER`, which sends the operator to the Stand screen's button, the run
-  document's own calibration); then `calibrate_wait`'s dry run, unknown objective and the plate's; the
+  written, in this order: the stand is closed; **the run document cannot be read** (its error as the
+  words, `run document: <text>`, as `offsets_step` says it: an unreadable document is not an empty one,
+  FM-229); **the plate is not registered from its walls** (no offer, D2:
+  `CALIBRATE_NO_OFFER`, which sends the operator to the Stand screen's button, the run document's
+  own calibration); then `calibrate_wait`'s dry run, unknown objective and the plate's; the
   button named none (`CALIBRATE_NAMES_NONE`) or another objective than the turret reads
   (`calibrate_changed`); **the position is not known** (`calibrate_position_unknown`: the labels could
   not be read, two positions carry the label, or it is past position 12); **the stand is halted**
@@ -6730,7 +6732,8 @@ through `_say`.
   is a line), FM-139 (plain text), FM-145 (the tick draws from the status and the last view; the
   read of the documents is `view()`'s and the click's), FM-151 (`_calibrate_for` is the view's), FM-171
   (the handler through `_handler`), FM-172 (what a new calibration replaces is said first), FM-182
-  (the block walked on a dry-run page that holds a real registration), FM-205 (the lines that carry
+  (the block walked on a dry-run page that holds a real registration), FM-229 (an unreadable run
+  document is said, not taken for a plate that is not registered), FM-205 (the lines that carry
   a label or a tool's words through the card's bound), FM-210 (a folder that cannot be made, or is
   left behind), FM-238 (the click's read opens nothing while an activity goes), FM-244 (the Scan
   screen's account is `run.json`'s: a calibration run does not write it). **FM-216 gets a line**
