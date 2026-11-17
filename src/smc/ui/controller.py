@@ -132,12 +132,16 @@ from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 from smc.ui.frames import Frame
 from smc.ui.guide import (
     ASSUMED_LINE_CHARS,
+    CALIBRATE_NAMES_NONE,
+    CALIBRATE_NO_OFFER,
+    CALIBRATIONS_FOLDER,
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     GOTO_ESTIMATED,
     GOTO_UNPLACED,
     GOTO_WALL_NEEDS_REGISTRATION,
     MAP_FIELDS_UP_TO,
+    MAX_POSITIONS,
     MEASURE_NOT_IN_A_DRY_RUN,
     NO_CALIBRATION_FOR_SIDES,
     NOT_CONNECTED,
@@ -162,10 +166,16 @@ from smc.ui.guide import (
     NextStep,
     a1_corner,
     busy_note,
+    calibrate_changed,
+    calibrate_position_unknown,
+    calibrate_wait,
+    calibration_failed,
+    calibration_file,
     calibration_paths,
     centres_reach_note,
     checkpoint_note,
     command_line,
+    error_words,
     local_time,
     next_slot,
     offsets_card_lines,
@@ -181,6 +191,7 @@ from smc.ui.guide import (
     side_words,
     suggested_centres,
     tool_title,
+    turret_position,
     walls_card_lines,
     walls_centres_problem,
     walls_square_wells,
@@ -204,6 +215,7 @@ __all__ = [
     "ChainEnd",
     "ChainStatus",
     "CheckItem",
+    "HeldCalibration",
     "LoadedPreset",
     "OffsetsOffer",
     "OffsetsPlanView",
@@ -603,13 +615,30 @@ class CalibrationRead:
     document's camera calibration's (``calibration_from``: the objective it was done with and
     the record's time to the second, or ``at an unknown time``); ``problem`` is why the
     document cannot be used, in the tool's words, and then ``objective`` is ``None`` and
-    ``measured`` is empty.
+    ``measured`` is empty. ``notes`` are the calibration's own ``assumed`` lines, each on one
+    line and cut at the card's bound, at most the card's count (m5 §18.6 D15); a read that
+    has a ``problem`` has none.
     """
 
     path: str
     objective: str | None
     measured: str
     problem: str | None
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HeldCalibration:
+    """A calibration document the page holds, for one turret position (m5 §18.6 D15).
+
+    ``position`` is the turret position (1 to ``MAX_POSITIONS``) whose file
+    ``calibrations/position-<n>.json`` this is, and ``read`` what the document says: the
+    page's own path to it, its objective and date, or why it cannot be used (for a record that
+    ended ``failed`` the tool's own words).
+    """
+
+    position: int
+    read: CalibrationRead
 
 
 @dataclass(frozen=True, slots=True)
@@ -703,6 +732,9 @@ class PlateView:
     out of date to the note that says so (m5 §17.12.11 D30): the page draws it under *Lay out
     the fields* and under the expert view's *Run* of that tool. The run is not refused (FM-236);
     the map is empty when no stage holds a checkpoint ``--resume`` can continue.
+    ``calibrations`` are the camera-calibration documents the page holds, one per turret
+    position at most (m5 §18.6 D15): read here, beside the run document, and only when the
+    block is offered; ``()`` otherwise, and a tick never reads them (FM-145).
     """
 
     plate: str
@@ -730,6 +762,7 @@ class PlateView:
     scan_end: ScanEnd | None = None
     offsets: OffsetsOffer | None = None
     checkpoint_notes: Mapping[str, str] = field(default_factory=dict)
+    calibrations: tuple[HeldCalibration, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1304,7 +1337,32 @@ def _read_calibration(path: str, *, profile: str, dry_run: bool) -> CalibrationR
     if found.objective is None or not found.objective.strip():
         # A calibration made at an empty turret position holds a blank label: no objective to turn to.
         return CalibrationRead(path, None, "", offsets_no_objective(path))
-    return CalibrationRead(path, found.objective, measured, None)
+    # The calibration's own assumptions, bounded like a card's lines: a line is a tool's
+    # words and a reused calibration carries the path it was reused from (FM-205).
+    notes = tuple(
+        _cut(_flat(line), _CARD_TEXT_CHARS) for line in found.assumed[:_CARD_LINES]
+    )
+    return CalibrationRead(path, found.objective, measured, None, notes)
+
+
+def _failed_calibration_words(path: Path) -> str | None:
+    """The tool's own words of a document whose latest ``camera-calibration`` record ended ``failed``, or ``None`` (m5 §18.6 D15).
+
+    ``calibration_from`` says ``the last run of camera-calibration ended failed; run it
+    again``, and the reason the tool gave (the light path, a field with no texture, a step that
+    wrapped) is what the operator acts on: the strip's outcome is gone at the next activity. Read
+    only for a document that already has a problem, and never an exception for a file that is
+    data (FM-98, FM-125): anything that cannot be read, a record that did not fail, one with no
+    error, is ``None`` and the generic problem stands. The words are one line, cut at the
+    card's bound (FM-205).
+    """
+    try:
+        record = RunDocument.load(path).provider("camera-calibration")
+    except Exception:
+        return None
+    if record is None or record.status is not StageStatus.failed or not record.error:
+        return None
+    return _cut(error_words(_flat(record.error)), _CARD_TEXT_CHARS)
 
 
 def _offsets_offer_of(registered: PlateResult | None) -> OffsetsOffer | None:
@@ -2853,6 +2911,7 @@ class PlatePage:
         *,
         resume: bool = False,
         afresh: bool = False,
+        doc_path: Path | None = None,
     ) -> _Prepared | str:
         """What ``smc run`` checks before it opens the stand, for one tool: the plugin and its parameters, or the outcome that refuses it.
 
@@ -2866,6 +2925,11 @@ class PlatePage:
         ``resume`` asks ``check_ready`` the resume's own questions (its ``ResumeError`` is the
         outcome) and, since the checkpoint is what it continues, no checkpoint refusal;
         ``afresh`` skips the checkpoint refusal alone (``run``). A chain passes neither.
+
+        ``doc_path`` is the run document the tool is run into when it is not the page's own
+        (the block's calibration of an objective, m5 §18.6 D14): ``check_ready`` and the
+        checkpoint are asked of **that** document, and the page's own is not read here for it.
+        The refusals above it are the page's own tools' and are asked as for any run.
         """
         if self._microscope is None:
             return f"{plugin}: {NOT_CONNECTED}"
@@ -2924,7 +2988,7 @@ class PlatePage:
                 # any other exception is the plugin's, and an outcome, never a click
                 # that ends with no word (FM-113).
                 return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
-            doc = RunDocument.load_or_new(self._run_doc)
+            doc = RunDocument.load_or_new(doc_path or self._run_doc)
             check_ready(
                 entry.plugin,
                 doc,
@@ -3475,6 +3539,7 @@ class PlatePage:
         *,
         resume: bool = False,
         planned: int | None = None,
+        doc_path: Path | None = None,
     ) -> _Ended:
         """A plugin's run on the worker: its outcome as text, and whether it ended done, stopped or failed.
 
@@ -3488,13 +3553,19 @@ class PlatePage:
         The end of a run of a tool that provides ``plate`` clears the drive's text (``_goto``
         and ``_goto_answer``): ``... not registered`` was true of the plate before it, and a
         drive's text never outlives the plate it was measured on.
+
+        ``doc_path`` is the document of a run that is not the page's own (m5 §18.6 D14): what
+        the page keeps about **its** document's records, the attempt the Scan screen counts
+        over (FM-244) and the plate's follow-up, is not touched for it. Its outcome is the
+        tool's own, and the block's account of it is the list of the documents it holds.
         """
         ended = self._run_plugin_once(
-            plugin, entry, parsed, event, preset, resume, planned
+            plugin, entry, parsed, event, preset, resume, planned, doc_path
         )
-        self._note_attempt(plugin)
+        if doc_path is None:
+            self._note_attempt(plugin)
         self._last_ended = ended
-        if entry.plugin.provides == "plate":
+        if doc_path is None and entry.plugin.provides == "plate":
             with self._lock:
                 self._goto = ""
                 self._goto_answer = None
@@ -3532,8 +3603,14 @@ class PlatePage:
         preset: str | None,
         resume: bool = False,
         planned: int | None = None,
+        doc_path: Path | None = None,
     ) -> _Ended:
-        """``_run_plugin`` without what it does after the run: the run and its outcome."""
+        """``_run_plugin`` without what it does after the run: the run and its outcome.
+
+        The run document is ``doc_path`` when one is given and the page's own otherwise (m5
+        §18.6 D14); a plate tool's follow-up reads the page's own document after it, so it is
+        for a run into that document alone.
+        """
         with self._lock:
             # Before the runner starts, so before its first report: every run says what its
             # own reports are counted over, and only a resumed scan has a plan to add back.
@@ -3556,7 +3633,7 @@ class PlatePage:
                 entry.plugin,
                 self._stand(),
                 parsed,
-                self._run_doc,
+                doc_path or self._run_doc,
                 resume=resume,
                 on_progress=self._on_progress,
                 stop=event,
@@ -3581,7 +3658,7 @@ class PlatePage:
         if record.status is StageStatus.done:
             seconds = time.monotonic() - started
             note = ""
-            if record.provides == "plate":
+            if record.provides == "plate" and doc_path is None:
                 note = self._follow_plate(turned_from)
             # The card's lines, read once: the strip's tail and a chain's both say them.
             assumed = _card(record).assumed
@@ -4350,24 +4427,28 @@ class PlatePage:
         has not failed yet).
         """
         with self._reading() as microscope:
-            if microscope is None:
-                return ()
-            turret = microscope.get(ObjectiveTurret)
-            if turret is None:
-                return ()
-            try:
-                labels = tuple(turret.labels())
-            except Exception as exc:
-                if not self._labels_failure_logged:
-                    self._labels_failure_logged = True
-                    log.warning(
-                        "objective: its positions could not be read: %s: %s",
-                        type(exc).__name__,
-                        _one_line(exc),
-                    )
-                return ()
-            self._labels_failure_logged = False
-            return labels
+            return self._labels_of(microscope)
+
+    def _labels_of(self, microscope: Microscope | None) -> tuple[str, ...]:
+        """``objective_labels`` for a facade the caller already holds inside its own ``_reading()``."""
+        if microscope is None:
+            return ()
+        turret = microscope.get(ObjectiveTurret)
+        if turret is None:
+            return ()
+        try:
+            labels = tuple(turret.labels())
+        except Exception as exc:
+            if not self._labels_failure_logged:
+                self._labels_failure_logged = True
+                log.warning(
+                    "objective: its positions could not be read: %s: %s",
+                    type(exc).__name__,
+                    _one_line(exc),
+                )
+            return ()
+        self._labels_failure_logged = False
+        return labels
 
     def light_lacks(self) -> str | None:
         """Why the light cannot be switched on from the page, or ``None``.
@@ -5091,6 +5172,7 @@ class PlatePage:
             else None
         )
         self._note_plate_attempt(plate_record)
+        offer = self._offsets_offer(registered)
         return PlateView(
             plate=self._plate,
             nominal=pose.kind in ("estimated", "unplaced"),
@@ -5131,11 +5213,14 @@ class PlatePage:
             register_refusal=self._register_refusal(),
             frame_wells=self._frame_wells(doc),
             scan_end=self._scan_end(doc),
-            offsets=(None if plate_record is None else _offsets_offer_of(registered)),
+            offsets=offer,
             checkpoint_notes={
                 tool: checkpoint_note(stage, self._end_word(stage, status, doc))
                 for tool, (stage, status) in self._checkpoint_feeders(doc).items()
             },
+            # Beside the run document, which it is read with, and only for the block that
+            # lists them (m5 §18.6 D15): the tick reads nothing of it.
+            calibrations=() if offer is None else self._held_calibrations(),
         )
 
     def _scan_end(self, doc: RunDocument) -> ScanEnd | None:
@@ -5675,6 +5760,207 @@ class PlatePage:
         pairs, wait = self._registration_step([])
         return tuple(pairs), wait
 
+    # --- the camera calibration of each objective (m5 §18.6, #501) ---------------------
+
+    @property
+    def calibrations_folder(self) -> Path:
+        """The folder beside the run document that holds one calibration document per turret position (m5 §18.6 D11).
+
+        The page's own path, **as the page was given the run document** and never resolved
+        (FM-24, FM-50): a relative ``run.json`` gives a relative ``calibrations``, read from where
+        ``smc ui`` was started, as the tool reads a path it is given. It is beside ``run.json``
+        and never inside it: a calibration run into ``run.json`` replaces the one the plate was
+        registered with and makes the plate out of date (FM-216).
+        """
+        return self._run_doc.parent / CALIBRATIONS_FOLDER
+
+    def calibrate_objective(self, expected: str, pairs: Sequence[str] = ()) -> None:
+        """Run ``camera-calibration`` at the objective in place into the document of its turret position, if it is the one the button named (m5 §18.6 D12, D13).
+
+        The block's *Calibrate the camera at <objective>*: ``expected`` is the label the button
+        showed when it was pressed, and the turret is read again here: a label drawn up to a
+        second ago is not what the turret says now (FM-177). ``pairs`` are the ``key=value`` of
+        the tool's own form (``step_um``, ``settle_ms``). **Nothing in it turns the turret**: the
+        tool moves the stage a probe in +X, a probe in +Y and back, so there is no confirmation
+        (FM-14 is about turns); the stage's own guards are the layer's.
+
+        The run is into ``calibrations/position-<n>.json`` (``doc_path``) and the page's own run
+        document is neither read nor written by it (FM-216). Every refusal the page can foresee
+        is the outcome ``Camera calibration: <text>`` with nothing written and nothing started,
+        in this order: the stand is closed, the run document cannot be read (not an empty one,
+        FM-229), the plate is not registered from its walls, a dry run, an objective not known or
+        the plate's own (``calibrate_wait``), the button named none or another objective than the
+        turret reads, the position is not known, the stand is halted. A new calibration replaces
+        its position's document, and a failed or stopped one leaves it with none: the button says
+        so before the click (FM-172).
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page is closed.
+        """
+        self._refuse_if_busy()
+        title = tool_title("camera-calibration")
+        found = self._calibrate_target(expected)
+        if isinstance(found, str):
+            self._set_outcome(f"{title}: {found}")
+            return
+        path = found
+        loaded = self.preset
+        preset = None if loaded is None else loaded.file.name
+        prepared = self._prepare("camera-calibration", pairs, doc_path=path)
+        if isinstance(prepared, str):
+            self._set_outcome(prepared)
+            return
+        entry, parsed, planned = prepared
+        folder = self.calibrations_folder
+
+        def body(event: threading.Event) -> str:
+            # Made on the worker: a folder on a share that does not answer must not hold the
+            # loop that handles STOP (FM-238). One left behind is no harm: the next click finds
+            # it (FM-210). The run document's own folder exists, so no parents are made.
+            try:
+                folder.mkdir(exist_ok=True)
+            except OSError as exc:
+                return f"{title} failed: could not make {folder}: {_one_line(exc)}"
+            return self._run_plugin(
+                "camera-calibration",
+                entry,
+                parsed,
+                event,
+                preset,
+                planned=planned,
+                doc_path=path,
+            ).outcome
+
+        self._start_activity("camera-calibration", body)
+
+    def _calibrate_target(self, expected: str) -> Path | str:
+        """The document a calibration at the objective in place is run into, or the text that refuses it (m5 §18.6 D13).
+
+        One place for every refusal the page foresees, in D13's order, so that the block's
+        button and a click that arrives anyway (a stale tab, a script) agree (FM-169). The
+        turret's label and labels are read together, in one read a Disconnect waits for; the
+        halt is read last and only here, after ``calibrate_objective`` has refused a busy page:
+        it reads every device (``_halted``), which a drawer must never do (FM-145).
+        """
+        if self._microscope is None:
+            return NOT_CONNECTED
+        doc, unreadable = self._document()
+        if unreadable is not None:
+            return f"run document: {_flat(unreadable)}"
+        offer = self._offsets_offer(self._slot(doc, "plate", PlateResult, []))
+        if offer is None:
+            return CALIBRATE_NO_OFFER
+        now, labels = self._turret_reading()
+        wait = calibrate_wait(
+            connected=True,
+            running=None,
+            live=False,
+            dry_run=self._dry_run,
+            objective=now,
+            plate_objective=offer.plate_objective,
+        )
+        if wait is not None:
+            return wait
+        if now is None:  # unreachable: ``calibrate_wait`` says an objective not known
+            return CALIBRATE_NAMES_NONE
+        if not expected.strip():
+            return CALIBRATE_NAMES_NONE
+        if expected != now:
+            return calibrate_changed(expected, now)
+        position = turret_position(labels, now)
+        if position is None:
+            return calibrate_position_unknown(now)
+        if self._halted():
+            return SCAN_HALTED
+        return self.calibrations_folder / calibration_file(position)
+
+    def _turret_reading(self) -> tuple[str | None, tuple[str, ...]]:
+        """The objective in place and every position's label, read together inside one read a Disconnect waits for (m5 §18.6 D13).
+
+        ``(None, ())`` with the stand closed. The label is ``None`` for a turret that cannot be
+        read or reads nothing (``_objective_in_place``); the labels are ``()`` when they cannot
+        be read (``objective_labels``). The position is the label's index in these labels, so
+        the two come from one read and not from two ticks apart.
+        """
+        with self._reading() as microscope:
+            if microscope is None:
+                return None, ()
+            return self._objective_in_place(microscope), self._labels_of(microscope)
+
+    def _offsets_offer(self, registered: PlateResult | None) -> OffsetsOffer | None:
+        """The block's offer for the usable ``plate`` result ``registered``: it is the page's plate and was registered from its walls (m5 §18.2 D2).
+
+        The one place ``view()`` and the calibration's click decide it, so that the button
+        shown and the click it sends agree (FM-169).
+        """
+        if registered is None or registered.plate != self._plate:
+            return None
+        return _offsets_offer_of(registered)
+
+    def _held_calibrations(self) -> tuple[HeldCalibration, ...]:
+        """The calibration documents the page holds, for the turret positions 1 to ``MAX_POSITIONS`` in order (m5 §18.6 D11, D15).
+
+        A file that exists is read as the tool reads it (``_read_calibration``); one that
+        cannot be read, a folder named like a document, a document of another stand or
+        a record that ended ``failed`` is a ``problem`` on its line and never an exception
+        (FM-98, FM-113, FM-125), each position in a ``try`` of its own so that one broken file
+        leaves the others. A record that **failed** says the tool's own words (the reason is what
+        the operator acts on, and the strip's outcome is gone at the next activity). Only the
+        twelve names the page writes are looked at, so a folder with 10 000 files costs nothing
+        (D11). Called by ``view()`` and ``offsets_step``, never by the tick (FM-145).
+        """
+        folder = self.calibrations_folder
+        profile = self._profile.microscope.name
+        held: list[HeldCalibration] = []
+        for position in range(1, MAX_POSITIONS + 1):
+            path = folder / calibration_file(position)
+            try:
+                if not path.exists():
+                    continue
+                read = _read_calibration(
+                    str(path), profile=profile, dry_run=self._dry_run
+                )
+                if read.problem is not None:
+                    failed = _failed_calibration_words(path)
+                    if failed is not None:
+                        read = replace(read, problem=calibration_failed(failed))
+            except Exception as exc:
+                # A path is data, and so is the file: text for the line, never the error.
+                read = CalibrationRead(
+                    str(path),
+                    None,
+                    "",
+                    _flat(f"{path}: {type(exc).__name__}: {_one_line(exc)}"),
+                )
+            held.append(HeldCalibration(position, read))
+        return tuple(held)
+
+    def _default_calibrations(self) -> tuple[CalibrationRead, ...]:
+        """The held documents that an empty field measures with: usable, not the plate's objective, and on the turret now, in position order (m5 §18.6 D16).
+
+        As if their paths were typed: ``offsets_step`` reads them, waits for them and
+        refuses them as it does a typed line. Each document left out has its reason in the
+        block's list (D15), so nothing is dropped silently. The turret's labels are read once
+        for the filter; labels that cannot be read filter nothing out, and the step's own wait
+        says so (``OFFSETS_TURRET_UNREAD``) rather than a list that looks empty. Nothing is read
+        for a page with no offer: the step's wait is the reason.
+        """
+        doc, unreadable = self._document()
+        if unreadable is not None:
+            return ()
+        offer = self._offsets_offer(self._slot(doc, "plate", PlateResult, []))
+        if offer is None:
+            return ()
+        labels = self.objective_labels()
+        return tuple(
+            held.read
+            for held in self._held_calibrations()
+            if held.read.problem is None
+            and held.read.objective is not None
+            and held.read.objective != offer.plate_objective
+            and (not labels or held.read.objective in labels)
+        )
+
     # --- the offsets block (m5 §18) -----------------------------------------------------
 
     def offsets_step(self, calibrations_text: str) -> OffsetsStep:
@@ -5697,6 +5983,13 @@ class PlatePage:
         sixth line, which is not read. Never called from the tick or from ``refresh()``: it
         reads files (FM-145), and none while an activity goes (``reads`` is then empty and the
         wait is the activity's).
+
+        **An empty field is not an empty list** (m5 §18.6 D16): with no path typed it takes the
+        documents the page holds that are usable, not the plate's objective and on the turret
+        now, in position order, as if their paths were typed (``_default_calibrations``): the
+        same reads, waits, refusals, ``MAX_TARGETS`` and pairs. ``measure_offsets`` asks this
+        again with the same text, so D4's comparison of the armed objectives with what would run
+        now is as it was. A typed field wins and is never merged with them.
         """
         paths = calibration_paths(calibrations_text)
         profile = self._profile.microscope.name
@@ -5704,14 +5997,18 @@ class PlatePage:
         # would hold the loop that handles STOP, with the stage moving (FM-62, FM-148); the wait
         # is the activity's, and the lines under the field come back with the next edit or click.
         busy = self._current_run is not None
-        reads = (
-            ()
-            if busy
-            else tuple(
+        reads: tuple[CalibrationRead, ...]
+        if busy:
+            reads = ()
+        elif paths:
+            reads = tuple(
                 _read_calibration(path, profile=profile, dry_run=self._dry_run)
                 for path in paths[:MAX_TARGETS]
             )
-        )
+        else:
+            held = self._default_calibrations()
+            paths = tuple(read.path for read in held)
+            reads = held[:MAX_TARGETS]
         targets = tuple(
             read.objective
             for read in reads
