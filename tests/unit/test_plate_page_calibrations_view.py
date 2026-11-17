@@ -300,7 +300,9 @@ def _fit(well: str, centre: tuple[float, float]) -> WellFit:
     )
 
 
-def _seed_plate(run_doc: Path, *, by_eye: bool = False) -> None:
+def _seed_plate(
+    run_doc: Path, *, by_eye: bool = False, minute: int | None = None
+) -> None:
     """A plate registered under the 10X from its walls, or by eye (no block)."""
     walls = WallImages(
         objective=TEN,
@@ -330,7 +332,7 @@ def _seed_plate(run_doc: Path, *, by_eye: bool = False) -> None:
         plate.model_dump(mode="json"),
         params={"plate": plate.plate},
         # A registration by eye is a later attempt: the latest provider decides the slot.
-        minute=1 if by_eye else 0,
+        minute=(1 if by_eye else 0) if minute is None else minute,
     )
 
 
@@ -490,6 +492,44 @@ def test_the_calibrate_button_names_the_objective_in_place_and_waits_for_each_re
         assert closed_view.offsets_calibrate_wait.object == NOT_CONNECTED
     finally:
         closed.close()
+
+
+def test_a_page_that_does_not_offer_the_block_says_nothing_of_the_calibrations(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # The dry-run states of `/ui-check` read `summary.txt` for the block's words: a hidden block
+    # must carry none (the page's panes are scraped whether they are shown or not).
+    _hold(run_doc, 1, FORTY)
+    _turn(fake_microscope, FORTY)
+    for by_eye in (None, True):
+        if by_eye:
+            _seed_plate(run_doc, by_eye=True)
+        view = make_view()
+        assert view.offsets_box.visible is False
+        assert view.page.view().calibrations == ()
+        for pane in (
+            view.calibrations_held_text,
+            view.calibrate_lead_text,
+            view.offsets_calibrate_wait,
+        ):
+            assert pane.object == ""
+        assert view._calibrate_for is None
+    # The block, offered, says them; the plate registered again by eye takes them back.
+    _seed_plate(run_doc, minute=2)
+    view.refresh()
+    view.tick()
+    assert view.calibrate_lead_text.object == CALIBRATE_LEAD
+    assert view.calibrations_held_text.object != ""
+    _seed_plate(run_doc, by_eye=True, minute=3)
+    view.refresh()
+    view.tick()
+    assert view.offsets_box.visible is False
+    assert view.calibrate_lead_text.object == ""
+    assert view.calibrations_held_text.object == ""
+    assert view.offsets_calibrate_wait.object == ""
+    assert view._calibrate_for is None
 
 
 def test_a_dry_run_page_on_a_walls_plate_shows_the_wait_beside_the_calibrate_button(
@@ -851,6 +891,12 @@ def test_the_new_widgets_are_in_the_block_once_and_the_guard_test_walks_the_new_
     ]
     assert ours
     assert all(hasattr(fn, "__wrapped__") for fn in ours)
+    # The field's label is a sentence of the design: it wraps and is not cut at the panel's edge
+    # (the browser session of #501 saw it run past it at 1280 x 800).
+    assert any(
+        "white-space: normal" in str(sheet)
+        for sheet in view.calibrations_input.stylesheets
+    )
 
 
 def test_a_second_tab_draws_its_own_button_objective(

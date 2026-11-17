@@ -368,6 +368,9 @@ _WARNING = "#b45309"
 #: ``<pre>`` through a stylesheet. Text, never markup (FM-139).
 _WRAP_STYLES = {"white-space": "pre-wrap", "overflow-wrap": "anywhere"}
 _WRAP_SHEET = "pre { white-space: pre-wrap; overflow-wrap: anywhere; }"
+#: A widget's label that is a sentence wraps in the 400 px panel instead of being cut (the browser
+#: session of #501: the offsets field's label ran past the edge at 1280 x 800).
+_LABEL_WRAP_SHEET = "label { white-space: normal; overflow-wrap: anywhere; }"
 #: The width of the text panes of the step panel, inside its 400 px (m5 §17.3): every fixed
 #: width placed in a screen is at most this, so that nothing runs past the panel's edge.
 _TEXT_WIDTH = 370
@@ -1495,7 +1498,9 @@ class PlatePageView:
         # it waits for. All text and flags from the status and the last view (FM-145).
         self.calibrations_held_text = _wrapped_text()
         self.calibrations_held_text.visible = False
-        self.calibrate_lead_text = _wrapped_text(CALIBRATE_LEAD)
+        # Said by ``_draw_offsets_view`` with the block, so that a page that does not offer it
+        # carries none of its text (the dry-run states of ``/ui-check`` read that, m5 §18.6 D18).
+        self.calibrate_lead_text = _wrapped_text()
         self.offsets_calibrate_button = pn.widgets.Button(
             label="Calibrate the camera at another objective"
         )
@@ -1506,6 +1511,8 @@ class PlatePageView:
             placeholder=_OFFSETS_CALIBRATIONS_PLACEHOLDER,
             rows=3,
             sizing_mode="stretch_width",
+            # The label is a sentence (m5 §18.6.3): it wraps, and is not cut at the panel's edge.
+            stylesheets=[_LABEL_WRAP_SHEET],
         )
         self.calibration_reads_text = _wrapped_text()
         self.calibration_reads_text.visible = False
@@ -4130,6 +4137,7 @@ class PlatePageView:
             self._offsets_wait = ""
             self.offsets_lead_text.object = ""
             self.objective_in_place_text.object = ""
+            self.calibrate_lead_text.object = ""
             self._calibrate_for = None
             for pane in (
                 self.calibrations_held_text,
@@ -4151,6 +4159,7 @@ class PlatePageView:
             if self._objective_labels
             else offsets_lead_unread(offer.plate_objective)
         )
+        self.calibrate_lead_text.object = CALIBRATE_LEAD
         self._say(
             self.calibrations_held_text,
             self._calibrations_held_lines(view.calibrations, offer.plate_objective),
