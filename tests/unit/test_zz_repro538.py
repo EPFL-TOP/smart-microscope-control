@@ -1,7 +1,7 @@
 """TEMPORARY (#538): run the exit test's child many times on CI and name the hang.
 
 Removed before the PR is ready: it only exists to reproduce the hang on Linux.
-Round 2: each child with and without a detach of the core's callbacks at
+Round 3, with the fix in smc.hardware.core; round 2 had: each child with and without a detach of the core's callbacks at
 ``atexit``, and a demo-core child with a slow handler in flight at exit.
 """
 
@@ -85,19 +85,11 @@ def _loop(script: Path, n: int, tmp_path: Path) -> str:
     return summary + ("\n" + "\n".join(bad[:2]) if bad else "")
 
 
-@pytest.mark.parametrize("detach", [False, True], ids=["as-is", "detached-at-exit"])
+@pytest.mark.parametrize("detach", [False], ids=["with-the-fix"])
 def test_repro_538_the_exit_child_never_hangs(tmp_path: Path, detach: bool) -> None:
     script = tmp_path / f"zeiss-{'detach' if detach else 'asis'}.py"
     script.write_text(
         _PRELUDE + t._CHILD + (_DETACH if detach else ""), encoding="utf-8"
     )
     result = _loop(script, N, tmp_path)
-    assert " 0/" in result, result
-
-
-@pytest.mark.parametrize("detach", [False, True], ids=["as-is", "detached-at-exit"])
-def test_repro_538_a_slow_handler_at_exit(tmp_path: Path, detach: bool) -> None:
-    script = tmp_path / f"slow-{'detach' if detach else 'asis'}.py"
-    script.write_text(_PRELUDE + f"DETACH = {detach}\n" + _SLOW, encoding="utf-8")
-    result = _loop(script, 40, tmp_path)
     assert " 0/" in result, result
