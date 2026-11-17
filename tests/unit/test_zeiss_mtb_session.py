@@ -239,7 +239,18 @@ def test_an_unregistered_darkener_does_not_run_at_exit() -> None:
     assert ran == []
 
 
-_CHILD = """
+#: Seconds after which the child dumps every thread's stack and exits (#538):
+#: below the parent's own bound, so a hang names its stuck thread in the
+#: failure instead of a bare ``TimeoutExpired``.
+_CHILD_DUMP_AFTER_S = 45
+
+_CHILD = (
+    f"""
+import faulthandler
+
+faulthandler.dump_traceback_later({_CHILD_DUMP_AFTER_S}, exit=True)
+"""
+    + """
 import atexit
 import json
 import sys
@@ -272,6 +283,7 @@ stand.core.setShutterOpen("TLShutter", True)
 assert fake.colibri.lit() == [475], fake.colibri.lit()
 assert fake.changers["MTBTLShutter"].position() == 1  # "Open"
 """
+)
 
 
 def test_process_exit_darkens_the_light_then_logs_out(tmp_path: Path) -> None:
