@@ -104,6 +104,16 @@ from smc.plugins.cell_focus.loop import (
     switch_off_for_sweep,
 )
 from smc.plugins.errors import PluginRunError
+from smc.plugins.plate_check.algorithm import DEFAULT_MAX_SHIFT_UM
+from smc.plugins.plate_check.loop import (
+    CheckSetup,
+    checked_line,
+    objective_text,
+    prepare_check,
+    run_check,
+    unsaved_line,
+)
+from smc.plugins.plate_walls.loop import AUTOFOCUS_LEFT_OFF
 from smc.plugins.scan.algorithm import (
     CALIBRATION_TOLERANCE,
     PROFILE_TOLERANCE,
@@ -127,6 +137,8 @@ from smc.plugins.slots import (
     FieldFocus,
     FocusSweep,
     PlannedField,
+    PlateCheck,
+    PlateResult,
     ScanFrame,
     ScanPlanResult,
     ScanResult,
@@ -150,6 +162,12 @@ _AGAIN = "run scan-plan again with the stand as it is now"
 #: Added to §8's refusals when the focus on the cells switched the autofocus
 #: off and nothing locked it again (FM-88: a failure restores nothing).
 _FOCUS_LEFT_OFF = "; the focus on the cells left the autofocus off"
+#: What the operator does about a plate that moved since it was registered (m3
+#: §27.4): a resume would place its new frames against the old registration too.
+_PLATE_AGAIN = (
+    "register it again (plate-walls), then run scan-plan and scan again, without "
+    "--resume: frames already taken are placed against the old registration"
+)
 
 #: Windows' MAX_PATH, which counts the terminating NUL: a path of 260
 #: characters or more fails where long paths are not enabled. Module
@@ -169,6 +187,20 @@ class ScanParams(PluginParams):
             "lock would cross every well's wall). It is never switched on by "
             "the scan."
         ),
+    )
+    check_plate: bool = Field(
+        True,
+        description=(
+            "Before the first field, re-measure two wells plate-walls measured and "
+            "refuse a plate that moved more than max_plate_shift_um since (about 20 s "
+            "at the 10x)."
+        ),
+    )
+    max_plate_shift_um: float = Field(
+        DEFAULT_MAX_SHIFT_UM,
+        gt=0.0,
+        le=500.0,
+        description="How far a checked well may lie from its registered centre, in µm.",
     )
     max_failed_in_row: int = Field(
         3,
@@ -449,7 +481,7 @@ class ScanPlugin:
     requires: tuple[type, ...] = (XYStage, Camera)
     provides = "scan"
     reads: tuple[str, ...] = ("scan-plan",)
-    reads_optional: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ("plate",)
 
     def run(
         self,
@@ -563,6 +595,10 @@ class ScanPlugin:
                 params.focus_range_um,
                 params.focus_step_um,
             )
+        # The last check before anything moves (m3 §27.5): a plate lifted and
+        # put back since it was registered is refused before its first frame.
+        check_setup, check_skipped = _prepare_plate_check(ctx, xy, plan, params)
+        plate_check: PlateCheck | None = None
         # The autofocus the focus step switches off: the one the scan uses.
         focus_af = af if stand.used else None
         unused_af_line: str | None = None
@@ -603,15 +639,24 @@ class ScanPlugin:
             # After the well's start check (FM-130), before anything moves to
             # it: PFS locked over a wall follows its reference to another plane,
             # with no guard (F11). A dry run never engages, so it switches nothing.
-            if (
+            switched_here = (
                 stand.used
                 and af is not None
                 and not ctx.dry_run
                 and _switch_off_at_wall(af, well)
-            ):
+            )
+            if switched_here:
                 off_by_the_scan = True
                 wall_offs += 1
                 after_wall = True
+            if check_setup is not None:
+                # The attempt's first well, after its switch-off: no lock crosses
+                # the walls of the check's wells (FM-223), and its first field
+                # engages the autofocus again as after any wall (m3 §27.5).
+                plate_check = _check_the_plate(
+                    check_setup, xy, camera, ctx, done, total, switched_here
+                )
+                check_setup = None
             for planned in fields:
                 ctx.raise_if_stopped()
                 error: str | None = None
@@ -858,6 +903,14 @@ class ScanPlugin:
             )
 
         assumed = stand.assumed
+        # What the frames' places rest on comes first after the stand's lines.
+        if plate_check is not None:
+            assumed.append(checked_line(plate_check, before_the_first_field=True))
+            unsaved = unsaved_line(plate_check)
+            if unsaved is not None:
+                assumed.append(unsaved)
+        elif check_skipped is not None:
+            assumed.append(check_skipped)
         if focus.off_by_focus and af is not None and not ctx.dry_run:
             # The last field's step left the autofocus off and no next field
             # locks it: one engage, on a normal end only (a failure or a stop
@@ -931,8 +984,118 @@ class ScanPlugin:
             # A dry run took no frame, whatever a resumed checkpoint holds.
             frames=() if ctx.dry_run else tuple(frames),
             failed=tuple(failed),
+            plate_check=plate_check,
             assumed=tuple(assumed),
         )
+
+
+def _prepare_plate_check(
+    ctx: RunContext, xy: XYStage, plan: ScanPlanResult, params: ScanParams
+) -> tuple[CheckSetup | None, str | None]:
+    """The check of the plate this attempt makes, or the line that says why it makes none (m3 §27.5).
+
+    In this order, each a skip logged once at WARNING: ``check_plate`` false, a
+    dry run (it takes no frame), the plate not read, a plate whose walls nobody
+    measured, a plan made from another registration's objective, an offset
+    between objectives that is not measured (a check would read it as a move,
+    §27.1), a camera matrix that was not measured (a wall is looked for in the
+    camera's own turn, §17.1). Nothing is guessed to make a check possible.
+
+    Raises:
+        PluginRunError: ``prepare_check``'s refusals: the scan is refused before
+            anything moves.
+    """
+    skip = _plate_check_skip(ctx, plan, params)
+    if isinstance(skip, str):
+        _LOG.warning("%s", skip)
+        return None, skip
+    plate, shift_um = skip
+    token = new_token()
+    setup = prepare_check(
+        _NAME,
+        xy,
+        plate,
+        (),
+        objective=plan.objective,
+        shift_um=shift_um,
+        matrix=plan.matrix_um_per_px,
+        pixel_size_um=plan.pixel_size_um,
+        shape=plan.image_shape_px,
+        max_shift_um=params.max_plate_shift_um,
+        search_um=None,
+        settle_s=0.0,
+        folder=ctx.run_dir / "plate-check" / token,
+        folder_text=f"plate-check/{token}",
+        again=_PLATE_AGAIN,
+    )
+    return setup, None
+
+
+def _plate_check_skip(
+    ctx: RunContext, plan: ScanPlanResult, params: ScanParams
+) -> str | tuple[PlateResult, tuple[float, float]]:
+    """The skip's line (§27.5's table, in its order), or the plate and the shift to check it with."""
+    if not params.check_plate:
+        return "the plate was not checked against its registration (check_plate=false)"
+    if ctx.dry_run:
+        return "dry run: the plate was not checked against its registration"
+    plate = ctx.upstream_or_none("plate", PlateResult)
+    if plate is None:
+        return f"the plate was not checked: plate not read: {ctx.why_not_read('plate')}"
+    if plate.method != "wall-images" or plate.walls is None:
+        return (
+            f"the plate was not checked: it was registered by {plate.method}, which "
+            "measures no well's walls (plate-walls does)"
+        )
+    if plan.plate_objective != plate.objective:
+        return (
+            "the plate was not checked: the plan was made from a registration under "
+            f"{objective_text(plan.plate_objective)}, the plate record is under "
+            f"{objective_text(plate.objective)}"
+        )
+    if plan.objective_shift_um is None:
+        return (
+            "the plate was not checked: the offset between "
+            f"{objective_text(plan.plate_objective)} and "
+            f"{objective_text(plan.objective)} is not measured (the profile's "
+            "[objectives]), and a check would read it as a move"
+        )
+    if plan.matrix_source != "camera-calibration":
+        return (
+            f"the plate was not checked: the plan's camera matrix is the "
+            f"{plan.matrix_source}'s, and a wall is looked for with a measured one only"
+        )
+    return plate, plan.objective_shift_um
+
+
+def _check_the_plate(
+    setup: CheckSetup,
+    xy: XYStage,
+    camera: Camera,
+    ctx: RunContext,
+    done: int,
+    total: int,
+    switched_off: bool,
+) -> PlateCheck:
+    """``run_check`` in the attempt's first well; a refusal after this well's switch-off says the autofocus was left off.
+
+    The scan's frames have not started, so its progress stays at ``done`` and
+    the message says what is under way. A halt, a motion stop and a stop pass
+    unchanged (FM-64); only a ``PluginRunError`` gets §5.7 D3's sentence, raised
+    after the handler (FM-98).
+    """
+
+    def on_side(text: str) -> None:
+        ctx.progress(done, total, f"checking the plate: {text}")
+
+    reason = ""
+    try:
+        return run_check(setup, xy, camera, ctx, on_side)
+    except PluginRunError as exc:
+        if not switched_off:
+            raise
+        reason = exc.reason
+    raise PluginRunError(_NAME, reason + AUTOFOCUS_LEFT_OFF)
 
 
 def _resume(
