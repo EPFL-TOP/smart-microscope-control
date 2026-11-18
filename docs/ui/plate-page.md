@@ -772,9 +772,10 @@ the stand and which the operator's right (`[holder] back`, `right`:
 [profiles](../../profiles/README.md#back-right-the-sides-of-the-stand)), the map labels
 its four sides around the wells: *back of the stand*, *front of the stand*, *operator's
 left*, *operator's right*, half a well's pitch outside them, inside the frame, the left and
-the right one **turned 90° along the plate's sides**. On the Ti2-E the back is at
-the top and the operator's right on the right; on a stand whose back is -X it is on the
-left of the map. Without them there are no side labels. **A1 is always labelled, bold**,
+the right one **turned 90° along the plate's sides**. The map is drawn in stage terms (X
+right, Y up), so on the Ti2-E, whose back is -Y and whose operator's right is -X, the back is
+at the bottom of the map and the operator's right on its left; on a stand whose back is +Y
+it is at the top, and on one whose back is -X it is on the left. Without them there are no side labels. **A1 is always labelled, bold**,
 on every plate: it is the one name you check against the plate.
 
 Names are drawn up to 96 wells. The selection has a thick blue
@@ -794,8 +795,9 @@ drive, at rest): a snap never moves it, since its frame is old by the time it is
 Live ends the cross is drawn from the stage again within a second.
 
 **Which way the plate lies.** A plate goes into its holder one of two ways round, and the
-page cannot see which. **Say it in *Plate lies***, next to *Plate*: `A1 at the back left` or `Turned 180°: A1 at the front
-right` on the Ti2-E, worded from the stand's sides (in stage terms, `Not turned: A1 at stage
+page cannot see which. **Say it in *Plate lies***, next to *Plate*: `A1 at the front right`
+or `Turned 180°: A1 at the back left` on the Ti2-E (a plate with A1 at the back left is the
+second), worded from the stand's sides (in stage terms, `Not turned: A1 at stage
 -X +Y` and `Turned 180°: A1 at stage +X -Y`, with a note under the menu, on a stand whose
 profile does not say them). Every plate tool is given the choice (`orientation=` of
 `plate-registration`, `plate-walls`, `plate-finding` and `plate-orientation`); no tool's form
@@ -1541,8 +1543,10 @@ the stand (a second outside Live, a tenth of a second in Live, and `state()` was
 to 0.5 s there during Live); the cross and its label at the PC's screen and zoom; and
 `plate-walls` from one rough position in each of three wells, with the time it takes.
 
-**Which way the plate lies** adds, for the owner at the Ti2-E: the profile's `back = "+Y"`
-and `right = "+X"` (inferred from session 3, not seen); the *Plate lies* switch read by an
+**Which way the plate lies** adds, for the owner at the Ti2-E: the profile's `back = "-Y"`
+and `right = "-X"` were seen in session 5 (#540), so a plate with A1 at the back left is
+asked for as `Turned 180°: A1 at the back left`, and **one line of the checklist checks it:
+a drive to B2 lands on B2**; the *Plate lies* switch read by an
 operator who has not read this page, with the cross over a well they can see; and whether a
 selection that keeps its names after a turn is what the operator expects.
 

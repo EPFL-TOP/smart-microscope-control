@@ -256,9 +256,9 @@ right") and labels the map's sides "back of the stand", "front of the stand",
 
 ```toml
 [holder]
-back = "+Y"
-right = "+X"
-directions_measured = "inferred from session 3 (#405, #414), not checked at the stand: ..."
+back = "-Y"
+right = "-X"
+directions_measured = "2026-11-17, session 5 (#198, #540), at the stand: the joystick moved the field towards row A at -Y and towards column 6 at -X; ..."
 ```
 
 - **Each is a stage direction**: `"+X"`, `"-X"`, `"+Y"` or `"-Y"`, the way
@@ -270,8 +270,10 @@ directions_measured = "inferred from session 3 (#405, #414), not checked at the 
   stand, or that they are inferred and from what.
 - **Unset**, the page speaks in stage terms ("Not turned: A1 at stage -X +Y"), draws no
   side labels, and says under its *Plate lies* choice that the stand does not say which
-  side is the back. `nikon-ti2` sets `+Y` and `+X`, **inferred** from session 3 and to be
-  checked at the stand; `demo-sample` the same, by construction (its map's +Y is up and +X
+  side is the back. `nikon-ti2` sets `-Y` and `-X`, **measured** at the stand in session 5
+  (#540; session 3 had inferred `+Y` and `+X` from a plate it took for one with A1 at the
+  front right, and was wrong), so a plate with A1 at the back left is its `Turned 180°`
+  choice; `demo-sample` sets `+Y` and `+X`, by construction (its map's +Y is up and +X
   right); `demo` and `nikon-tie` neither.
 
 ## Shipped profiles
