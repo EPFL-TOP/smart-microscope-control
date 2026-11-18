@@ -263,6 +263,7 @@ __all__ = [
     "step_states",
     "stop_segments_clause",
     "suggested_centres",
+    "time_line",
     "tool_title",
     "turret_position",
     "wall_touches_note",
@@ -1528,11 +1529,14 @@ def scan_plan_card_lines(result: ScanPlanResult) -> tuple[str, ...]:
     Built from the result because the generic card shows its first eight keys and
     cut ``estimate_s`` away, the figure the operator wants before pressing *scan*.
     The wells are named in the plan's order (the visiting order, not the
-    alphabetical one). The estimate says what ``estimate_s()`` sums, the moves, a
-    refocus when the timings know its cost and the snaps, and no more: it leaves out a
-    channel change, the cells, the report and the export. An unknown estimate says what
-    makes it unknown and what to run, and is never a zero (CLAUDE.md: unknown beats
-    guessed).
+    alphabetical one). The estimate says what ``estimate_s()`` sums, the moves, one
+    lock of the autofocus in each well when the stand has one and the timings know its
+    cost, and the snaps, and no more: it leaves out a channel change, the cells, the
+    report and the export. Which of the three texts it is follows the plan's second
+    figure (m5 §14.3, #549): below the first, a lock was counted; equal, none was; and
+    absent, the plan was written when a refocus was charged at every field, and says so.
+    An unknown estimate says what makes it unknown and what to run, and is never a zero
+    (CLAUDE.md: unknown beats guessed).
     """
     names = list(result.wells[:_CARD_WELLS])
     if len(result.wells) > _CARD_WELLS:
@@ -1557,10 +1561,14 @@ def scan_plan_card_lines(result: ScanPlanResult) -> tuple[str, ...]:
             "estimate: unknown, no usable timing: run timing, then scan-plan again"
         )
     else:
-        estimate = (
-            f"estimate: about {duration_text(result.estimate_s)} "
-            "(the moves, refocus and snaps of the timings)"
-        )
+        without = result.estimate_without_autofocus_s
+        if without is None:
+            sums = "the moves, refocus and snaps of the timings"
+        elif without < result.estimate_s:
+            sums = "the moves, the autofocus locked again in each well, and the snaps of the timings"
+        else:
+            sums = "the moves and snaps of the timings"
+        estimate = f"estimate: about {duration_text(result.estimate_s)} ({sums})"
     return (wells, fields, field, estimate)
 
 
@@ -1704,12 +1712,47 @@ def scan_lock_note(mode: str, *, autofocus_locked: bool | None, dry_run: bool) -
     return ""
 
 
+def time_line(plan: PlanLayer, autofocus: str) -> str:
+    """The Wells screen's ``Time`` line for the autofocus mode the field holds (m5 §17.10.3, #549).
+
+    The plan carries two figures, with the autofocus used and with it not used, and the
+    mode is the ``scan`` tool's ``autofocus`` field, which the plan cannot know: it is
+    chosen after the plan is made. The text is read stripped; ``off`` and ``required``
+    are themselves and every other text, the empty one and a mistyped one included, reads
+    as ``if-engaged`` (the tool's default), because ``scan`` refuses a mistyped value with
+    its own words when it runs and the line is not where that is said. ``if-engaged`` gives
+    both figures, since the page cannot know whether ``scan`` will find the autofocus on.
+
+    A plan with nothing to say about the autofocus (an older plan has one figure; a stand
+    with no autofocus, or timings with no lock time, has two equal ones) reads as the
+    plain figure, and so does one whose second figure is above the first, which the result
+    model refuses but a layer built from a hand-edited record could hold. An unknown
+    estimate is ``TIME_NOT_KNOWN``, never ``0 s`` (FM-170).
+    """
+    on = plan.estimate_s
+    if on is None:
+        return TIME_NOT_KNOWN
+    off = plan.estimate_without_autofocus_s
+    if off is None or off >= on:
+        return f"Time: about {duration_text(on)}"
+    mode = autofocus.strip()
+    if mode == "off":
+        return f"Time: about {duration_text(off)}, with the autofocus not used"
+    line = (
+        f"Time: about {duration_text(on)}, with the autofocus locked again in each well"
+    )
+    if mode == "required" or duration_text(off) == duration_text(on):
+        return line
+    return f"{line}; about {duration_text(off)} if it is off at the start"
+
+
 def wells_known_lines(
     *,
     objective: str | None,
     plan: PlanLayer | None,
     out_of_date: str | None,
     assumed: Sequence[str],
+    autofocus: str = "",
 ) -> tuple[str, ...]:
     """The Wells screen's "known" block under *Lay out the fields*: objective, fields, time, assumptions (m5 §17.4.3, §17.10.3).
 
@@ -1717,7 +1760,9 @@ def wells_known_lines(
     plan is out of date and why (``out_of_date``: the checklist's reason for the slot) or
     that none is laid out yet. A plan made with no timing says ``Time: not known`` with
     what to run, never ``0 s`` (FM-170, CLAUDE.md: unknown beats guessed). ``assumed`` are
-    the plan card's own lines, drawn only beside a plan they are about. Plain text (FM-139).
+    the plan card's own lines, drawn only beside a plan they are about. ``autofocus`` is the
+    text of the ``scan`` tool's ``autofocus`` field as typed, which the ``Time`` line follows
+    (``time_line``). Plain text (FM-139).
     """
     lines = [objective_line(objective)]
     if plan is None:
@@ -1732,10 +1777,7 @@ def wells_known_lines(
     # would read as a count of nothing (m5 §17.10.3).
     count = "1 field" if plan.count == 1 else str(plan.count)
     lines.append(f"Fields: {count} in {_count(plan.wells, 'well')}")
-    if plan.estimate_s is None:
-        lines.append(TIME_NOT_KNOWN)
-    else:
-        lines.append(f"Time: about {duration_text(plan.estimate_s)}")
+    lines.append(time_line(plan, autofocus))
     lines.extend(f"assumed: {line}" for line in assumed)
     return tuple(lines)
 
