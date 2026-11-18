@@ -502,10 +502,13 @@ class PlanLayer:
     field. ``fields`` are the ``(x_um, y_um)`` centres in visiting order, or ``()``
     past ``MAP_FIELDS_UP_TO``: a first part of a large plan would pass for all of it.
 
-    The Wells and Scan screens (m5 §17.10.2) read four more, each defaulted: ``well_names``
+    The Wells and Scan screens (m5 §17.10.2) read five more, each defaulted: ``well_names``
     are the plan's wells in visiting order (the title names them in plate order), ``objective``
     the objective the plan was made for and ``estimate_s`` its estimate, ``None`` when no
-    timing was measured: an unknown, never a zero (FM-170). ``imaged`` are the ``(x_um, y_um)``
+    timing was measured: an unknown, never a zero (FM-170). ``estimate_without_autofocus_s``
+    is the same time with the autofocus not used (m3 §7.4), ``None`` for a plan written
+    before it existed: the Wells screen's *Time* line follows the ``autofocus`` field with
+    the two figures. ``imaged`` are the ``(x_um, y_um)``
     of the plan's fields the usable ``scan`` of this plan holds a frame for, ``()`` while
     there is none, for a dry run, and past ``MAP_FIELDS_UP_TO`` as ``fields`` are.
     """
@@ -517,6 +520,7 @@ class PlanLayer:
     well_names: tuple[str, ...] = ()
     objective: str | None = None
     estimate_s: float | None = None
+    estimate_without_autofocus_s: float | None = None
     imaged: tuple[tuple[float, float], ...] = ()
 
 
@@ -1424,6 +1428,7 @@ def _plan_layer(
         well_names=tuple(plan.wells),
         objective=plan.objective,
         estimate_s=plan.estimate_s,
+        estimate_without_autofocus_s=plan.estimate_without_autofocus_s,
         imaged=tuple((f.x_um, f.y_um) for f in plan.fields if f.name in framed),
     )
 

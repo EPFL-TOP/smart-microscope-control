@@ -30,10 +30,12 @@ from smc.plugins.slots import PlannedField, PlateResult, TimingsResult, WellGeom
 from smc.plugins.slots.plate import normalise_well, well_geometry
 
 __all__ = [
+    "estimate_assumed",
     "estimate_s",
     "gap_overlap",
     "grid_size",
     "plan_fields",
+    "refocus_count",
     "turn_from_axes_deg",
 ]
 
@@ -219,14 +221,30 @@ def plan_fields(
 
 
 def estimate_s(
-    fields: Sequence[PlannedField], timings: TimingsResult, *, refocus: bool
+    fields: Sequence[PlannedField], timings: TimingsResult, *, refocuses: int
 ) -> float:
-    """Seconds to visit ``fields`` in order: each move, a refocus when ``refocus``, each snap.
+    """Seconds to visit ``fields`` in order: each move and snap, and ``refocuses`` locks of the autofocus.
 
     The first field costs no move (the stage is taken to be there), and a move
-    is the straight line between two fields in µm. A refocus whose cost the
-    timings do not know (``refocus_ms`` is ``None``) is left out and not guessed.
+    is the straight line between two fields in µm. A lock is charged **per
+    well, not per field** (m3 §8, #416): the scan switches the autofocus off at
+    each well's wall and the first field locks it again, so a continuous
+    autofocus costs one ``refocus_ms`` at a well's entry and nothing at the
+    fields that follow. Charging it at every field made three scans of the
+    Ti2-E's session 5 read 2.7 to 3.3 times slower than they ran (#549), which
+    is why the caller says how many locks the scan makes (``refocus_count``)
+    instead of this function guessing. A refocus whose cost the timings do not
+    know (``refocus_ms`` is ``None``) is left out and not guessed.
+
+    The locks are added once, after the loop, so that ``refocuses=0`` is
+    exactly the figure the others add to and the figure without them is never
+    above the figure with them.
+
+    Raises:
+        ValueError: ``refocuses`` is negative.
     """
+    if refocuses < 0:
+        raise ValueError(f"refocuses must be at least 0, got {refocuses}")
     total_ms = 0.0
     previous: PlannedField | None = None
     for field in fields:
@@ -234,11 +252,48 @@ def estimate_s(
             total_ms += timings.move_ms(
                 math.hypot(field.x_um - previous.x_um, field.y_um - previous.y_um)
             )
-        if refocus and timings.refocus_ms is not None:
-            total_ms += timings.refocus_ms
         total_ms += timings.snap_ms
         previous = field
+    if timings.refocus_ms is not None:
+        total_ms += refocuses * timings.refocus_ms
     return total_ms / 1000.0
+
+
+def refocus_count(fields: Sequence[PlannedField]) -> int:
+    """The locks a scan of ``fields`` makes: one in each distinct well (m3 §7.4 D1).
+
+    The scan groups the fields by well and locks the autofocus again at each
+    group's first field, so the count is the wells and not the runs of the
+    order or the fields.
+    """
+    return len({field.well for field in fields})
+
+
+def estimate_assumed(locks: int) -> tuple[str, ...]:
+    """The ``estimate:`` lines of a plan that has an estimate (m3 §7.4 D5).
+
+    The first, when ``locks`` is above 0, says what a lock assumes: the layer
+    cannot tell an autofocus that holds its lock from one that refocuses at each
+    field (D4), so the estimate takes the first and says so. The last says what
+    the figure leaves out, which is about a fifth of the real time and is not
+    guessed (*measured beats assumed*). The page puts ``assumed: `` before each
+    and shows it whole up to ``ASSUMED_LINE_CHARS``; the longest forms are
+    152 and 155 characters (a test holds them to the bound, FM-205).
+    """
+    if locks > 0:
+        noun = "1 lock" if locks == 1 else f"{locks} locks"
+        return (
+            "estimate: the autofocus holds its lock between fields and locks again "
+            f"once in each well ({noun}); one that refocuses at each field would "
+            "take longer",
+            "estimate: the timed moves, locks and snaps; it leaves out each frame's "
+            "write, a lock lost in a well, a channel change, the cells, the report "
+            "and the export",
+        )
+    return (
+        "estimate: the timed moves and snaps; it leaves out each frame's write, a "
+        "channel change, the cells, the report and the export",
+    )
 
 
 def _touches(well: WellGeometry, frame: Sequence[Point]) -> bool:

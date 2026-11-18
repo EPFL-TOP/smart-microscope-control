@@ -354,7 +354,10 @@ def _plate_result() -> PlateResult:
 
 
 def _scan_plan_result(
-    wells: tuple[str, ...] = ("B11", "B2", "A1"), *, estimate_s: float | None = 42.16
+    wells: tuple[str, ...] = ("B11", "B2", "A1"),
+    *,
+    estimate_s: float | None = 42.16,
+    estimate_without_autofocus_s: float | None = None,
 ) -> ScanPlanResult:
     """A plan of 2 x 2 fields in each well, in visiting order: B11, then B2, then A1 (FM-204)."""
     fov_um = (512.0, 512.0)
@@ -388,6 +391,7 @@ def _scan_plan_result(
         columns=2,
         fields=fields,
         estimate_s=estimate_s,
+        estimate_without_autofocus_s=estimate_without_autofocus_s,
     )
 
 
@@ -896,6 +900,88 @@ def test_a_plan_with_an_estimate_says_the_time_and_the_singular(
         "Fields: 12 in 3 wells",
         "Time: about 42 s",
     ]
+
+
+LOCKED_EACH_WELL = "with the autofocus locked again in each well"
+
+
+def _time_line(view: PlatePageView) -> str:
+    return view.wells_known_block.object.split("\n")[2]
+
+
+def test_typing_the_autofocus_mode_changes_the_time_line_without_a_refresh(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # #549: the plan holds the time with the autofocus used and with it not used, and the
+    # line follows the `autofocus` field, which the plan cannot know: no `scan-plan` run,
+    # no refresh, only the field changing.
+    view = PlatePageView(page)
+    _seed_plate(run_doc)
+    _seed_plan(
+        run_doc,
+        _scan_plan_result(estimate_s=90.4, estimate_without_autofocus_s=88.4),
+    )
+    view.show_step("wells")
+    view.refresh()
+    field = view.tool_fields["scan"]["autofocus"]
+    assert field.value == ""
+    both = (
+        f"Time: about 1 min 30 s, {LOCKED_EACH_WELL}; "
+        "about 1 min 28 s if it is off at the start"
+    )
+    assert _time_line(view) == both
+    field.value = "off"
+    assert _time_line(view) == "Time: about 1 min 28 s, with the autofocus not used"
+    field.value = "required"
+    assert _time_line(view) == f"Time: about 1 min 30 s, {LOCKED_EACH_WELL}"
+    field.value = ""
+    assert _time_line(view) == both
+    # The rest of the block did not move with it: only the Time line is the field's.
+    assert view.wells_known_block.object.split("\n")[:2] == [
+        f"Objective: {TEN_X}, in place",
+        "Fields: 12 in 3 wells",
+    ]
+
+
+def test_a_preset_load_leaves_the_time_line_to_the_refresh_that_ends_it(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # `_on_field_changed` returns while a load fills the fields, and the load's own
+    # `refresh()` draws the block once at its end: no redraw per field (m5 §17.10.3).
+    view = PlatePageView(page)
+    _seed_plate(run_doc)
+    _seed_plan(
+        run_doc,
+        _scan_plan_result(estimate_s=90.4, estimate_without_autofocus_s=88.4),
+    )
+    view.refresh()
+    before = _time_line(view)
+    view._filling = True
+    try:
+        view.tool_fields["scan"]["autofocus"].value = "off"
+        assert _time_line(view) == before
+    finally:
+        view._filling = False
+    view.refresh()
+    assert _time_line(view) == "Time: about 1 min 28 s, with the autofocus not used"
+
+
+def test_a_page_without_the_scan_tool_reads_the_time_line_as_if_engaged(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(stubs=(Slow,))
+    view = PlatePageView(page)
+    assert "scan" not in view.tool_fields
+    _seed_plate(run_doc)
+    _seed_plan(
+        run_doc,
+        _scan_plan_result(estimate_s=90.4, estimate_without_autofocus_s=88.4),
+    )
+    view.refresh()
+    assert _time_line(view) == (
+        f"Time: about 1 min 30 s, {LOCKED_EACH_WELL}; "
+        "about 1 min 28 s if it is off at the start"
+    )
 
 
 def test_a_selection_changed_after_the_plan_is_said_on_both_screens(

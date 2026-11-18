@@ -33,6 +33,7 @@ from smc.plugins.scan_plan.algorithm import (
     gap_overlap,
     grid_size,
     plan_fields,
+    refocus_count,
     turn_from_axes_deg,
 )
 from smc.plugins.slots import PlannedField, PlateResult, TimingsResult, well_geometry
@@ -688,25 +689,52 @@ def _field(index: int, x: float, y: float) -> PlannedField:
     return PlannedField(well="A1", index=index, name=f"A1_{index:04d}", x_um=x, y_um=y)
 
 
-def test_the_estimate_adds_moves_refocus_and_snaps() -> None:
+def _field_in(well: str, index: int, x: float, y: float) -> PlannedField:
+    return PlannedField(
+        well=well, index=index, name=f"{well}_{index:04d}", x_um=x, y_um=y
+    )
+
+
+#: What `timing` measured at the Ti2-E, 10x, PFS locked (session 5, 2026-11-17, #549).
+SESSION_5 = {
+    "move_overhead_ms": 133.8,
+    "move_ms_per_mm": 63.3,
+    "refocus_ms": 1019.5,
+    "snap_ms": 165.7,
+}
+
+
+def _two_wells() -> tuple[PlannedField, ...]:
+    """Four fields in two wells, 1 mm apart inside a well and 8 mm between the wells."""
+    return (
+        _field_in("C3", 0, 0.0, 0.0),
+        _field_in("C3", 1, 1000.0, 0.0),
+        _field_in("C2", 0, 9000.0, 0.0),
+        _field_in("C2", 1, 10000.0, 0.0),
+    )
+
+
+def test_the_estimate_adds_moves_locks_and_snaps() -> None:
     fields = (_field(0, 0.0, 0.0), _field(1, 1000.0, 0.0), _field(2, 1000.0, 2000.0))
     timings = _timings()
 
     # Moves: none for the first field, 100 + 50 ms for 1 mm, 100 + 100 ms for 2 mm.
-    assert estimate_s(fields, timings, refocus=True) == pytest.approx(1.61)
-    assert estimate_s(fields, timings, refocus=False) == pytest.approx(0.41)
+    assert estimate_s(fields, timings, refocuses=3) == pytest.approx(1.61)
+    assert estimate_s(fields, timings, refocuses=0) == pytest.approx(0.41)
+    # A lock is added once, with no field in it: one lock is 400 ms more than none.
+    assert estimate_s(fields, timings, refocuses=1) == pytest.approx(0.81)
 
 
 def test_an_unknown_refocus_cost_is_left_out_not_guessed() -> None:
     fields = (_field(0, 0.0, 0.0), _field(1, 1000.0, 0.0), _field(2, 1000.0, 2000.0))
 
-    assert estimate_s(fields, _timings(refocus_ms=None), refocus=True) == pytest.approx(
+    assert estimate_s(fields, _timings(refocus_ms=None), refocuses=3) == pytest.approx(
         0.41
     )
 
 
 def test_the_estimate_of_no_fields_is_zero() -> None:
-    assert estimate_s((), _timings(), refocus=True) == 0.0
+    assert estimate_s((), _timings(), refocuses=0) == 0.0
 
 
 def test_the_estimate_moves_by_euclidean_distance() -> None:
@@ -714,9 +742,75 @@ def test_the_estimate_moves_by_euclidean_distance() -> None:
     fields = (_field(0, 0.0, 0.0), _field(1, 3000.0, 4000.0))
     timings = _timings(refocus_ms=None, snap_ms=0.0)
 
-    assert estimate_s(fields, timings, refocus=False) == pytest.approx(
+    assert estimate_s(fields, timings, refocuses=0) == pytest.approx(
         (100.0 + 50.0 * 5.0) / 1000.0
     )
+
+
+def test_a_lock_is_charged_once_per_well_and_none_with_the_autofocus_off() -> None:
+    """The scan locks the autofocus again once in each well; the old model did it at each field (#549)."""
+    fields = _two_wells()
+    timings = _timings(**SESSION_5)
+
+    assert refocus_count(fields) == 2
+    off = estimate_s(fields, timings, refocuses=0)
+    per_well = estimate_s(fields, timings, refocuses=refocus_count(fields))
+    per_field = estimate_s(fields, timings, refocuses=len(fields))
+
+    # Moves 197.1 + 640.2 + 197.1 ms and four snaps of 165.7 ms; a lock is 1019.5 ms.
+    assert off == pytest.approx(1.6972, abs=1e-9)
+    assert per_well == pytest.approx(3.7362, abs=1e-9)
+    assert per_field == pytest.approx(5.7752, abs=1e-9)
+    assert per_field - per_well > 1.0
+    assert per_well - off > 1.0
+
+
+def test_the_lock_count_is_the_number_of_wells_not_of_fields() -> None:
+    assert refocus_count(()) == 0
+    one_each = tuple(_field_in(well, 0, 0.0, 0.0) for well in ("A1", "A2", "A3"))
+    assert refocus_count(one_each) == 3
+    many = (
+        *(_field_in("A1", i, 0.0, 0.0) for i in range(2)),
+        _field_in("A2", 0, 0.0, 0.0),
+        *(_field_in("A3", i, 0.0, 0.0) for i in range(3)),
+    )
+    assert refocus_count(many) == 3
+    assert len(many) == 6
+    assert refocus_count(tuple(_field_in("B4", i, 0.0, 0.0) for i in range(5))) == 1
+    # A well that appears twice in the order is locked once: the scan groups its
+    # fields by well (A1, A2, A1 is two wells, not three runs).
+    again = (
+        _field_in("A1", 0, 0.0, 0.0),
+        _field_in("A2", 0, 0.0, 0.0),
+        _field_in("A1", 1, 0.0, 0.0),
+    )
+    assert refocus_count(again) == 2
+
+
+@pytest.mark.parametrize("refocuses", [-1, -100])
+def test_a_negative_number_of_refocuses_is_refused(refocuses: int) -> None:
+    message = f"refocuses must be at least 0, got {refocuses}"
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+        estimate_s((_field(0, 0.0, 0.0),), _timings(), refocuses=refocuses)
+
+
+@pytest.mark.parametrize("refocus_ms", [0.0, 1019.5])
+def test_the_figure_without_locks_is_never_above_the_figure_with_them(
+    refocus_ms: float,
+) -> None:
+    timings = _timings(refocus_ms=refocus_ms)
+    layouts = (
+        (),
+        (_field(0, 0.0, 0.0),),
+        (_field(0, 0.0, 0.0), _field(1, 1000.0, 0.0), _field(2, 1000.0, 2000.0)),
+        _two_wells(),
+    )
+    for fields in layouts:
+        without = estimate_s(fields, timings, refocuses=0)
+        with_locks = estimate_s(fields, timings, refocuses=refocus_count(fields))
+        assert without <= with_locks
+        if refocus_ms == 0.0:
+            assert without == with_locks
 
 
 # --------------------------------------------------------------------- gaps

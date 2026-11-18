@@ -174,6 +174,7 @@ _SCAN_PLAN: dict[str, Any] = {
     "columns": 3,
     "fields": [_PLANNED],
     "estimate_s": 1830.5,
+    "estimate_without_autofocus_s": 1790.25,
     "plate_objective": "Nikon 10X Plan Fluor",
     "objective_shift_um": [-37.5, 12.25],
     "calibration_from": "cal-40x.json",
@@ -464,6 +465,7 @@ SAMPLES: dict[type[BaseModel], Sample] = {
             "wells": [],
             "fields": [],
             "estimate_s": None,
+            "estimate_without_autofocus_s": None,
             "plate_objective": None,
             "objective_shift_um": None,
             "calibration_from": None,
@@ -712,7 +714,10 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (ScanPlanResult, ("overlap",), [-0.1, 1.0, 1.5], [0.0, 0.999]),
     (ScanPlanResult, ("rows",), [0, -1], [1]),
     (ScanPlanResult, ("columns",), [0, -1], [1]),
-    (ScanPlanResult, ("estimate_s",), [-0.1], [0.0]),
+    # `estimate_s` on its bound is a test of its own below: the full sample's
+    # second figure is above 0, which a first figure of 0 would refuse (#549).
+    (ScanPlanResult, ("estimate_s",), [-0.1], []),
+    (ScanPlanResult, ("estimate_without_autofocus_s",), [-0.1], [0.0]),
     (ScanFrame, ("index",), [-1], [0]),
     (ScanFrame, ("t_s",), [-0.1], [0.0]),
     (FieldFocus, ("duration_s",), [-0.1], [0.0]),
@@ -839,6 +844,12 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (PlateCheck, ("folder",)),
 ]
 
+#: A field that is unknown only together with another one: the second figure of a
+#: scan plan (#549) cannot be given while the first is unknown.
+UNKNOWN_WITH: dict[tuple[type[BaseModel], tuple[Any, ...]], tuple[Any, ...]] = {
+    (ScanPlanResult, ("estimate_s",)): ("estimate_without_autofocus_s",),
+}
+
 
 @pytest.mark.parametrize(
     ("model", "path"),
@@ -850,7 +861,10 @@ def test_a_field_that_may_be_unknown_must_still_be_present(
 ) -> None:
     full, _ = SAMPLES[model]
     assert _error_types(model, _without(full, path)) == ["missing"]
-    model.model_validate(_with(full, path, None))
+    unknown = _with(full, path, None)
+    if (model, path) in UNKNOWN_WITH:
+        unknown = _with(unknown, UNKNOWN_WITH[model, path], None)
+    model.model_validate(unknown)
 
 
 # --- the plate -------------------------------------------------------------------
@@ -927,6 +941,61 @@ def test_a_scan_plan_without_a_calibration_document_loads_as_none() -> None:
         "cal-40x.json",
         "2026-11-10T19:50:30+00:00",
     )
+
+
+def test_a_scan_plan_without_the_second_estimate_loads_as_unknown() -> None:
+    # m3 §7.4 D6: a plan written before #549 has one figure, `estimate_s`, which
+    # charged a lock at every field. It loads as it is; the second is unknown.
+    older = {
+        key: value
+        for key, value in _SCAN_PLAN.items()
+        if key != "estimate_without_autofocus_s"
+    }
+    loaded = ScanPlanResult.model_validate(older)
+    assert loaded.estimate_without_autofocus_s is None
+    assert loaded.estimate_s == 1830.5
+    assert ScanPlanResult.model_validate(loaded.model_dump(mode="json")) == loaded
+    assert (
+        ScanPlanResult.model_validate(_SCAN_PLAN).estimate_without_autofocus_s
+        == 1790.25
+    )
+
+
+def test_a_second_estimate_above_the_first_is_refused() -> None:
+    sample = {**_SCAN_PLAN, "estimate_s": 10.0, "estimate_without_autofocus_s": 10.5}
+    with pytest.raises(ValidationError) as raised:
+        ScanPlanResult.model_validate(sample)
+    (error,) = raised.value.errors()
+    assert error["type"] == "value_error"
+    assert str(error["ctx"]["error"]) == (
+        "estimate_without_autofocus_s (10.5) is above estimate_s (10)"
+    )
+    equal = {**_SCAN_PLAN, "estimate_s": 10.0, "estimate_without_autofocus_s": 10.0}
+    assert ScanPlanResult.model_validate(equal).estimate_s == 10.0
+
+
+@pytest.mark.parametrize("without", [1.0, 0.0])
+def test_a_second_estimate_without_a_first_is_refused(without: float) -> None:
+    # A figure of 0 is a figure (FM-170): refused as 1.0 is, not read as absent.
+    sample = {
+        **_SCAN_PLAN,
+        "estimate_s": None,
+        "estimate_without_autofocus_s": without,
+    }
+    with pytest.raises(ValidationError) as raised:
+        ScanPlanResult.model_validate(sample)
+    (error,) = raised.value.errors()
+    assert error["type"] == "value_error"
+    assert str(error["ctx"]["error"]) == (
+        "estimate_without_autofocus_s is given but estimate_s is None"
+    )
+
+
+def test_an_estimate_of_zero_is_accepted_with_a_second_figure_of_zero() -> None:
+    # The bound of `estimate_s` (the RANGES row refuses -0.1): a plan that costs
+    # nothing, with no lock to leave out, reads 0 and 0.
+    sample = {**_SCAN_PLAN, "estimate_s": 0.0, "estimate_without_autofocus_s": 0.0}
+    assert ScanPlanResult.model_validate(sample).estimate_s == 0.0
 
 
 @pytest.mark.parametrize("side", ["left", "x", "+x", "X+", "", "+Z"])

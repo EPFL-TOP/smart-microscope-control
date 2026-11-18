@@ -5566,6 +5566,7 @@ def _scan_plan_result(
     columns: int = 2,
     fov_um: tuple[float, float] = (512.0, 512.0),
     estimate_s: float | None = 42.16,
+    estimate_without_autofocus_s: float | None = None,
 ) -> ScanPlanResult:
     """A scan plan built as test_report.py builds one: ``plan_fields`` over a registered plate.
 
@@ -5612,6 +5613,7 @@ def _scan_plan_result(
         columns=columns,
         fields=fields,
         estimate_s=estimate_s,
+        estimate_without_autofocus_s=estimate_without_autofocus_s,
     )
 
 
@@ -5769,6 +5771,51 @@ def test_the_card_of_a_done_scan_plan_holds_the_estimate_line_the_generic_card_c
         "estimate: about 42 s (the moves, refocus and snaps of the timings)"
     )
     assert card.stale is False
+
+
+def test_the_plan_layer_carries_both_estimates(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # #549: the page draws the Wells screen's Time line from the plan's two figures.
+    _seed(
+        run_doc,
+        "scan-plan",
+        "scan-plan",
+        _scan_plan_result(estimate_s=90.4, estimate_without_autofocus_s=88.4),
+    )
+    plan = _plan_page(fake_microscope, run_doc).view().plan
+    assert plan is not None
+    assert (plan.estimate_s, plan.estimate_without_autofocus_s) == (90.4, 88.4)
+    # A plan written before #549 has no second figure: unknown, not the first.
+    _seed(run_doc, "scan-plan", "scan-plan", _scan_plan_result(estimate_s=42.16))
+    older = _plan_page(fake_microscope, run_doc).view().plan
+    assert older is not None
+    assert (older.estimate_s, older.estimate_without_autofocus_s) == (42.16, None)
+
+
+def test_the_card_of_a_plan_with_a_lock_says_it_whole_in_each_of_three_cases(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-205: the card builder cuts each line at 600, and the longest of the three
+    # texts (hours, and a lock counted) is about 110: asserted whole, through the card.
+    def card_estimate(result: ScanPlanResult) -> str:
+        _seed(run_doc, "scan-plan", "scan-plan", result)
+        card = _plan_page(fake_microscope, run_doc).view().cards["scan-plan"]
+        assert len(card.lines) == 4
+        return card.lines[3]
+
+    assert card_estimate(
+        _scan_plan_result(estimate_s=3900.0, estimate_without_autofocus_s=3800.0)
+    ) == (
+        "estimate: about 1 h 05 min (the moves, the autofocus locked again in each "
+        "well, and the snaps of the timings)"
+    )
+    assert card_estimate(
+        _scan_plan_result(estimate_s=42.16, estimate_without_autofocus_s=42.16)
+    ) == ("estimate: about 42 s (the moves and snaps of the timings)")
+    assert card_estimate(_scan_plan_result(estimate_s=42.16)) == (
+        "estimate: about 42 s (the moves, refocus and snaps of the timings)"
+    )
 
 
 @pytest.mark.parametrize("status", [StageStatus.stopped, StageStatus.failed])

@@ -228,6 +228,7 @@ from smc.ui.guide import (
     step_states,
     stop_segments_clause,
     suggested_centres,
+    time_line,
     tool_title,
     turret_position,
     wall_touches_note,
@@ -1003,6 +1004,7 @@ def _scan_plan(
     overlap: float = 0.1,
     objective: str | None = "Nikon 10X S Fluor",
     estimate_s: float | None = None,
+    estimate_without_autofocus_s: float | None = None,
 ) -> ScanPlanResult:
     """A scan plan as ``scan-plan`` writes it, built as test_report.py builds one.
 
@@ -1047,6 +1049,7 @@ def _scan_plan(
         columns=columns,
         fields=fields,
         estimate_s=estimate_s,
+        estimate_without_autofocus_s=estimate_without_autofocus_s,
     )
 
 
@@ -1081,6 +1084,53 @@ def test_scan_plan_card_says_what_to_run_when_the_estimate_is_unknown() -> None:
     # An unknown is not a zero (FM-170): 0.0 is an estimate, and says so.
     zero = scan_plan_card_lines(_scan_plan(estimate_s=0.0))[-1]
     assert zero == "estimate: about 0 s (the moves, refocus and snaps of the timings)"
+
+
+def test_the_scan_plan_card_says_what_its_estimate_sums_in_each_of_three_cases() -> (
+    None
+):
+    # A lock was counted: the second figure is below the first (m5 §14.3, #549).
+    locked = scan_plan_card_lines(
+        _scan_plan(estimate_s=90.4, estimate_without_autofocus_s=88.4)
+    )[-1]
+    assert locked == (
+        "estimate: about 1 min 30 s (the moves, the autofocus locked again in each "
+        "well, and the snaps of the timings)"
+    )
+    # None was (no autofocus, or no lock time known): the two figures are equal.
+    none = scan_plan_card_lines(
+        _scan_plan(estimate_s=42.16, estimate_without_autofocus_s=42.16)
+    )[-1]
+    assert none == "estimate: about 42 s (the moves and snaps of the timings)"
+    # A plan written before #549 has no second figure, and charged a refocus at each
+    # field: it says so, in the words this card had.
+    older = scan_plan_card_lines(_scan_plan(estimate_s=42.16))[-1]
+    assert older == "estimate: about 42 s (the moves, refocus and snaps of the timings)"
+    # The longest forms (FM-205): hours, and the text of a counted lock.
+    longest = scan_plan_card_lines(
+        _scan_plan(estimate_s=3900.0, estimate_without_autofocus_s=3800.0)
+    )[-1]
+    assert longest == (
+        "estimate: about 1 h 05 min (the moves, the autofocus locked again in each "
+        "well, and the snaps of the timings)"
+    )
+    # An unknown estimate is the same line whatever the second figure: it is None then.
+    assert scan_plan_card_lines(_scan_plan(estimate_s=None))[-1] == (
+        "estimate: unknown, no usable timing: run timing, then scan-plan again"
+    )
+    # A figure of 0 is a figure (FM-170): a second one of 0 under 2 s is a counted lock,
+    # and two of 0 are none, neither read as the older plan's missing figure.
+    zero_without = scan_plan_card_lines(
+        _scan_plan(estimate_s=2.0, estimate_without_autofocus_s=0.0)
+    )[-1]
+    assert zero_without == (
+        "estimate: about 2 s (the moves, the autofocus locked again in each well, "
+        "and the snaps of the timings)"
+    )
+    both_zero = scan_plan_card_lines(
+        _scan_plan(estimate_s=0.0, estimate_without_autofocus_s=0.0)
+    )[-1]
+    assert both_zero == "estimate: about 0 s (the moves and snaps of the timings)"
 
 
 def test_scan_plan_card_names_the_wells_in_the_plans_order_and_cuts_after_six() -> None:
@@ -2166,6 +2216,7 @@ def _plan(
     wells: int = 2,
     objective: str | None = "Nikon 10X S Fluor",
     estimate_s: float | None = 42.16,
+    estimate_without_autofocus_s: float | None = None,
 ) -> PlanLayer:
     return PlanLayer(
         count=count,
@@ -2174,6 +2225,7 @@ def _plan(
         fields=(),
         objective=objective,
         estimate_s=estimate_s,
+        estimate_without_autofocus_s=estimate_without_autofocus_s,
     )
 
 
@@ -2375,6 +2427,110 @@ def test_the_wells_known_lines_say_what_is_laid_out_out_of_date_or_not_known() -
         "Fields: out of date (scan-plan read its inputs from an earlier run; run it "
         "again)"
     )
+
+
+LOCKED_EACH_WELL = "with the autofocus locked again in each well"
+
+
+@pytest.mark.parametrize(
+    ("autofocus", "expected"),
+    [
+        ("off", "Time: about 1 min 28 s, with the autofocus not used"),
+        # The text is read stripped: what the operator typed around the word is not the mode.
+        (" off ", "Time: about 1 min 28 s, with the autofocus not used"),
+        ("required", f"Time: about 1 min 30 s, {LOCKED_EACH_WELL}"),
+        (
+            "if-engaged",
+            f"Time: about 1 min 30 s, {LOCKED_EACH_WELL}; "
+            "about 1 min 28 s if it is off at the start",
+        ),
+        # The empty field is the tool's default, `if-engaged`; a mistyped text reads as
+        # it too, and `scan` refuses it with its own words when it runs.
+        (
+            "",
+            f"Time: about 1 min 30 s, {LOCKED_EACH_WELL}; "
+            "about 1 min 28 s if it is off at the start",
+        ),
+        (
+            "banana",
+            f"Time: about 1 min 30 s, {LOCKED_EACH_WELL}; "
+            "about 1 min 28 s if it is off at the start",
+        ),
+    ],
+)
+def test_the_time_line_follows_the_autofocus_mode(
+    autofocus: str, expected: str
+) -> None:
+    plan = _plan(estimate_s=90.4, estimate_without_autofocus_s=88.4)
+    assert time_line(plan, autofocus) == expected
+    # The Wells screen's block carries the same line, in its place after the fields.
+    lines = wells_known_lines(
+        objective="Nikon 10X S Fluor",
+        plan=plan,
+        out_of_date=None,
+        assumed=(),
+        autofocus=autofocus,
+    )
+    assert lines == (
+        "Objective: Nikon 10X S Fluor, in place",
+        "Fields: 72 in 2 wells",
+        expected,
+    )
+
+
+@pytest.mark.parametrize("autofocus", ["off", "required", "if-engaged", "", "banana"])
+def test_the_time_line_is_the_plain_figure_when_there_is_nothing_to_say_about_the_autofocus(
+    autofocus: str,
+) -> None:
+    # An older plan has no second figure; a plan with none to leave out has two equal ones.
+    for plan in (
+        _plan(estimate_s=42.16),
+        _plan(estimate_s=42.16, estimate_without_autofocus_s=42.16),
+        # A hand-edited plan whose second figure is above the first is not a time that
+        # gets longer with the autofocus off: the plain line (the model refuses it, the
+        # layer is built from a record that may not have been validated first).
+        _plan(estimate_s=42.16, estimate_without_autofocus_s=99.0),
+    ):
+        assert time_line(plan, autofocus) == "Time: about 42 s"
+    # Unknown stays unknown: never `0 s` (FM-170).
+    unknown = _plan(estimate_s=None)
+    assert time_line(unknown, autofocus) == TIME_NOT_KNOWN
+
+
+@pytest.mark.parametrize("autofocus", ["off", "required", "if-engaged", ""])
+def test_a_measured_zero_is_a_time_and_not_an_unknown(autofocus: str) -> None:
+    # FM-170 both ways: 0 is a figure (a plan of nothing, or a stand whose scan without
+    # the autofocus costs nothing), and only `None` is not known.
+    assert time_line(_plan(estimate_s=0.0), autofocus) == "Time: about 0 s"
+    assert (
+        time_line(_plan(estimate_s=0.0, estimate_without_autofocus_s=0.0), autofocus)
+        == "Time: about 0 s"
+    )
+    # A second figure of 0 under a first of 2 s is a lock counted, not an absent figure.
+    plan = _plan(estimate_s=2.0, estimate_without_autofocus_s=0.0)
+    expected = {
+        "off": "Time: about 0 s, with the autofocus not used",
+        "required": f"Time: about 2 s, {LOCKED_EACH_WELL}",
+        "if-engaged": (
+            f"Time: about 2 s, {LOCKED_EACH_WELL}; about 0 s if it is off at the start"
+        ),
+        "": (
+            f"Time: about 2 s, {LOCKED_EACH_WELL}; about 0 s if it is off at the start"
+        ),
+    }
+    assert time_line(plan, autofocus) == expected[autofocus]
+
+
+def test_the_if_engaged_clause_is_left_out_when_the_two_durations_read_the_same() -> (
+    None
+):
+    # 42.4 and 41.6 both read `42 s`: saying `about 42 s if it is off` would say nothing.
+    plan = _plan(estimate_s=42.4, estimate_without_autofocus_s=41.6)
+    assert time_line(plan, "if-engaged") == f"Time: about 42 s, {LOCKED_EACH_WELL}"
+    assert time_line(plan, "") == f"Time: about 42 s, {LOCKED_EACH_WELL}"
+    # `off` and `required` say their own figure, whatever the other reads.
+    assert time_line(plan, "off") == "Time: about 42 s, with the autofocus not used"
+    assert time_line(plan, "required") == f"Time: about 42 s, {LOCKED_EACH_WELL}"
 
 
 def test_plan_selection_note_is_empty_when_the_wells_agree_and_names_both_otherwise() -> (
