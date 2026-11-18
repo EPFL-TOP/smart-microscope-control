@@ -119,7 +119,9 @@ written, and the message says what to do:
 10. **The plate check's walk** ([below](#the-plate-check)), when the check is made: the
     frame must not hold a whole well, the walk must not be too long, and every frame of
     it must lie inside the stage's soft limits, as for
-    [`plate-walls`](plate-walls.md#what-each-refusal-means).
+    [`plate-walls`](plate-walls.md#what-each-refusal-means). Such a refusal ends with
+    `(the plate check before the first field; nothing moved: check_plate=false scans
+    without it)`.
 
 ## The plate check
 
@@ -145,7 +147,10 @@ them with the registered centres moved into the plan's objective's frame. It is
   scan-plan and scan again, without --resume: frames already taken are placed against
   the old registration`. When the scan had switched PFS off at that well, the reason
   ends with `; the autofocus was switched off before anything moved and was not engaged
-  again: engage it again on the sample`.
+  again: engage it again on the sample`. A stop, a halt or a fault during the check
+  ends the scan as it would anywhere (`stopped` stays `stopped`), and after that
+  switch-off a WARNING says that nothing engaged PFS again: lock it on the sample before
+  the next scan, since no frame of the attempt records that it was used.
 - **A plate that did not move**: the result's `plate_check` holds the check, with
   `checked_utc`, and the first line of `assumed` after the stand's says `the plate was
   checked before the first field: A1 and H12 lie within 0.4 µm of their registered

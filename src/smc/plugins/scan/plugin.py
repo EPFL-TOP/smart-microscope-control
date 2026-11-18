@@ -168,6 +168,18 @@ _PLATE_AGAIN = (
     "register it again (plate-walls), then run scan-plan and scan again, without "
     "--resume: frames already taken are placed against the old registration"
 )
+#: The end of a refusal of the plate check's walk before anything moved: it is
+#: the check's, not the scan's, and the scan can be run without it.
+_CHECK_REFUSED = (
+    " (the plate check before the first field; nothing moved: check_plate=false "
+    "scans without it)"
+)
+#: The WARNING of a check that a stop, a halt or a fault ended after the scan
+#: switched the autofocus off at its first well.
+_CHECK_LEFT_OFF = (
+    "the plate check ended after the autofocus was switched off before the first "
+    "well, and nothing engaged it again: lock it on the sample before the next scan"
+)
 
 #: Windows' MAX_PATH, which counts the terminating NUL: a path of 260
 #: characters or more fails where long paths are not enabled. Module
@@ -1011,7 +1023,27 @@ def _prepare_plate_check(
         return None, skip
     plate, shift_um = skip
     token = new_token()
-    setup = prepare_check(
+    problem: str | None = None
+    try:
+        return _prepared_check(ctx, xy, plan, params, plate, shift_um, token), None
+    except PluginRunError as exc:
+        problem = exc.reason
+    # Raised outside the handler (FM-98). A refusal of the check's walk is not
+    # the scan's own: the operator is told it is the check's, and the way past it.
+    raise PluginRunError(_NAME, f"{problem}{_CHECK_REFUSED}")
+
+
+def _prepared_check(
+    ctx: RunContext,
+    xy: XYStage,
+    plan: ScanPlanResult,
+    params: ScanParams,
+    plate: PlateResult,
+    shift_um: tuple[float, float],
+    token: str,
+) -> CheckSetup:
+    """``prepare_check`` with the scan's arguments (m3 §27.5)."""
+    return prepare_check(
         _NAME,
         xy,
         plate,
@@ -1028,7 +1060,6 @@ def _prepare_plate_check(
         folder_text=f"plate-check/{token}",
         again=_PLATE_AGAIN,
     )
-    return setup, None
 
 
 def _plate_check_skip(
@@ -1095,6 +1126,14 @@ def _check_the_plate(
         if not switched_off:
             raise
         reason = exc.reason
+    except BaseException:
+        # A stop, a halt or a device's fault keeps its type (FM-64), and leaves no
+        # checkpoint and no frame for a resume to read: the WARNING is the only
+        # trace that the scan switched PFS off and nothing locked it again, for
+        # the 20 s the check walks (FM-165).
+        if switched_off:
+            _LOG.warning("%s", _CHECK_LEFT_OFF)
+        raise
     raise PluginRunError(_NAME, reason + AUTOFOCUS_LEFT_OFF)
 
 

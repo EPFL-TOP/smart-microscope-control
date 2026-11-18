@@ -34,9 +34,11 @@ import pytest
 from plate_check_stand import (
     FORTY,
     TEN,
+    TWENTY,
     Documents,
     build_documents,
     move_registration,
+    move_well,
     open_stand,
     profile,
 )
@@ -60,7 +62,7 @@ from smc.plugins.plate_walls.loop import AUTOFOCUS_LEFT_OFF
 from smc.plugins.scan.plugin import ScanParams, ScanPlugin
 from smc.plugins.scan_plan.plugin import ScanPlanParams, ScanPlanPlugin
 from smc.plugins.slots import ScanResult
-from smc.run import RunDocument, StageRecord, StageStatus
+from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing.sample_stand import sample_refs
 
 pytestmark = [pytest.mark.demo, pytest.mark.filterwarnings("error::RuntimeWarning")]
@@ -338,6 +340,118 @@ def test_the_check_runs_again_on_a_resume(
     # The resume took the check's 16 frames and none of the scan's.
     assert rig.camera.snaps == snaps + 16
     assert len(_frames_written(rig)) == 2
+
+
+def test_the_scan_refuses_one_well_moved_alone(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    rig = _rig(stands, documents, tmp_path)
+    move_well(rig.run_doc, "H12", (40.0, 0.0))
+
+    refused = _refused(rig)
+
+    match = _REFUSED.fullmatch(refused.reason)
+    assert match is not None, refused.reason
+    assert float(match[1]) < 0.2
+    assert float(match[2]) == pytest.approx(40.0, abs=0.2)
+    assert _frames_written(rig) == []
+
+
+def test_a_walk_the_soft_limits_refuse_ends_the_scan_before_anything_moves(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    # The check's walk to H12 leaves the travel; A1's fields do not. It is refused
+    # before the autofocus is touched, the focus step or the first move (FM-88).
+    base = profile()
+    limited = base.model_copy(
+        update={
+            "safety": base.safety.model_copy(
+                update={"xy_soft_limits_um": ((-60_000.0, 0.0), (0.0, 60_000.0))}
+            )
+        }
+    )
+    af = RecordingAutofocus(engaged=True, locked=True)
+    rig = _rig(stands, documents, tmp_path, limited, autofocus=af)
+
+    refused = _refused(rig)
+
+    assert refused.reason.startswith("H12's ")
+    assert refused.reason.endswith(
+        "outside the stage's soft limits (the plate check before the first field; "
+        "nothing moved: check_plate=false scans without it)"
+    )
+    assert not refused.reason.endswith(AUTOFOCUS_LEFT_OFF)
+    assert rig.stage.moves == 0
+    assert rig.camera.snaps == 0
+    assert "disengage" not in af.calls
+    assert af.engaged is True
+
+
+def test_a_stop_during_the_check_ends_stopped_and_says_the_autofocus_was_left_off(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    af = RecordingAutofocus(engaged=True, locked=True)
+    rig = _rig(stands, documents, tmp_path, autofocus=af)
+    stop = threading.Event()
+
+    def in_the_check(progress: Progress) -> None:
+        if progress.message == "checking the plate: A1 -Y":
+            stop.set()
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        record = _scan(rig, stop=stop, on_progress=in_the_check)
+
+    # A stop keeps its type (FM-64): stopped, not failed, and nothing engages PFS.
+    assert record.status is StageStatus.stopped
+    assert record.error is None
+    assert "engage" not in af.calls
+    assert af.engaged is False
+    assert _frames_written(rig) == []
+    assert (
+        "the plate check ended after the autofocus was switched off before the first "
+        "well, and nothing engaged it again: lock it on the sample before the next scan"
+    ) in caplog.messages
+
+
+def test_a_plan_made_from_another_registrations_objective_skips_the_check_and_says_so(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rig = _rig(stands, documents, tmp_path)
+    record = RunDocument.load(rig.run_doc).stages["scan-plan"]
+    dumped = record.model_dump(mode="json")
+    dumped["result"]["plate_objective"] = TWENTY
+    write_stage(rig.run_doc, StageRecord.model_validate(dumped))
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_scan(rig))
+
+    _skipped(
+        result,
+        f"the plate was not checked: the plan was made from a registration under "
+        f"{TWENTY}, the plate record is under {TEN}",
+        caplog,
+    )
+
+
+def test_check_frames_that_cannot_be_saved_are_said_after_the_checks_line(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    rig = _rig(stands, documents, tmp_path)
+    (rig.run_doc.parent / "plate-check").write_text("not a folder", encoding="utf-8")
+
+    result = _result(_scan(rig))
+
+    assert result.plate_check is not None
+    assert result.assumed[0].startswith("the plate was checked before the first field")
+    assert result.assumed[1] == (
+        "8 frames of the plate check could not be saved (the log says why)"
+    )
 
 
 # ------------------------------------------------------------------ it passes

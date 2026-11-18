@@ -34,6 +34,7 @@ from plate_check_stand import (
     Documents,
     build_documents,
     move_registration,
+    move_well,
     open_stand,
     profile,
     truth,
@@ -452,6 +453,57 @@ def test_a_plate_turned_0_06_degrees_in_the_record_is_refused(
     assert float(match[2]) == pytest.approx(61.5, abs=0.5)
     assert float(match[3]) == pytest.approx(-0.06, abs=0.002)
     assert refused.reason.endswith(AGAIN)
+
+
+@pytest.mark.parametrize("moved", ["A1", "H12"])
+def test_one_well_moved_alone_is_refused_and_named(
+    stands: list[Microscope], run_doc: Path, moved: str
+) -> None:
+    # A plate bumped at one corner: one well 40 µm off, the other where it was. The
+    # verdict is the farther well's, whichever of the two it is (§27.2 D3).
+    move_well(run_doc, moved, (0.0, 40.0))
+    rig = _rig(stands)
+
+    refused = _refused(rig, run_doc)
+
+    distances = dict(re.findall(r"(A1|H12)(?: lies)? (\d+\.\d) µm", refused.reason))
+    still = "H12" if moved == "A1" else "A1"
+    assert float(distances[moved]) == pytest.approx(40.0, abs=0.2)
+    assert float(distances[still]) < 0.2
+
+
+def test_wells_each_within_the_bound_pass_on_the_farther_ones_distance(
+    stands: list[Microscope], run_doc: Path
+) -> None:
+    # 20 µm and 0: within 25 one by one, though their sum is not a distance a well moved.
+    move_well(run_doc, "H12", (20.0, 0.0))
+    move_well(run_doc, "A1", (0.0, -12.0))
+    rig = _rig(stands)
+
+    result = _result(_run(rig, run_doc))
+
+    assert result.check.worst_um == pytest.approx(20.0, abs=0.2)
+    assert result.check.wells[0].distance_um == pytest.approx(12.0, abs=0.2)
+
+
+def test_check_frames_that_cannot_be_saved_are_said_and_the_check_stands(
+    stands: list[Microscope], run_doc: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A file where the folder goes: every frame's write fails, the measure does not.
+    (run_doc.parent / "plate-check").write_text("not a folder", encoding="utf-8")
+    rig = _rig(stands)
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(rig, run_doc))
+
+    assert result.check.worst_um < 0.1
+    assert result.assumed[-2] == (
+        "8 frames of the plate check could not be saved (the log says why)"
+    )
+    assert any(
+        m.startswith("plate-check: 8 frames of the plate check could not be saved: ")
+        for m in caplog.messages
+    )
 
 
 def test_a_larger_bound_lets_the_moved_plate_through(

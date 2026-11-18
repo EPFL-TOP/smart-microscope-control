@@ -27,6 +27,10 @@ smc run plate-check -p nikon-ti2 --run-doc run.json --param calibration=cal-40x.
 smc run plate-check -p nikon-ti2 --run-doc run.json --param 'wells=["B2", "B5"]'
 ```
 
+The commands are written for a POSIX shell. In `cmd.exe` and PowerShell 5.1, escape each
+inner double quote with a backslash, as the [`smc run`](README.md#running-a-plugin-smc-run)
+page says (`--param "wells=[\"B2\",\"B5\"]"`); that form was not tried on a Windows shell.
+
 The first is under the objective the plate was registered with: the run document's own
 camera calibration is that objective's. Under **another objective**, give a run document
 whose `camera-calibration` was made with it in place (`calibration=`, as

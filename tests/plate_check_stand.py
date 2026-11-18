@@ -186,3 +186,20 @@ def move_registration(
     for fit in result["walls"]["wells"]:
         fit["center_xy_um"] = _moved(fit["center_xy_um"], turn_deg, slide_um)
     write_stage(path, StageRecord.model_validate(dumped))
+
+
+def move_well(path: Path, well: str, by_um: tuple[float, float]) -> None:
+    """Move one well's measured centre in ``plate-walls``' record, the others where they are.
+
+    A plate bumped at one corner, or turned about one of the two wells: one well
+    moved, the other not. The verdict must be the farther well's (§27.2 D3).
+    """
+    record = RunDocument.load(path).stages["plate-walls"]
+    dumped = record.model_dump(mode="json")
+    for fit in dumped["result"]["walls"]["wells"]:
+        if fit["well"] == well:
+            fit["center_xy_um"] = [
+                fit["center_xy_um"][0] + by_um[0],
+                fit["center_xy_um"][1] + by_um[1],
+            ]
+    write_stage(path, StageRecord.model_validate(dumped))

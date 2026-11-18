@@ -140,6 +140,13 @@ def test_the_pair_farthest_apart_is_chosen_and_a_tie_keeps_the_registrations_ord
     assert farthest_pair([("H12", (5.0, 5.0)), ("A1", (0.0, 0.0))]) == ("H12", "A1")
 
 
+def test_the_pair_is_the_farthest_on_the_stage_not_along_its_axes() -> None:
+    # (A, B) is 10 µm apart, (A, C) 9.9 µm but 14 along the axes: the lever of a
+    # turn is the straight distance.
+    wells = [("A", (0.0, 0.0)), ("B", (10.0, 0.0)), ("C", (7.0, 7.0))]
+    assert farthest_pair(wells) == ("A", "B")
+
+
 def test_farthest_pair_refuses_fewer_than_two_wells() -> None:
     with pytest.raises(ValueError, match="two"):
         farthest_pair([("A1", (0.0, 0.0))])
