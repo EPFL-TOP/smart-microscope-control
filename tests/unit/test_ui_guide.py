@@ -82,6 +82,7 @@ from smc.ui.guide import (
     LAY_OUT_FIRST,
     MAP_FIELDS_UP_TO,
     MAX_POSITIONS,
+    MEASURE_THE_TIME,
     NO_CALIBRATION_FOR_SIDES,
     NO_FILES_YET,
     NOT_CONNECTED,
@@ -95,6 +96,7 @@ from smc.ui.guide import (
     REGISTER_ACROSS_A_TURN,
     REGISTER_FIRST,
     REGISTER_OBJECTIVES_DIFFER,
+    RELOCK_NOTE,
     RESULT_CHOICES,
     RESULT_NAMES,
     RESULT_OPTIONAL_READS,
@@ -106,9 +108,11 @@ from smc.ui.guide import (
     SCAN_CONTINUE,
     SCAN_FIRST,
     SCAN_HALTED,
+    SCAN_NEEDS_A_LOCK,
     SCAN_REPLACES,
     SCAN_START_AGAIN,
     SCAN_START_AGAIN_CONFIRM,
+    SCAN_WITHOUT_A_LOCK,
     SCREEN_LEADS,
     SCREEN_TITLES,
     SELECT_WELLS,
@@ -203,6 +207,7 @@ from smc.ui.guide import (
     register_objective_refusal,
     register_replace_note,
     registered_line,
+    relock_note,
     replace_note,
     result_row,
     results_left,
@@ -211,6 +216,7 @@ from smc.ui.guide import (
     scan_again_confirm,
     scan_end_lines,
     scan_lead,
+    scan_lock_note,
     scan_plan_card_lines,
     scan_progress_lines,
     scan_title,
@@ -4423,3 +4429,93 @@ def test_error_words_also_drop_the_calibration_tools_name_and_leave_other_text_a
         f"see camera-calibration: {words}"
     )
     assert error_words("camera-calibrationx: it") == "camera-calibrationx: it"
+
+
+# --- the lock notes after Measure the time and before the scan (m5 §20, #546) --------------
+
+
+def _measured_chain(
+    *,
+    label: str = MEASURE_THE_TIME,
+    current: str | None = None,
+    plugins: tuple[str, ...] = ("timing",),
+) -> ChainStatus:
+    """*Measure the time*'s chain after its one tool ended ``done`` (``current`` ``None``)."""
+    ended = (ChainEnd("timing", "done", "Timing done"),)
+    return ChainStatus(plugins, ended, current, label)
+
+
+def test_the_lock_notes_are_m5_section_20_3s_words() -> None:
+    """Whole texts, written out here and not read back from the constants (FM-45)."""
+    assert RELOCK_NOTE == (
+        "The autofocus is not locked: Autofocus on, under the image, locks it again at the "
+        "offset now set if this page has read that offset locked since Connect. After a "
+        "Disconnect, or from smc autofocus engage in a terminal, no lock has been read, and "
+        "the engage is refused."
+    )
+    assert SCAN_NEEDS_A_LOCK == (
+        "Autofocus is required and it is not locked, so the scan will refuse to start: "
+        "press Autofocus on, under the image, first, if this page has read the offset now "
+        "set locked since Connect."
+    )
+    assert SCAN_WITHOUT_A_LOCK == (
+        "The autofocus is not locked, so the scan will not use it (if-engaged): press "
+        "Autofocus on, under the image, to scan with it, if this page has read the offset "
+        "now set locked since Connect."
+    )
+
+
+def test_relock_note_is_said_only_after_measure_the_time_with_the_autofocus_not_locked() -> (
+    None
+):
+    """One input changed at a time from the one full case: each other value says nothing (D2, D4)."""
+    full = relock_note(_measured_chain(), autofocus_locked=False, dry_run=False)
+    assert full == RELOCK_NOTE
+
+    assert (
+        relock_note(
+            _measured_chain(label=RUN_ALL_LABEL), autofocus_locked=False, dry_run=False
+        )
+        == ""
+    )
+    assert (
+        relock_note(
+            _measured_chain(current="timing"), autofocus_locked=False, dry_run=False
+        )
+        == ""
+    )
+    assert relock_note(_measured_chain(), autofocus_locked=True, dry_run=False) == ""
+    assert relock_note(_measured_chain(), autofocus_locked=None, dry_run=False) == ""
+    assert relock_note(_measured_chain(), autofocus_locked=False, dry_run=True) == ""
+    assert relock_note(None, autofocus_locked=False, dry_run=False) == ""
+    assert (
+        relock_note(_measured_chain(plugins=()), autofocus_locked=False, dry_run=False)
+        == ""
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "said"),
+    [
+        pytest.param("required", SCAN_NEEDS_A_LOCK, id="required"),
+        pytest.param("if-engaged", SCAN_WITHOUT_A_LOCK, id="if-engaged"),
+        pytest.param("off", "", id="off"),
+        pytest.param("bogus", "", id="a value the tool would refuse"),
+        pytest.param("", "", id="empty"),
+        pytest.param("Required", "", id="the tool's words are lower case"),
+    ],
+)
+def test_scan_lock_note_names_autofocus_on_for_required_and_if_engaged_only(
+    mode: str, said: str
+) -> None:
+    assert scan_lock_note(mode, autofocus_locked=False, dry_run=False) == said
+
+
+@pytest.mark.parametrize("mode", ["required", "if-engaged"])
+def test_scan_lock_note_says_nothing_for_a_lock_that_reads_locked_or_unknown_or_in_a_dry_run(
+    mode: str,
+) -> None:
+    assert scan_lock_note(mode, autofocus_locked=True, dry_run=False) == ""
+    assert scan_lock_note(mode, autofocus_locked=None, dry_run=False) == ""
+    assert scan_lock_note(mode, autofocus_locked=False, dry_run=True) == ""
+    assert scan_lock_note(mode, autofocus_locked=False, dry_run=False) != ""

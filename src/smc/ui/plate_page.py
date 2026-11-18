@@ -165,6 +165,7 @@ from smc.ui.guide import (
     preset_note_text,
     register_replace_note,
     registered_line,
+    relock_note,
     result_row,
     results_left,
     run_all_wait,
@@ -172,6 +173,7 @@ from smc.ui.guide import (
     scan_again_confirm,
     scan_end_lines,
     scan_lead,
+    scan_lock_note,
     scan_progress_lines,
     scan_title,
     scan_wait,
@@ -1648,6 +1650,10 @@ class PlatePageView:
         self.measure_time_wait.visible = False
         self.wells_chain_text = _wrapped_text()
         self.wells_chain_text.visible = False
+        # Under that line, after *Measure the time* with the autofocus not locked: how to lock
+        # it again (m5 §20 D2). A note and never a wait: no button is disabled by it.
+        self.wells_relock_text = _wrapped_text()
+        self.wells_relock_text.visible = False
         self.wells_note = _wrapped_text()
         self.wells_note.visible = False
         self.layout_command = _wrapped_text()
@@ -1671,6 +1677,10 @@ class PlatePageView:
         self.scan_button = pn.widgets.Button(label="Start the scan", color="primary")
         self.scan_wait_text = _wrapped_text()
         self.scan_wait_text.visible = False
+        # Before the click: the scan's ``autofocus`` field wants a lock the stand does not
+        # have (m5 §20 D3). A note and never a wait: *Start the scan* stays as it is.
+        self.scan_lock_text = _wrapped_text()
+        self.scan_lock_text.visible = False
         # What *Start the scan* would replace (``SCAN_REPLACES``), under it before the click.
         self.scan_replaces_text = _wrapped_text()
         self.scan_replaces_text.visible = False
@@ -2055,6 +2065,7 @@ class PlatePageView:
             "scan": [
                 self.scan_button,
                 self.scan_wait_text,
+                self.scan_lock_text,
                 self.scan_replaces_text,
                 self.scan_end_text,
                 self.scan_continue_button,
@@ -2133,6 +2144,7 @@ class PlatePageView:
             self.measure_time_button,
             self.measure_time_wait,
             self.wells_chain_text,
+            self.wells_relock_text,
             self.wells_note,
             self.layout_card,
         ]
@@ -4519,6 +4531,7 @@ class PlatePageView:
         offer = end is not None and end.resumable and "scan" in self.tool_runs
         self.scan_button.visible = not offer
         self._say(self.scan_wait_text, "" if offer else (start or busy or ""))
+        self._say(self.scan_lock_text, self._scan_lock_note(connected, running))
         self._draw_measure_time(busy)
         self.scan_continue_button.visible = offer
         self.scan_again_button.visible = offer
@@ -4538,6 +4551,33 @@ class PlatePageView:
         self._say(
             self.scan_actions_text,
             wait or (scan_again_confirm(end.done) if armed is not None else ""),
+        )
+
+    def _scan_lock_note(self, connected: bool, running: str | None) -> str:
+        """What the Scan screen says before the click about a lock the scan wants and the stand has not (m5 §20 D3).
+
+        The field's value as the click would send it: the widget's text stripped, or the tool's
+        default when it is empty, each through ``plain_default``. Nothing is said with the stand
+        closed, while an activity goes (the status is then the latest read's, about a second
+        old, and the note must not flicker during a scan), when ``scan`` did not load, or
+        before the first status. The note never disables a button: the scan's own check is the
+        one guard (FM-169).
+        """
+        status = self._status
+        widget = self.tool_fields.get("scan", {}).get("autofocus")
+        if (
+            not connected
+            or running is not None
+            or status is None
+            or "scan" not in self.tool_runs
+            or widget is None
+        ):
+            return ""
+        mode = plain_default(
+            str(widget.value).strip() or self._field_defaults.get(_AUTOFOCUS_FIELD, "")
+        )
+        return scan_lock_note(
+            mode, autofocus_locked=status.autofocus_locked, dry_run=status.dry_run
         )
 
     def _scan_end_offered(self) -> ScanEnd | None:
@@ -4696,6 +4736,18 @@ class PlatePageView:
         self._say(
             self.wells_chain_text,
             chain_line(chain) if label == MEASURE_THE_TIME else "",
+        )
+        # How to lock again, from the status's read of the autofocus and never from the
+        # tool's words (m5 §20 D2, FM-155). With no status nothing is known, so nothing is said.
+        self._say(
+            self.wells_relock_text,
+            ""
+            if status is None
+            else relock_note(
+                chain,
+                autofocus_locked=status.autofocus_locked,
+                dry_run=status.dry_run,
+            ),
         )
 
     def _draw_results_buttons(self) -> None:

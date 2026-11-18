@@ -7014,9 +7014,14 @@ Throwaway scripts, not committed, on `main` at `1aeee0e`, Python 3.13, on
   `autofocus_locked: bool | None = None` (last field). It comes from the same
   `Microscope.state()` read as `autofocus` (no new read on the tick, FM-178): `None` while
   the stand is closed, without an autofocus, or when `autofocus_known(state)` is false;
-  otherwise `state.autofocus_engaged and state.autofocus_locked` as a `bool` (off is
-  `False`, on and not locked is `False`). During an activity it is the latest read's, as
-  every stand field is. Every tab draws the same (FM-151).
+  otherwise it is `False` when the autofocus reads off, `True` when it is on and locked,
+  and `None` when it is on and not locked (PFS searching). **Amended before the merge by
+  the owner's decision on #546 (option a)**: the first plan folded on and not locked into
+  `False`, and the Scan note then said the scan would not use an autofocus that the scan
+  refuses (FM-252); while PFS searches, in the documented first lock from below, no note
+  is drawn, and the strip's `autofocus on, not locked` is the only word. During an
+  activity it is the latest read's, as every stand field is. Every tab draws the same
+  (FM-151).
 - **D2 The Wells screen says how to lock again after *Measure the time*.** Under the
   chain's line (`wells_chain_text`), a plain-text pane `wells_relock_text` says
   `RELOCK_NOTE` when the chain whose line the Wells screen draws (label
@@ -7030,8 +7035,9 @@ Throwaway scripts, not committed, on `main` at `1aeee0e`, Python 3.13, on
   right after `scan_wait_text` on the Scan screen, says `SCAN_NEEDS_A_LOCK` when the scan's
   `autofocus` field means `required`, and `SCAN_WITHOUT_A_LOCK` when it means
   `if-engaged`, in both cases only while the page is connected, not a dry run, no activity
-  goes, and `autofocus_locked is False`. `off`, an unknown read (`None`, the strip says
-  `autofocus ?`), and a value the tool would refuse say nothing. What the field means is
+  goes, and `autofocus_locked is False` (the autofocus reads off). `off`, an unknown read
+  (`None`: the strip says `autofocus ?`, or `autofocus on, not locked` while PFS
+  searches), and a value the tool would refuse say nothing. What the field means is
   its value as the click would send it: the widget's text stripped, or the tool's default
   when it is empty, each through `plain_default`. It is a note, not a wait: *Start the
   scan* and *Continue the scan* stay enabled. The scan's own check (`_check_autofocus`) is
@@ -7039,7 +7045,13 @@ Throwaway scripts, not committed, on `main` at `1aeee0e`, Python 3.13, on
   operator may press right after locking at the stand. It is drawn whether *Start the
   scan* or the checkpoint's two buttons are offered: a refused `required` start is a
   failed scan, and its end line is the plugin's text (`engage PFS on the stand and let it
-  lock on the sample before the scan`); the note under it names the page's button.
+  lock on the sample before the scan`); the note under it names the page's button. **Both
+  texts carry the condition of D2's** (`if this page has read the offset now set locked
+  since Connect`; the owner's decision on #546, option c): after a fresh Connect no lock
+  has been read, the status does not say which offsets were, and *Autofocus on* is then
+  refused by design (m2 §12.5). The note is shown on every default scan of such a stand
+  until a lock has been read; the refusal of a click is a finding, not a hazard (no
+  motion).
 - **D4 Not on a dry-run page.** *Autofocus on* sends nothing in a dry run, so pressing it
   never locks: both notes say nothing there (FM-182). `timing` refuses a dry run anyway
   (§17.12.11 D33).
@@ -7067,11 +7079,13 @@ RELOCK_NOTE = (
 )
 SCAN_NEEDS_A_LOCK = (
     "Autofocus is required and it is not locked, so the scan will refuse to start: "
-    "press Autofocus on, under the image, first."
+    "press Autofocus on, under the image, first, if this page has read the offset now "
+    "set locked since Connect."
 )
 SCAN_WITHOUT_A_LOCK = (
     "The autofocus is not locked, so the scan will not use it (if-engaged): press "
-    "Autofocus on, under the image, to scan with it."
+    "Autofocus on, under the image, to scan with it, if this page has read the offset "
+    "now set locked since Connect."
 )
 
 
@@ -7114,8 +7128,9 @@ did not load.
   whole text.
 - `tests/unit/test_ui_guide.py`: `relock_note` and `scan_lock_note` over each condition,
   one input changed at a time, whole texts (FM-45).
-- The controller's `autofocus_locked` for locked, off, on and not locked, a failed read and
-  a closed stand.
+- The controller's `autofocus_locked` for locked (`True`), off (`False`), on and not
+  locked (`None`), a failed read and a closed stand; and the two panes driven through the
+  real read of an autofocus that is on and not locked, which say nothing (FM-252).
 - The view: each pane drawn and empty in its states, on a page with a fake status.
 - **Failure modes**: FM-155 (the notes follow the read, not the tool's flag or its
   words), FM-178 (no new read on the tick), FM-169 (the notes never disable a button; the
