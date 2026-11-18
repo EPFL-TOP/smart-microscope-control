@@ -38,7 +38,10 @@ from smc.plugins import (
 from smc.plugins.camera_calibration.algorithm import (
     MIN_RESPONSE,
     MIN_SIGNAL_SPREAD_COUNTS,
+    PARALLEL_SHIFTS_NOTE,
     Fit,
+    carries_signal,
+    measure_shift,
     precision_reasons,
     signal_spread,
 )
@@ -394,6 +397,9 @@ def test_a_step_over_forty_percent_of_the_field_is_blamed_when_the_fit_fails(
     assert "a step over 40 % of the field may wrap: give a smaller step_um" in (
         raised.value.reason
     )
+    # The probe frames' contrast belongs to the parallel-shifts note only (#545).
+    assert "parallel shifts" not in raised.value.reason
+    assert "probe frames span" not in raised.value.reason
     assert _stored(tmp_path).result is None
 
 
@@ -1307,6 +1313,31 @@ class _BeadCamera(SampleCamera):
         return np.rint(frame).astype(np.uint16)
 
 
+class _StillBackgroundCamera(_BeadCamera):
+    """Beads that follow the stage, over a background that does not: dust and shading on the sensor.
+
+    At the 40x in water (Ti2-E session 5, F12, #545) the still background won the
+    correlation on a field of two beads: the stage moved, the image said it had not.
+    The background here is a gradient of 600 counts and a fixed pattern of 30; the
+    beads of ``_BeadCamera`` are 3000 over it. ``taken`` keeps every frame snapped.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        rows, cols = np.mgrid[0 : SHAPE[0], 0 : SHAPE[1]]
+        self._still = (
+            400.0 * cols / SHAPE[1]
+            + 200.0 * rows / SHAPE[0]
+            + np.random.default_rng(12).normal(0.0, 30.0, SHAPE)
+        )
+        self.taken: list[np.ndarray] = []
+
+    def snap(self) -> np.ndarray:
+        frame = np.rint(super().snap() + self._still).astype(np.uint16)
+        self.taken.append(frame)
+        return frame
+
+
 @pytest.mark.parametrize(
     ("spoil", "head", "advice"),
     [
@@ -1516,6 +1547,63 @@ def test_a_field_of_a_few_beads_on_a_dark_background_is_calibrated(
 
     assert result.pixel_size_um == pytest.approx(1.0, rel=0.02)
     assert result.assumed == ()
+
+
+def test_parallel_shifts_on_two_beads_over_a_still_background_name_the_frames_before_the_stage(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """F12 (#545): "did the stage move?" blamed the stage when the background won the correlation.
+
+    The stage moved a quarter field in X and in Y and came back; the frames shifted
+    by zero, because dust and shading fixed to the sensor out-correlate two beads.
+    The message names the frames first, then the light path, then the stage, and
+    gives the contrast of the probe frames as a number to bring back.
+    """
+    camera = _StillBackgroundCamera(
+        demo_microscope,
+        PlateSample(),
+        pixel_size_um=1.0,
+        shape=SHAPE,
+        beads_px=((120, 180), (250, 330)),
+    )
+    demo_microscope.override(Camera, camera)
+    stage = _FlakyStage(demo_microscope.require(XYStage))
+    demo_microscope.override(XYStage, stage)
+    start = _here(demo_microscope)
+    # A lit field, not a dark one: it reaches the fit, which is where the note is.
+    assert carries_signal(camera.snap())
+    camera.taken.clear()
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(demo_microscope, tmp_path)
+
+    reference, probe_x, probe_y = camera.taken[:3]
+    # The premise: the stage moved (two probes and the return) and the frames did not.
+    assert stage.moves == 3
+    assert stage.targets[0] == (start[0] + STEP_UM, start[1])
+    assert stage.targets[1] == (start[0], start[1] + STEP_UM)
+    for probe in (probe_x, probe_y):
+        shift = measure_shift(reference, probe)
+        assert (shift.d_col_px, shift.d_row_px) == (0.0, 0.0)
+        assert shift.response >= MIN_RESPONSE  # lit frames that agree, not a blank
+    reason = raised.value.reason
+    assert reason.startswith(PARALLEL_SHIFTS_NOTE)
+    assert "did the stage move" not in reason
+    # The frames, then the light path, then the stage.
+    assert (
+        reason.index("too little texture")
+        < reason.index("light path")
+        < reason.index("then the stage")
+    )
+    figures = f"{round(signal_spread(probe_x))} and {round(signal_spread(probe_y))}"
+    assert (
+        reason == f"{PARALLEL_SHIFTS_NOTE}; the probe frames span {figures} counts "
+        f"(1st to 99th percentile); step {STEP_UM:g} µm"
+    )
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+    assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
 
 
 def test_a_lit_frame_of_a_12_bit_mode_is_calibrated_and_its_dark_frame_is_refused(

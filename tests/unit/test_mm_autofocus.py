@@ -247,6 +247,24 @@ def test_moving_z_by_re_engages_pfs() -> None:
         assert stand.core.isContinuousFocusLocked() is True
 
 
+def test_a_z_jog_names_its_noisy_offset_rounded_in_the_autofocus_lines(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #545: the offset is part of the name the suspend and the relock lines reuse.
+    offset = 0.1 + 0.2
+    assert offset != 0.3
+    with _ti2() as stand:
+        stand.core.setPosition("ZDrive", 10.0)
+        stand.engage_directly()
+        with caplog.at_level(logging.INFO):
+            stand.z.move_by_um(offset)
+        assert [m for m in caplog.messages if m.startswith(("autofocus", "z:"))] == [
+            "autofocus: suspend for z: move_by 0.3 µm",
+            "z: move_by 0.3 µm to 10.3 µm",
+            "autofocus: engage after z: move_by 0.3 µm",
+        ]
+
+
 def test_the_z_readback_is_taken_before_the_relock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

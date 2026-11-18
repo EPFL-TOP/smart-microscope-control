@@ -3162,7 +3162,12 @@ is logged, then raises `RuntimeError('Error in device "<label>":
 Unsupported device command (11)')`, the Ti2-E's text. `busy_devices` is
 left alone, so a busy device stays busy: the move goes on. Through
 `as_hardware_errors`, the error reaches the layer as `xy_stage: stop('XY')
-failed (…)`, measured with a prototype (2026-10-28).
+failed (…)`, measured with a prototype (2026-10-28). With the role declared
+(`as_hardware_errors(core, role, stop_refused=True)`, which the stage, Z and
+offset backends pass from `[safety] stop_refused_by`) a failed `stop` ends at the
+device's text, with no `; check the device: power, cable, …`: the advice is for a
+fault, and the line's declaration note says what happened (Ti2-E session 5, F3,
+#545). Every other call of the role, and an undeclared stop, keeps the hint.
 
 ### 11.9 §3.3.1 on the Ti2-E
 
@@ -3957,9 +3962,14 @@ class AutofocusExcursionError(HardwareError):  # not a SafetyRefusedError (FM-64
   PFS: not engaged: on this stand engaging drives Z to the plane the offset
   names ([autofocus] engage_drives_z_to_offset, m2 §12), and offset 9370
   PFSOffset units has not been seen locked with objective '40x' since the
-  stand was opened (seen: 7927, 7977 | seen: none)[; it was on and
-  searching, so it was switched off]. <the advice of §12.10.5> ``. The
-  advice never names the stand's button (#331).
+  stand was opened (seen: 7927, 7977 | seen: none); each smc command and
+  each Connect of the page opens the stand anew, so a lock read by another
+  one does not count[; it was on and searching, so it was switched off].
+  <the advice of §12.10.5> ``. The advice never names the stand's button
+  (#331). The clause after the seen offsets is #546's (m5 §20 D5): the seen
+  offsets live in the `MMAutofocus` (D1), so a console engage after a lock
+  that a page or another command read can only be refused, and a checklist
+  must not plan one.
 - **Z outside the soft limits before the switch-on** (`SafetyRefusedError`,
   `how_to_force=""`): `autofocus PFS: not engaged: Z is at 4400.00 µm,
   outside the soft limits [10, 4350] µm`.

@@ -46,6 +46,7 @@ from smc.hardware.safety import (
     SEGMENT_END_TOLERANCE_UM,
     Safety,
     _coords,
+    line_coords_um,
     segment_targets_um,
 )
 from smc.testing import FakeCore, FakeDevice
@@ -610,6 +611,30 @@ def _landing_off_by(core: FakeCore, segment: int, off_um: float) -> None:
     core.setXYPosition = short  # type: ignore[method-assign]
 
 
+def test_a_move_by_names_its_offset_rounded_in_the_error_of_a_segment_that_does_not_land() -> (
+    None
+):
+    # #545: the action's name is the move line's first half, and an error quotes it.
+    offset = 2500.0 + 1e-9
+    assert offset != 2500.0
+    with _stand() as (core, microscope):
+        send = core.setXYPosition
+
+        def half_way(label: str, x_um: float, y_um: float) -> None:
+            send(label, x_um, y_um)
+            core._xy[label] = (x_um / 2, y_um)
+
+        core.setXYPosition = half_way  # type: ignore[method-assign]
+        try:
+            with pytest.raises(HardwareError) as failed:
+                microscope.require(XYStage).move_by_um(offset, 0.0, force=True)
+        finally:
+            del core.setXYPosition
+    assert str(failed.value).startswith(
+        "`xy_stage: move_by (2500.0, 0.0) µm`: segment 1 of 3 read "
+    )
+
+
 def test_a_segment_that_does_not_land_stops_the_move_with_a_diagnosis() -> None:
     with _stand() as (core, microscope):
         send = core.setXYPosition
@@ -758,6 +783,16 @@ def test_the_segment_lines_round_the_coordinates_to_hundredths_and_the_move_does
     # A value that rounds to zero is not written with a minus sign, and no digits is as it was.
     assert _coords((-0.001, 4.0), 2) == "(0.0, 4.0)"
     assert _coords((-250.0 / 3,)) == repr(-250.0 / 3)
+
+
+def test_line_coords_um_rounds_to_two_decimals_and_never_shows_a_negative_zero() -> (
+    None
+):
+    # #545: the whole target of a move is written as its segments are.
+    assert line_coords_um((0.2000000000007276, -0.1)) == "(0.2, -0.1)"
+    assert line_coords_um((-0.001, 4.0)) == "(0.0, 4.0)"
+    assert line_coords_um((-250.0 / 3,)) == "-83.33"
+    assert line_coords_um((485.00000000001,)) == "485.0"
 
 
 def test_a_z_segment_that_does_not_land_says_so_in_single_numbers() -> None:

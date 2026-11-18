@@ -68,6 +68,7 @@ from smc.hardware.errors import (
 
 __all__ = [
     "DEFAULT_MAX_Z_JOG_UM",
+    "LINE_DIGITS",
     "MAX_SEGMENTS",
     "MIN_SEGMENT_CAP_UM",
     "POLL_INTERVAL_S",
@@ -79,6 +80,7 @@ __all__ = [
     "SegmentPlan",
     "Step",
     "StopLink",
+    "line_coords_um",
     "segment_cap_below_floor",
     "segment_targets_um",
     "segment_without_refusal",
@@ -592,6 +594,22 @@ def _coords(point: tuple[float, ...], digits: int | None = None) -> str:
     if len(values) == 1:
         return str(values[0])
     return f"({', '.join(str(value) for value in values)})"
+
+
+#: How many decimals a position has in an INFO line (#514, #545): 0.01 µm, finer
+#: than any stage of the project resolves.
+LINE_DIGITS = 2
+
+
+def line_coords_um(point: tuple[float, ...]) -> str:
+    """A position as an INFO line writes it: rounded to ``LINE_DIGITS`` and never ``-0.0``.
+
+    One rounding for every coordinate a move's line prints, its whole target as
+    well as its segments': a jog from a stage that read ``0.2000000000007276``
+    logged the float's noise beside a rounded segment (Ti2-E session 5, #545).
+    A figure a comparison reads keeps its digits (``_coords`` without any).
+    """
+    return _coords(point, LINE_DIGITS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1365,7 +1383,7 @@ class Executor:
         """
         n = len(plan.targets)
         target = plan.targets[k - 1]
-        line = f"{plan.log}, segment {k} of {n} to {_coords(target, 2)} µm"
+        line = f"{plan.log}, segment {k} of {n} to {line_coords_um(target)} µm"
         step = plan.step(line, target)
         if sending is not None:
             command = step.send

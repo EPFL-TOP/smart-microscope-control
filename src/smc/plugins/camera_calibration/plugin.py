@@ -43,6 +43,7 @@ from smc.plugins.camera_calibration.algorithm import (
     DEFAULT_STEP_FRACTION,
     FALLBACK_STEP_UM,
     MIN_RESPONSE,
+    PARALLEL_SHIFTS_NOTE,
     Fit,
     carries_signal,
     fit,
@@ -224,7 +225,14 @@ class CameraCalibrationPlugin:
         if not fitted.trustworthy:
             raise PluginRunError(
                 self.name,
-                _unusable_reason(fitted, step_um, shape, reported_um, used_fallback),
+                _unusable_reason(
+                    fitted,
+                    step_um,
+                    shape,
+                    reported_um,
+                    used_fallback,
+                    tuple(spread for _lit, spread in signals),
+                ),
             )
         reasons = precision_reasons(fitted, step_um, shape)
         if reasons:
@@ -406,9 +414,22 @@ def _unusable_reason(
     shape: tuple[int, int],
     reported_um: float,
     used_fallback: bool,
+    probe_spreads: tuple[float, ...] = (),
 ) -> str:
-    """Why the fit is no good, the step that was tried, and a hint when it may have wrapped."""
-    reason = "; ".join(fitted.notes) + f"; step {step_um:g} µm"
+    """Why the fit is no good, the step that was tried, and a hint when it may have wrapped.
+
+    Parallel shifts name the frames first (``PARALLEL_SHIFTS_NOTE``), and the
+    message gives the contrast of the probe frames, the 1st to 99th percentile
+    spread in counts: the number to bring back from a stand, which tells a
+    frame with a little light from one with a lot, since the percentiles of a
+    still background (dust, shading) read as contrast the sample does not have
+    (F12, #545).
+    """
+    reason = "; ".join(fitted.notes)
+    if PARALLEL_SHIFTS_NOTE in fitted.notes and probe_spreads:
+        shown = " and ".join(f"{spread:.0f}" for spread in probe_spreads)
+        reason += f"; the probe frames span {shown} counts (1st to 99th percentile)"
+    reason += f"; step {step_um:g} µm"
     wide = _usable(reported_um) and step_um / reported_um >= _WRAP_FRACTION * min(shape)
     if used_fallback or wide:
         reason += "; a step over 40 % of the field may wrap: give a smaller step_um"

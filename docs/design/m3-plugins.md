@@ -1567,9 +1567,13 @@ def fit(
   the scaled rotation (mirrored if so) of that size and angle: how far the
   frame's edge is from a rigid camera. Notes, each making the result
   unusable: `min(response) < MIN_RESPONSE` ("the frames barely correlate:
-  find a field with texture"); `|det J| < 1e-12` ("the two moves gave
-  parallel shifts: did the stage move?"), with a zero matrix and no
-  division; and `max|M − ideal| >= pixel_size_um` ("the shifts do not fit
+  find a field with texture"); `|det J| < 1e-12` (`PARALLEL_SHIFTS_NOTE`:
+  "the two moves gave parallel shifts: the frames probably hold too little
+  texture (a sparse field, a dark or flat frame): try a field with more
+  structure, then the light path, then the stage", which names the frames
+  before the stage as F12 at the 40x showed, #545; the plugin adds "the
+  probe frames span <a> and <b> counts (1st to 99th percentile)" to the
+  reason), with a zero matrix and no division; and `max|M − ideal| >= pixel_size_um` ("the shifts do not fit
   a rigid camera: did each axis move its full command?"), which refuses
   an axis that moves a fraction of its command, or none plus noise
   (review of #211).

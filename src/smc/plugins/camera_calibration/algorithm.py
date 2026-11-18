@@ -55,6 +55,7 @@ __all__ = [
     "MIN_FEATURE_FRACTION",
     "MIN_RESPONSE",
     "MIN_SIGNAL_SPREAD_COUNTS",
+    "PARALLEL_SHIFTS_NOTE",
     "SMALL_STEP_FRACTION",
     "UPSAMPLE",
     "Fit",
@@ -84,6 +85,18 @@ SMALL_STEP_FRACTION = 0.1
 #: A fit whose residual is more than this share of its probe is poorly measured:
 #: 21 % at 18 px, against 0.1 to 0.5 % for the three good fits of session 3.
 MAX_RESIDUAL_SHARE = 0.05
+
+#: What the fit says when the two probes shifted the content the same way, most
+#: often by zero. The frames come first, then the stage: at the 40x in water, on
+#: a field of two beads over a still background (dust, shading), the stage moved
+#: and the background won the correlation, and "did the stage move?" sent the
+#: operator to the wrong device, as it had for a frame with no light (F8, F12,
+#: #408, #545). No semicolon in it: the plugin joins the notes with one.
+PARALLEL_SHIFTS_NOTE = (
+    "the two moves gave parallel shifts: the frames probably hold too little "
+    "texture (a sparse field, a dark or flat frame): try a field with more "
+    "structure, then the light path, then the stage"
+)
 
 #: Fewer overlapping pixels than this on an axis say nothing about agreement.
 _MIN_OVERLAP_PX = 8
@@ -205,7 +218,7 @@ def fit(
     c, d = shift_x.d_row_px / step_um, shift_y.d_row_px / step_um
     determinant = a * d - b * c
     if not abs(determinant) >= _MIN_DETERMINANT:
-        notes.append("the two moves gave parallel shifts: did the stage move?")
+        notes.append(PARALLEL_SHIFTS_NOTE)
         return Fit(((0.0, 0.0), (0.0, 0.0)), 0.0, 0.0, False, 0.0, tuple(notes))
 
     # M = -inv(J) = (1 / det J) * [[-d, b], [c, -a]]; `+ 0.0` turns a -0.0 into 0.0.
