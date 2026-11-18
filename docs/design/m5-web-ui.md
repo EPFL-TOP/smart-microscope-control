@@ -647,7 +647,7 @@ smc objective get  [-p PROFILE]
 smc objective list [-p PROFILE]
 smc objective set LABEL [--confirm] [--dry-run] [-p PROFILE]
 smc autofocus get  [-p PROFILE]
-smc autofocus engage    [--dry-run] [-p PROFILE]
+smc autofocus engage    [--timeout-s S] [--dry-run] [-p PROFILE]
 smc autofocus disengage [--dry-run] [-p PROFILE]
 smc light get [-p PROFILE]
 smc light on  [--dry-run] [-p PROFILE]
@@ -690,11 +690,17 @@ smc light off [--dry-run] [-p PROFILE]
   names it (`smc objective list` prints them).
 - **`objective get`** prints `objective '<label>'`; **`objective list`** one line
   per label in the turret's order, `'<label>'`, and `  (current)` after the
-  current one. **`autofocus get`** prints `describe_autofocus(state)`. **`light
+  current one. **`autofocus get`** prints `describe_autofocus(state)`, then
+  `; ` and `read_in_range`'s clause when it is not empty (m2 §12.13 D17, #574):
+  `in range: yes|no`, or `in range: ? (<cause>)`; its exit code follows the state
+  alone. **`light
   get`** prints `light on`, `light off`, or, when `is_on()` is `None`, `light
   <device()>: no on/off that smc knows` (exit 0: a reading, not a failure).
-- No option takes a free number here (FM-32), and none forces a guard: the
-  confirmation is the turret's only guard that the operator answers.
+- No option takes a free number here (FM-32) but `autofocus engage --timeout-s`
+  (m2 §12.13 D17, #574): it is passed to `engage(timeout_s=…)`, whose own check
+  (finite, in (0, 600] s, above `settle_s`) refuses it before anything is sent,
+  exit 2 with that text. None forces a guard: the confirmation is the turret's
+  only guard that the operator answers.
 
 ### 6.3 The controller (`smc/ui/controller.py`)
 
