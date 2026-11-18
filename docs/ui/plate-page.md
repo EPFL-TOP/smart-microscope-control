@@ -519,9 +519,20 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   want to change);
 - **what is known**, under the button: `Objective: <label>, in place`; `Fields: 72 in 2 wells`
   (or `Fields: not laid out yet`, or `Fields: out of date (<why>)` when the plate or the timings
-  were produced again since, so the plan is stale); `Time: about 42 s`, or, for a plan made with
-  no timing measured, `Time: not known (no timing measured yet)`: an unknown, never `0 s`; then what the plan
-  assumed (`assumed: no camera calibration for ...`);
+  were produced again since, so the plan is stale); the `Time` line, which **says which
+  autofocus mode its figure is for and follows the Scan screen's `autofocus` field** as you type
+  it, with no new *Lay out the fields* (the plan holds the time with the autofocus used and
+  with it not used, m3 §7.4): `Time: about 1 min 28 s, with the autofocus not used` for
+  `off`, `Time: about 1 min 30 s, with the autofocus locked again in each well` for
+  `required`, and for `if-engaged`, the default, which is what an empty or a mistyped field
+  reads as, `Time: about 1 min 30 s, with the autofocus locked again in each well; about 1
+  min 28 s if it is off at the start` (the second clause is left out when the two read the
+  same). `Time: about 42 s` alone says nothing of the autofocus: the stand has none, the
+  timings know no lock time, or the plan was written before this line existed and
+  charged a refocus at every field (lay the fields out again). For a plan made with no
+  timing measured it is `Time: not known (no timing measured yet)`: an unknown, never
+  `0 s`. Then what the plan assumed (`assumed: no camera calibration for ...`, and the
+  `estimate:` lines that say how many locks the figure counts and what it leaves out);
 - **Measure the time**, under what is known, only while the plan says `Time: not known`: it
   runs `timing` and then lays the fields out again (`scan-plan`, which reads the timings), as
   one chain, each with what its own *Run* sends (the profile's suggestions are the fields'
@@ -1154,10 +1165,15 @@ away, the figure the operator wants before pressing `scan`, so it shows four lin
 `wells: 2 (B11, B2)` (the plan's visiting order, at most six names, then `, … n more`),
 `fields: 72, a grid of 6 × 6 in each well` (or `fields: 344 of 392, a grid of 14 × 14 in
 each well, the fields that miss the well left out` when clipping to the well removed
-some), `field: 512 × 512 µm at <objective>, overlap 0.1` and `estimate: about 42 s (the
-moves, refocus and snaps of the timings)`. **The estimate sums only that**: each move, a
-refocus when the stand has an autofocus and the timings know its cost, and each snap; it
-leaves out a channel change, the cells, the report and the export. These four lines are
+some), `field: 512 × 512 µm at <objective>, overlap 0.1` and `estimate: about 14 s (the moves,
+the autofocus locked again in each well, and the snaps of the timings)`. **The estimate
+sums only that**: each move, one lock of the autofocus in each well when the stand has an
+autofocus and the timings know its cost, and each snap; it leaves out a channel change, the
+cells, the report and the export. The words in the parentheses say which: `the moves, the
+autofocus locked again in each well, and the snaps of the timings` when a lock is counted,
+`the moves and snaps of the timings` when none is (no autofocus, or no lock time known),
+and `the moves, refocus and snaps of the timings` for a plan written before #549, which
+charged a refocus at every field. These four lines are
 cut at 600 characters, as an assumption is, and not at a value's 80: the clipped `fields:`
 line is 90 long. With no usable
 `timing` it says `estimate: unknown, no usable timing: run timing, then scan-plan again`

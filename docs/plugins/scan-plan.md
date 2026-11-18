@@ -60,6 +60,7 @@ $ smc run scan-plan -p demo --run-doc run.json --param wells=A1:B2 --param rows=
     ...
   ],
   "estimate_s": null,
+  "estimate_without_autofocus_s": null,
   "plate_objective": "Nikon 10X S Fluor",
   "objective_shift_um": [0.0, 0.0]
 }
@@ -314,12 +315,34 @@ the scan without a word.
 ## The estimate
 
 `estimate_s` is the time of the scan in seconds, **only when a `timings` stage is in the
-run document**: each stage move between two fields (the first field costs none), a refocus
-when the stand has an autofocus and the timings know its cost, and each snap, as
-measured, and what the timings assumed (a refocus that was not timed, soft limits the
-stage did not report) is named in `assumed`, one line each starting with `timings:`.
-Without timings it is `null`: unknown, not guessed. A dry run is the same plan, and
-gives the same estimate.
+run document**: each stage move between two fields (the first field costs none), **one
+lock of the autofocus in each well** when the stand has an autofocus and the timings know
+its cost, and each snap, as measured. A lock is charged per well and not per field because
+the scan switches the autofocus off at each well's wall and its first field locks it again:
+a continuous autofocus costs nothing at the fields that follow. (Until #549 the estimate
+charged the lock at every field: three scans at the Ti2-E ran 2.7 to 3.3 times faster than
+the page said.) The result carries a second figure, `estimate_without_autofocus_s`, the
+same without any lock: the time of a `scan` with `autofocus=off`. It is equal to
+`estimate_s` when nothing was charged to leave out (a stand with no autofocus, or timings
+with no lock time) and never above it. The plan names no mode itself: the plate page's
+`Time` line takes the figure that its `autofocus` field names.
+
+What the timings assumed (a refocus that was not timed, soft limits the stage did not
+report) is named in `assumed`, one line each starting with `timings:`, and then the
+estimate's own lines, starting with `estimate:`. With a lock counted there are two:
+`estimate: the autofocus holds its lock between fields and locks again once in each well
+(2 locks); one that refocuses at each field would take longer` (the layer cannot tell an
+autofocus that refocuses at each field from one that holds its lock, so the plan assumes
+the second and says so), and `estimate: the timed moves, locks and snaps; it leaves out
+each frame's write, a lock lost in a well, a channel change, the cells, the report and the
+export`. With none counted there is one, `estimate: the timed moves and snaps; it leaves
+out each frame's write, a channel change, the cells, the report and the export`. What the
+figure leaves out was about a fifth of the real time at the Ti2-E (the figures came to 0.77
+to 0.82 of three real scans, to be measured again at the stand): it is not modelled, and
+not guessed. Without timings both figures are `null`: unknown, not guessed, and no
+`estimate:` line. A dry run is the same plan, and gives the same estimate. A plan written
+before #549 has no second figure and an `estimate_s` that charged a refocus at every
+field; it loads as it is, and running `scan-plan` again replaces it.
 
 ## The result
 
@@ -328,7 +351,8 @@ The slot `scan-plan` holds a `ScanPlanResult` (`smc.plugins.slots`): `plate_plan
 `GridRowsColumns`), `wells`, `objective`, `pixel_size_um`, `matrix_um_per_px`,
 `matrix_source`, `image_shape_px` (`(height, width)`), `fov_um` (`(width, height)` in
 stage axes), `overlap`, `rows`, `columns`, `fields` (`well`, `index`, `name`, `x_um`,
-`y_um`, in visiting order), `estimate_s`, `plate_objective`, `objective_shift_um`,
+`y_um`, in visiting order), `estimate_s`, `estimate_without_autofocus_s` (`null` in a
+document written before #549), `plate_objective`, `objective_shift_um`,
 `calibration_from` and `calibration_measured` (the document a `calibration` was read
 from, as typed, and when it was measured; `null` for any other source of the matrix and
 in a document written before they existed) and `assumed`. A failed run fills no slot.
