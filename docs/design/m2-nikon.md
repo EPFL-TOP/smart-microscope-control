@@ -3957,9 +3957,14 @@ class AutofocusExcursionError(HardwareError):  # not a SafetyRefusedError (FM-64
   PFS: not engaged: on this stand engaging drives Z to the plane the offset
   names ([autofocus] engage_drives_z_to_offset, m2 §12), and offset 9370
   PFSOffset units has not been seen locked with objective '40x' since the
-  stand was opened (seen: 7927, 7977 | seen: none)[; it was on and
-  searching, so it was switched off]. <the advice of §12.10.5> ``. The
-  advice never names the stand's button (#331).
+  stand was opened (seen: 7927, 7977 | seen: none); each smc command and
+  each Connect of the page opens the stand anew, so a lock read by another
+  one does not count[; it was on and searching, so it was switched off].
+  <the advice of §12.10.5> ``. The advice never names the stand's button
+  (#331). The clause after the seen offsets is #546's (m5 §20 D5): the seen
+  offsets live in the `MMAutofocus` (D1), so a console engage after a lock
+  that a page or another command read can only be refused, and a checklist
+  must not plan one.
 - **Z outside the soft limits before the switch-on** (`SafetyRefusedError`,
   `how_to_force=""`): `autofocus PFS: not engaged: Z is at 4400.00 µm,
   outside the soft limits [10, 4350] µm`.

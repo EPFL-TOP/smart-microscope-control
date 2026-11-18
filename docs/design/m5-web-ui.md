@@ -6969,3 +6969,171 @@ three rows and before `other_captures` (FM-171's guard walks `screens`).
 B2, B5 and C2 are reachable by *Go to* and that a well centred there by eye stays inside
 the travel); the 1 000 µm margin against a seating that is further off than the two
 measured; the note read by a newcomer.
+
+## 20. The page says how to lock again after a tool switched the autofocus off (#546)
+
+Fixed by #546's plan (2026-11-18). At the Ti2-E (session 5, F10), *Measure the time*
+timed the PFS lock at offset 7808 and then switched PFS off before its 9 mm probe, as
+§17.12 D18 and m3 §12 say. The chain's line ended `Assumed: the autofocus was switched off
+before anything moved, so that no lock crossed a well's wall: engage it again on the
+sample.` The checklist had the operator *Disconnect* and run `smc autofocus engage`,
+which refused: the offsets seen locked live in the `MMAutofocus` of the process that
+opened the stand (m2 §12.2 D1), and each `smc` command opens it anew. The operator redid
+a lock from the floor. The page's own *Autofocus on*, in the connection that had read
+7808 locked, was not tried, and nothing on the page named it. This section adds three
+texts and one field of the status. It adds no plugin, slot, command or guard, and changes
+no guard: the unseen-offset refusal stays, and stays unforceable. **Merging this section
+decides it.**
+
+### 20.1 What was measured (2026-11-18, planning #546)
+
+Throwaway scripts, not committed, on `main` at `1aeee0e`, Python 3.13, on
+`FakeCore.demo_like()` with `Profile.demo()` plus `[autofocus] engage_drives_z_to_offset
+= true` and `[safety] max_engage_excursion_um = 50`:
+
+- Before any lock, the page's `PlatePage.autofocus(True)` is refused with m2 §12.5's
+  unseen-offset text (`offset 0 has not been seen locked with objective 'Nikon 10X S
+  Fluor' since the stand was opened (seen: none)`).
+- With the offset set to 7808 and the autofocus switched on at the "stand"
+  (`core.enableContinuousFocus(True)`), `PlatePage.run("timing", ["repeats=1"])` and
+  `run_chain(("timing",), {"timing": ["repeats=1"]})` both end `done`, with the autofocus
+  off and the offset still 7808. `PlatePage.autofocus(True)` then ends `autofocus engage:
+  autofocus locked`, with one `enableContinuousFocus(True)` and nothing else sent: no
+  offset written, no floor step, Z where it was. **So the page's *Autofocus on* already
+  locks again at the timed offset in the same connection; no code of the layer changes.**
+- A second `Microscope.from_core` on the same core (what another `smc` command is) refuses
+  `engage()` at 7808 with `(seen: none)`.
+- `PageStatus.autofocus` is `describe_autofocus(state)`'s words (`autofocus locked`,
+  `autofocus off`, `autofocus on, not locked`, `autofocus ?`) from the tick's one
+  `Microscope.state()` read; the state's `autofocus_engaged` and `autofocus_locked` are
+  not on the status, and FM-155 forbids deciding from the words.
+
+### 20.2 Decisions
+
+- **D1 The status carries whether the autofocus reads locked.** `PageStatus` gains
+  `autofocus_locked: bool | None = None` (last field). It comes from the same
+  `Microscope.state()` read as `autofocus` (no new read on the tick, FM-178): `None` while
+  the stand is closed, without an autofocus, or when `autofocus_known(state)` is false;
+  otherwise `state.autofocus_engaged and state.autofocus_locked` as a `bool` (off is
+  `False`, on and not locked is `False`). During an activity it is the latest read's, as
+  every stand field is. Every tab draws the same (FM-151).
+- **D2 The Wells screen says how to lock again after *Measure the time*.** Under the
+  chain's line (`wells_chain_text`), a plain-text pane `wells_relock_text` says
+  `RELOCK_NOTE` when the chain whose line the Wells screen draws (label
+  `MEASURE_THE_TIME`) has ended (`current is None`), the page is not a dry run, and
+  `autofocus_locked is False`; otherwise it is empty and takes no height (`_say`). The
+  condition is the read, never the tool's own flag or the words of its `assumed` line
+  (FM-155): an autofocus the timing found off, or one the operator locked again at the
+  stand's own controls since, is drawn as it reads. The chain's line itself is unchanged:
+  it quotes the tool's `assumed` line, which is the plugin's, for the CLI too.
+- **D3 The Scan screen says it before the click.** A plain-text pane `scan_lock_text`,
+  right after `scan_wait_text` on the Scan screen, says `SCAN_NEEDS_A_LOCK` when the scan's
+  `autofocus` field means `required`, and `SCAN_WITHOUT_A_LOCK` when it means
+  `if-engaged`, in both cases only while the page is connected, not a dry run, no activity
+  goes, and `autofocus_locked is False`. `off`, an unknown read (`None`, the strip says
+  `autofocus ?`), and a value the tool would refuse say nothing. What the field means is
+  its value as the click would send it: the widget's text stripped, or the tool's default
+  when it is empty, each through `plain_default`. It is a note, not a wait: *Start the
+  scan* and *Continue the scan* stay enabled. The scan's own check (`_check_autofocus`) is
+  the one guard (FM-169), and a status about a second old must not hold a button the
+  operator may press right after locking at the stand. It is drawn whether *Start the
+  scan* or the checkpoint's two buttons are offered: a refused `required` start is a
+  failed scan, and its end line is the plugin's text (`engage PFS on the stand and let it
+  lock on the sample before the scan`); the note under it names the page's button.
+- **D4 Not on a dry-run page.** *Autofocus on* sends nothing in a dry run, so pressing it
+  never locks: both notes say nothing there (FM-182). `timing` refuses a dry run anyway
+  (§17.12.11 D33).
+- **D5 The console refusal says that another process's lock does not count.** m2 §12.5's
+  unseen-offset reason gains, after `(seen: …)`: `; each smc command and each Connect of
+  the page opens the stand anew, so a lock read by another one does not count`. It is the
+  layer's one text for the refusal, so the page's outcome says it too, and the relock's
+  `AutofocusLostError`, which embeds the reason, carries it. The refusal itself does not
+  change (m2 §12.2 D1).
+- **D6 The plugins' `AUTOFOCUS_OFF_LINE` does not change.** It is shared by `plate-walls`,
+  `objective-offsets`, `plate-check` and `timing`, and is read on the CLI, where no
+  *Autofocus on* exists; naming a page's button there would be wrong in a terminal. The
+  page adds its line beside it (D2, D3).
+
+### 20.3 The interface
+
+`smc/ui/guide.py` (pure):
+
+```python
+RELOCK_NOTE = (
+    "The autofocus is not locked: Autofocus on, under the image, locks it again at the "
+    "offset now set if this page has read that offset locked since Connect. After a "
+    "Disconnect, or from smc autofocus engage in a terminal, no lock has been read, and "
+    "the engage is refused."
+)
+SCAN_NEEDS_A_LOCK = (
+    "Autofocus is required and it is not locked, so the scan will refuse to start: "
+    "press Autofocus on, under the image, first."
+)
+SCAN_WITHOUT_A_LOCK = (
+    "The autofocus is not locked, so the scan will not use it (if-engaged): press "
+    "Autofocus on, under the image, to scan with it."
+)
+
+
+def relock_note(
+    chain: ChainStatus | None, *, autofocus_locked: bool | None, dry_run: bool
+) -> str: ...
+
+
+def scan_lock_note(
+    mode: str, *, autofocus_locked: bool | None, dry_run: bool
+) -> str: ...
+```
+
+`relock_note` is D2's rule: `RELOCK_NOTE` when `chain` is not `None`, has `plugins`, its
+`label` is `MEASURE_THE_TIME`, `current is None`, `not dry_run` and `autofocus_locked is
+False`; `""` otherwise. `scan_lock_note` is D3's text for `mode` (already through
+`plain_default`): `SCAN_NEEDS_A_LOCK` for `"required"`, `SCAN_WITHOUT_A_LOCK` for
+`"if-engaged"`, each only when `not dry_run` and `autofocus_locked is False`; `""` for any
+other mode or state. The view passes the connection and the activity by not calling it
+(D3). Both return plain text (FM-139).
+
+`smc/ui/controller.py`: `PageStatus.autofocus_locked` (D1), filled where `autofocus` is
+(`_StandRead` gains the same field; the closed and failed reads leave it `None`).
+`smc/hardware/backends/mm.py`: D5's clause in `_check_engage`'s unseen-offset `reason`.
+
+`smc/ui/plate_page.py`: `wells_relock_text` and `scan_lock_text` (`_wrapped_text()`,
+hidden), listed in `_wells_region` right after `wells_chain_text` and in `screens["scan"]`
+right after `scan_wait_text` (FM-171's guard walks `screens`). `_draw_chain_line(status)`
+draws `wells_relock_text`; `_draw_wells_scan_buttons` draws `scan_lock_text` from
+`self._status` and the scan's `autofocus` field (`_AUTOFOCUS_FIELD`, `tool_fields`,
+`_field_defaults`), `""` with the stand closed, while an activity goes, or when `scan`
+did not load.
+
+### 20.4 Tests and failure modes
+
+- A page test on the declared fake stand (§20.1's set-up): the operator's lock at 7808,
+  *Measure the time*'s `timing` through `run_chain`, then `autofocus(True)`: the outcome is
+  `autofocus engage: autofocus locked`, the offset is still 7808, one switch-on and nothing
+  else was sent, Z did not move. The same stand opened a second time refuses with D5's
+  whole text.
+- `tests/unit/test_ui_guide.py`: `relock_note` and `scan_lock_note` over each condition,
+  one input changed at a time, whole texts (FM-45).
+- The controller's `autofocus_locked` for locked, off, on and not locked, a failed read and
+  a closed stand.
+- The view: each pane drawn and empty in its states, on a page with a fake status.
+- **Failure modes**: FM-155 (the notes follow the read, not the tool's flag or its
+  words), FM-178 (no new read on the tick), FM-169 (the notes never disable a button; the
+  scan's check stays the guard), FM-182 (dry run), FM-151 (from the status every tab
+  reads), FM-139 (plain text), FM-45, FM-44. **New entry**, named by its text: *a guard's
+  memory that lives in one process, advised as a step to a command that opens another*
+  (F10: the checklist planned a console engage that could never pass).
+
+### 20.5 What this does not do
+
+- It does not change the seen offsets, the engage check, the first lock from below or the
+  unseen-offset refusal; a console engage still cannot use a lock a page read (D5 says so).
+- It does not engage the autofocus for the operator after `timing`, nor make the scan
+  switch it on: engaging drives Z (m3 §12, FM-129), and it stays the operator's click.
+- It does not add notes after the other tools that share `AUTOFOCUS_OFF_LINE`
+  (`plate-walls`, `objective-offsets`, `plate-check`): the Scan screen's note (D3) covers
+  the scan that follows any of them.
+
+**Not verified (for the owner)**: *Autofocus on* at the Ti2-E after *Measure the time*, in
+the same connection, at the 10× and at the 40× (that PFS locks again at the timed offset
+with Z within the band); the three texts read at the stand.
