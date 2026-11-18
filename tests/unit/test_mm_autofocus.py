@@ -797,7 +797,7 @@ def test_pfs_refuses_the_one_shot_mode_and_sends_nothing() -> None:
                 run()
             assert str(refused.value) == (
                 f"autofocus PFS: {call} is not supported: it holds focus "
-                f"continuously (PFS): engage(); nothing was sent"
+                f"continuously, as PFS does: engage(); nothing was sent"
             )
             assert not isinstance(refused.value, SafetyRefusedError)
         assert stand.core.log == []

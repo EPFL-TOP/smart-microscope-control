@@ -90,14 +90,7 @@ from smc.hardware.errors import (
     stop_notes,
 )
 from smc.hardware.profile import Profile
-from smc.hardware.roles import (
-    DeviceInfo,
-    Role,
-    RoleMap,
-    core_roles,
-    device_type_name,
-    devices_from_core,
-)
+from smc.hardware.roles import DeviceInfo, Role, RoleMap, core_roles, devices_from_core
 from smc.hardware.roles import resolve as resolve_roles
 from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM, Executor, Safety
 
@@ -647,10 +640,15 @@ class Microscope:
     def _is_generic(self, label: str) -> bool:
         """Whether ``label`` is a Generic device: a one-shot focus stabilizer as the autofocus.
 
-        Read from the core's inventory, which contacts no device; a type this
-        pymmcore-plus does not know is no Generic device (``device_type_name``).
+        Read from the inventory taken when the facade was built
+        (``self.devices``), not from the core again: the build of a capability
+        contacts nothing, so a device that faults, or a stand closed since, does
+        not make a status read fail here.
         """
-        return device_type_name(self.core.getDeviceType(label)) == "Generic"
+        return any(
+            device.label == label and device.type == "Generic"
+            for device in self.devices
+        )
 
     def _point_autofocus_slot(self) -> None:
         """Point the core's AutoFocus slot at the ``autofocus`` role, once, at construction.

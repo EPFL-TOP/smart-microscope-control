@@ -2939,7 +2939,7 @@ class MMAutofocus:
     def _one_shot_refused(self, call: str) -> AutofocusUnsupportedError:
         return AutofocusUnsupportedError(
             f"autofocus {self._label}: {call} is not supported: it holds focus "
-            f"continuously (PFS): engage(); nothing was sent"
+            f"continuously, as PFS does: engage(); nothing was sent"
         )
 
     def learn_reference(self) -> FocusReference:
