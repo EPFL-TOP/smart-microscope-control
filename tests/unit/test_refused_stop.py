@@ -44,10 +44,15 @@ from smc.testing import FakeCore, FakeDevice
 
 LOGGER = "smc.hardware.microscope"
 
-#: The Ti2-E's refusal, as the layer's translator words it (m2 §11.8).
-_XY_REFUSED = (
+#: The Ti2-E's refusal of a stop, as the layer's translator words it (m2 §11.8): the
+#: device's answer, with the advice for a fault only when the profile declares nothing.
+_XY_REFUSED_DECLARED = (
     "xy_stage: stop('XY') failed (Error in device \"XY\": Unsupported device "
-    "command (11)); check the device: power, cable, another program holding it"
+    "command (11))"
+)
+_XY_REFUSED = (
+    f"{_XY_REFUSED_DECLARED}; check the device: power, cable, another program "
+    "holding it"
 )
 
 
@@ -116,16 +121,16 @@ def test_a_declared_refused_stop_raises_stop_refused_error_and_was_sent(
     error = refused.value
     assert error.refused == ("xy_stage XY",)
     assert type(error.__cause__) is HardwareError
-    assert str(error.__cause__) == _XY_REFUSED
+    assert str(error.__cause__) == _XY_REFUSED_DECLARED
     assert str(error) == (
         "`xy_stage XY` refused the stop, as the profile declares ([safety] "
         "stop_refused_by): a move under way runs to its target; stop it with the "
         "stand's own controls if it must not finish"
     )
     assert caplog.messages[0] == (
-        f"xy_stage XY: stop failed (HardwareError({_XY_REFUSED!r})); the profile "
-        "declares this refusal ([safety] stop_refused_by), so a move under way runs "
-        "to its target"
+        f"xy_stage XY: stop failed (HardwareError({_XY_REFUSED_DECLARED!r})); the "
+        "profile declares this refusal ([safety] stop_refused_by), so a move under "
+        "way runs to its target"
     )
 
 
@@ -468,9 +473,11 @@ def test_the_give_up_line_on_a_declared_role_says_the_move_runs_to_its_target(
         caplog, _declared(Role.xy_stage, Role.focus), ctrl_c=cause == "ctrl-c"
     )
     assert line == (
-        f"xy_stage XY: stop after {why} failed (HardwareError({_XY_REFUSED!r}))"
-        f"{_DECLARES}{_STILL_BUSY}"
+        f"xy_stage XY: stop after {why} failed "
+        f"(HardwareError({_XY_REFUSED_DECLARED!r})){_DECLARES}{_STILL_BUSY}"
     )
+    # F3 of #545: a Ctrl-C during a jog sent the operator to a cable.
+    assert "power, cable" not in line
 
 
 @pytest.mark.parametrize(("cause", "why"), _CAUSES)
@@ -805,6 +812,54 @@ def test_the_emergency_stop_on_the_ti2_names_the_pfs_offset_too() -> None:
         "the emergency stop halted the microscope and switched autofocus PFS off, "
         "but autofocus_offset PFSOffset, xy_stage XYStage and z ZDrive refused the "
         "stop, as the profile declares"
+    )
+
+
+def test_a_declared_stop_warns_with_no_device_hint_on_each_of_the_ti2s_three_devices(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # F3 of #545: each STOP from the page logged "check the device: power, cable"
+    # three times, once for PFSOffset, XYStage and ZDrive, for a refusal the
+    # profile declares. The declaration is the whole of what the line says.
+    _, microscope = _ti2_stand()
+    try:
+        with (
+            caplog.at_level(logging.WARNING, logger=LOGGER),
+            pytest.raises(StopRefusedError),
+        ):
+            microscope.stop()
+        lines = [m for m in caplog.messages if ": stop failed (" in m]
+    finally:
+        microscope.close()
+    assert len(lines) == 3
+    for line, (name, role, label) in zip(
+        lines,
+        [
+            ("autofocus_offset PFSOffset", "autofocus_offset", "PFSOffset"),
+            ("xy_stage XYStage", "xy_stage", "XYStage"),
+            ("z ZDrive", "focus", "ZDrive"),
+        ],
+        strict=True,
+    ):
+        device = (
+            f'{role}: stop({label!r}) failed (Error in device "{label}": '
+            "Unsupported device command (11))"
+        )
+        assert line == (f"{name}: stop failed (HardwareError({device!r})){_DECLARES}")
+        assert "power, cable" not in line
+
+
+def test_a_declared_role_keeps_the_hint_on_a_call_that_is_not_the_stop() -> None:
+    # The declaration is about the stop. A read of the same stage that faults is a
+    # fault, and the operator is sent to the device (the undeclared stop's own
+    # text is pinned above).
+    with _stand() as (core, microscope):
+        core.failing["XY"] = RuntimeError("device fault")
+        with pytest.raises(HardwareError) as failed:
+            microscope.require(XYStage).position_um()
+    assert str(failed.value) == (
+        "xy_stage: getXPosition('XY') failed (device fault); check the device: "
+        "power, cable, another program holding it"
     )
 
 

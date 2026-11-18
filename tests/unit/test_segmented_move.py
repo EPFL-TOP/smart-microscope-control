@@ -46,6 +46,7 @@ from smc.hardware.safety import (
     SEGMENT_END_TOLERANCE_UM,
     Safety,
     _coords,
+    line_coords_um,
     segment_targets_um,
 )
 from smc.testing import FakeCore, FakeDevice
@@ -758,6 +759,16 @@ def test_the_segment_lines_round_the_coordinates_to_hundredths_and_the_move_does
     # A value that rounds to zero is not written with a minus sign, and no digits is as it was.
     assert _coords((-0.001, 4.0), 2) == "(0.0, 4.0)"
     assert _coords((-250.0 / 3,)) == repr(-250.0 / 3)
+
+
+def test_line_coords_um_rounds_to_two_decimals_and_never_shows_a_negative_zero() -> (
+    None
+):
+    # #545: the whole target of a move is written as its segments are.
+    assert line_coords_um((0.2000000000007276, -0.1)) == "(0.2, -0.1)"
+    assert line_coords_um((-0.001, 4.0)) == "(0.0, 4.0)"
+    assert line_coords_um((-250.0 / 3,)) == "-83.33"
+    assert line_coords_um((485.00000000001,)) == "485.0"
 
 
 def test_a_z_segment_that_does_not_land_says_so_in_single_numbers() -> None:
