@@ -27,6 +27,9 @@ fits each well's centre and size, then the plate; it needs the camera's calibrat
 plate: it turns the turret to each objective you name, with your confirmation, finds again the
 wells `plate-walls` measured, and `smc objective offset --write` puts the result into the
 profile; it needs one camera calibration per objective),
+[`plate-check`](plate-check.md) (whether the registered plate still lies where
+`plate-walls` registered it: it measures again two wells the registration measured and
+refuses a plate that moved; the scan makes the same check before its first field),
 [`plate-finding`](plate-finding.md) (which plate it is and where, from a coarse survey
 of the plate with the stage and the camera; it switches the autofocus off),
 [`plate-orientation`](plate-orientation.md) (which way the registered plate lies in its

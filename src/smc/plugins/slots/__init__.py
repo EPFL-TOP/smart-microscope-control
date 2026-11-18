@@ -38,6 +38,7 @@ from smc.plugins.slots.plate import (
     refuse_image_side,
     well_geometry,
 )
+from smc.plugins.slots.plate_check import CheckedWell, PlateCheck, PlateCheckResult
 from smc.plugins.slots.report import ReportResult
 from smc.plugins.slots.route import OffsetFromFocus, RoutePosition, RouteResult
 from smc.plugins.slots.scan import (
@@ -57,6 +58,7 @@ __all__ = [
     "CellFocusResult",
     "CellsFile",
     "CellsResult",
+    "CheckedWell",
     "DensityResult",
     "DensityWell",
     "FailedField",
@@ -71,6 +73,8 @@ __all__ = [
     "OffsetFromFocus",
     "OffsetWell",
     "PlannedField",
+    "PlateCheck",
+    "PlateCheckResult",
     "PlateResult",
     "ReportResult",
     "RoutePosition",
