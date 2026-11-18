@@ -65,6 +65,7 @@ from typing import (
     Protocol,
     TypeVar,
     cast,
+    runtime_checkable,
 )
 
 from smc.hardware.capabilities import (
@@ -518,10 +519,13 @@ class MMXYStage:
         return (Limits(x_low, x_high), Limits(y_low, y_high))
 
 
+@runtime_checkable
 class ZInterlock(Protocol):
     """What ``MMZStage`` needs of an autofocus to move Z under it (m2 §3.4); internal.
 
-    ``MMAutofocus`` implements it. Both calls run only inside the Z move's
+    ``MMAutofocus`` and ``MMFocusStabilizer`` implement it; the facade
+    interlocks any autofocus that does, whatever its class (m4 §11.7), so it
+    is checked at run time. Both calls run only inside the Z move's
     compound, so no other action comes between the suspend, the move and
     the relock. ``str()`` of an interlock names it in the Z stage's log lines
     (``autofocus PFS``).

@@ -463,9 +463,10 @@ class Microscope:
         log.info(
             "%s: overridden by %s", capability.__name__, type(implementation).__name__
         )
-        if capability is Autofocus:
-            # The interlock trusts only MMAutofocus (_interlock): a Z move on a
-            # Nikon stand now leaves PFS off, or fights it.
+        if capability is Autofocus and not isinstance(implementation, ZInterlock):
+            # The interlock holds only an autofocus that is a ZInterlock
+            # (_interlock): a Z move on a Nikon stand now leaves PFS off, or
+            # fights it.
             log.warning(
                 "Autofocus overridden: Z moves no longer suspend and re-engage it"
             )
@@ -612,13 +613,15 @@ class Microscope:
         """The autofocus a Z move suspends and engages again; ``None`` when there is none.
 
         Asked by the Z stage at each move, so neither build calls the other.
-        An autofocus that ``override`` replaced is not an ``MMAutofocus`` and
-        is not interlocked: a test double cannot be trusted to hold Z. The
+        Any autofocus that is a ``ZInterlock`` is interlocked, whatever its
+        class (m4 §11.7): ``MMAutofocus`` (PFS) and ``MMFocusStabilizer``
+        (DF2), or an override that implements both calls. One that does not
+        is not: a test double without them cannot be trusted to hold Z. The
         cache lock it takes is re-entrant, since this runs during a Z move,
         where a Ctrl-C handler may land (FM-70).
         """
         found = self._lookup(Autofocus)
-        return found if isinstance(found, MMAutofocus) else None
+        return found if isinstance(found, ZInterlock) else None
 
     def _point_autofocus_slot(self) -> None:
         """Point the core's AutoFocus slot at the ``autofocus`` role, once, at construction.
