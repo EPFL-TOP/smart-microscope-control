@@ -142,11 +142,13 @@ plate_centre_xy_um = [400.0, -325.0]
 measured = "2026-11-10, sessions 2 and 3 (#334, #405): the Greiner 24-well's centre was (543, -313) and (258, -336) um; their mean to 5 um"
 # Which stage direction is the back of the stand and which the operator's right, seen from the
 # front (m5 §16 D1, #422). The plate page names A1's corner and the map's sides from them ("A1 at
-# the back left"). Inferred, not seen: in session 3 the rows ran towards +Y with row A by the
-# operator, and a plate turned 180 deg had A1 at the front right. Check both at the stand.
-back = "+Y"
-right = "+X"
-directions_measured = "inferred from session 3 (#405, #414), not checked at the stand: rows ran towards +Y with row A by the operator"
+# the back left"). Measured at the stand in session 5 (#198, #540): the joystick moves the field
+# towards row A (the back) at -Y and towards column 6 (the operator's right) at -X. A plate with A1
+# at the back left is therefore the "Turned 180 deg" choice of the page: the stage frame is turned
+# 180 deg from useq's for it. The keys only word the page; the estimate follows useq.
+back = "-Y"
+right = "-X"
+directions_measured = "2026-11-17, session 5 (#198, #540), at the stand: a plate with A1 at the back left; the joystick moved the field towards row A at -Y and towards column 6 at -X; a drive to B2 landed on B2 with the page's Turned 180 deg, and plate-walls registered the plate at -179.96 deg; session 3's raw centres (#405) agree"
 
 [quirks]
 # The direction of Z is known (#98, session 3): a falling Z lowers the nosepiece, away from the

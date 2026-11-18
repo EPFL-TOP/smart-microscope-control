@@ -35,6 +35,7 @@ HOLDER_CENTRE = (400.0, -325.0)
 LEFT, RIGHT = -49_100.0 - 3_200.0, -49_100.0 + 99_000.0 + 3_200.0
 TOP, BOTTOM = 31_175.0 + 3_200.0, 31_175.0 - 63_000.0 - 3_200.0
 HALF_PITCH = 4_500.0
+PROFILES = Path(__file__).resolve().parents[2] / "profiles"
 
 
 def _profile(sides: tuple[str, str] | None) -> Profile:
@@ -107,7 +108,8 @@ def test_the_orientation_select_is_next_to_the_plate_menu(make_view: Any) -> Non
     assert columns[0] in view.screens["expert"]
     select = view.orientation_select
     assert select.name == "Plate lies"
-    # The Ti2-E's words: +Y is the back and +X the operator's right.
+    # The words of a stand whose back is +Y and whose operator's right is +X (not the
+    # Ti2-E's: see the test of the shipped profile below).
     assert select.options == {
         "A1 at the back left": "not-turned",
         f"Turned 180{DEG}: A1 at the front right": "turned-180",
@@ -181,6 +183,35 @@ def test_a_stand_whose_back_is_minus_x_has_it_on_the_left_of_the_map(
     assert _close(sides["operator's left"], (middle_x, BOTTOM - HALF_PITCH))
     # A1 at -X +Y is then the back right.
     assert next(iter(view.orientation_select.options)) == "A1 at the back right"
+
+
+def test_the_ti2_e_offers_turned_180_for_a_plate_with_a1_at_the_back_left(
+    make_view: Any,
+) -> None:
+    # Session 5 (#540): the plate lay A1 at the back left, and the stand's back is -Y
+    # and its operator's right -X. The sides come from the shipped profile itself, so a
+    # later edit of its [holder] fails here, not at the stand.
+    holder = Profile.load(PROFILES / "nikon-ti2.toml").holder
+    assert holder.back is not None
+    assert holder.right is not None
+    view = make_view((holder.back, holder.right))
+    assert view.orientation_select.options == {
+        "A1 at the front right": "not-turned",
+        f"Turned 180{DEG}: A1 at the back left": "turned-180",
+    }
+    # The map is drawn in stage terms, X right and Y up: the back is at its bottom and
+    # the operator's right on its left (the plate's own view of it is #547).
+    middle_x, middle_y = (LEFT + RIGHT) / 2.0, (TOP + BOTTOM) / 2.0
+    sides = _labels(view.side_source)
+    assert _close(sides["back of the stand"], (middle_x, BOTTOM - HALF_PITCH))
+    assert _close(sides["front of the stand"], (middle_x, TOP + HALF_PITCH))
+    assert _close(sides["operator's right"], (LEFT - HALF_PITCH, middle_y))
+    assert _close(sides["operator's left"], (RIGHT + HALF_PITCH, middle_y))
+    # The choice the operator makes for that plate: A1 at the map's bottom right.
+    view.orientation_select.value = "turned-180"
+    assert view.figure.title.text.endswith(
+        f"declared turned 180{DEG}, A1 at the bottom right of this map"
+    )
 
 
 @pytest.mark.parametrize("plate", ["384-well", "1536-well"])
