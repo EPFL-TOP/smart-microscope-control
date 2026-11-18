@@ -29,6 +29,7 @@ from smc.plates import PLATES_FILE, LabPlate, PlateSource, load_lab_plates
 #: changing a line of this literal is a decision, made in the same commit.
 PUBLISHED = {
     "greiner-24-well": (4, 6, (19.45, 19.45), (15.6, 15.6), True),
+    "greiner-662892-24-well": (4, 6, (19.5, 19.5), (15.66, 15.66), True),
 }
 
 #: A valid plate, with ``{name}`` and ``{extra}`` to fill and lines to replace.
@@ -115,6 +116,29 @@ def test_the_greiner_plate_says_its_spacing_was_measured_and_its_size_assumed() 
     assert greiner.well_spacing_source.kind == "measured"
     assert "session 3" in greiner.well_spacing_source.note
     assert greiner.well_size_source.kind == "assumed"
+
+
+def test_the_first_greiner_plate_names_the_one_that_replaces_it() -> None:
+    """D5: the old name stays with its numbers, and its description says what replaced it (#541)."""
+    greiner = load_lab_plates()["greiner-24-well"]
+
+    assert "greiner-662892-24-well" in greiner.description
+    assert greiner.well_spacing_source.kind == "measured"
+    assert greiner.well_size_source.kind == "assumed"
+
+
+def test_the_makers_plate_says_both_its_measures_are_the_makers() -> None:
+    """#541: the maker's drawing gives the pitch and the well; session 5 checked the pitch at the stand."""
+    senso = load_lab_plates()["greiner-662892-24-well"]
+
+    for source in (senso.well_spacing_source, senso.well_size_source):
+        assert source.kind == "maker"
+        assert "revision 9" in source.note
+        assert "662892" in source.note
+    assert "session 5" in senso.well_spacing_source.note
+    assert "662892" in senso.description
+    assert "662896" in senso.description
+    assert "glass" in senso.description
 
 
 # ---- the registration --------------------------------------------------------
@@ -227,17 +251,19 @@ def test_registering_twice_is_a_no_op_that_returns_the_same_names(
     assert "test-twice-well" in useq.registered_well_plate_keys()
 
 
-def test_the_registered_plate_is_useqs_with_the_name_as_its_key() -> None:
+@pytest.mark.parametrize("name", sorted(PUBLISHED))
+def test_the_registered_plate_is_useqs_with_the_name_as_its_key(name: str) -> None:
     """``useq`` gets the geometry only: the key stays the plate's name, not the description."""
     assert plates.register_lab_plates() == tuple(sorted(PUBLISHED))
+    rows, columns, spacing, size, circular = PUBLISHED[name]
 
-    plate = useq.WellPlate.from_str("greiner-24-well")
+    plate = useq.WellPlate.from_str(name)
 
-    assert plate.name == "greiner-24-well"
-    assert (plate.rows, plate.columns) == (4, 6)
-    assert plate.well_spacing == (19.45, 19.45)
-    assert plate.well_size == (15.6, 15.6)
-    assert plate.circular_wells is True
+    assert plate.name == name
+    assert (plate.rows, plate.columns) == (rows, columns)
+    assert plate.well_spacing == spacing
+    assert plate.well_size == size
+    assert plate.circular_wells is circular
 
 
 def test_a_lab_plate_cannot_redefine_a_useq_plate(

@@ -158,23 +158,30 @@ def test_the_plate_is_identified_and_located(
     assert err < radius * 0.30, f"{err:.0f} µm is {err / radius:.0%} of a well radius"
 
 
-def test_the_two_24_well_types_are_a_coin_toss_and_the_notes_say_so() -> None:
-    """D7: the default candidates hold the lab's plate; 2.4 % apart, the survey cannot choose.
+_24_WELL_TYPES = {"24-well", "greiner-24-well", "greiner-662892-24-well"}
 
-    The note is the truth, and the operator names the plate. Either fit still
-    places every well well inside it.
+
+@pytest.mark.parametrize("truth", sorted(_24_WELL_TYPES))
+def test_the_24_well_types_are_a_coin_toss_and_the_notes_say_so(truth: str) -> None:
+    """D7: the default candidates hold the lab's plates; 2.6 % apart at most, the survey cannot choose.
+
+    ``24-well`` (19.0 mm), ``greiner-24-well`` (19.45) and the maker's
+    ``greiner-662892-24-well`` (19.5, #541) score within 0.02 of each other,
+    whichever of the three the plate is. The note is the truth, and the operator
+    names the plate. Whichever fit wins still places every well well inside it
+    (measured 19 %, 25 % and 24 % of a radius).
     """
     a1, rot = (500.0, -500.0), -0.8
-    fits = fit(survey_for("24-well", a1, rot))
+    fits = fit(survey_for(truth, a1, rot))
 
     best, notes = decide(fits)
 
-    assert {fits[0].plate, fits[1].plate} == {"24-well", "greiner-24-well"}
+    assert {fits[0].plate, fits[1].plate} < _24_WELL_TYPES
     assert best is not None
     said = f"{fits[0].plate} ({fits[0].score:.3f}) barely beats {fits[1].plate} ("
     assert any(note.startswith(said) for note in notes), notes
-    err = worst_well_error("24-well", a1, rot, best.a1_center_xy_um, best.rotation_deg)
-    radius = min(well_size_um("24-well")) / 2
+    err = worst_well_error(truth, a1, rot, best.a1_center_xy_um, best.rotation_deg)
+    radius = min(well_size_um(truth)) / 2
     assert err < radius * 0.30, f"{err:.0f} µm is {err / radius:.0%} of a well radius"
 
 

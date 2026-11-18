@@ -667,6 +667,39 @@ def test_session_3s_hand_centres_fit_the_greiner_plate_once_turned_180_degrees()
     assert abs(cal.scale_error) < 0.02  # measured +0.0007
 
 
+#: ``plate-walls``' centres at the 10x on B2, B5 and C3 of the Ti2-E's Greiner SensoPlate
+#: (session 5, 2026-11-17, #198; #541): the registration came within 10 µm of its bound.
+SESSION_5_CENTRES = (
+    ("B2", 29601.8, -9936.3),
+    ("B5", -28924.5, -9968.3),
+    ("C3", 10056.7, 9544.1),
+)
+
+
+def test_session_5s_centres_fit_the_makers_pitch_at_under_a_quarter_of_the_residual() -> (
+    None
+):
+    """19.5 mm (the maker's) leaves 19.6 µm where 19.45 mm left 90.7 of the 100 µm bound (#541).
+
+    The plate lay turned 180° in its holder (A1 at the back left, #540), so the
+    centres are registered as ``turned-180``: the fit then reads -179.96° either way.
+    """
+    refs = [WellRef(well=w, x_um=x, y_um=y) for w, x, y in SESSION_5_CENTRES]
+
+    maker = calibrate("greiner-662892-24-well", refs, orientation="turned-180")
+    measured = calibrate("greiner-24-well", refs, orientation="turned-180")
+
+    assert maker.residual_um == pytest.approx(19.55, abs=0.1)
+    assert maker.scale_error is not None
+    assert abs(maker.scale_error) < 0.001  # measured +0.00045
+    assert abs(wrap_deg(maker.rotation_deg - 180.0)) < 0.1  # measured 0.04
+    # The stand's own number: close to the bound, which is what #541 fixes.
+    assert measured.residual_um == pytest.approx(90.67, abs=0.1)
+    assert measured.residual_um is not None
+    assert maker.residual_um is not None
+    assert measured.residual_um > 4 * maker.residual_um
+
+
 def test_session_3s_hand_centres_as_measured_are_refused_as_turned_180_degrees() -> (
     None
 ):

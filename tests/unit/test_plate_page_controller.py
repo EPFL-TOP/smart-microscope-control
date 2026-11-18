@@ -2232,10 +2232,11 @@ def test_choose_plate_clears_the_selection_and_the_captures(
     assert page.plate == "384-well"
 
 
-def test_the_lab_plates_can_be_chosen(page: PlatePage) -> None:
+@pytest.mark.parametrize("name", ["greiner-24-well", "greiner-662892-24-well"])
+def test_the_lab_plates_can_be_chosen(page: PlatePage, name: str) -> None:
     """A plate of ``src/smc/plates.toml`` is a ``useq`` key like any other (m3 §22)."""
-    page.choose_plate("greiner-24-well")
-    assert page.plate == "greiner-24-well"
+    page.choose_plate(name)
+    assert page.plate == name
 
 
 def test_scan_plan_params_are_the_selection_in_order(page: PlatePage) -> None:

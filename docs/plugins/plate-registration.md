@@ -423,7 +423,7 @@ new well is a first lock from below, after a focus by eye (m2 §12.11.3).
 
 ```text
 smc run goto-well -p <profile> --run-doc run.json --param well=A1 --param plate=96-well
-smc run goto-well -p <profile> --run-doc run.json --param well=B3 --param plate=greiner-24-well --param orientation=turned-180
+smc run goto-well -p <profile> --run-doc run.json --param well=B3 --param plate=greiner-662892-24-well --param orientation=turned-180
 ```
 
 With no usable `plate` in the run document, `goto-well` drives to the well's

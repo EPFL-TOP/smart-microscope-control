@@ -841,6 +841,14 @@ registration on. No cells. The 10× and 40×, the lever at 1.0×.
   100 µm bound, rotation −179.96°; pitch 19.509 mm between columns and
   19.496 mm between rows (`greiner-24-well` says 19.45, the maker 19.5:
   #541). Wells 15 520–15 643 µm across.
+- **The plate is `greiner-662892-24-well`** (#541): the maker's drawing,
+  19.5 mm between wells and a well 15.66 mm across at the bottom, for the
+  SensoPlate 662892 / 662896. The same three centres fit it at **19.6 µm**
+  (rotation −179.96°, `scale_error` +0.0004), where `greiner-24-well` left
+  90.7. **Ask for `plate=greiner-662892-24-well` from the next session on**;
+  `greiner-24-well` stays, with its 19.45 mm, for the run documents that name
+  it. Not yet tried at the stand: a registration, and a `goto-well` to a
+  fourth well, under the new name.
 - **A plate lifted and put back moved −0.056° and about (−5, +1) µm**, and
   nothing noticed until `objective-offsets` refused (#542). A `plate-walls`
   recheck on the same captures measured it, with residuals ≤ 1.5 µm.

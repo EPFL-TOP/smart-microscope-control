@@ -220,7 +220,8 @@ when it is imported. A lab plate is used exactly as a `useq` one.
 
 | Name | Rows x columns | Pitch (mm) | Well (mm) | Sources |
 |---|---|---|---|---|
-| `greiner-24-well` | 4 x 6 | 19.45 | 15.6, round | Greiner Bio-One 24-well, the Ti2-E's plate. Pitch **measured** in session 3 (2026-11-10, #405): 19.49 mm along the columns, 19.43 along the rows, 19.45 on both by the owner's decision. Well size **assumed**: `useq`'s 24-well. |
+| `greiner-662892-24-well` | 4 x 6 | 19.5 | 15.66, round | **The Ti2-E's plate**: Greiner Bio-One 24 Well SensoPlate, PS, glass bottom, items 662892 (with lid) and 662896. Pitch and well (at the bottom) are the **maker's**, from its drawing (revision 9, 2024-09-20). Session 5 (2026-11-17, #198, #541) read 19.509 mm along the columns and 19.496 along the rows, a `plate-walls` residual of 19.6 µm on B2, B5, C3. |
+| `greiner-24-well` | 4 x 6 | 19.45 | 15.6, round | The same plate, as session 3 measured it. Pitch **measured** in session 3 (2026-11-10, #405): 19.49 mm along the columns, 19.43 along the rows, 19.45 on both by the owner's decision. Well size **assumed**: `useq`'s 24-well. Kept, with its numbers, for the run documents that name it; session 5's registration under it left 90.7 µm of its 100 µm bound. |
 
 `useq`'s `24-well` has a 19.0 mm pitch: a Greiner plate registered under that name
 is refused (`the measured well spacing is off the 24-well definition by +2.4%`), and
@@ -238,12 +239,13 @@ a line to the table above.
 geometry: editing a used plate's pitch would move every well of every run that names
 it, with nothing to say so. A corrected plate (the maker's datasheet replacing a
 measurement) takes a **new name**, such as `greiner-<catalogue>-24-well`; the old
-one stays, its description saying what replaced it (m3 §22 D5). The test above fails
+one stays, its description saying what replaced it (m3 §22 D5): `greiner-24-well`'s
+measured 19.45 mm became `greiner-662892-24-well`'s 19.5 mm that way (#541). The test above fails
 an edit in place until its literal is changed in the same commit.
 
 **`plate-finding`** fits every registered `-well` plate, the lab's included. A survey
-cannot tell `24-well` from `greiner-24-well`, 2.4 % apart, and says so
-(`… barely beats …`): name the plate, or give `plates`.
+cannot tell `24-well` from the two Greiner definitions, 2.4 and 2.6 % apart, and says
+so (`… barely beats …`): name the plate, or give `plates`.
 
 ## Trying the workflow without a microscope
 
