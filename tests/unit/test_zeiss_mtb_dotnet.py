@@ -11,6 +11,7 @@ The behaviours pinned here are the ones the predecessor verified at the stand.
 from __future__ import annotations
 
 import builtins
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -646,6 +647,68 @@ def test_on_off_reads_take_the_end_of_the_text_and_the_first_item() -> None:
     assert df2.periodic() is True
     df2.stop_periodic(30_000)
     assert raw.periodic_calls == [(_OnOff.Off,)]
+
+
+def test_a_learn_answered_false_gives_no_reference_whatever_its_out_parameter_holds() -> (
+    None
+):
+    # What a failed learn leaves in the out-parameter, or in GetStabilizerData,
+    # is not known (m4 §12): a stale blob is no reference.
+    class Fails(FakeStabilizer):
+        def InitOnCurrentFocusPosition(self, *args: Any) -> Any:
+            self.init_calls.append(args)
+            if args[0] is None:
+                return (False, bytearray(b"\x01\x02"))
+            return False
+
+    raw = Fails()
+    with pytest.raises(MTBError, match="gave no reference") as caught:
+        _df2(raw).learn(30_000)
+    assert "(None, 30000): answered False" in str(caught.value)
+    assert "(object, 30000): answered False" in str(caught.value)
+    assert len(raw.init_calls) == 4
+
+
+def test_answers_the_adapter_cannot_take_are_mtb_errors() -> None:
+    # Each of these fails closed: a periodic mode that may still be on, a mode
+    # not set, a piezo reading that would let a stabilize through.
+    class Odd(FakeStabilizer):
+        def StabilizePeriodically(self, *args: Any) -> bool:
+            return False
+
+        def SetOperationMode(self, *args: Any) -> bool:
+            return False
+
+        def GetPiezoFocusUsage(self) -> str:
+            return "MTBOnOff.Unknown"
+
+        def GetOperationMode(self) -> str:
+            return "MTBFocusStabilizer2OperationMode.Sharpish"
+
+    df2 = _df2(Odd())
+    with pytest.raises(MTBError, match=r"StabilizePeriodically\(Off\) answered False"):
+        df2.stop_periodic(30_000)
+    with pytest.raises(MTBError, match=r"SetOperationMode\(Exact\) answered False"):
+        df2.set_operation_mode("Exact")
+    with pytest.raises(MTBError, match="neither on nor off"):
+        df2.piezo_focus_usage()
+    with pytest.raises(MTBError, match=r"Sharpish', not one of Exact, Balanced, Fast"):
+        df2.operation_mode()
+
+
+def test_a_stop_answered_false_is_logged_as_unknown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Shrugs(FakeStabilizer):
+        def Stop(self, *args: Any) -> bool:
+            return False
+
+    with caplog.at_level(logging.WARNING):
+        _df2(Shrugs()).stop(30_000)
+    assert any(
+        "Stop answered False; whether DF2 stopped is not known" in m
+        for m in caplog.messages
+    )
 
 
 def test_connect_without_pythonnet_is_a_session_error_naming_the_extra(

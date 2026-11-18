@@ -607,6 +607,11 @@ class DotNetFocusStabilizer:
                 continue
             except Exception as exc:
                 raise self._ran(call, args, tried, exc) from exc
+            if _answer(result) is False:
+                # (False, Byte[]): what fills the out-parameter of a failed
+                # learn is not known (m4 §12); it is no reference.
+                tried.append(f"{_shape(args)}: answered False")
+                continue
             data = _extract_bytes(result)
             if data:
                 return data
