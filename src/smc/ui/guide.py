@@ -150,6 +150,7 @@ __all__ = [
     "SCREEN_TITLES",
     "SELECTION_KEPT_ITS_NAMES",
     "SELECT_WELLS",
+    "STAND_HALTED",
     "STEPS",
     "STEP_OF_SLOT",
     "STEP_TITLES",
@@ -232,6 +233,7 @@ __all__ = [
     "offsets_written_line",
     "opening_step",
     "orientation_label",
+    "page_words",
     "plain_default",
     "plan_selection_note",
     "plan_title",
@@ -261,6 +263,7 @@ __all__ = [
     "stage_label",
     "step_button_label",
     "step_states",
+    "stop_refused_text",
     "stop_segments_clause",
     "suggested_centres",
     "time_line",
@@ -462,6 +465,10 @@ AUTOFOCUS_WORDS = (
 #: Why everything that needs the stand is refused while the page holds none (m5 §7.2):
 #: the one reason a disabled control gives, and the first one. The controller's too.
 NOT_CONNECTED = "the stand is not connected"
+
+#: What a halted stand is, in the page's words: the clause every STOP note starts from, so
+#: that the accepted stop and the refused one say the same thing about the halt (#544).
+STAND_HALTED = "the stand is halted (Resume clears the halt)"
 
 #: The Scan screen after a scan that did not end ``done`` (m5 §17.12 D17, part B). The two
 #: ``UNCOUNTED`` variants are for a page that kept no progress of that scan (it was opened
@@ -1659,6 +1666,67 @@ def stop_segments_clause(segments_um: Sequence[tuple[str, float]]) -> str:
     if not sizes:
         return ""
     return f"; a long one ends at the end of its current segment (at most {', '.join(sizes)})"
+
+
+#: The closing phrases the layer writes for a program, and what the page says in their
+#: place: the operator's way out is the **Resume** button, never a call (FM-254, #544).
+#: The layer's texts are right for the CLI and for a caller, so they are not changed there.
+_LAYER_PHRASES = (
+    (" (`Microscope.stop()`)", ""),
+    ("call `resume()` to continue", "press Resume to continue"),
+    ("then call `resume()`", "then press Resume"),
+)
+
+
+def page_words(text: str) -> str:
+    """``text``, an error's message from the layer, with its closing advice said as the page says it (FM-254).
+
+    ``MicroscopeHaltedError`` ends "call `resume()` to continue" and the facade's failed
+    emergency stop "then call `resume()`", advice to a program; on the page the halt is
+    cleared with **Resume**, and no API name is shown (m5 §17.12 D20, #544). Only these
+    three phrases are replaced, each where it stands: any other text, a backtick call
+    included, comes back as it is, since a phrase the page cannot honour (the advice of
+    ``MotionInProgressError``, which is given while nothing is halted, and the page offers
+    **Resume** only while it is) must stay the layer's until it is decided. The tests build
+    the layer's real errors, so that a rewording there fails there.
+    """
+    for layer, page in _LAYER_PHRASES:
+        text = text.replace(layer, page)
+    return text
+
+
+def stop_refused_text(
+    refused: Sequence[str],
+    *,
+    autofocus: str | None,
+    segments_um: Sequence[tuple[str, float]] = (),
+) -> str:
+    """What a STOP that some devices refused did, in the page's words (FM-117, m3 §15, #544).
+
+    The stand is halted, the autofocus was switched off first (the layer's fallback that
+    ends a move PFS drives, named where the stand has one), and the devices in ``refused``
+    do not stop what they are moving: a move already sent finishes first, and a long one
+    ends at the end of its current segment when the profile cuts it (``segments_um`` are the
+    profile's ``(role, size)`` pairs, the Scan lead's own clause, never sizes typed here).
+    The facade's sentence is not used: it begins at "the emergency stop" and ends on a call
+    of the API, and the page prefixed it with its own "halted, but".
+
+    ``refused`` are the layer's motion names, ``<role word> <device label>``
+    (``"xy_stage XYStage"``); the label is what the operator knows the device by, and a name
+    with no label is said as it is. ``autofocus`` is the autofocus role's label, ``None``
+    for a stand with none: then nothing is said of it, since nothing was switched off. The
+    text never starts with "stopped" (FM-117): a move may run on.
+    """
+    devices = [name.split(" ", 1)[-1] for name in refused]
+    switched = (
+        "" if autofocus is None else f" and the autofocus ({autofocus}) is switched off"
+    )
+    verb = "refuses" if len(devices) == 1 else "refuse"
+    return (
+        f"{STAND_HALTED}{switched}. {_join_names(devices)} {verb} a stop on this stand: "
+        f"a move already sent finishes first{stop_segments_clause(segments_um)}. "
+        "Use the stand's own controls to stop a move that must not finish."
+    )
 
 
 def scan_lead(

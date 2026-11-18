@@ -22,7 +22,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.errors import MicroscopeHaltedError, SafetyRefusedError
 from smc.hardware.safety import Safety
 from smc.plugins.api import Progress
 from smc.plugins.geometry import Matrix2
@@ -116,6 +116,7 @@ from smc.ui.guide import (
     SCREEN_LEADS,
     SCREEN_TITLES,
     SELECT_WELLS,
+    STAND_HALTED,
     STEP_OF_SLOT,
     STEP_TITLES,
     STEPS,
@@ -197,6 +198,7 @@ from smc.ui.guide import (
     offsets_written_line,
     opening_step,
     orientation_label,
+    page_words,
     plain_default,
     plan_selection_note,
     plan_title,
@@ -226,6 +228,7 @@ from smc.ui.guide import (
     stage_label,
     step_button_label,
     step_states,
+    stop_refused_text,
     stop_segments_clause,
     suggested_centres,
     time_line,
@@ -2345,6 +2348,80 @@ def test_stop_segments_clause_names_each_cut_axis_with_its_size() -> None:
     assert stop_segments_clause(()) == ""
     assert stop_segments_clause((("autofocus_offset", 3.0),)) == ""
     assert dict(STOP_SEGMENT_AXES) == {"xy_stage": "XY", "focus": "Z"}
+
+
+def test_stop_refused_text_names_the_devices_that_refused_and_the_autofocus_switch_off() -> (
+    None
+):
+    # The Ti2-E's three refusals, in the layer's order, and its profile's two cuts.
+    said = stop_refused_text(
+        ("autofocus_offset PFSOffset", "xy_stage XYStage", "z ZDrive"),
+        autofocus="PFS",
+        segments_um=(("xy_stage", 500.0), ("focus", 100.0)),
+    )
+    assert said == (
+        "the stand is halted (Resume clears the halt) and the autofocus (PFS) is "
+        "switched off. PFSOffset, XYStage and ZDrive refuse a stop on this stand: a "
+        "move already sent finishes first; a long one ends at the end of its current "
+        "segment (at most 500 µm in XY, 100 µm in Z). Use the stand's own controls to "
+        "stop a move that must not finish."
+    )
+    assert said.startswith(STAND_HALTED)
+    assert STAND_HALTED == "the stand is halted (Resume clears the halt)"
+    assert not said.startswith("stopped")
+    for word in ("resume()", "halted, but", "`", "stop()"):
+        assert word not in said
+
+
+def test_stop_refused_text_agrees_with_the_number_of_devices_and_drops_what_does_not_apply() -> (
+    None
+):
+    # One device: it refuses. The label is what follows the role word.
+    one = stop_refused_text(("xy_stage XY",), autofocus=None)
+    assert one == (
+        "the stand is halted (Resume clears the halt). XY refuses a stop on this "
+        "stand: a move already sent finishes first. Use the stand's own controls to "
+        "stop a move that must not finish."
+    )
+    # A motion with no label is named as it is, never as an empty word.
+    assert stop_refused_text(("xy_stage",), autofocus=None).startswith(
+        "the stand is halted (Resume clears the halt). xy_stage refuses a stop"
+    )
+    # Two devices: `and`, and the verb follows the number.
+    two = stop_refused_text(("xy_stage XY", "z Z"), autofocus="PFS")
+    assert "(PFS) is switched off. XY and Z refuse a stop on this stand" in two
+    # The autofocus clause is the stand's: no role, no clause (the layer said nothing).
+    assert "autofocus" not in stop_refused_text(("z Z",), autofocus=None)
+    # A cut the profile makes on a role that did not refuse is the strip's business,
+    # not this sentence's: the pairs given are the ones said.
+    assert "segment" not in stop_refused_text(
+        ("z Z",), autofocus=None, segments_um=(("autofocus_offset", 3.0),)
+    )
+
+
+def test_page_words_says_press_resume_where_the_layer_says_call_resume() -> None:
+    assert page_words("the microscope was stopped; call `resume()` to continue") == (
+        "the microscope was stopped; press Resume to continue"
+    )
+    assert page_words("stop the stage if it still moves, then call `resume()`") == (
+        "stop the stage if it still moves, then press Resume"
+    )
+    assert page_words("the microscope was stopped (`Microscope.stop()`); go on") == (
+        "the microscope was stopped; go on"
+    )
+    # Only those phrases: any other text is returned as it is, backticks included.
+    for plain in ("the stop failed: cable unplugged", "a `wait()` that never ends", ""):
+        assert page_words(plain) == plain
+
+
+def test_the_layers_own_stop_texts_say_no_api_call_once_the_page_has_said_them() -> (
+    None
+):
+    # The real errors, not copies of their words: a rewording in the layer fails here
+    # and not at the stand (FM-254).
+    halted = page_words(" ".join(str(MicroscopeHaltedError()).split()))
+    assert halted == "the microscope was stopped; press Resume to continue"
+    assert "`" not in halted
 
 
 def test_scan_lead_says_where_a_cut_move_ends_on_a_stand_that_cuts_its_moves() -> None:

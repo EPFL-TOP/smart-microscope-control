@@ -634,6 +634,9 @@ def test_while_halted_moves_are_refused_and_switching_off_runs(
     light_page.stop()
     halted = _refusal(lambda: shutter_light.require(XYStage).move_by_um(1.0, 0.0))
     assert halted.startswith("MicroscopeHaltedError: ")
+    # The facade's refusal ends on a call of the API; the page says Resume (FM-254, #544).
+    assert "call `resume()`" in halted
+    said = "MicroscopeHaltedError: the microscope was stopped; press Resume to continue"
 
     for act, name in (
         (lambda: light_page.jog_xy(10.0, 0.0), "stage jog"),
@@ -644,7 +647,7 @@ def test_while_halted_moves_are_refused_and_switching_off_runs(
     ):
         act()
         assert light_page.join(10.0)
-        assert light_page.status().outcome == f"{name}: {halted}"
+        assert light_page.status().outcome == f"{name}: {said}"
     light_page.autofocus(False)
     assert light_page.join(10.0)
     assert light_page.status().outcome == "autofocus disengage: autofocus off"

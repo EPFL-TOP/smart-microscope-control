@@ -1159,12 +1159,21 @@ def _refusing_stand(
         microscope.close()
 
 
+#: What the page says after a STOP that only the demo-like fake's XY refuses (#544): the
+#: facade's own sentence is no longer on the page (FM-254), its fields are.
+_XY_REFUSED = (
+    "the stand is halted (Resume clears the halt) and the autofocus (Autofocus) is "
+    "switched off. XY refuses a stop on this stand: a move already sent finishes first. "
+    "Use the stand's own controls to stop a move that must not finish."
+)
+
+
 def test_stop_says_what_the_stand_did_when_it_refuses_the_stop(
     run_doc: Path,
 ) -> None:
     with _refusing_stand(("XY",), (Role.xy_stage,)) as microscope:
-        # The facade's own words for the refusal, taken once so the test does not
-        # restate them; the stand is then resumed.
+        # The facade's own words, taken once: the refusal is real, and its call to the
+        # API is not on the page.
         with pytest.raises(StopRefusedError) as refusal:
             microscope.stop()
         said = " ".join(str(refusal.value).split())
@@ -1173,7 +1182,8 @@ def test_stop_says_what_the_stand_did_when_it_refuses_the_stop(
         page.stop()
         status = page.status()
     assert "refused the stop" in said
-    assert status.stop_note == f"halted, but {said}"
+    assert "call `resume()`" in said
+    assert status.stop_note == _XY_REFUSED
     assert not (status.stop_note or "").startswith("stopped")
     assert status.halted
     assert status.stop_refused == ("xy_stage",)
@@ -1434,19 +1444,11 @@ def test_close_says_what_a_refused_stop_did_and_never_that_the_run_was_stopped(
     run_doc: Path,
 ) -> None:
     with _refusing_stand(("XY",), (Role.xy_stage,)) as microscope:
-        # The facade's own words for the refusal, taken once; the stand is resumed.
-        with pytest.raises(StopRefusedError) as refusal:
-            microscope.stop()
-        said = " ".join(str(refusal.value).split())
-        microscope.resume()
         page = _page(microscope, run_doc)
         page.run("slow", [])
         assert Slow.started.wait(5)
         page.close()
-    assert page.close_lines == (
-        f"slow told to stop; halted, but {said}",
-        "slow stopped",
-    )
+    assert page.close_lines == (f"slow told to stop; {_XY_REFUSED}", "slow stopped")
     assert page.close_ended
 
 
@@ -4152,19 +4154,21 @@ def test_close_waits_for_a_snap_and_says_what_the_stop_did(
         page.snap()
 
 
-def test_a_snap_while_the_stand_is_halted_is_the_facades_refusal(
+def test_a_snap_while_the_stand_is_halted_is_the_facades_refusal_in_the_pages_words(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
     # The fake core's own camera, not an override: an override bypasses the halt.
     page.stop()
-    with pytest.raises(HardwareError) as refusal:
+    with pytest.raises(MicroscopeHaltedError) as refusal:
         fake_microscope.require(Camera).snap()
-    said = " ".join(str(refusal.value).split())
-    name = type(refusal.value).__name__
+    # The facade's refusal ends on a call of the API (FM-254); the page says Resume.
+    assert "call `resume()`" in str(refusal.value)
     del refusal
     page.snap()
     assert page.join(10.0)
-    assert page.status().outcome == f"snap: {name}: {said}"
+    assert page.status().outcome == (
+        "snap: MicroscopeHaltedError: the microscope was stopped; press Resume to continue"
+    )
     assert page.frame() is None
 
 
@@ -4621,19 +4625,21 @@ def test_a_live_whose_camera_fails_keeps_no_exception(
         gc.enable()
 
 
-def test_live_while_the_stand_is_halted_ends_at_its_first_frame_with_the_facades_refusal(
+def test_live_while_the_stand_is_halted_ends_at_its_first_frame_with_the_facades_refusal_in_the_pages_words(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
     # The fake core's own camera, not an override: an override bypasses the halt.
     page.stop()
-    with pytest.raises(HardwareError) as refusal:
+    with pytest.raises(MicroscopeHaltedError) as refusal:
         fake_microscope.require(Camera).snap()
-    said = " ".join(str(refusal.value).split())
-    name = type(refusal.value).__name__
+    assert "call `resume()`" in str(refusal.value)
     del refusal
     page.live(True)
     assert page.join(10.0)
-    assert page.status().outcome == f"live ended after 0 frames: {name}: {said}"
+    assert page.status().outcome == (
+        "live ended after 0 frames: MicroscopeHaltedError: "
+        "the microscope was stopped; press Resume to continue"
+    )
     assert page.frame() is None
 
 
