@@ -513,8 +513,10 @@ MEASURE_AFTER_THE_SCAN = (
 #: not locked, and what the Scan screen says before a click whose scan would not have one (m5 §20,
 #: #546). The page's own *Autofocus on* locks again at the offset now set when this page read that
 #: offset locked since Connect; ``smc autofocus engage`` opens the stand anew and is refused
-#: whatever a page read (m2 §12.5), so the notes name the button and not the command. Notes, never
-#: waits: no button is disabled by them (FM-169).
+#: whatever a page read (m2 §12.5), so the notes name the button and not the command. All three
+#: carry the condition: after a fresh Connect no lock has been read, and the status does not say
+#: which offsets were (the owner's decision on #546, option c). Notes, never waits: no button is
+#: disabled by them (FM-169).
 RELOCK_NOTE = (
     "The autofocus is not locked: Autofocus on, under the image, locks it again at the "
     "offset now set if this page has read that offset locked since Connect. After a "
@@ -523,11 +525,13 @@ RELOCK_NOTE = (
 )
 SCAN_NEEDS_A_LOCK = (
     "Autofocus is required and it is not locked, so the scan will refuse to start: "
-    "press Autofocus on, under the image, first."
+    "press Autofocus on, under the image, first, if this page has read the offset now "
+    "set locked since Connect."
 )
 SCAN_WITHOUT_A_LOCK = (
     "The autofocus is not locked, so the scan will not use it (if-engaged): press "
-    "Autofocus on, under the image, to scan with it."
+    "Autofocus on, under the image, to scan with it, if this page has read the offset "
+    "now set locked since Connect."
 )
 
 
@@ -1685,9 +1689,11 @@ def scan_lock_note(mode: str, *, autofocus_locked: bool | None, dry_run: bool) -
     tool's default when empty, through ``plain_default``). ``required`` is refused by the
     scan's own check at the start, and ``if-engaged`` would scan without the autofocus:
     both are told, and both name the page's button, which the plugin's own refusal text
-    (read on the CLI too) does not (D6). ``off``, an unknown read and a value the tool would
-    refuse say nothing. It is a note and never a wait: the scan's check is the one guard
-    (FM-169). Not on a dry run (D4, FM-182). Plain text (FM-139).
+    (read on the CLI too) does not (D6). ``off``, an unknown read (an autofocus that is on and
+    not locked reads unknown too: the scan refuses it and the engage is refused at an offset
+    not seen locked, FM-252) and a value the tool would refuse say nothing. It is a note and
+    never a wait: the scan's check is the one guard (FM-169). Not on a dry run (D4, FM-182).
+    Plain text (FM-139).
     """
     if dry_run or autofocus_locked is not False:
         return ""
@@ -2454,7 +2460,8 @@ def relock_note(
     ``timing`` switches the autofocus off before its probe, so the chain ends with a stand
     the operator must lock again, and the one button that does it in the connection that
     read the lock is *Autofocus on* (F10, Ti2-E session 5). The condition is the read
-    (``autofocus_locked is False``), never the tool's own flag or the words of its
+    (``autofocus_locked is False``: off only, an autofocus on and still searching reads
+    unknown, FM-252), never the tool's own flag or the words of its
     ``assumed`` line (FM-155): an autofocus the timing found off, or one the operator locked
     again at the stand's controls since, is drawn as it reads. Not on a dry run, where
     *Autofocus on* sends nothing (D4, FM-182). Plain text (FM-139).

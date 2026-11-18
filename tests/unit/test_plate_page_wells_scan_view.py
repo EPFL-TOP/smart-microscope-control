@@ -40,6 +40,7 @@ from bokeh.models import Line, Rect
 import smc.ui.controller as controller_module
 import smc.ui.plate_page as plate_page
 from smc.hardware import Microscope
+from smc.hardware.capabilities import Autofocus
 from smc.hardware.errors import MotionStoppedError
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, Progress, RunContext
@@ -3199,6 +3200,51 @@ def test_the_scan_screen_names_autofocus_on_while_the_scan_needs_a_lock(
         assert drawn("required") == "", changes
     _with_status(monkeypatch, page, autofocus_locked=False)
     assert drawn("required") == SCAN_NEEDS_A_LOCK
+
+
+def test_the_notes_say_nothing_while_the_autofocus_is_on_and_still_searching(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FM-252: on and not locked reaches both panes through the real read, and neither advises a lock.
+
+    The scan refuses an autofocus that is on and not locked, and *Autofocus on* is refused
+    at an offset not seen locked, so a note that says "press Autofocus on" or "the scan
+    will not use it" would be wrong under a strip that says ``autofocus on, not locked``
+    (the owner's decision on #546, option a). The patched status of the other tests never
+    reaches ``_read_stand``; this one drives the stand's own two reads.
+    """
+    page, view = _after_measure_the_time(make_page, run_doc)
+    field = view.tool_fields["scan"]["autofocus"]
+    field.value = "required"
+    view.tick()
+    assert page.status().autofocus == "autofocus off"
+    assert view.wells_relock_text.object == RELOCK_NOTE  # off: both notes are said
+    assert view.scan_lock_text.object == SCAN_NEEDS_A_LOCK
+
+    microscope = page._microscope
+    assert microscope is not None
+    autofocus = microscope.require(Autofocus)
+    monkeypatch.setattr(autofocus, "is_engaged", lambda: True)
+    monkeypatch.setattr(autofocus, "is_locked", lambda: False)
+    status = page.status()
+    assert status.autofocus == "autofocus on, not locked"
+    assert status.autofocus_locked is None
+    for typed in ("required", "if-engaged", ""):
+        field.value = typed
+        view.tick()
+        assert view.wells_relock_text.object == "", typed
+        assert view.wells_relock_text.visible is False, typed
+        assert view.scan_lock_text.object == "", typed
+        assert view.scan_lock_text.visible is False, typed
+        assert view.scan_button.disabled is False, typed
+
+    # Locked says nothing either; off said both again (the first lines of this test).
+    monkeypatch.setattr(autofocus, "is_locked", lambda: True)
+    view.tick()
+    assert page.status().autofocus == "autofocus locked"
+    assert view.scan_lock_text.object == ""
 
 
 def test_the_scan_screen_names_autofocus_on_over_a_checkpoint_too_and_continue_stays_enabled(

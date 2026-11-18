@@ -1033,9 +1033,10 @@ class PageStatus:
     ``max_z_segment_um``): such a move ends at the end of its current segment, so the strip
     does not say it runs to its target (m2 §11.12, #514). ``autofocus_locked`` is whether the
     autofocus reads locked, from the same read as ``autofocus``: ``None`` with the stand closed,
-    without an autofocus or when a read it needs failed, ``False`` for off and for on and not
-    locked (m5 §20 D1). A decision (a note that says how to lock again) reads it and never the
-    words of ``autofocus`` (FM-155).
+    without an autofocus, when a read it needs failed and while the autofocus is on and not
+    locked (PFS searching: the scan refuses it, so no note advises a lock then), ``False`` for
+    off only (m5 §20 D1, as amended by the owner's decision on #546). A decision (a note that
+    says how to lock again) reads it and never the words of ``autofocus`` (FM-155).
     """
 
     stand: str
@@ -4755,12 +4756,16 @@ class PlatePage:
                 )
                 # From the fields and not from the words (FM-155), and from this read:
                 # a second ``is_locked()`` on the tick would be a device call the strip
-                # does not need (FM-178, m5 §20 D1). Unknown stays ``None``.
+                # does not need (FM-178, m5 §20 D1). Unknown stays ``None``, and so does
+                # an autofocus that is on and not locked (PFS searching): no note may
+                # advise a lock then, the scan refuses it and the engage is refused
+                # at an offset not seen locked (FM-252).
                 autofocus_locked: bool | None = None
                 if microscope.has(Autofocus) and autofocus_known(state):
-                    autofocus_locked = bool(
-                        state.autofocus_engaged and state.autofocus_locked
-                    )
+                    if not state.autofocus_engaged:
+                        autofocus_locked = False
+                    elif state.autofocus_locked:
+                        autofocus_locked = True
                 if self._microscope is microscope:
                     return _StandRead(
                         began_s=began_s,

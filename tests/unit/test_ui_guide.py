@@ -4455,11 +4455,13 @@ def test_the_lock_notes_are_m5_section_20_3s_words() -> None:
     )
     assert SCAN_NEEDS_A_LOCK == (
         "Autofocus is required and it is not locked, so the scan will refuse to start: "
-        "press Autofocus on, under the image, first."
+        "press Autofocus on, under the image, first, if this page has read the offset now "
+        "set locked since Connect."
     )
     assert SCAN_WITHOUT_A_LOCK == (
         "The autofocus is not locked, so the scan will not use it (if-engaged): press "
-        "Autofocus on, under the image, to scan with it."
+        "Autofocus on, under the image, to scan with it, if this page has read the offset "
+        "now set locked since Connect."
     )
 
 

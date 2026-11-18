@@ -1680,9 +1680,7 @@ def test_status_says_no_autofocus_without_the_capability(
     [
         pytest.param(True, True, "autofocus locked", True, id="locked"),
         pytest.param(False, True, "autofocus off", False, id="off"),
-        pytest.param(
-            True, False, "autofocus on, not locked", False, id="on-not-locked"
-        ),
+        pytest.param(True, False, "autofocus on, not locked", None, id="on-not-locked"),
     ],
 )
 def test_status_autofocus_locked_follows_the_read(
@@ -1691,9 +1689,15 @@ def test_status_autofocus_locked_follows_the_read(
     engage: bool,
     lockable: bool,
     words: str,
-    locked: bool,
+    locked: bool | None,
 ) -> None:
-    """``autofocus_locked`` is the state's two fields read once, not the words of the strip (m5 §20 D1, FM-155)."""
+    """``autofocus_locked`` is the state's two fields read once, not the words of the strip (m5 §20 D1, FM-155).
+
+    On and not locked (PFS searching, the first lock from below) is ``None`` and not
+    ``False``: a scan whose autofocus is on and not locked is refused by its own check
+    and *Autofocus on* is refused at an offset not seen locked, so no note may advise
+    either (the owner's decision on #546's plan deviation, option a).
+    """
     fake_core.autofocus_lockable = lockable
     fake_core.enableContinuousFocus(engage)
 
