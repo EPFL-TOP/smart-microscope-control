@@ -1,0 +1,797 @@
+# Algorithms design — a collaborator's kit for selection algorithms on acquired data
+
+- **Status**: design for issue #554 (2026-11-18, with the owner), built by
+  #564 (§3), #565 (§2), #566 (§4), #567 (§5), #568 (§6) and #554 itself (§7);
+  the first task is #570, its wiring #569.
+- **Owner**: the design session. **Executors**: `/develop` sessions, one per
+  issue, the collaborator's included.
+- **Rule**: as in M1 to M5, this document is the contract between issues built
+  in parallel. Names, module paths and signatures below are fixed; an executor
+  who needs to change one stops and comments on its issue (`## Plan
+  deviation`). M1's conventions and CLI rules, and M3's plugin API (§1), hold
+  everywhere this document does not say otherwise; §4 and §5 amend m3 §1.10,
+  §3.5 and §11, and say so where they do.
+
+Read first: [ADR-0004](../adr/0004-plugin-architecture.md) (the pure algorithm
+and the hardware loop are separate) and m3 §3.4, §3.5, §9 and §11.
+
+## 0. Scope and the split
+
+A second developer writes algorithms that run on what a scan acquired (the
+frames, their records, the detected cells) and decide which fields to image
+and in what order. They work on a laptop with no microscope and no
+Micro-Manager, and what they write runs online unchanged, through `route`,
+when the owner connects it at the stand. This is ADR-0004's split made into
+an arrangement between two people:
+
+- **The collaborator** owns the *pure algorithm*: data in, a decision out,
+  unit-tested on synthetic data and checked on a real dataset. Their issues
+  carry `area: algorithms` and touch nothing of `smc.hardware`, `profiles/`
+  or `smc.ui` (§7).
+- **The owner** owns the *hardware loop*, the page and the stand: a second
+  issue connects each result and carries the check at a stand (§7.2).
+
+The kit is: a dataset exported from a run folder (§2), a loader with no
+hardware (§3), the plugins that never drive the stand run offline (§4), the
+contract of a selection algorithm (§5), a drawing of what it chose (§6), and
+the way two people work in one repository (§7).
+
+**Decided with the owner (2026-11-18)**: the collaborator has write access
+to the repository and works with Claude Code and this repository's skills;
+datasets travel as a zip on the lab's share; `main` asks for the code
+owner's review on the paths of §7.4 only; tools run offline through `smc
+run NAME --offline` rather than a second set of commands; the contract is
+two halves, a selector and an orderer, chosen by name; the algorithms live
+in this repository under `src/smc/selection/`; the first task (#570) uses
+the 10× scan with cells of 2026-11-19 and a 40× scan of the same wells taken
+the same day.
+
+Out of scope: the acquisition loop (#556, its engine is an ADR), decisions
+taken *during* an acquisition (#32), the page's choice of a selector (#569).
+
+## 1. Measured (2026-11-18)
+
+On the main checkout's `.venv` (Python 3.13, pymmcore-plus as pinned):
+
+- `import smc.run`, `smc.plugins.slots`, `smc.plugins.scan`,
+  `smc.plugins.cells`, `smc.plugins.route`, `smc.plugins.api`,
+  `smc.hardware.profile`, `smc.plates` and `smc.cli` leave `pymmcore_plus`
+  out of `sys.modules`. `smc.testing` imports it (`fakes.py` imports
+  `DeviceType`), so nothing of the kit may import `smc.testing` outside
+  tests. `smc.plugins.slots` imports `smc.hardware.microscope` (not
+  `pymmcore_plus`).
+- `Profile.load("nikon-ti2")` loads with no Micro-Manager. Its
+  `[camera.pixel_size_um]` holds the 4×, 10× and 40× sizes (2.73909,
+  1.12447, 0.276136 µm); a profile's `[microscope] name` equals its file stem
+  for the five profiles of `profiles/`.
+- The run document of the 10× scan of 2026-11-17 (`local/`, private): stages
+  `goto-well`, `camera-calibration`, `plate-walls`, `scan-plan`, `scan`,
+  `timing`, all `done` on `nikon-ti2`, none a dry run, no path in any
+  string parameter; the scan holds 218 frames of 1412 × 1412 px at
+  1.1249 µm/px with `2-Plan Fluor 10x`, 1.1 GB of TIFFs; each frame's record
+  has `well`, `index`, `name`, `file` (`scan/<token>/<well>/<name>.tif`),
+  `x_um`, `y_um`, `z_um`, `focus`, `pfs_offset`, `t_s`, `well_dx_um`,
+  `well_dy_um`. The plate held beads, so it has no `cells` record.
+- The runner (`smc/plugins/runner.py`) reads only `microscope.profile` (its
+  `[microscope] name`, into the record's `profile`) and `microscope.dry_run`,
+  and calls `microscope.has` for each capability in `requires`. `cells`,
+  `density` and `nis-export` never use their `microscope` argument; `report`
+  reads its profile's name; `route` reads the profile's autofocus factors and
+  limits, and asks the turret for its labels and pixel sizes only when
+  `objective` names another objective than the scan's
+  (`route/plugin.py` `_imaging_with`).
+- `RunDocument.unusable` refuses an upstream whose `profile` differs from
+  the reader's, and a dry-run upstream read by a real run.
+- The turret's `pixel_size_um(label)` is the profile's size divided by the
+  core's magnification factor, the same factor for every label
+  (`backends/mm.py`), so the ratio of two objectives' sizes is the ratio of
+  the profile's entries.
+- `scripts/dev/select_fields.py` draws with Pillow (`render_png`,
+  `canvas_of`, `place_frame`, `stretch_to_uint8`); Pillow (≥ 10.1) and SciPy
+  come only through scikit-image, and nothing in `src/` imports them.
+- `smc run` always opens a `Microscope` (`Microscope.open`, which needs the
+  adapters), even with `--dry-run`.
+
+## 2. The dataset (#565)
+
+**A dataset is a run folder.** It keeps the run document and the files the
+scan and the cells wrote at the same relative paths, so every tool that
+reads a run folder reads a dataset, and a dataset loads with the same
+`load_scan` (§3).
+
+### 2.1 `smc dataset export RUN_DOC --out DIR`
+
+`src/smc/data/dataset.py` (`export_dataset`), the command in
+`src/smc/data/cli.py`.
+
+```python
+def export_dataset(
+    run_doc: Path,
+    out: Path,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> DatasetManifest: ...
+```
+
+- **Refused before anything is written** (exit 2, a `DatasetError` naming
+  the reason): `out` exists and is not an empty folder (the export never
+  overwrites and never deletes); the `scan` slot has no provider, or it is
+  not usable (`RunDocument.unusable("scan", profile=<its own profile>,
+  dry_run=False)`), or it was a dry run; one or more frame files are
+  missing (their count and the first five paths).
+- **Written**, in this order: every frame of the scan's result at its own
+  relative path (`shutil.copyfile`, bytes unchanged); the `cells` file when
+  the `cells` slot's provider is `done`, not stale, on the scan's profile
+  (else no cells, and the manifest says why); `run.json`, the scrubbed run
+  document (§2.2), whatever the source's file name; `README.md` (§2.3); and
+  `manifest.json` last, so a folder with no manifest is an interrupted
+  export.
+- **Kept and not copied**: every other stage record stays in `run.json`
+  (staleness reads them), but no other file is copied; the README says so.
+- **Exit codes**: 0 written; 1 an I/O error while writing (the partial
+  folder stays, with no manifest, and the message says so); 2 refused.
+- A progress bar per frame (`rich`) on the CLI; the function takes a
+  callback.
+
+### 2.2 What is scrubbed
+
+Host and account names reach a run document only through paths (a model
+path, an output file, an error that quotes a file). In every record's
+`params`, `result`, `checkpoint` and `error`, recursively:
+
+- a string that **is** an absolute path (POSIX `/…`, Windows `X:\…` or
+  `X:/…`, UNC `\\…`) becomes its last component
+  (`PureWindowsPath`/`PurePosixPath` `.name`);
+- inside any other string, each substring matching
+  `(?:[A-Za-z]:[\\/]|\\\\|/(?:Users|home)/)[^\s'"]*` becomes its last
+  component;
+- each rewritten value's JSON pointer (`/stages/cells/params/model_path`)
+  goes into the manifest's `scrubbed`.
+
+Relative paths (`scan/<token>/A1/A1_0003.tif`) are never touched. The TIFFs
+are copied unchanged: their description is the frame's record (m3 §8),
+which holds no path but the relative one.
+
+### 2.3 The manifest and the README
+
+```python
+class DatasetFile(BaseModel):
+    bytes: int
+    sha256: str
+
+
+class DatasetManifest(BaseModel):
+    schema_version: int = 1
+    smc_version: str
+    exported_utc: AwareDatetime
+    source: str  # the source run document's file name, never its path
+    profile: str  # the scan record's profile ([microscope] name)
+    objective: str | None
+    pixel_size_um: float
+    image_shape_px: tuple[int, int]
+    wells: tuple[str, ...]  # the plan's order
+    frames: int
+    cells: bool
+    cells_absent: str | None  # why there are no cells, when there are none
+    files: dict[str, DatasetFile]  # POSIX relative path -> size and hash
+    scrubbed: tuple[str, ...]  # JSON pointers rewritten by §2.2
+```
+
+Both models are `extra="forbid"`, `frozen=True`; `files` holds every file
+but `manifest.json`. The generated `README.md` (English, plain) says: what
+the scan is (date, profile, objective, pixel size, image shape, wells,
+frames, cells or why not); the layout; the units and conventions (stage µm
+readbacks, `well_dx_um`/`well_dy_um` as the readback minus the well's
+centre in stage axes, `(dx, dy) = M @ (col, row)` for the matrix, a pixel
+size of 0 is unknown); how to load it (`from smc.data import load_scan`);
+how to check it (`smc dataset check`); and that only the scan's frames and
+the cells file were copied.
+
+### 2.4 `smc dataset check DIR`
+
+Reads `DIR/manifest.json`, checks every listed file's size and SHA-256,
+then loads `DIR/run.json` with `load_scan`. Exit 0 when all hold; 1 when a
+file is missing or differs (each named); 2 with no readable manifest or
+when `load_scan` refuses.
+
+### 2.5 How a dataset travels
+
+Zipped onto the lab's share (the owner names the folder in the guide,
+§7.6), never in the repository. The collaborator unzips it under `local/`
+in their clone (ignored by git, `.gitignore`'s `/local/`) and runs `smc
+dataset check` first. The cell model's weights travel the same way.
+
+## 3. The loader (#564)
+
+Package `src/smc/data/`: `__init__.py` re-exports `load_scan`, `Scan`,
+`cells_table`, `DatasetError`; `scan.py` holds them. Nothing in
+`src/smc/data/` imports `smc.hardware`, `smc.testing` or `smc.ui` (§8).
+
+```python
+class DatasetError(ValueError):
+    """A run folder or dataset that cannot be read; the message names the file and why."""
+
+
+def load_scan(run_doc: Path | str) -> Scan: ...
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class Scan:
+    run_dir: Path
+    document: RunDocument
+    profile: str
+    plan: ScanPlanResult
+    result: ScanResult
+    wells: tuple[str, ...]
+    geometry: Mapping[str, WellGeometry]
+    cells: tuple[Cell, ...] | None
+    cells_result: CellsResult | None
+    cells_absent: str | None
+
+    @classmethod
+    def from_results(
+        cls,
+        run_dir: Path,
+        document: RunDocument,
+        *,
+        plan: ScanPlanResult,
+        result: ScanResult,
+        cells_result: CellsResult | None,
+        cells: Sequence[Cell] | None,
+    ) -> Scan: ...
+
+    @property
+    def pixel_size_um(self) -> float: ...
+    @property
+    def matrix_um_per_px(self) -> Matrix2: ...
+    @property
+    def image_shape_px(self) -> tuple[int, int]: ...
+    def frames(self, well: str | None = None) -> tuple[ScanFrame, ...]: ...
+    def image(self, frame: ScanFrame) -> NDArray[Any]: ...
+    def cells_of(
+        self, *, well: str | None = None, frame: int | None = None
+    ) -> tuple[Cell, ...]: ...
+```
+
+- **`load_scan`** loads the document (`RunDocument.load`; its
+  `RunDocumentError` becomes a `DatasetError`), takes the `scan` slot's
+  provider, refuses it as §2.1 does (no provider, not usable on its own
+  profile, a dry run), and takes the `scan-plan` provider the same way. The
+  cells are the `cells` provider's when it is usable on the scan's profile
+  (`load_cells`); otherwise `cells` and `cells_result` are `None` and
+  `cells_absent` holds the reason (`unusable`'s text, or "no cells record").
+  Frames are not read at load.
+- **`wells`** is the plan's order; **`geometry`** is `well_geometry(plan,
+  well)` for each. The camera is the scan's (`result.matrix_um_per_px`,
+  `result.image_shape_px`), never the plan's copy (FM-124).
+- **`image(frame)`** is `ScanResult.load_frame(run_dir, frame)`; its
+  `FileNotFoundError` and `ValueError` become a `DatasetError` naming the
+  frame.
+- **`from_results`** builds a `Scan` from results already read (`route`
+  uses it, §5.6); it checks nothing `ctx.upstream` has checked.
+- `cells_of(well=…)` and `cells_of(frame=…)` filter by the cell's `well` and
+  `frame` (the index into `result.frames`); both may be given.
+
+```python
+def cells_table(cells: Sequence[Cell]) -> dict[str, NDArray[Any]]: ...
+```
+
+Columns, one entry per cell, in the input's order: `well` and `label`
+(`str` arrays), `frame` (`int64`), `score`, `x_um`, `y_um`, `row_px`,
+`col_px` (the box's centre), `row0_px`, `col0_px`, `row1_px`, `col1_px`
+(`float64`). `pandas.DataFrame(cells_table(cells))` is a table; pandas is
+not a dependency.
+
+**`smc dataset show RUN_DOC`** prints, through `rich`: the profile, the
+objective, the pixel size and image shape, each well with its frame count
+and its frames per focus state, and the cells per class per well, or why
+there are none. Exit 0, or 2 when `load_scan` refuses. The `smc dataset`
+group is a `typer` sub-app in `src/smc/data/cli.py`, added to
+`src/smc/cli.py` by #564; #565 and #568 add their commands to the
+sub-app only.
+
+## 4. Offline runs (#566)
+
+Amends m3 §1.10 (the CLI) and §1.3 (an optional plugin attribute).
+
+### 4.1 `smc run NAME --offline --run-doc RUN_DOC`
+
+- **Which plugins**: those whose class sets `offline: ClassVar[bool] =
+  True`: `cells`, `density`, `route`, `report`, `nis-export`. The attribute
+  is optional (`getattr(plugin, "offline", False)`); the registry does not
+  require it, so a third-party plugin may set it. Any other is refused
+  (exit 2): "NAME drives the stand; --offline runs: cells, density,
+  nis-export, report, route" (the list from the registry, sorted).
+- **The profile** is the one the run document recorded: the `profile` of
+  the providers of the plugin's `reads` that exist. They must agree (they
+  do whenever `unusable` passes). An explicit `--profile` (or
+  `SMC_PROFILE`) that differs is refused naming both; none is the recorded
+  one. No provider of any read slot: refused, "nothing upstream: an
+  offline run reads a run document made at a stand". The profile is loaded
+  by name from the search paths (`Profile.load`), which needs no
+  Micro-Manager (§1).
+- `--offline` with `--dry-run` is refused (usage error, exit 2).
+  `--resume`, `--param` and `--preset` behave as on a stand.
+- No stand is opened: the plugin runs on `Microscope.offline(profile)`
+  (§4.2). The record carries `profile` = the profile's name, `dry_run` =
+  false, and `offline` = true (§4.3).
+
+### 4.2 `Microscope.offline(profile)`
+
+`src/smc/hardware/microscope.py`; the owner's path (§7.4).
+
+```python
+class Microscope:
+    @classmethod
+    def offline(cls, profile: Profile) -> Microscope: ...
+    @property
+    def is_offline(self) -> bool: ...
+```
+
+(A class method and a property cannot share a name: the constructor is
+`offline`, the property `is_offline`.)
+
+- A facade with **no core and no device**: `has(capability)` is false for
+  every capability, `get` returns `None`, `require` raises
+  `CapabilityMissingError` whose message says that no stand is open (offline
+  run). Every move therefore fails before it starts, by construction: there
+  is no capability to move with.
+- `profile` is the profile given; `dry_run` is false; `is_offline` is true, and false on every other `Microscope`.
+- Creating one never imports `pymmcore_plus` and never calls `open_core`.
+  Whatever the facade's other members do with no core (a state, a stop, a
+  close) is a no-op or an empty answer; the plan of #566 lists them.
+
+### 4.3 The stage record's `offline`
+
+`StageRecord.offline: bool = False`, omitted from the JSON when false (as
+`preset` is), so every existing run document reads and writes unchanged
+and `SCHEMA_VERSION` stays 1. An offline run's record says it was made off
+the stand; nothing else changes (staleness, `unusable`).
+
+### 4.4 `route` offline
+
+`_imaging_with` on an offline microscope (`microscope.is_offline`), with `objective` naming another
+objective than the scan's: the labels are the keys of the profile's
+`[camera] pixel_size_um` and the sizes its entries. The ratio is the one the
+stand would give (§1: the magnification factor divides both), so `assumed`
+says what it already says ("the field of <objective> is the scan's scaled
+by the profile's pixel sizes") and nothing more. An objective absent from
+the map is the same refusal as on a stand, naming the map. `_offset_profile`
+reads the profile, as now.
+
+## 5. The selection contract (#567)
+
+Amends m3 §11 (route chooses through a selector and an orderer) and §3.5
+(`RoutePosition` gains two optional fields).
+
+### 5.1 The package
+
+`src/smc/selection/`:
+
+- `api.py`: `SelectorParams`, `OrdererParams`, `SelectionInput`, `Choice`,
+  `Selector`, `Orderer`, `SelectionError`;
+- `registry.py`: the two entry-point groups;
+- `checks.py`: what the layer checks (§5.5);
+- `builtin.py`: `MostCells`, `Nearest`, `AsChosen` (§5.4);
+- `testing.py`: `make_input` for tests (§5.7);
+- one module per algorithm, `src/smc/selection/<name>.py` (a package
+  `src/smc/selection/<name>/` when it grows), the collaborator's.
+
+Nothing in `src/smc/selection/` imports `smc.hardware`, `smc.testing` or
+`smc.ui` (§8). It may import `smc.data`, `smc.plugins.slots`,
+`smc.plugins.geometry` and `smc.plugins.route.algorithm`; `route`'s plugin
+imports `smc.selection`, and `smc.selection` never imports
+`smc.plugins.route.plugin`.
+
+### 5.2 Inputs and outputs
+
+```python
+class SelectorParams(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+
+class OrdererParams(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+
+class SelectionError(ValueError):
+    """Data a selector or an orderer cannot use, or a choice the layer refuses."""
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class SelectionInput:
+    scan: Scan
+    labels: tuple[str, ...]
+    fields_per_well: int
+    wall_margin_um: float
+    exclude_centre_um: float
+    objective: str | None
+    matrix_um_per_px: Matrix2
+    image_shape_px: tuple[int, int]
+
+    @property
+    def fov_um(self) -> tuple[float, float]: ...
+    @property
+    def cells(self) -> tuple[Cell, ...]: ...
+    def allowed(self, x_um: float, y_um: float, well: str) -> bool: ...
+    def cells_in(
+        self,
+        x_um: float,
+        y_um: float,
+        well: str,
+        *,
+        labels: Sequence[str] | None = None,
+    ) -> tuple[Cell, ...]: ...
+    def first_field(self, well: str) -> tuple[float, float]: ...
+```
+
+- `scan` holds cells (route reads the `cells` slot); `cells` returns them
+  and raises `SelectionError` if `scan.cells` is `None`.
+- `matrix_um_per_px` and `image_shape_px` are the **imaging objective's**
+  field (the scan's, or scaled per m3 §11), not the scan's: a field chosen
+  at 40× from a 10× scan has the 40× footprint. `fov_um` is `fov_of` of
+  them.
+- `allowed` is `route.algorithm.allowed` with this input's matrix, shape,
+  margin and excluded centre. `cells_in` is route's counting arithmetic (a
+  cell is in a field when `pixel_of_stage` of its centre falls in the
+  footprint, m3 §11), filtered to `labels` (default: this input's), made
+  public by #567 as `route.algorithm.cells_in_field(cells, x_um, y_um, *,
+  matrix, image_shape_px) -> tuple[Cell, ...]`. `first_field` is the plan's
+  first field of the well, the reference route's order starts from.
+
+```python
+@dataclass(frozen=True, slots=True)
+class Choice:
+    well: str
+    x_um: float
+    y_um: float
+    score: float | None = None
+    measures: Mapping[str, float] = field(default_factory=dict)
+```
+
+A choice is a field centre in stage µm. `score` is the selector's own
+(larger is better, any scale); `measures` are the numbers it decided on,
+keys in `snake_case` with their unit (`density_per_mm2`, `nn_median_um`,
+`doublet_fraction`), values finite.
+
+### 5.3 The two protocols
+
+```python
+class Selector(Protocol[SP]):
+    name: str
+    summary: str
+    Params: type[SP]
+
+    def select(self, data: SelectionInput, params: SP) -> Sequence[Choice]: ...
+```
+
+```python
+class Orderer(Protocol[OP]):
+    name: str
+    summary: str
+    Params: type[OP]
+
+    def order(
+        self, choices: Sequence[Choice], data: SelectionInput, params: OP
+    ) -> Sequence[int]: ...
+```
+
+(`SP` and `OP` are type variables bound to `SelectorParams` and
+`OrdererParams`.)
+
+- **`select`** returns the chosen fields of every well, in the order it
+  ranks them (the order in which `counts` are attributed, §5.6). It may
+  choose any centre (the scan's frames, route's lattice, anything else);
+  the layer checks them (§5.5).
+- **`order`** returns a permutation of `range(len(choices))`: the visiting
+  order of the whole plate, across wells. It may reorder the wells.
+- **Pure**: deterministic for the same input (a randomised method takes a
+  `seed` in its params), no I/O but `data.scan.image(frame)`, no clock, no
+  import of the hardware layer. NumPy is there; another library is a
+  declared dependency in the same PR (SciPy: `scipy>=1.11.4`, the floor
+  scikit-image already sets).
+- A selector that cannot use its input raises `SelectionError` with a
+  sentence the owner can act on.
+
+### 5.4 The registry and the built-ins
+
+`registry.py`:
+
+```python
+SELECTOR_GROUP = "smc.selectors"
+ORDERER_GROUP = "smc.orderers"
+
+
+def selectors() -> dict[str, Selector[Any]]: ...
+def orderers() -> dict[str, Orderer[Any]]: ...
+def selector(name: str) -> Selector[Any]: ...
+def orderer(name: str) -> Orderer[Any]: ...
+```
+
+- An entry point's value names a class instantiated with no argument; its
+  `name` equals the entry point's name and is kebab-case (m3's
+  `NAME_PATTERN`); `summary` is one line; `Params` subclasses
+  `SelectorParams` or `OrdererParams`. An entry point that fails to load or
+  breaks these rules is left out with a logged warning, and `selector(name)`
+  for it raises `SelectionError` giving the load error.
+- An unknown name raises `SelectionError` that lists the known names,
+  sorted.
+- Registered in `pyproject.toml`:
+
+```toml
+[project.entry-points."smc.selectors"]
+most-cells = "smc.selection.builtin:MostCells"
+
+[project.entry-points."smc.orderers"]
+nearest = "smc.selection.builtin:Nearest"
+as-chosen = "smc.selection.builtin:AsChosen"
+```
+
+- **`most-cells`** is m3 §11's rule unchanged: per well in the plan's
+  order, `choose_fields` on route's lattice; params `min_cells: int = 1`
+  (≥ 1) and `candidate_step_fraction: float = 0.25` (> 0, ≤ 1). Its choices
+  carry `score=None` and no measures, so the default route's JSON is
+  unchanged.
+- **`nearest`** is m3 §11's order unchanged: the wells in the plan's order;
+  in each, nearest neighbour then 2-opt (`order_route`), starting at the
+  choice nearest the previous well's last stop, or the well's
+  `first_field` for the first well. No params.
+- **`as-chosen`** keeps the selector's order (the identity). No params.
+
+### 5.5 What the layer checks
+
+`checks.py`, called by `route` on every result, raising `SelectionError`
+that names the selector or orderer and the offending choice:
+
+```python
+def check_choices(choices: Sequence[Choice], data: SelectionInput) -> None: ...
+def check_order(order: Sequence[int], n: int) -> None: ...
+```
+
+- each choice's well is one of `data.scan.wells`; `x_um`, `y_um`, `score`
+  and every measure are finite; measure keys match `[a-z][a-z0-9_]*`;
+- each choice is `data.allowed` (inside the well shrunk by the wall margin,
+  away from the excluded centre);
+- no well has more than `data.fields_per_well` choices;
+- no two choices of one well overlap (route's rule: `|d_col| < W − 1e-6`
+  and `|d_row| < H − 1e-6` in the imaging field's pixels; touching is
+  allowed);
+- the order is a permutation of `range(n)`.
+
+A selector's mistake is a refusal, never a silent drop: the stage ends
+`failed` with the check's sentence, and the collaborator sees it.
+
+### 5.6 `route` with a selector and an orderer (amends m3 §11)
+
+`RouteParams` gains four fields; the others are unchanged:
+
+```python
+class RouteParams(PluginParams):
+    selector: str = "most-cells"
+    selector_params: dict[str, JsonValue] = Field(default_factory=dict)
+    orderer: str = "nearest"
+    orderer_params: dict[str, JsonValue] = Field(default_factory=dict)
+```
+
+(`labels`, `fields_per_well`, `min_cells`, `exclude_centre_um`,
+`wall_margin_um`, `objective` and `candidate_step_fraction` stay as m3 §11
+has them.)
+
+- **Validation** (an `after` model validator, so `--param` reports it as a
+  `ParamsError`): the names are registered; `selector_params` validates
+  against the selector's `Params` and `orderer_params` against the
+  orderer's. `min_cells` and `candidate_step_fraction` are `most-cells`'
+  parameters, kept on `RouteParams` for the presets and the page: with
+  `most-cells`, they are its params, and giving either one in
+  `selector_params` too is refused; with another selector, a value other
+  than their default is refused, naming `most-cells`.
+- `--param selector_params='{"min_density_per_mm2": 20}'` takes JSON (m3
+  §1.6, a non-scalar field).
+- **The run**: after the upstreams and the imaging field (unchanged), route
+  builds `Scan.from_results(...)` and a `SelectionInput`; calls
+  `select`; `check_choices`; attributes `counts` in the selector's order
+  (each wanted cell to the first choice that holds it, as today); calls
+  `order`; `check_order`; then numbers, names, focuses and measures the
+  stops as m3 §11 and §26 do (`order`, `<well>_r<k:03d>`, `stop_focus`,
+  `uncovered`, `distance_um`, `travel_s`). No stop at all is the
+  `PluginRunError` it is today.
+- A `SelectionError` from `select`, `order` or a check, and any other
+  exception from a selector or an orderer, ends the stage as a
+  `PluginRunError` whose message starts with `selector <name>:` or `orderer
+  <name>:` (another exception's type is named too); the stage is `failed`.
+- `RoutePosition` (m3 §3.5) gains `score: float | None = None` and
+  `measures: dict[str, float] = {}`, both omitted from the JSON when `None`
+  or empty; `nis-export` ignores them. The default route's result is
+  byte-identical to today's.
+
+### 5.7 Tests of a selector
+
+`smc.selection.testing.make_input(...)` builds a `SelectionInput` in memory,
+with no file and no stand, from cell positions:
+
+```python
+def make_input(
+    cells: Sequence[tuple[str, float, float, str]],
+    *,
+    wells: Sequence[str] = ("B2",),
+    plate: str = "96-well",
+    field_um: tuple[float, float] = (100.0, 100.0),
+    fields_per_well: int = 10,
+    wall_margin_um: float = 0.0,
+    exclude_centre_um: float = 0.0,
+) -> SelectionInput: ...
+```
+
+Each cell is `(well, x_um, y_um, label)`, in stage µm; the plate's wells
+come from useq's plate (`plate`, A1 at the origin); the field is a square
+camera with no rotation (`field_um` over a 100 × 100 px frame). It is in
+`smc.selection`, not `smc.testing`, so it never imports `pymmcore_plus`.
+`image()` on such an input raises `DatasetError` (no frames); a selector
+that reads pixels is tested on a run folder written by the test.
+
+## 6. The drawing (#568)
+
+`smc dataset draw RUN_DOC [--out DIR] [--wells A1,B2] [--max-px 1600]`,
+the drawing in `src/smc/data/draw.py`, moved from
+`scripts/dev/select_fields.py` (`canvas_of`, `place_frame`,
+`stretch_to_uint8`, `render_png`, and what they use), which then imports
+it.
+
+- One PNG per well, `<DIR>/<well>.png`, default `DIR` = `<run
+  folder>/draw/`: the frames' pixels block-meaned onto the well's canvas
+  (longest side at most `--max-px`), the well's wall, the cells coloured by
+  label, the `route` slot's stops of that well as footprints (the route's
+  own matrix and shape, FM-124) numbered `order + 1`, the path between
+  them, and the score after the number when the stop has one; a caption
+  with the well, the route record's plugin, `selector` and `orderer`, the
+  number of stops and the uncovered cells.
+- Without a usable `route` record (none, or not usable on the scan's
+  profile), the frames and the cells only, and the caption says why.
+- The PNGs it writes are overwritten; nothing else in `DIR` is touched.
+  Exit 0; 1 a PNG not written; 2 when `load_scan` refuses or `--wells`
+  names a well the scan lacks.
+- `pillow>=10.1` becomes a declared dependency (`ImageFont.load_default(size=…)`
+  needs 10.1).
+
+## 7. Two people in one repository (#554)
+
+### 7.1 Where things go
+
+An `area: algorithms` change lives in `src/smc/selection/` (its module),
+`tests/` (its tests), `docs/algorithms/` (its page) and `pyproject.toml`
+(its entry point; a dependency if it needs one). It does not touch
+`src/smc/hardware/`, `profiles/` or `src/smc/ui/`; `/review` checks the
+paths.
+
+### 7.2 Two issues per result
+
+- **The algorithm issue** (`area: algorithms`, the collaborator's, from the
+  *Algorithm* template, §7.3) is done when the algorithm passes its tests
+  in CI and has been looked at on a dataset with the owner.
+- **The wiring issue** (`area: plugins` or `area: ui`, the owner's) names
+  the first on its plan's `**Depends on**` line, connects the result to the
+  tool that drives the microscope, and carries the check at a stand.
+
+### 7.3 The issue template
+
+`.github/ISSUE_TEMPLATE/algorithm.yml`, labels `type: feature` and `area:
+algorithms`, fields: **Goal**; **Data in** (the dataset on the share, the
+stages it needs); **Decision out** (the selector or orderer, its params,
+what its measures hold); **How it is judged** (tests on synthetic inputs,
+the dataset's drawings looked at with the owner, the numbers to report);
+**The wiring issue** (the owner's, filled when it exists).
+`scripts/github/labels.json` gains `area: algorithms` (colour `5319E7`,
+"Pure algorithm on acquired data — no microscope, no smc.hardware (ADR-0004's
+algorithm half)"), as it already is on GitHub.
+
+### 7.4 Reviews and `main`
+
+`.github/CODEOWNERS`:
+
+```text
+/src/smc/hardware/  @clementhelsens
+/profiles/          @clementhelsens
+/docs/adr/          @clementhelsens
+/docs/design/       @clementhelsens
+/.github/           @clementhelsens
+/.claude/           @clementhelsens
+/CLAUDE.md          @clementhelsens
+```
+
+Branch protection of `main`, set by the owner in the repository's settings
+(not by a PR): a pull request is required; the light set and *closing
+references* are required checks; **review from code owners is required**,
+with no general approval count, so a PR on the paths above needs the
+owner's approval and any other needs CI only. The owner remains the only
+one who merges (CLAUDE.md applies to people too); the owner, as an
+administrator, may bypass the rule for their own PRs on those paths, since
+an author cannot approve their own PR.
+
+### 7.5 Sessions
+
+The collaborator has write access and runs this repository's skills in
+Claude Code: `/develop <issue>` on an `area: algorithms` issue labelled
+`status: ready`, `/feature` for a small one, `/adversarial-review` inside
+`/develop` as for anyone. `/point`, `/lane`, `/plan`, `/review`, `/adr` and
+`/hardware-session` stay the owner's. Their comments carry the same headers
+(`## Report (develop session, <date>)`), which `point.py` reads as an
+agent's. Their own notes start with no header, as the owner's do; `/point`
+tells them apart by author.
+
+### 7.6 Set-up on a laptop, and the guide
+
+`CONTRIBUTING.md` gains a section *Working on algorithms (no microscope)*:
+
+```sh
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"          # pymmcore-plus comes as a library; no adapters
+pre-commit install
+pytest                           # the demo tests skip: "Micro-Manager demo adapters not installed"
+pip install -e ".[dev,detect]"   # only to run the cell model (torch)
+```
+
+No `mmcore install`, no `smc doctor`, no vendor software. The demo tests
+skip locally and run in CI (`SMC_REQUIRE_MM=1`); never set
+`SMC_REQUIRE_MM` on the laptop. Building the acquisition loop (#556) needs
+the demo adapters: `mmcore install --test-adapters`.
+
+`docs/algorithms/README.md`, the guide, in this order: what the kit is for
+(§0); set-up (above); get a dataset (the share's folder, unzip under
+`local/`, `smc dataset check`, `smc dataset show`); load it in Python
+(`load_scan`, frames, images, cells, `cells_table`); run the chain
+offline (`smc run cells --offline` with the model or `detector=blobs`,
+`density`, `route` with `selector=…`, `smc dataset draw`, `report`,
+`nis-export`); write a selector (`/new-selector <name>`, or by hand: the
+module, the entry point, the test, the page); test it (`make_input` cases
+whose answer is known, then the dataset); what never to assume (a stage
+position is a readback; a pixel size of 0 is unknown; a frame's `focus`
+may be `unlocked`; the field chosen at another objective has that
+objective's footprint); what never to touch (§7.1); the issue pair and
+the PR (§7.2); what comes next (#556, #32). A page per algorithm,
+`docs/algorithms/<name>.md`: what it measures, its params, what was tried
+on which dataset, with numbers.
+
+The skill `.claude/skills/new-selector/SKILL.md` (`/new-selector <name>`)
+scaffolds `src/smc/selection/<module>.py` (its `Params`, a `Selector` whose
+`select` returns the allowed scan frames' centres with the most wanted
+cells, a working example to replace), `tests/test_selector_<module>.py`
+(two `make_input` cases), the entry-point line, and
+`docs/algorithms/<name>.md`.
+
+## 8. Tests that hold the kit together
+
+- `tests/test_kit_imports.py::test_kit_never_imports_pymmcore_plus` — a
+  subprocess imports `smc.data` and `smc.selection` (and, from #568,
+  `smc.data.draw`) and finds no `pymmcore_plus` in `sys.modules`.
+- `tests/test_kit_imports.py::test_kit_modules_never_import_the_hardware_layer`
+  — an AST walk over `src/smc/data/` and `src/smc/selection/` finds no
+  import of `smc.hardware`, `smc.testing`, `smc.ui`, `pymmcore_plus` or
+  `pymmcore`. #564 creates the module with its package; #567 adds its
+  package to both lists.
+- Each issue's own tests are named in its plan.
+
+## 9. The issues and their order
+
+| Issue | What | Depends on | Edits |
+|---|---|---|---|
+| #564 | §3 loader, `smc dataset show`, the import guard | — | `src/smc/data/`, `src/smc/cli.py` (one line) |
+| #566 | §4 offline runs | — | `src/smc/cli.py` (`run`), `src/smc/hardware/microscope.py`, `src/smc/run/document.py`, the five plugins' classes, `route/plugin.py` |
+| #565 | §2 export and check | #564 | `src/smc/data/` |
+| #567 | §5 selection contract | #564, #566 | `src/smc/selection/`, `route/`, `slots/route.py`, `pyproject.toml` |
+| #568 | §6 drawing | #565, #567 | `src/smc/data/`, `scripts/dev/select_fields.py`, `pyproject.toml` |
+| #554 | §7 guide, template, CODEOWNERS, labels, skill | #564–#568 | `docs/`, `.github/`, `.claude/skills/`, `CONTRIBUTING.md`, `CLAUDE.md` |
+| #570 | the first task (collaborator) | #554, a dataset of 2026-11-19 | `src/smc/selection/<name>.py` |
+| #569 | the page's choice (owner) | #567 | `src/smc/ui/` |
+
+#564 and #566 both edit `src/smc/cli.py` and do not run at the same time.
+
+## 10. Not decided here
+
+- Whether a selector may read the 40× frames of another run to judge its
+  choice (the first task may want it; a second `Scan` in the input is the
+  likely shape, decided when #570 needs it).
+- A decision during an acquisition (#556, #32): the contract here is for
+  a choice made after a scan.
+- pandas as a dependency: not now; `cells_table` gives the columns.
