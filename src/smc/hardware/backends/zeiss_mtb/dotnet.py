@@ -506,15 +506,34 @@ def _shape(args: tuple[Any, ...]) -> str:
     return f"({', '.join(shown)})"
 
 
+def _answer(value: Any) -> Any:
+    """MTB's own answer: the first item when pythonnet appended out-parameters to it.
+
+    A tuple is never ``False``, so ``(False, <out>)`` read whole would pass for
+    a success. Which of DF2's calls have an out-parameter is not known from the
+    stand (m4 §12): every answer is read this way.
+    """
+    if isinstance(value, tuple):
+        return value[0] if value else None
+    return value
+
+
+def _tried(args: tuple[Any, ...], exc: BaseException) -> str:
+    return f"{_shape(args)}: {type(exc).__name__}: {exc}"
+
+
 class DotNetFocusStabilizer:
     """Definite Focus 2, cast to ``IMTBFocusStabilizer2`` only (m4 §11.3).
 
     Ported from the predecessor's ``MTBDefiniteFocus``, whose learn ran at the
     stand (2026-09-11). Its argument shapes are kept, in its order, because
-    the overloads MTB 2.12 offers are known from reflection only; each one
-    that raises is kept, and when none answers, the ``MTBError`` names the call
-    and every shape tried, chained from the last failure (FM-113). Unlike the
-    predecessor, nothing is swallowed: a learn with no blob, a stop or a mode
+    the overloads MTB 2.12 offers are known from reflection only; when none
+    binds, the ``MTBError`` names the call and every shape tried, chained from
+    the last failure (FM-113). Unlike the predecessor, the next shape is tried
+    only after pythonnet's ``TypeError`` (no overload takes these arguments):
+    any other failure means MTB ran the call, and a ``StabilizeNow`` sent
+    again would drive the focus drive a second time, after a failure or a
+    ``Stop``. Nothing is swallowed: a learn with no blob, a stop or a mode
     switch that fails is an ``MTBError``. Its fallback to ``IMTBAutoFocus`` is
     not ported: a stand without DF2 fails its ``initialize()`` naming the cast.
     """
@@ -532,18 +551,31 @@ class DotNetFocusStabilizer:
             )
         self._c = stabilizer
 
+    def _ran(
+        self, call: str, args: tuple[Any, ...], tried: list[str], exc: Exception
+    ) -> MTBError:
+        """The error of a call MTB ran and failed in: never tried again with another shape."""
+        before = f" (after {'; '.join(tried)})" if tried else ""
+        return MTBError(f"{self.mtb_id}: {call} failed: {_tried(args, exc)}{before}")
+
     def _first_answer(
         self, call: str, method: Callable[..., Any], shapes: Sequence[tuple[Any, ...]]
     ) -> Any:
-        """``method`` with each shape in turn; the answer of the first that does not raise."""
+        """``method`` with each shape until one binds; MTB's answer (``_answer``).
+
+        Only a ``TypeError`` moves on to the next shape. Any other failure is
+        raised at once, chained (see the class).
+        """
         tried: list[str] = []
         last: Exception | None = None
         for args in shapes:
             try:
-                return method(*args)
-            except Exception as exc:
-                tried.append(f"{_shape(args)}: {type(exc).__name__}: {exc}")
+                return _answer(method(*args))
+            except TypeError as exc:
+                tried.append(_tried(args, exc))
                 last = exc
+            except Exception as exc:
+                raise self._ran(call, args, tried, exc) from exc
         raise MTBError(
             f"{self.mtb_id}: {call} failed with every argument shape tried: "
             + "; ".join(tried)
@@ -561,6 +593,7 @@ class DotNetFocusStabilizer:
         The data overload first, as the predecessor did, since only it hands
         the reference back; then the mode overload and ``GetStabilizerData``.
         """
+        call = "InitOnCurrentFocusPosition (learn)"
         mode = resolve_mode(self._ns)
         init = self._method("InitOnCurrentFocusPosition")
         tried: list[str] = []
@@ -568,30 +601,31 @@ class DotNetFocusStabilizer:
         for args in ((None, int(timeout_ms)), (None,)):
             try:
                 result = init(*args)
-            except Exception as exc:
-                tried.append(f"{_shape(args)}: {type(exc).__name__}: {exc}")
+            except TypeError as exc:
+                tried.append(_tried(args, exc))
                 last = exc
                 continue
+            except Exception as exc:
+                raise self._ran(call, args, tried, exc) from exc
             data = _extract_bytes(result)
             if data:
                 return data
             tried.append(f"{_shape(args)}: answered {result!r} with no reference")
         for args in ((mode, int(timeout_ms)), (mode,)):
             try:
-                answer = init(*args)
-            except Exception as exc:
-                tried.append(f"{_shape(args)}: {type(exc).__name__}: {exc}")
+                answer = _answer(init(*args))
+            except TypeError as exc:
+                tried.append(_tried(args, exc))
                 last = exc
                 continue
+            except Exception as exc:
+                raise self._ran(call, args, tried, exc) from exc
             if answer is False:
                 tried.append(f"{_shape(args)}: answered False")
                 continue
-            try:
-                data = _extract_bytes(self._c.GetStabilizerData())
-            except Exception as exc:
-                tried.append(f"GetStabilizerData(): {type(exc).__name__}: {exc}")
-                last = exc
-                continue
+            data = _extract_bytes(
+                _net(self.mtb_id, "GetStabilizerData", self._c.GetStabilizerData)
+            )
             if data:
                 return data
             tried.append(f"{_shape(args)}, then GetStabilizerData(): no reference")

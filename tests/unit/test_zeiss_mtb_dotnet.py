@@ -496,13 +496,15 @@ def test_focus_stabilizer_learn_falls_back_to_the_mode_overload_and_its_data() -
 
 
 def test_focus_stabilizer_every_shape_failing_names_each_and_chains_the_last() -> None:
-    class Dead(FakeStabilizer):
+    # pythonnet raises TypeError when no overload takes the arguments: the
+    # only failure after which the next shape is tried.
+    class Unbound(FakeStabilizer):
         def InitOnCurrentFocusPosition(self, *args: Any) -> Any:
             self.init_calls.append(args)
-            raise RuntimeError(f"no focus signal {len(self.init_calls)}")
+            raise TypeError(f"no overload matches {len(self.init_calls)}")
 
     with pytest.raises(MTBError) as caught:
-        _df2(Dead()).learn(30_000)
+        _df2(Unbound()).learn(30_000)
     text = str(caught.value)
     assert text.startswith(
         "MTBFocusStabilizer2: InitOnCurrentFocusPosition (learn) gave no reference"
@@ -514,8 +516,51 @@ def test_focus_stabilizer_every_shape_failing_names_each_and_chains_the_last() -
         ("(object, 30000)", 3),
         ("(object)", 4),
     ):
-        assert f"{shape}: RuntimeError: no focus signal {n}" in text
-    assert str(caught.value.__cause__) == "no focus signal 4"
+        assert f"{shape}: TypeError: no overload matches {n}" in text
+    assert str(caught.value.__cause__) == "no overload matches 4"
+
+
+def test_focus_stabilizer_a_call_mtb_ran_is_never_sent_again_with_another_shape() -> (
+    None
+):
+    # A failure that is not pythonnet's TypeError means MTB ran the call: a
+    # StabilizeNow sent again would drive the focus drive a second time.
+    class Dead(FakeStabilizer):
+        def StabilizeNow(self, *args: Any) -> bool:
+            self.stabilize_calls.append(args)
+            raise RuntimeError("lost the surface")
+
+        def InitOnCurrentFocusPosition(self, *args: Any) -> Any:
+            self.init_calls.append(args)
+            raise RuntimeError("no focus signal")
+
+    raw = Dead()
+    with pytest.raises(MTBError) as caught:
+        _df2(raw).stabilize_now(30_000)
+    assert raw.stabilize_calls == [(_Modes.Synchronous, 30_000)]
+    assert str(caught.value) == (
+        "MTBFocusStabilizer2: StabilizeNow failed: (object, 30000): RuntimeError: "
+        "lost the surface"
+    )
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    with pytest.raises(MTBError, match=r"learn\) failed: \(None, 30000\)"):
+        _df2(raw).learn(30_000)
+    assert raw.init_calls == [(None, 30_000)]
+
+
+def test_focus_stabilizer_an_answer_with_an_out_parameter_is_read_by_its_first_item() -> (
+    None
+):
+    # A tuple is never False: (False, <out>) read whole would pass for a success.
+    class Refuses(FakeStabilizer):
+        def StabilizeNow(self, *args: Any) -> Any:
+            return (False, "no surface")
+
+        def InitWithStabilizingData(self, *args: Any) -> Any:
+            return (False, None)
+
+    assert _df2(Refuses()).stabilize_now(30_000) is False
+    assert _df2(Refuses()).restore(b"\x01", 30_000) is False
 
 
 def test_focus_stabilizer_a_learn_with_an_empty_blob_is_an_mtb_error() -> None:
@@ -576,7 +621,7 @@ def test_focus_stabilizer_answers_cross_the_seam_and_a_raise_names_stabilize_now
 
     assert _df2(Refuses()).stabilize_now(30_000) is False
     assert _df2(Refuses()).restore(b"\x01", 30_000) is False
-    with pytest.raises(MTBError, match=r"StabilizeNow failed .*lost the surface"):
+    with pytest.raises(MTBError, match=r"StabilizeNow failed: .*lost the surface"):
         _df2(Dead()).stabilize_now(30_000)
 
 
