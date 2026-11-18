@@ -1675,6 +1675,93 @@ def test_status_says_no_autofocus_without_the_capability(
         assert page.status().autofocus == "no autofocus"
 
 
+@pytest.mark.parametrize(
+    ("engage", "lockable", "words", "locked"),
+    [
+        pytest.param(True, True, "autofocus locked", True, id="locked"),
+        pytest.param(False, True, "autofocus off", False, id="off"),
+        pytest.param(
+            True, False, "autofocus on, not locked", False, id="on-not-locked"
+        ),
+    ],
+)
+def test_status_autofocus_locked_follows_the_read(
+    page: PlatePage,
+    fake_core: FakeCore,
+    engage: bool,
+    lockable: bool,
+    words: str,
+    locked: bool,
+) -> None:
+    """``autofocus_locked`` is the state's two fields read once, not the words of the strip (m5 §20 D1, FM-155)."""
+    fake_core.autofocus_lockable = lockable
+    fake_core.enableContinuousFocus(engage)
+
+    status = page.status()
+
+    assert status.autofocus == words
+    assert status.autofocus_locked is locked
+
+
+def test_status_autofocus_locked_is_unknown_when_the_read_fails(
+    page: PlatePage, fake_core: FakeCore, fake_microscope: Microscope
+) -> None:
+    """A read that raised says nothing: unknown is ``None``, never ``False`` (FM-19, m5 §20 D1)."""
+    fake_core.enableContinuousFocus(True)
+
+    def broken() -> bool:
+        raise RuntimeError("the autofocus does not answer")
+
+    with _replaced(fake_microscope.require(Autofocus), "is_engaged", broken):
+        status = page.status()
+
+    assert status.autofocus == "autofocus ?"
+    assert status.autofocus_locked is None
+
+
+def test_status_autofocus_locked_is_unknown_when_the_lock_read_fails_on_an_engaged_autofocus(
+    page: PlatePage, fake_core: FakeCore, fake_microscope: Microscope
+) -> None:
+    """On and unreadable lock is unknown, while off needs no lock read (``autofocus_known``)."""
+    fake_core.enableContinuousFocus(True)
+
+    def broken() -> bool:
+        raise RuntimeError("the lock does not answer")
+
+    with _replaced(fake_microscope.require(Autofocus), "is_locked", broken):
+        engaged = page.status()
+        fake_core.enableContinuousFocus(False)
+        off = page.status()
+
+    assert (engaged.autofocus, engaged.autofocus_locked) == ("autofocus ?", None)
+    assert (off.autofocus, off.autofocus_locked) == ("autofocus off", False)
+
+
+def test_status_autofocus_locked_is_unknown_without_the_capability(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    with _replaced(
+        fake_microscope, "has", lambda capability: capability is not Autofocus
+    ):
+        status = page.status()
+    assert (status.autofocus, status.autofocus_locked) == ("no autofocus", None)
+
+
+def test_status_autofocus_locked_is_unknown_with_the_stand_closed(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    closed = PlatePage.closed(fake_microscope.profile, run_doc)
+    try:
+        status = closed.status()
+    finally:
+        closed.close()
+    assert (status.connected, status.autofocus, status.autofocus_locked) == (
+        False,
+        "?",
+        None,
+    )
+
+
 def test_a_light_that_cannot_be_read_is_a_problem_and_not_a_crash(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:

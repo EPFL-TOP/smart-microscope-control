@@ -135,3 +135,24 @@ def test_a_second_opening_of_the_stand_refuses_the_lock_the_first_read(
 
     assert core.isContinuousFocusEnabled() is False
     assert _focus_calls(core) == []
+
+
+def test_the_status_says_locked_after_the_relock_and_not_locked_after_the_timing(
+    stand: tuple[FakeCore, Microscope, PlatePage],
+) -> None:
+    """The three reads the notes follow (m5 §20 D1): locked, then off after the timing, then locked again.
+
+    With no activity going ``status()`` reads the stand on the caller's thread, so each
+    call is a fresh read and no sleep is needed (FM-44).
+    """
+    _core, _microscope, page = stand
+    assert page.status().autofocus_locked is True
+
+    _measure_the_time(page)
+    after_timing = page.status()
+    assert after_timing.autofocus == "autofocus off"
+    assert after_timing.autofocus_locked is False
+
+    page.autofocus(True)
+    assert page.join(WAIT_S), "Autofocus on did not end"
+    assert page.status().autofocus_locked is True

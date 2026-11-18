@@ -58,7 +58,7 @@ from smc.hardware.errors import (
     ProfileError,
     StopRefusedError,
 )
-from smc.hardware.microscope import describe_autofocus
+from smc.hardware.microscope import autofocus_known, describe_autofocus
 from smc.hardware.profile import Profile, SafetySection
 from smc.hardware.roles import Role
 from smc.hardware.safety import Safety
@@ -1031,7 +1031,11 @@ class PageStatus:
     stays the drive bar's line. ``stop_segments_um`` are the ``(role, segment)`` pairs of the
     refused roles whose moves the profile cuts into segments (``max_segment_um``,
     ``max_z_segment_um``): such a move ends at the end of its current segment, so the strip
-    does not say it runs to its target (m2 §11.12, #514).
+    does not say it runs to its target (m2 §11.12, #514). ``autofocus_locked`` is whether the
+    autofocus reads locked, from the same read as ``autofocus``: ``None`` with the stand closed,
+    without an autofocus or when a read it needs failed, ``False`` for off and for on and not
+    locked (m5 §20 D1). A decision (a note that says how to lock again) reads it and never the
+    words of ``autofocus`` (FM-155).
     """
 
     stand: str
@@ -1055,6 +1059,7 @@ class PageStatus:
     chain: ChainStatus | None = None
     goto_answer: GotoAnswer | None = None
     stop_segments_um: tuple[tuple[str, float], ...] = ()
+    autofocus_locked: bool | None = None
 
 
 def _stop_segments_um(safety: SafetySection) -> tuple[tuple[str, float], ...]:
@@ -1093,6 +1098,7 @@ class _StandRead:
     moving: tuple[str, ...]
     halted: bool
     problems: tuple[str, ...]
+    autofocus_locked: bool | None = None
 
 
 def jog_crossing(
@@ -4710,6 +4716,7 @@ class PlatePage:
             chain=chain,
             goto_answer=goto_answer,
             stop_segments_um=stop_segments_um,
+            autofocus_locked=read.autofocus_locked,
         )
 
     def _read_stand(self) -> _StandRead:
@@ -4746,6 +4753,14 @@ class PlatePage:
                     if microscope.has(Autofocus)
                     else "no autofocus"
                 )
+                # From the fields and not from the words (FM-155), and from this read:
+                # a second ``is_locked()`` on the tick would be a device call the strip
+                # does not need (FM-178, m5 §20 D1). Unknown stays ``None``.
+                autofocus_locked: bool | None = None
+                if microscope.has(Autofocus) and autofocus_known(state):
+                    autofocus_locked = bool(
+                        state.autofocus_engaged and state.autofocus_locked
+                    )
                 if self._microscope is microscope:
                     return _StandRead(
                         began_s=began_s,
@@ -4760,6 +4775,7 @@ class PlatePage:
                         moving=tuple(state.moving),
                         halted=state.halted,
                         problems=tuple(problems),
+                        autofocus_locked=autofocus_locked,
                     )
         return _StandRead(
             began_s=began_s,
