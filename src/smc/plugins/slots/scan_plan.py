@@ -10,7 +10,12 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import useq
-from pydantic import Field, ValidatorFunctionWrapHandler, field_validator
+from pydantic import (
+    Field,
+    ValidatorFunctionWrapHandler,
+    field_validator,
+    model_validator,
+)
 
 from smc.plugins.api import PluginResult
 from smc.plugins.geometry import Matrix2
@@ -39,6 +44,16 @@ class ScanPlanResult(PluginResult):
     ``fov_um`` is ``(width, height)``, the footprint's extent in stage axes.
     ``matrix_source`` says where the camera matrix came from: a calibration
     that was measured, the profile's pixel size, or a parameter.
+
+    ``estimate_s`` is the time of the scan with the autofocus used: each timed
+    move and snap, and one lock of the autofocus in each well when the stand has
+    one and the timings know its cost (m3 §7.4). ``estimate_without_autofocus_s``
+    is the same with no lock, the time of ``scan`` with ``autofocus="off"``; it is
+    equal to ``estimate_s`` when nothing was charged to leave out, and never above
+    it. Both are ``None`` without usable timings: an unknown is not a zero. A plan
+    written before #549 has no second figure (``None``) and an ``estimate_s`` that
+    charged a refocus at every field; it loads as it is, and running ``scan-plan``
+    again replaces it.
 
     ``plate_plan`` and every field are in the frame of ``objective`` (m3
     §18.3). ``plate_objective`` is the objective the registration was made
@@ -74,10 +89,36 @@ class ScanPlanResult(PluginResult):
     columns: int = Field(ge=1)
     fields: tuple[PlannedField, ...]
     estimate_s: float | None = Field(ge=0.0)
+    estimate_without_autofocus_s: float | None = Field(None, ge=0.0)
     plate_objective: str | None = None
     objective_shift_um: tuple[float, float] | None = None
     calibration_from: str | None = None
     calibration_measured: str | None = None
+
+    @model_validator(mode="after")
+    def _the_figure_without_the_autofocus_is_not_above_the_figure_with_it(
+        self,
+    ) -> ScanPlanResult:
+        """Refuse a second figure that cannot be the first less its locks (FM-125).
+
+        The page reads ``estimate_without_autofocus_s`` as the first figure with the
+        locks taken out, so a hand-edited record with it above ``estimate_s``, or
+        with it and no ``estimate_s``, would be drawn as a time that gets longer
+        when the autofocus is switched off.
+        """
+        without = self.estimate_without_autofocus_s
+        if without is None:
+            return self
+        if self.estimate_s is None:
+            raise ValueError(
+                "estimate_without_autofocus_s is given but estimate_s is None"
+            )
+        if without > self.estimate_s:
+            raise ValueError(
+                f"estimate_without_autofocus_s ({without:g}) is above "
+                f"estimate_s ({self.estimate_s:g})"
+            )
+        return self
 
     @field_validator("plate_plan", mode="wrap")
     @classmethod
