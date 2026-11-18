@@ -265,10 +265,9 @@ class Scan:
 - **`wells`** is the plan's order; **`geometry`** is `well_geometry(plan,
   well)` for each. The camera is the scan's (`result.matrix_um_per_px`,
   `result.image_shape_px`), never the plan's copy (FM-124).
-- **`image(frame)`** is `smc.plugins.slots.load_frame(run_dir, frame)` (a
-  function of the slots module, not a method of `ScanResult`: #564's plan
-  measured it); its `FileNotFoundError`, `ValueError` and `tifffile`'s own
-  error become a `DatasetError` naming the frame.
+- **`image(frame)`** is `ScanResult.load_frame(run_dir, frame)`; its
+  `FileNotFoundError` and `ValueError` become a `DatasetError` naming the
+  frame.
 - **`from_results`** builds a `Scan` from results already read (`route`
   uses it, §5.6); it checks nothing `ctx.upstream` has checked.
 - `cells_of(well=…)` and `cells_of(frame=…)` filter by the cell's `well` and
