@@ -1,8 +1,8 @@
 # M4 design — the Zeiss Axio Observer 7
 
 - **Status**: design for issue #25 (§0 to §10, 2026-11-16, with the owner);
-  §11 is reserved for #26 (Definite Focus 2), fixed by `/plan 26`; §12 lists
-  what the first session at the stand (#27) measures.
+  §11 is #26's (Definite Focus 2), fixed by `/plan 26` on 2026-11-18; §12
+  lists what the first session at the stand (#27) measures.
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -183,6 +183,19 @@ src/smc/testing/fixtures.py                  (edit) §9: zeiss_fake_microscope
 profiles/zeiss-observer7.toml, .cfg          (new)  §10
 pyproject.toml                               (edit) mypy override for clr, System, ZEISS
 tests/contracts/conftest.py                  (edit) §9: the zeiss-fake backend
+```
+
+Issue #26 adds (§11):
+
+```
+src/smc/hardware/capabilities.py             (edit) §11.5: FocusReference, FocusStabilized, two Autofocus methods
+src/smc/hardware/errors.py                   (edit) §11.5: AutofocusUnsupportedError
+src/smc/hardware/backends/mm.py              (edit) §11.5, §11.7: MMAutofocus refuses the one-shot mode; ZInterlock runtime-checkable
+src/smc/hardware/backends/mm_stabilizer.py   (new)  §11.6: MMFocusStabilizer
+src/smc/hardware/microscope.py               (edit) §11.7: the build, the slot, the interlock
+src/smc/hardware/backends/zeiss_mtb/         (edit) §11.3, §11.4: the seam, the .NET adapter, MTBDefiniteFocus
+src/smc/testing/fake_mtb.py                  (edit) §11.3: FakeFocusStabilizer
+profiles/zeiss-observer7.toml, .cfg          (edit) §11.7
 ```
 
 Nothing outside `smc.hardware.backends.zeiss_mtb` imports `clr`, `System`
@@ -652,11 +665,346 @@ max_z_segment_um = 100.0 # chosen as m2 §11.12 D1: equal to max_z_jog_um; not m
 
 ## 11. Definite Focus 2 (#26)
 
-Reserved; fixed by `/plan 26`: DF2 as a `GenericDevice` with its own
-`Autofocus` implementation, the interlock generalised to any `Autofocus`,
-`stabilize_now`, and the per-position reference blobs in the run document
-(ADR-0007 point 4). §6's session and §4's seam are what it builds on: its
-`MTBApi` method is added then.
+Fixed by `/plan 26` (2026-11-18) on ADR-0007 point 4 (option F1). It
+extends M2 §3 (the `Autofocus` capability) and §4 to §9 of this document,
+whose rules still hold.
+
+### 11.1 What is known
+
+From the predecessor (`lightsheet-live-tracking-tool`, branch `zeiss`:
+`mtb.py`'s `MTBDefiniteFocus`, `mtb_backend.py`, `tools/df2_test.py`) and its
+run at the stand on 2026-09-11:
+
+- Component `MTBFocusStabilizer2`; its members appear after the cast
+  `IMTBFocusStabilizer2`. Learn: `InitOnCurrentFocusPosition(None, timeout)`,
+  the overload with a `Byte[]&` out-parameter, which pythonnet returns as
+  `(bool, Byte[])`. Restore: `InitWithStabilizingData(mode, data, timeout)`.
+  One shot: `StabilizeNow(mode, timeout)`. `Stop(mode, timeout)`. Continuous:
+  `StabilizePeriodically(MTBOnOff, period)`, with a period whose unit MTB
+  does not document; `GetStabilizePeriodicallyOnOff()` returns a tuple, the
+  on/off first. `GetOperationMode`/`SetOperationMode` take
+  `MTBFocusStabilizer2OperationMode.{Exact, Balanced, Fast}`: a precision
+  setting, not one shot versus continuous. `GetPiezoFocusUsage()`. `mode` is
+  `MTBCmdSetModes.Synchronous`. The predecessor's timeout was 30 000 ms (the
+  Micro-Manager wiki recommends 25 s).
+- **A reference is an opaque blob**: 9 bytes on the stand, learned in 0.4 s
+  (Balanced, with the Fluar 10x/0.50, which `ObjectiveSuitability` called
+  "Suitable"). The predecessor kept one per position, as base64, keyed by
+  nothing else.
+- **DF2 holds a distance from the coverslip, not from the sample**, and on
+  this stand it **corrects through the focus drive** (`GetPiezoFocusUsage`
+  is Off): disturbed by +5.009 µm on the piezo, `StabilizeNow` moved the
+  focus drive by −5.398 µm and the piezo by +0.019 µm, a residual of
+  −0.370 µm on the total. The first run looked failed because it watched
+  the piezo alone.
+- `SignalQuality` read 0 after a successful recovery: it is no health signal.
+- **Not measured**: how long `StabilizeNow` takes; whether it answers `False`
+  on a success; whether `Stop` ends a synchronous `StabilizeNow` from another
+  thread; how far one `StabilizeNow` may move Z; whether a reference holds
+  after an objective change; what happens with no coverslip;
+  `StabilizePeriodically` at all.
+- The predecessor ignored the answers and swallowed the failures (the visit
+  then imaged at the commanded Z). This layer does neither.
+
+### 11.2 Scope
+
+DF2 is a unicore `GenericDevice` (§11.4), since unicore has no autofocus
+type (§1.2), and the layer reaches it through a vendor-neutral `Autofocus`
+implementation over its properties, `MMFocusStabilizer` (§11.6).
+`Autofocus` gains `learn_reference` and `stabilize_now` (§11.5).
+
+**One shot only.** In smc, DF2 never holds focus on its own: its periodic
+mode is switched off, never on. Continuous stabilisation, as an
+engage/lock, is a later issue that measures the period first.
+
+Not in #26: `SetFocusPositionOffset` (an offset on a reference, not verified
+at the stand), `FindFocus` (it finds the coverslip, not the sample),
+`ObjectiveSuitability`, the tool that visits positions with references and
+its "who owns Z" choice (§11.8), the web UI, and the `AutoFocusDevice`
+proposal upstream (ADR-0007 point 4: in parallel, not a dependency).
+
+### 11.3 The seam: `api.py`, `dotnet.py`, the fake
+
+```python
+STABILIZER_TIMEOUT_MS = 30_000
+
+
+class MTBFocusStabilizer(Protocol):
+    mtb_id: str
+
+    # InitOnCurrentFocusPosition: the reference blob
+    def learn(self, timeout_ms: int) -> bytes: ...
+    # InitWithStabilizingData: MTB's own answer
+    def restore(self, reference: bytes, timeout_ms: int) -> bool: ...
+    # StabilizeNow: MTB's own answer
+    def stabilize_now(self, timeout_ms: int) -> bool: ...
+    def stop(self, timeout_ms: int) -> None: ...
+    # "Exact", "Balanced" or "Fast"
+    def operation_mode(self) -> str: ...
+    def set_operation_mode(self, mode: str) -> None: ...
+    def piezo_focus_usage(self) -> bool: ...
+    # GetStabilizePeriodicallyOnOff, its first item
+    def periodic(self) -> bool: ...
+    # StabilizePeriodically(Off, 0)
+    def stop_periodic(self, timeout_ms: int) -> None: ...
+```
+
+`MTBApi` gains `focus_stabilizer(mtb_id) -> MTBFocusStabilizer` and
+`MTBSession` the same method, cached by id as the other components are.
+
+- `learn` returns the blob from the out-parameter; no blob, or an empty
+  one, is an `MTBError`. `restore` and `stabilize_now` return MTB's answer:
+  the device judges it (§11.4). `operation_mode` returns the member's name;
+  `set_operation_mode` takes the member by name (`getattr`, never an int,
+  §1.1), and a name that is not one of the three is an `MTBError` listing
+  them.
+- `dotnet.py`: `DotNetFocusStabilizer`, ported from `MTBDefiniteFocus`
+  **with its tests** (the predecessor's `FakeStabilizer`, `tests/test_mtb.py`).
+  The cast is to `IMTBFocusStabilizer2` only: the predecessor's fallback to
+  `IMTBAutoFocus` is not ported, and a stand without DF2 fails
+  `initialize()` naming the cast. The argument shapes are the predecessor's,
+  tried in its order; when every shape fails, the `MTBError` names the call
+  and each shape tried, chained from the last failure (FM-113). `MTBOnOff`
+  is taken as the member. Out-parameters come from the returned tuple.
+- `smc.testing.fake_mtb`: `FakeFocusStabilizer`, at `FakeMTB.stabilizer`,
+  id `MTBFocusStabilizer2`, refused like any id in `FakeMTB.absent`. It acts
+  on `FakeMTB.axes["MTBFocus"]`: `learn` returns a new 9-byte blob at each
+  call and records the focus position as that blob's plane; `restore` makes
+  a blob it learned the held one (any other blob: `False`); `stabilize_now`
+  moves the focus axis to the held blob's plane as `FakeAxis` moves (a
+  straight line over `move_s`) and answers `False` with none held; `stop`
+  ends a running `stabilize_now` where the axis is. Knobs, as §9.1's:
+  `refuse_next` (answers `False`, moves nothing), `fail_next` (raises
+  `MTBError`), `piezo_focus_usage = False`, `periodic_on = False`,
+  `stop_ignored = False` (a `stop` that ends nothing); every call is in
+  `calls`.
+
+### 11.4 The device: `MTBDefiniteFocus`
+
+| Class | Base | MTB id | Label in the `.cfg` | Role |
+|---|---|---|---|---|
+| `MTBDefiniteFocus` | `GenericDevice` | `MTBFocusStabilizer2` | `DefiniteFocus` | `autofocus` (§11.7) |
+
+Properties, registered per instance (§1.2); unicore refuses a value outside
+the allowed ones and a set of a read-only one with `ValueError` (measured,
+0.18.1):
+
+| Property | Values | Read | Set |
+|---|---|---|---|
+| `Action` | `Idle`, `Learn`, `StabilizeNow`, `Stop` | the action whose worker runs, else `Idle` | `Learn`, `StabilizeNow`: start it on the worker; `Stop`: rule 4; `Idle`: nothing |
+| `Reference` | base64 text, or `""` | the reference this device learned or restored since `initialize()`; `""`: none | a restore, on the worker; `""` is refused |
+| `OperationMode` | `Exact`, `Balanced`, `Fast` | MTB's, live | MTB's, in the call |
+| `PiezoFocusUsage` | `On`, `Off`; read-only | MTB's, live | — |
+| `Periodic` | `On`, `Off` | MTB's, live | `Off`: `stop_periodic`; `On`: refused (`MTBError`) |
+
+Rules, beside §7.2's:
+
+1. **`initialize()`** finds the component, reads the operation mode (a
+   failed cast fails here), and switches `periodic` off when it reads on,
+   with a WARNING (another MTB client left it on). `Reference` reads `""`:
+   what DF2 held before this process is not this process's to trust (FM-118).
+2. **One worker at a time** (`_Mover`, §7.2 rule 3): a learn, a stabilize and
+   a restore each run on it, and one is refused while another runs
+   (`MTBError` naming the action that runs); `busy()` is `True` while it
+   runs and raises its failure once after (§7.2 rule 4). The set returns at
+   once, and reads do not wait behind the worker (measured on a unicore
+   `GenericDevice`, 0.18.1: the set returned in under 1 ms, `deviceBusy` and
+   `getProperty` answered during a 0.5 s worker, `waitForDevice` returned
+   after 0.51 s).
+3. **What counts as done.** `Learn` calls `learn(STABILIZER_TIMEOUT_MS)`;
+   `Reference` then reads the blob as base64 (ASCII). A restore decodes the
+   text with `base64.b64decode(text, validate=True)` in the set, before
+   anything is sent (a text that is not base64 is an `MTBError` naming the
+   device), then calls `restore`: a `False` is a failure, and after any
+   failed restore `Reference` reads `""`, since DF2's reference is then
+   unknown. `StabilizeNow` calls `stabilize_now`: a `False` is a failure
+   ("DF2 answered False to StabilizeNow"), never a success, although
+   whether DF2 answers `False` on a success is not measured (§12).
+4. **`Stop`** is sent in the set, not on the worker, even while the worker
+   runs (unicore holds the device's lock for the set only). When a worker
+   runs, it logs at WARNING that whether DF2 ends a synchronous call from
+   another thread is not known (§12).
+5. **`shutdown()`** sends `Stop` to a running worker and waits for it up to
+   `STABILIZER_TIMEOUT_MS` (`_shutdown_mover`), then switches `periodic` off
+   if it reads on. It never raises; a failure is logged at ERROR. DF2 needs
+   no darkener (§8).
+6. **No `SignalQuality`**: it reads 0 while DF2 works (§11.1).
+
+### 11.5 The capability: `Autofocus` gains two methods
+
+In `smc.hardware.capabilities`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class FocusReference:
+    """A focal plane as the autofocus records it (m4 §11.5); opaque to the layer."""
+
+    #: The autofocus device that learned it; another device refuses it.
+    device: str
+    #: The device's own bytes as base64 (ASCII): a run document holds it as text.
+    data: str
+    #: The objective in place when it was learned; ``None``: no turret.
+    objective: str | None
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class FocusStabilized:
+    """What one ``Autofocus.stabilize_now`` did (m4 §11.5)."""
+
+    reference: FocusReference
+    #: The focus drive before and after; ``None``: the stand has no focus drive.
+    z_before_um: float | None
+    z_um: float | None
+```
+
+```python
+class Autofocus(Protocol):
+    # ... the methods of M2 §3, unchanged ...
+
+    def learn_reference(self) -> FocusReference:
+        """Record the plane in focus now as the reference; nothing moves."""
+        ...
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        """Bring focus to ``reference`` (else the one held) once, and leave it there."""
+        ...
+```
+
+`smc.hardware.errors` gains `AutofocusUnsupportedError(HardwareError)`:
+this autofocus does not hold focus that way, and nothing was sent. It is not
+a `SafetyRefusedError`: no guard refused a move that the stand could make,
+so a tool that skips a target on a refusal must not skip on it; a tool that
+can work either way catches it and uses the other way.
+
+- `MMAutofocus` (PFS): `learn_reference` and `stabilize_now` raise it ("PFS
+  holds focus continuously: engage()"). Nothing else in it changes.
+- `MMFocusStabilizer` (§11.6): `engage` raises it ("it holds focus one shot
+  at a time: learn_reference(), stabilize_now()").
+- A pydantic model with a `dict[str, FocusReference]` field round-trips
+  through `model_dump(mode="json")` and `model_validate` unchanged (measured,
+  pydantic 2.13.5), so a plugin's result holds references and the run
+  document stores them (§11.8).
+
+### 11.6 `MMFocusStabilizer` (`smc/hardware/backends/mm_stabilizer.py`)
+
+Vendor-neutral: it knows §11.4's five properties and nothing of MTB, so any
+Generic device that offers them is a focus stabilizer.
+
+```python
+class MMFocusStabilizer:  # implements Autofocus and ZInterlock
+    def __init__(
+        self,
+        core: CMMCorePlus,
+        label: str,
+        executor: Executor,
+        safety: Safety,
+        *,
+        objective_label: Callable[[], str | None],
+        focus: Callable[[], ZStage | None],
+    ) -> None: ...
+```
+
+`objective_label` and `focus` are the facade's, as `MMAutofocus` takes them:
+the objective is read live (`getStateLabel`, never the cached `Label`,
+§1.3), and the focus drive is looked up at the call.
+
+- **Reads** go through `executor.read` and never wait behind a stabilize
+  (§7.2 rule 5, FM-70): `is_engaged()` is `Periodic` reading `On`;
+  `is_locked()` is `is_engaged()` (smc reads no lock flag of DF2);
+  `is_in_range()` is `None`.
+- **No offset.** smc sets no offset on a DF2 reference, so the offset is
+  zero by construction, not by assumption: `offset_native()` is `0.0`,
+  `offset_unit()` `"µm"`, `offset_limits_native()` `(0.0, 0.0)`;
+  `set_offset_native(0.0)` and `offset_by_native(0.0)` return `0.0` and send
+  nothing, and any other value raises `AutofocusUnsupportedError`.
+  `focus_by_um(dz_um, force=…)` is a Z move, as on an autofocus that is off:
+  `FocusStep("z", focus().move_by_um(dz_um, force=force), None)`; with no
+  focus drive, `CapabilityMissingError` for `ZStage`.
+- **`engage()`** raises `AutofocusUnsupportedError` before anything is sent.
+- **`disengage()`** is a safe call (`executor.safe`): never refused, run
+  while halted and in dry-run. It sets `Action` to `Stop` when it reads
+  anything but `Idle`, then `Periodic` to `Off` when it reads `On`; both
+  are tried, and their failures raised together after the second.
+- **`learn_reference()`** is one action (`executor.do`) with the motion
+  below: `Action` set to `Learn`, the wait, then `Reference` read back; a
+  `""` after a learn that ended without an error is a `HardwareError`. The
+  reference is held from then on. In dry-run nothing is sent and it returns
+  `FocusReference(label, "", objective)`.
+- **`stabilize_now(reference=None)`** is one compound
+  (`executor.compound`). It is refused before anything is sent
+  (`SafetyRefusedError`, not forceable) when: no `reference` is given and
+  none is held; `reference.device` is not this label; `reference.data` is
+  `""` outside dry-run; `reference.objective` and the objective now are both
+  known and differ (FM-223: DF2 learned the plane through another
+  objective); `PiezoFocusUsage` reads `On` (DF2 would correct through the
+  piezo, which no role reads, so the Z readback would not see the
+  correction, §11.1). Then: Z is read (`z_before_um`); when `reference`
+  differs from the held one, a restore action (`Reference` set to its data,
+  the wait); then the stabilize action (`Action` set to `StabilizeNow`, the
+  wait, Z read back). A failed restore leaves no reference held. Every
+  stabilize logs its Z change at INFO. In dry-run nothing is sent and it
+  returns `FocusStabilized(reference, z, z)`.
+- **The Z guard reads after, it cannot stop during.** A Z change beyond
+  `[safety] max_engage_excursion_um`, or a Z outside `z_soft_limits_um`,
+  raises `AutofocusExcursionError(message, z_start_um=z_before_um,
+  z_um=z_um)`, whose message says that DF2 has already moved Z there and
+  that the layer left it there. A stand whose profile sets neither key has
+  no bound (the Zeiss profile, until #27 measures one, §12).
+- **The motion** of its actions: `Motion(device=label, name=f"autofocus
+  {label}", is_busy=deviceBusy(label), stop=<Action set to Stop>,
+  stop_refused=False)`, with the core's timeout (`device_timeout_ms`, 60 s
+  on this stand). `Microscope.stop()` reaches it through `disengage()`, as
+  it reaches PFS.
+- **The interlock** (`ZInterlock`): `suspend(reason)` reads `Periodic`; on
+  `On` (another MTB client) it switches it off with a WARNING and returns
+  `False`, since smc did not switch it on and does not switch it on again;
+  on `Off` it returns `False`. `relock` is never reached after a `False`,
+  and does nothing.
+
+### 11.7 The facade, the profile and the contracts
+
+- `ZInterlock` becomes `@runtime_checkable`. `Microscope._interlock()`
+  returns the autofocus when it is a `ZInterlock`, whatever its class
+  (ADR-0007 point 4); `override` logs its WARNING only for an
+  implementation that is not one.
+- `Microscope._build`: the `autofocus` role's device type decides. A
+  `GenericDevice` gets `MMFocusStabilizer`, any other `MMAutofocus`,
+  unchanged. No profile key decides it (ADR-0007, *What M1–M3 taught*,
+  point 2: no backend selection).
+- `_point_autofocus_slot` leaves the core's AutoFocus slot alone for a
+  Generic device: `setAutoFocusDevice` refuses one with `ValueError`
+  (measured, 0.18.1).
+- `Role.autofocus`'s rule is unchanged: the heuristics never pick a Generic
+  device as an autofocus; `[roles.assign] autofocus` names it, with the note
+  the role map already writes for an assigned device of another type.
+- `profiles/zeiss-observer7.cfg` gains, after the Colibri line,
+  `#py pyDevice,DefiniteFocus,smc.hardware.backends.zeiss_mtb.devices,MTBDefiniteFocus`;
+  `profiles/zeiss-observer7.toml` gains `autofocus = "DefiniteFocus"` under
+  `[roles.assign]`, and no `[autofocus]` key. `max_engage_excursion_um`
+  stays unset until #27 measures a bound (§12); its docstring in
+  `profile.py` adds "or a one-shot stabilize moves it (m4 §11.6)".
+- The contract stand `zeiss-fake` now has an autofocus. In
+  `tests/contracts/`, a case that needs `engage()` or a non-zero offset skips
+  on `AutofocusUnsupportedError` on `zeiss-fake` and `hardware` (the set
+  `_SKIPS_WHAT_IT_LACKS`) and fails on it on `fake` and `demo`. The cases of
+  the one-shot mode skip on it on every backend, since PFS has no one-shot
+  mode. One contract keeps a stand from skipping both: an autofocus holds
+  focus one way or the other (`engage` or `stabilize_now`), on every stand.
+
+### 11.8 References in the run document, and who owns Z
+
+- A tool that visits positions keeps one `FocusReference` per position in
+  its result (`dict[str, FocusReference]`), so the run document holds them
+  as ASCII text (§11.5). The layer keeps the held reference for the
+  facade's life only.
+- **Who owns Z** (the predecessor's `df2_owns_z`) is that tool's choice, a
+  param, not a profile key: after `stabilize_now`, the tool either keeps the
+  Z that DF2 left (DF2 owns Z) or adds its own correction with a Z move. The
+  layer offers both calls and decides neither. The param's name and default
+  come with the first tool that visits positions with references, a later
+  issue; the predecessor defaulted to DF2 owning Z, and called the choice a
+  scientific one, to settle by running both.
 
 ## 12. Not verified (for #27)
 
@@ -675,3 +1023,9 @@ Reserved; fixed by `/plan 26`: DF2 as a `GenericDevice` with its own
   focus direction away from the sample.
 - The soft limits, the pixel sizes per objective, the TL shutter's element
   names as MTB reports them.
+- Definite Focus 2 (§11.1): how long `StabilizeNow` takes, whether it
+  answers `False` on a success, whether `Stop` ends it from another thread,
+  how far one moves Z (then `max_engage_excursion_um`, before any
+  stabilize runs unattended), whether a reference holds after an objective
+  change, and the `piezo_focus_usage` reading. The stand check is the
+  one-shot contracts on `hardware` (learn, a 2 µm move down, a stabilize).
