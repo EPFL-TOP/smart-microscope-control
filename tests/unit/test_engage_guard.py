@@ -67,7 +67,9 @@ UNSEEN = (
     "autofocus PFS: not engaged: on this stand engaging drives Z to the plane the "
     "offset names ([autofocus] engage_drives_z_to_offset, m2 §12), and offset "
     "{offset}{unit} has not been seen locked with objective {objective!r} since the "
-    "stand was opened (seen: {seen}){switched}. {advice}"
+    "stand was opened (seen: {seen}); each smc command and each Connect of the page "
+    "opens the stand anew, so a lock read by another one does not count{switched}. "
+    "{advice}"
 )
 # The advice of m2 §12.10.5: it never names the stand's button (#331).
 NO_FIRST_LOCK = (

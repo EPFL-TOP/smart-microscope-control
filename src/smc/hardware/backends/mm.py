@@ -2054,11 +2054,17 @@ class MMAutofocus:
                 "" if objective is None else f" with objective {objective!r}"
             )
             known = ", ".join(f"{value:g}" for value in sorted(seen)) or "none"
+            # The offsets seen locked live in this ``MMAutofocus`` (m2 §12.2 D1), so a
+            # lock that a page or another command read can never count here: the clause
+            # says so, so that a checklist does not plan a console engage after a lock
+            # the page read (#546, m5 §20 D5; F10 of Ti2-E session 5).
             reason = (
                 f"on this stand engaging drives Z to the plane the offset names "
                 f"([autofocus] engage_drives_z_to_offset, m2 §12), and offset "
                 f"{offset:g}{unit} has not been seen locked{with_objective} since the "
-                f"stand was opened (seen: {known})"
+                f"stand was opened (seen: {known}); each smc command and each Connect "
+                f"of the page opens the stand anew, so a lock read by another one "
+                f"does not count"
             )
         if on:
             try:
