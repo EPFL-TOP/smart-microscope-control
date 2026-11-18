@@ -5340,9 +5340,18 @@ class PlatePage:
   `Event.set()`; no lock of the controller, FM-70), then `microscope.stop()`,
   and keeps what it did as `stop_note`, said by its outcome and never "stopped"
   by default (FM-117): `stopped: the stand is halted (Resume clears the halt)`;
-  `halted, but <the StopRefusedError, on one line>`; `the stop failed: <the
+  `the stand is halted (Resume clears the halt) and the autofocus (<label>) is
+  switched off. <devices> refuse a stop on this stand: a move already sent finishes
+  first<segments>. Use the stand's own controls to stop a move that must not finish.`
+  for a `StopRefusedError` (#544: the page's words, built from the error's `refused`
+  names, the autofocus role's label and the profile's segments, never the facade's
+  text, which ends on an API call; the clause on the autofocus only when the stand
+  has one, `<segments>` the Scan lead's own clause); `the stop failed: <the
   HardwareError, on one line>`; each starts with `<plugin> told to stop;`
-  and a space when a run was going. It never raises for a stop that fails. STOP is always
+  and a space when a run was going. The text of an error that the page shows has the
+  layer's closing phrases in the page's words (`page_words`: "call resume() to
+  continue" and "then call resume()" say "press Resume", and "(Microscope.stop())"
+  goes); the CLI keeps the facade's text. It never raises for a stop that fails. STOP is always
   offered, a run or not. **`resume()`** refuses while a run is going
   (`RuntimeError("<plugin> is running")`), then `microscope.resume()` and clears
   `stop_note`; the page offers **Resume** only while `status().halted`, because

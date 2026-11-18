@@ -5489,7 +5489,8 @@ after the other (both edit `controller.py`, `guide.py` and `plate_page.py`):
   left*), never under each row; a row's wait says only what is the row's own.
 - **D20 Plain words and local time.** The outcome line names a tool by its plain
   title (`TOOL_TITLES`), never its plugin name; a tool's exception is its one-line
-  message without the type name (the type goes to the log); the guided screens give
+  message without the type name (the type goes to the log) and with no API call in it
+  (`resume()`, `Microscope.stop()`: the page says *press Resume*, #544); the guided screens give
   times in local time to the minute (`local_time`); the expert view's cards keep UTC.
   The Wells screen says in plain words what `coverage` and `autofocus` are, on a line
   above each (the fields are the tools' own, one instance, D5, and keep their names in
