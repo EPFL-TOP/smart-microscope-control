@@ -3201,6 +3201,29 @@ def test_the_scan_screen_names_autofocus_on_while_the_scan_needs_a_lock(
     assert drawn("required") == SCAN_NEEDS_A_LOCK
 
 
+def test_the_scan_screen_names_autofocus_on_over_a_checkpoint_too_and_continue_stays_enabled(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """D3: the note is drawn whether *Start the scan* or the checkpoint's two buttons are offered, and holds none."""
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    view = _stopped_view(page, run_doc)
+    field = view.tool_fields["scan"]["autofocus"]
+
+    field.value = "required"
+    view.tick()
+    assert view.scan_button.visible is False  # the checkpoint's buttons are offered
+    assert view.scan_continue_button.visible is True
+    assert view.scan_lock_text.object == SCAN_NEEDS_A_LOCK
+    assert view.scan_lock_text.visible is True
+    assert view.scan_continue_button.disabled is False
+    assert view.scan_again_button.disabled is False
+
+    field.value = "off"
+    view.tick()
+    assert view.scan_lock_text.object == ""
+    assert view.scan_continue_button.disabled is False
+
+
 def test_the_scan_screen_says_nothing_of_a_lock_while_an_activity_goes(
     make_page: Callable[..., PlatePage],
     run_doc: Path,

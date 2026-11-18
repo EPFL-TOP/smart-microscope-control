@@ -1703,6 +1703,38 @@ def test_status_autofocus_locked_follows_the_read(
     assert status.autofocus_locked is locked
 
 
+def test_status_autofocus_locked_is_false_while_the_autofocus_reads_off_whatever_the_lock_read_says(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    """Off is never locked: a lock read that says True beside an off autofocus is not a lock (m5 §20 D1).
+
+    The facade reads ``is_engaged`` and ``is_locked`` as two device calls, so the pair can
+    disagree for a moment; the note for a lock to regain must not stay silent on it.
+    """
+    with _replaced(fake_microscope.require(Autofocus), "is_locked", lambda: True):
+        status = page.status()
+
+    assert status.autofocus == "autofocus off"
+    assert status.autofocus_locked is False
+
+
+def test_status_autofocus_locked_served_during_an_activity_is_the_latest_reads(
+    page: PlatePage, fake_core: FakeCore
+) -> None:
+    """While an activity goes the stand's fields are the latest read's, this one included (m5 §20 D1, FM-151)."""
+    fake_core.enableContinuousFocus(True)
+    assert page.status().autofocus_locked is True  # an idle read: the one that is kept
+    page.run("slow", [])
+    try:
+        assert Slow.started.wait(5)
+        going = page.status()
+        assert going.running == "slow"
+        assert going.autofocus_locked is True
+    finally:
+        Slow.release.set()
+    assert page.join(10.0)
+
+
 def test_status_autofocus_locked_is_unknown_when_the_read_fails(
     page: PlatePage, fake_core: FakeCore, fake_microscope: Microscope
 ) -> None:
