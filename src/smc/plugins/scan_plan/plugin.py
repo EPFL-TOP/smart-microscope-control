@@ -60,10 +60,12 @@ from smc.plugins.geometry import (
 )
 from smc.plugins.objectives import log_frame, objective_for, plate_for_objective
 from smc.plugins.scan_plan.algorithm import (
+    estimate_assumed,
     estimate_s,
     gap_overlap,
     grid_size,
     plan_fields,
+    refocus_count,
     turn_from_axes_deg,
 )
 from smc.plugins.scan_plan.wells import order_wells, parse_wells
@@ -283,13 +285,25 @@ class ScanPlanPlugin:
         plate_plan, fields = built
 
         timings = ctx.upstream_or_none("timings", TimingsResult)
-        estimate = (
-            estimate_s(fields, timings, refocus=microscope.get(Autofocus) is not None)
-            if timings is not None
-            else None
-        )
+        estimate: float | None = None
+        without: float | None = None
+        estimate_lines: tuple[str, ...] = ()
+        if timings is not None:
+            # A lock is the scan's, one in each well (m3 §7.4 D1): charged only on a
+            # stand that has an autofocus and a lock time that was measured, so that
+            # an unknown cost is left out and nothing is said about a lock.
+            locks = (
+                refocus_count(fields)
+                if microscope.get(Autofocus) is not None
+                and timings.refocus_ms is not None
+                else 0
+            )
+            estimate = estimate_s(fields, timings, refocuses=locks)
+            without = estimate_s(fields, timings, refocuses=0)
+            estimate_lines = estimate_assumed(locks)
         # The frame's line first: the positions are what the rest rests on. An
-        # estimate whose refocus was assumed must not read as measured.
+        # estimate whose refocus was assumed must not read as measured, and its own
+        # lines, what it counted and what it leaves out, come last.
         assumed = (
             (*frame.assumed, *basis.assumed)
             if timings is None
@@ -297,6 +311,7 @@ class ScanPlanPlugin:
                 *frame.assumed,
                 *basis.assumed,
                 *(f"timings: {line}" for line in timings.assumed),
+                *estimate_lines,
             )
         )
         return ScanPlanResult(
@@ -313,6 +328,7 @@ class ScanPlanPlugin:
             columns=columns,
             fields=fields,
             estimate_s=estimate,
+            estimate_without_autofocus_s=without,
             plate_objective=plate.objective,
             objective_shift_um=frame.shift_um,
             calibration_from=given[0] if given is not None else None,

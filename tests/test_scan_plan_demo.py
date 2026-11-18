@@ -85,6 +85,23 @@ CALIBRATION_OF_ANOTHER_FRAME = (
 )
 #: When ``_seed`` says the calibration was measured.
 SEEDED_AT = "2026-10-27T09:30:00+00:00"
+#: The ``estimate:`` lines of m3 §7.4 D5, whole (FM-45): the lock line of a plan
+#: that counts locks, and the line of what the figure leaves out, in its two forms.
+LOCKS_ASSUMED = (
+    "estimate: the autofocus holds its lock between fields and locks again once "
+    "in each well ({n}); one that refocuses at each field would take longer"
+)
+LEFT_OUT_WITH_LOCKS = (
+    "estimate: the timed moves, locks and snaps; it leaves out each frame's "
+    "write, a lock lost in a well, a channel change, the cells, the report and "
+    "the export"
+)
+LEFT_OUT_WITHOUT_LOCKS = (
+    "estimate: the timed moves and snaps; it leaves out each frame's write, a "
+    "channel change, the cells, the report and the export"
+)
+ONE_LOCK_LINES = (LOCKS_ASSUMED.format(n="1 lock"), LEFT_OUT_WITH_LOCKS)
+TWO_LOCK_LINES = (LOCKS_ASSUMED.format(n="2 locks"), LEFT_OUT_WITH_LOCKS)
 
 
 def _matrix(pixel_size_um: float, rotation_deg: float, mirrored: bool) -> Matrix2:
@@ -183,11 +200,13 @@ def _write_calibration(
     return calibration
 
 
-def _write_timings(path: Path, assumed: tuple[str, ...] = ()) -> TimingsResult:
+def _write_timings(
+    path: Path, assumed: tuple[str, ...] = (), *, refocus_ms: float | None = 400.0
+) -> TimingsResult:
     timings = TimingsResult(
         move_overhead_ms=100.0,
         move_ms_per_mm=50.0,
-        refocus_ms=400.0,
+        refocus_ms=refocus_ms,
         snap_ms=20.0,
         samples=5,
         assumed=assumed,
@@ -1126,11 +1145,15 @@ def test_the_estimate_carries_what_the_timings_assumed(
     result = _result(_run(microscope, tmp_path, wells="A1", **SMALL))
 
     assert result.estimate_s is not None
-    # Every line, in the timings' order, after the plan's own.
-    assert result.assumed == (*without.assumed, *(f"timings: {line}" for line in lines))
+    # Every line, in the timings' order, after the plan's own, then the estimate's.
+    assert result.assumed == (
+        *without.assumed,
+        *(f"timings: {line}" for line in lines),
+        *ONE_LOCK_LINES,
+    )
 
 
-def test_the_estimate_counts_refocus_on_a_stand_with_autofocus(
+def test_the_estimate_counts_one_lock_per_well_on_a_stand_with_autofocus(
     demo_microscope_with_sample: SampleMicroscopeFactory,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1139,21 +1162,61 @@ def test_the_estimate_counts_refocus_on_a_stand_with_autofocus(
     timings = _write_timings(tmp_path / "run.json")
     assert microscope.get(Autofocus) is not None
 
-    with_autofocus = _result(_run(microscope, tmp_path, wells="A1:A2", **SMALL))
-    assert with_autofocus.estimate_s == pytest.approx(
-        estimate_s(with_autofocus.fields, timings, refocus=True)
+    two = _result(_run(microscope, tmp_path, wells="A1:A2", **SMALL))
+    assert {field.well for field in two.fields} == {"A1", "A2"}
+    # A lock in each of the two wells, and not at each of the fields (#549).
+    assert two.estimate_s == pytest.approx(estimate_s(two.fields, timings, refocuses=2))
+    assert two.estimate_without_autofocus_s == pytest.approx(
+        estimate_s(two.fields, timings, refocuses=0)
     )
-    assert with_autofocus.estimate_s != pytest.approx(
-        estimate_s(with_autofocus.fields, timings, refocus=False)
+    assert two.estimate_without_autofocus_s != pytest.approx(two.estimate_s)
+    assert two.estimate_s != pytest.approx(
+        estimate_s(two.fields, timings, refocuses=len(two.fields))
     )
 
-    # One field, so no move: a refocus (400 ms) and a snap (20 ms), or the snap alone.
+    # One field, so no move: a lock (400 ms) and a snap (20 ms), or the snap alone.
     one = _result(_run(microscope, tmp_path, wells="A1", rows=1, columns=1))
     assert one.estimate_s == pytest.approx(0.42)
+    assert one.estimate_without_autofocus_s == pytest.approx(0.02)
 
     _without(microscope, monkeypatch, Autofocus)
     without = _result(_run(microscope, tmp_path, wells="A1", rows=1, columns=1))
     assert without.estimate_s == pytest.approx(0.02)
+    assert without.estimate_without_autofocus_s == pytest.approx(0.02)
+    # No autofocus: nothing is said about a lock.
+    assert without.assumed[-1:] == (LEFT_OUT_WITHOUT_LOCKS,)
+    assert not any("lock" in line for line in without.assumed)
+
+
+def test_the_estimate_says_the_locks_it_counted_and_what_it_leaves_out(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+
+    # No timings: no estimate, so no line about one, and both figures unknown.
+    unknown = _result(_run(microscope, tmp_path, wells="A1:A2", **SMALL))
+    assert (unknown.estimate_s, unknown.estimate_without_autofocus_s) == (None, None)
+    assert not any(line.startswith("estimate:") for line in unknown.assumed)
+
+    _write_timings(tmp_path / "run.json")
+    counted = _result(_run(microscope, tmp_path, wells="A1:A2", **SMALL))
+    assert counted.assumed == (*unknown.assumed, *TWO_LOCK_LINES)
+
+    # Timings that do not know a lock's cost: none is charged, and none is named.
+    _write_timings(tmp_path / "run.json", refocus_ms=None)
+    unpriced = _result(_run(microscope, tmp_path, wells="A1:A2", **SMALL))
+    assert unpriced.estimate_s is not None
+    assert unpriced.estimate_without_autofocus_s == unpriced.estimate_s
+    assert unpriced.assumed == (*unknown.assumed, LEFT_OUT_WITHOUT_LOCKS)
+
+    # A stand without an autofocus charges no lock either.
+    _write_timings(tmp_path / "run.json")
+    _without(microscope, monkeypatch, Autofocus)
+    bare = _result(_run(microscope, tmp_path, wells="A1:A2", **SMALL))
+    assert bare.estimate_without_autofocus_s == bare.estimate_s
+    assert bare.assumed == (*unknown.assumed, LEFT_OUT_WITHOUT_LOCKS)
 
 
 # ------------------------------------------------------------ dry run, reading back
@@ -1597,11 +1660,13 @@ def test_an_unmeasured_offset_is_planned_unshifted_and_says_so_before_the_timing
 
     assert (result.plate_objective, result.objective_shift_um) == (TEN, None)
     assert result.plate_plan.a1_center_xy == (1000.0, -500.0)
-    # Frame, then camera, then timings: the positions are what the rest rests on.
+    # Frame, then camera, then timings, then the estimate's own: the positions
+    # are what the rest rests on.
     assert result.assumed == (
         line,
         f"pixel size of {FORTY} from the profile, for binning 1: "
         "the camera's binning is not applied",
         NO_CALIBRATION.format(objective=FORTY),
         "timings: refocus assumed",
+        *ONE_LOCK_LINES,
     )
