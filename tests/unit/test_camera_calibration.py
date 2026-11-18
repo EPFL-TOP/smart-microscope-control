@@ -23,6 +23,7 @@ from smc.plugins.camera_calibration.algorithm import (
     MIN_FEATURE_FRACTION,
     MIN_RESPONSE,
     MIN_SIGNAL_SPREAD_COUNTS,
+    PARALLEL_SHIFTS_NOTE,
     SMALL_STEP_FRACTION,
     UPSAMPLE,
     Fit,
@@ -482,6 +483,31 @@ def test_the_residual_says_how_far_the_camera_is_from_rigid() -> None:
     off_um_per_px = 0.55 - math.sqrt(0.55 * 0.5)
     assert result.residual_um == pytest.approx(off_um_per_px * 300 / 2, rel=1e-6)
     assert result.notes == ()
+
+
+def test_the_parallel_shifts_note_names_the_frames_before_the_light_path_before_the_stage() -> (
+    None
+):
+    """F12 (#545): at the 40x the stage moved, and "did the stage move?" sent the operator to it.
+
+    Parallel shifts come most often from the frames (a sparse field over a still
+    background, F12; a frame with no light, F8), so the note says so first. The
+    words "parallel shifts" stay: the docs and the page's readers search them.
+    """
+    still = Shift(0.0, 0.0, 0.8)
+
+    result = fit(still, still, step_um=50.0, image_shape_px=(200, 300))
+
+    assert result.notes == (PARALLEL_SHIFTS_NOTE,)
+    assert "parallel shifts" in PARALLEL_SHIFTS_NOTE
+    assert (
+        PARALLEL_SHIFTS_NOTE.index("too little texture")
+        < PARALLEL_SHIFTS_NOTE.index("light path")
+        < PARALLEL_SHIFTS_NOTE.index("then the stage")
+    )
+    assert "did the stage move" not in PARALLEL_SHIFTS_NOTE
+    # The plugin joins notes with a semicolon: one inside would split this one.
+    assert ";" not in PARALLEL_SHIFTS_NOTE
 
 
 def test_a_stage_that_does_not_move_is_caught() -> None:
