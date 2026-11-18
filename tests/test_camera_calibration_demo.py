@@ -397,6 +397,9 @@ def test_a_step_over_forty_percent_of_the_field_is_blamed_when_the_fit_fails(
     assert "a step over 40 % of the field may wrap: give a smaller step_um" in (
         raised.value.reason
     )
+    # The probe frames' contrast belongs to the parallel-shifts note only (#545).
+    assert "parallel shifts" not in raised.value.reason
+    assert "probe frames span" not in raised.value.reason
     assert _stored(tmp_path).result is None
 
 

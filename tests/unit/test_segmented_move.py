@@ -611,6 +611,30 @@ def _landing_off_by(core: FakeCore, segment: int, off_um: float) -> None:
     core.setXYPosition = short  # type: ignore[method-assign]
 
 
+def test_a_move_by_names_its_offset_rounded_in_the_error_of_a_segment_that_does_not_land() -> (
+    None
+):
+    # #545: the action's name is the move line's first half, and an error quotes it.
+    offset = 2500.0 + 1e-9
+    assert offset != 2500.0
+    with _stand() as (core, microscope):
+        send = core.setXYPosition
+
+        def half_way(label: str, x_um: float, y_um: float) -> None:
+            send(label, x_um, y_um)
+            core._xy[label] = (x_um / 2, y_um)
+
+        core.setXYPosition = half_way  # type: ignore[method-assign]
+        try:
+            with pytest.raises(HardwareError) as failed:
+                microscope.require(XYStage).move_by_um(offset, 0.0, force=True)
+        finally:
+            del core.setXYPosition
+    assert str(failed.value).startswith(
+        "`xy_stage: move_by (2500.0, 0.0) µm`: segment 1 of 3 read "
+    )
+
+
 def test_a_segment_that_does_not_land_stops_the_move_with_a_diagnosis() -> None:
     with _stand() as (core, microscope):
         send = core.setXYPosition
