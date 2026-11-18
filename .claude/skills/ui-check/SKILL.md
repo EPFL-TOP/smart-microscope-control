@@ -94,16 +94,21 @@ the tool refuses a dry run, and the dry-run page's plate is registered from the 
 not from walls, so the block is **hidden** there (the regression to read in `summary.txt`). It is
 checked in a **one-off browser session** of the same kind: a scratch copy of `demo-sample.toml`
 with `[sample]` turned as m3 §20.1 (`rotation_deg`, `camera_rotation_deg`, `mirrored`) and
-`objective_shift_um` set for the 10X, 20X and 40X (m3 §20.8); a scratch run folder holding the
-documents of m5 §18.1 (the 40X's and the 20X's calibration, one document each, and the 10X's
-calibration with `plate-walls` on A1, H12 and A12 in `run.json`, built through `run_plugin`);
-the page served **without** `--dry-run` on that profile and folder, on a free port; and
-Playwright at 1280 x 800 through the Plate screen: the block offered with its lead, the two
-paths typed and the lines under them, the confirmation, the block while it measures (twice, so
-that `Objective in place` shows two turns; at the demo's default 10 mm/s a run takes about a
-minute), the card and the preview, the session typed, the write, the written line and the
-profile file read. One more with a missing path and one with the plate's own document, for the
-waits. The PNGs are cited in the develop session's Report and never committed.
+`objective_shift_um` set for the 10X, 20X and 40X (m3 §20.8); a scratch run folder holding
+**only** `run.json`, with the 10X's calibration and `plate-walls` on A1, H12 and A12, built through
+`run_plugin` (since #501 the page makes the other calibrations itself, m5 §18.6 D18: no document
+of the 40X or the 20X is made beforehand); the page served **without** `--dry-run` on that profile
+and folder, on a free port; and Playwright at 1280 x 800: the Stand screen with the turret turned
+to the 40X (*Change objective*, confirmed) and the note under *Calibrate the camera* that says
+what it replaces; the Plate screen's block offered with its lead and its list of documents
+(empty, every objective `no calibration yet`) and the button naming the 40X; the click and the
+list; the same for the 20X, and a second click at the 20X (`Calibrate the camera again at ...`
+and its note); the field left empty, *Measure the offsets* and its confirmation, the block while
+it measures (twice, so that `Objective in place` shows two turns; at the demo's default 10 mm/s
+a run takes about a minute), the card and the preview, the session typed, the write, the written
+line and the profile file read. One more with a missing path typed and one with the plate's own
+document, for the waits. The dry-run states above still show the block **hidden**. The PNGs are
+cited in the develop session's Report and never committed.
 
 **A chain in motion** (*Run all that are left* with a step running and the others waiting:
 `Running now`, `after <step>`, the chain's line `Running <step> (k of 5).`) is the same kind

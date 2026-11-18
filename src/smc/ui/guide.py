@@ -65,6 +65,12 @@ __all__ = [
     "AGAIN_NOTE",
     "ASSUMED_LINE_CHARS",
     "AUTOFOCUS_WORDS",
+    "CALIBRATE_DRY_RUN",
+    "CALIBRATE_LEAD",
+    "CALIBRATE_NAMES_NONE",
+    "CALIBRATE_NOT_KNOWN",
+    "CALIBRATE_NO_OFFER",
+    "CALIBRATIONS_FOLDER",
     "CALIBRATION_HOW_WINDOWS_NOTE",
     "CAMERA_NOT_CALIBRATED_NOTE",
     "CAPTURE_FAR",
@@ -92,6 +98,7 @@ __all__ = [
     "LAY_OUT_FIRST",
     "LEFT_NOT_KNOWN_NO_TIMING",
     "MAP_FIELDS_UP_TO",
+    "MAX_POSITIONS",
     "MEASURE_AFTER_THE_SCAN",
     "MEASURE_NOT_IN_A_DRY_RUN",
     "MEASURE_THE_TIME",
@@ -160,9 +167,22 @@ __all__ = [
     "a1_corner",
     "again_note",
     "busy_note",
+    "calibrate_changed",
+    "calibrate_is_the_plates",
+    "calibrate_label",
+    "calibrate_position_unknown",
+    "calibrate_replaces",
+    "calibrate_replaces_plate",
+    "calibrate_wait",
+    "calibration_failed",
+    "calibration_file",
+    "calibration_held_line",
     "calibration_how_text",
+    "calibration_missing_line",
+    "calibration_note_line",
     "calibration_paths",
     "calibration_read_line",
+    "calibrations_held_heading",
     "capture_centre_label",
     "capture_note",
     "capture_wall_label",
@@ -239,6 +259,7 @@ __all__ = [
     "stop_segments_clause",
     "suggested_centres",
     "tool_title",
+    "turret_position",
     "wall_touches_note",
     "walls_card_lines",
     "walls_centres_problem",
@@ -2692,8 +2713,9 @@ def files_html(cards: Mapping[str, ResultCard], run_folder: PurePath | None) -> 
 #: The offsets block's title: the text of its Card (D1).
 OFFSETS_TITLE = "Measure the offsets between objectives"
 
-#: What the block waits for while no calibration document is typed (D3).
-OFFSETS_NO_DOCUMENT = "Give the camera calibration of each objective to measure: one run document per line."
+#: What the block waits for while no calibration document is typed and the page holds none
+#: it may use (m5 §18.2 D3, §18.6 D16): the button above makes them, a terminal does too.
+OFFSETS_NO_DOCUMENT = "Calibrate the camera at each objective to measure (the button above), or give one run document per line."
 
 #: Why the block does not run on a page served with ``--dry-run`` (D8): the tool refuses a
 #: dry run before anything moves, and its refusal would be a ``failed`` record that
@@ -2731,7 +2753,8 @@ OFFSETS_RESTART_FIRST = (
 )
 
 #: Under the how-to's command on a Windows page: its own note, since no button of the block makes
-#: this call (the document is made in a terminal, #501) and the line carries a placeholder.
+#: this call (the block's button runs the tool into a document of its own: the terminal's
+#: command is the other way, m5 §18.6) and the line carries a placeholder.
 CALIBRATION_HOW_WINDOWS_NOTE = (
     "On Windows that line is quoted for a POSIX shell: in PowerShell or cmd.exe, drop the single "
     "quotes around the profile's path, and write the objective's name for <objective> in the "
@@ -2750,6 +2773,8 @@ OFFSETS_TURRET_UNREAD = (
 #: ``PluginRunError: objective-offsets: <words>``: the type, then the tool's own name.
 _ERROR_TYPE = re.compile(r"^[A-Za-z_][\w.]*Error: ")
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
+#: The two tools whose error the block words: one prefix at most is dropped (``error_words``).
+_TOOL_PREFIXES = ("objective-offsets: ", "camera-calibration: ")
 
 
 def offsets_others(labels: Sequence[str], plate_objective: str) -> tuple[str, ...]:
@@ -2807,8 +2832,8 @@ def offsets_lead(plate_objective: str, others: Sequence[str]) -> str:
         return _flat(f"{registered} The turret has no other objective.")
     return _flat(
         f"{registered} Other objectives on the turret: {', '.join(others)}. The page "
-        "turns the turret to each objective of the documents below, finds the walls of "
-        "the wells it registered again, and says how far the same wells moved."
+        "turns the turret to each objective of the calibrations below, finds the walls "
+        "of the wells it registered again, and says how far the same wells moved."
     )
 
 
@@ -2900,12 +2925,17 @@ def _xy(value: tuple[float, float]) -> str:
 
 
 def error_words(text: str) -> str:
-    """``text`` as the tool words it: without the exception's type and without the tool's own name (D6).
+    """``text`` as the tool words it: without the exception's type and without the tool's own name (D6, m5 §18.6.3).
 
-    The card's ``error`` is ``PluginRunError: objective-offsets: <words>``; the block
-    draws the words, which name what to do. Any other text is returned as it is.
+    The card's ``error`` is ``PluginRunError: objective-offsets: <words>``, or
+    ``camera-calibration: <words>`` for a calibration the page made; the block draws the
+    words, which name what to do. Any other text is returned as it is.
     """
-    return _ERROR_TYPE.sub("", text, count=1).removeprefix("objective-offsets: ")
+    words = _ERROR_TYPE.sub("", text, count=1)
+    for prefix in _TOOL_PREFIXES:
+        if words.startswith(prefix):
+            return words[len(prefix) :]
+    return words
 
 
 def offsets_plate_refusal(plate: PlateResult) -> str | None:
@@ -3011,11 +3041,11 @@ def offsets_lead_unread(plate_objective: str) -> str:
 def calibration_how_text(command: str) -> str:
     """How to make the calibration document of an objective, in the operator's steps (D9).
 
-    The page does not make it (a run into a document of its own is #501), and the terminal
-    needs the stand: *Disconnect* releases it, *Connect* takes it back. ``command`` is the
-    page's own ``smc run camera-calibration`` line, ``cal-<objective>.json`` standing for the
-    file the operator names; a relative path is read from where ``smc ui`` was started, as
-    the tool reads it.
+    The block's button makes the documents of the page itself (m5 §18.6); this is the other
+    way, a terminal's, which needs the stand: *Disconnect* releases it, *Connect* takes it
+    back. ``command`` is the page's own ``smc run camera-calibration`` line,
+    ``cal-<objective>.json`` standing for the file the operator names; a relative path is
+    read from where ``smc ui`` was started, as the tool reads it.
     """
     return "\n".join(
         [
@@ -3026,3 +3056,226 @@ def calibration_how_text(command: str) -> str:
             "A relative path is read from where smc ui was started.",
         ]
     )
+
+
+# -- the page makes the camera calibration of each objective (m5 §18.6, #501) -------------
+
+#: The folder beside the run document that holds one calibration document per turret
+#: position (D11): never inside ``run.json``, whose calibration the plate was registered with
+#: (FM-216).
+CALIBRATIONS_FOLDER = "calibrations"
+
+#: How many turret positions the page reads a document for (D11). The Ti2-E's nosepiece has 6
+#: and the demo's turret 6; that no nosepiece the lab uses has more than 7 is assumed, not
+#: measured. The bound is a read's, so that a folder with 10 000 files costs nothing.
+MAX_POSITIONS = 12
+
+#: Why the block's button waits on a page served with ``--dry-run`` (D12): the tool's own
+#: refusal, pinned to its raise by a test. Written into a position's document it would
+#: replace the usable calibration it holds (FM-206).
+CALIBRATE_DRY_RUN = "a dry run cannot measure the camera; run it without --dry-run"
+
+#: The turret is between two objectives, or its read failed (D12).
+CALIBRATE_NOT_KNOWN = "the objective in place is not known: wait for the turret to stop turning, or check the stand"
+
+#: The block is only offered for a plate registered from its walls, so a click without an
+#: offer is the Stand screen's button's case (D13).
+CALIBRATE_NO_OFFER = "the plate is not registered from its walls: calibrate with the Stand screen's button, into the run document"
+
+#: A click whose button named no objective (D13, FM-169): the controller refuses it.
+CALIBRATE_NAMES_NONE = (
+    "the button names no objective: wait until it does, then press it again"
+)
+
+#: Under the block's lead: what the operator does before the button, and what the stage does
+#: after it (D12).
+CALIBRATE_LEAD = "To calibrate the camera at an objective: turn the turret to it (Stand screen, Change objective), bring a well's wall into the image (the arrows, Live), then press the button. The stage moves by about a quarter of the field in X, then in Y, and comes back."
+
+
+def calibration_file(position: int) -> str:
+    """The file name of a turret position's calibration document: ``position-<n>.json`` (D11).
+
+    A label is free text that a configuration renames and a path is built from none of it
+    (FM-24, FM-77): the name is a small integer the page writes itself.
+
+    Raises:
+        ValueError: ``position`` is outside ``1..MAX_POSITIONS``.
+    """
+    if not 1 <= position <= MAX_POSITIONS:
+        raise ValueError(
+            f"a turret position is 1 to {MAX_POSITIONS}, not {position}: "
+            "the page holds no document for it"
+        )
+    return f"position-{position}.json"
+
+
+def turret_position(labels: Sequence[str], objective: str | None) -> int | None:
+    """The turret position of ``objective``: its label's index in ``labels`` plus one, or ``None`` when that is not one position (D11).
+
+    ``labels`` are every position's label in position order, **empty positions included**
+    (``ObjectiveTurret.labels``), so the index counts them. ``None`` for no objective, a
+    blank one, a label the turret does not have, a label **two** positions carry (which of
+    them is in place cannot be said) and a position past ``MAX_POSITIONS``: the page names no
+    file for a position it does not know.
+    """
+    if objective is None or not objective.strip():
+        return None
+    found = [index for index, label in enumerate(labels) if label == objective]
+    if len(found) != 1:
+        return None
+    position = found[0] + 1
+    return position if position <= MAX_POSITIONS else None
+
+
+def calibrate_wait(
+    *,
+    connected: bool,
+    running: str | None,
+    live: bool,
+    dry_run: bool,
+    objective: str | None,
+    plate_objective: str,
+) -> str | None:
+    """Why *Calibrate the camera* waits, or ``None``: the one function the view draws and the controller refuses with (D12, FM-169, FM-206).
+
+    The first that holds: the stand is closed, an activity goes, the page is a dry run (the
+    tool refuses it, and its refusal is a ``failed`` record that replaces the position's
+    usable document), the objective in place is not known (a blank label is an empty
+    position), or it is the plate's own (its calibration is the run document's).
+    """
+    if not connected:
+        return NOT_CONNECTED
+    if running is not None:
+        return busy_note(running, live=live)
+    if dry_run:
+        return CALIBRATE_DRY_RUN
+    if objective is None or not objective.strip():
+        return CALIBRATE_NOT_KNOWN
+    if objective == plate_objective:
+        return calibrate_is_the_plates(objective)
+    return None
+
+
+def calibrate_label(objective: str | None, plate_objective: str, *, again: bool) -> str:
+    """The button's label: it names the objective in place, and says ``again`` when the position holds a usable document (D12).
+
+    The click carries this objective, and the controller runs only if the turret still reads
+    it (FM-177). For no objective, a blank one or the plate's the button waits and names none.
+    """
+    if objective is None or not objective.strip() or objective == plate_objective:
+        return "Calibrate the camera at another objective"
+    if again:
+        return _flat(f"Calibrate the camera again at {objective}")
+    return _flat(f"Calibrate the camera at {objective}")
+
+
+def calibrate_is_the_plates(objective: str) -> str:
+    """Why the block does not calibrate the plate's own objective: its calibration is the run document's (D12)."""
+    return _flat(
+        f"{objective} is the objective the plate was registered with: its calibration "
+        "is the run document's (Stand screen, Calibrate the camera); turn the turret to "
+        "an objective to measure"
+    )
+
+
+def calibrate_changed(expected: str, now: str) -> str:
+    """Why a click calibrates nothing: the turret no longer reads the label the button showed (D12, FM-177)."""
+    return _flat(
+        f"the objective in place is {now}, not {expected} as the button said: press it "
+        "again"
+    )
+
+
+def calibrate_position_unknown(label: str) -> str:
+    """Why a click calibrates nothing: the file of the label's position cannot be named (D13)."""
+    return _flat(
+        f"the turret position of {label} is not known: its labels could not be read, "
+        f"two positions carry that label, or it is past position {MAX_POSITIONS}"
+    )
+
+
+def calibrate_replaces(objective: str, measured: str) -> str:
+    """What a new calibration replaces, said before the click: a failed or stopped one leaves the position with none (D13, FM-172).
+
+    ``measured`` is what ``calibration_from`` returns for the held document; its date is the
+    first ten characters when it is an ISO time, as ``calibration_read_line`` shows one.
+    """
+    when = measured[:10] if _ISO_DATE.match(measured) else "an unknown time"
+    return _flat(
+        f"A new calibration replaces the one of {when}: if it fails or is stopped, "
+        f"{objective} has none until one succeeds."
+    )
+
+
+def calibrate_replaces_plate(plate_objective: str, objective: str) -> str:
+    """The Stand screen's note: its *Calibrate the camera* runs into the run document and replaces the one the plate was registered with (D17, FM-216)."""
+    return _flat(
+        f"The plate was registered with {plate_objective} using this calibration: a "
+        f"calibration at {objective} here replaces it, and the plate goes out of date. "
+        f"To measure the offsets, calibrate at {objective} in {OFFSETS_TITLE} (Plate "
+        "screen): it keeps a document of its own."
+    )
+
+
+def calibrations_held_heading(folder: str) -> str:
+    """The line above the list of the documents the page holds (D15)."""
+    return _flat(
+        f"Camera calibrations the page holds, one document per objective, in {folder}:"
+    )
+
+
+def calibration_held_line(
+    position: int,
+    label: str | None,
+    objective: str | None,
+    measured: str,
+    problem: str | None,
+    *,
+    plate_objective: str,
+    on_turret: bool | None,
+) -> str:
+    """One document of the list: its objective and date, or its position and why it is not usable, and why it is left out of the default (D15, D16).
+
+    A usable document is ``<objective>: calibrated on <date>``, with what keeps it out of the
+    empty field's default added after a semicolon: it is the plate's objective, or its
+    objective is no label of the turret now (``on_turret`` ``False``; ``None`` is not
+    known, and says nothing). One with a ``problem`` is ``position <n> (<label>): <problem>``;
+    the label is the position's own, when the page knows it. Plain text on one line (FM-139):
+    a label, a path and a tool's words come from outside.
+    """
+    if problem is not None:
+        where = (
+            f"position {position}"
+            if label is None or not label.strip()
+            else f"position {position} ({label})"
+        )
+        return _flat(f"{where}: {problem}")
+    named = "an unknown objective" if objective is None else objective
+    when = (
+        f" on {measured[:10]}" if _ISO_DATE.match(measured) else ", at an unknown time"
+    )
+    line = f"{named}: calibrated{when}"
+    if objective is not None and objective == plate_objective:
+        line += "; the plate's objective, not measured from itself"
+    if on_turret is False:
+        line += "; not on the turret now: calibrate its position again, or type the documents to use"
+    return _flat(line)
+
+
+def calibration_missing_line(label: str) -> str:
+    """The line of an objective of the turret that no usable document names (D15)."""
+    return _flat(f"{label}: no calibration yet")
+
+
+def calibration_note_line(objective: str, note: str) -> str:
+    """One ``assumed`` line of a calibration, indented two spaces under its document (D15)."""
+    return _flat(f"  {objective}: {note}")
+
+
+def calibration_failed(words: str) -> str:
+    """The problem of a document whose last record ended ``failed``: the tool's own words, not ``ended failed; run it again`` (D15).
+
+    The reason (the light path, a field with no texture, a step that wrapped) is what the
+    operator acts on, and the strip's outcome is gone at the next activity.
+    """
+    return _flat(f"the last calibration failed: {words}")

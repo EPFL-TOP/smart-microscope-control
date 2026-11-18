@@ -275,7 +275,14 @@ disclosure shows the `smc run` line it makes.
   connected, `Disconnect releases <stand> for NIS-Elements or ZEN.`;
 - **Calibrate the camera**, shown only when there is no calibration or it was made at
   another objective. It runs `camera-calibration` with what the profile suggests, as the
-  tool's own *Run* does.
+  tool's own *Run* does, **into the run document**: that replaces the calibration the plate was
+  registered with. So when the plate was registered from its walls (the offsets block is
+  offered) and the objective in place is known and is not the plate's, a note under it says so:
+  `The plate was registered with <O> using this calibration: a calibration at <X> here
+  replaces it, and the plate goes out of date. To measure the offsets, calibrate at <X> in
+  Measure the offsets between objectives (Plate screen): it keeps a document of its own.` The
+  button is not hidden or routed elsewhere: it is the way to register the plate with another
+  objective.
 
 **2. Plate: "Where is the plate?"** From the top:
 
@@ -376,17 +383,56 @@ the walls*) **with an objective the result records**: the tool compares the cent
 recorded has no block. A page served with `--dry-run` shows the block with the reason it
 waits (`a dry run cannot turn the turret or image the walls; run it without --dry-run`).
 
-**The documents.** The block's one field takes the **camera calibration of each objective to
-measure**: one run document per line, in the order the turret is to turn (the last one stays in
-place). The objective to measure is the one **the document holds**, so a document with no
-target and a target with no document cannot be typed. Under the field, one line each:
-`<path as typed>: calibrated at <objective> on <date>`, or the tool's own reason (`<path>: does
-not exist`, not JSON, no calibration, another stand's). The page adds three refusals of its
-own, the first that holds in line order: the plate's own objective (its offset from itself is
-zero), an objective that is not on the turret, an objective in two documents; and at most five
-objectives in one run. A pasted path loses one pair of surrounding quotes (Windows' *Copy as
-path* adds them) and a relative path is read from where `smc ui` was started. The documents are
-read when the field changes and at *Measure the offsets*, never at each tick.
+**The documents.** The offsets are measured from the **camera calibration of each objective to
+measure**, one run document each, and the page makes them. Turn the turret to an objective (Stand
+screen, *Change objective*), bring a well's wall into the image (the arrows, *Live*) and press
+**Calibrate the camera at `<objective>`**: it runs `camera-calibration` (the stage moves by about a
+quarter of the field in X, then in Y, and comes back; nothing turns the turret, so nothing asks
+to confirm) into `calibrations/position-<n>.json` **beside the run document**, `<n>` being the
+objective's turret position (its label's index plus one: the demo's 40X is position 1, its 20X
+position 4). The file's name is a number the page writes and never a label, which is free text; the
+objective measured is the one inside it. **The run document is not touched**, so the plate stays
+registered and the block stays offered (a calibration run into `run.json` replaces the one the plate
+was registered with, which is why the Stand screen's button says so, above). The button names the
+objective in place, and **the click carries that name**: the page reads the turret again and runs
+only if it still reads it (another tab, or the operator at the turret, may have turned it since).
+It waits with its reason beside it: the stand is not connected, an activity goes, a dry run (the
+tool refuses it), the objective is not known, or it is the plate's own (its calibration is the run
+document's: Stand screen, *Calibrate the camera*). A new calibration **replaces** the position's
+document, and a failed or stopped one leaves it with none until one succeeds: when the position
+holds a usable one of that objective, the button says `Calibrate the camera again at <objective>`
+and the line beside it says `A new calibration replaces the one of <date>: if it fails or is
+stopped, <objective> has none until one succeeds.` When the usable document at the position is
+another objective's (the turret was relabelled since), the button does not say `again` and the
+line names **that** objective as the one that loses its calibration. The button sends the camera
+calibration's `step_um` and `settle_ms` as typed in its form, and not its advanced `from_run_doc`.
+
+Above the button, the block lists **the documents the page holds**, `Camera calibrations the page
+holds, one document per objective, in <folder>:` and one line each: `<objective>: calibrated on
+<date>`, with `; the plate's objective, not measured from itself` or `; not on the turret now:
+calibrate its position again, or type the documents to use` for a usable one that the empty field
+leaves out; `position <n> (<label>): <problem>` for one that cannot be used, a calibration that
+failed in the tool's own words (`the last calibration failed: the frame is dark or flat ...`: the
+light path, a field with no texture, a step that wrapped); the calibration's own `assumed` lines
+under it; and `<label>: no calibration yet` for each other objective of the turret that no usable
+document names. Only the twelve names `position-1.json` to `position-12.json` are looked at.
+
+**The field is optional.** *Other calibration documents (optional), one path per line, in the
+order the turret turns*: **empty, *Measure the offsets* measures with the documents the page holds**
+that are usable, not the plate's objective, and on the turret now, in turret order, as if their
+paths were typed (the page never writes into the field). A typed field is used instead, never
+merged with them, as it always was: the objective to measure is the one **the document holds**,
+so a document with no target and a target with no document cannot be typed. Under the field,
+one line per **typed** path: `<path as typed>: calibrated at <objective> on <date>`, or the tool's
+own reason (`<path>: does not exist`, not JSON, no calibration, another stand's). The page adds
+three refusals of its own, the first that holds in line order: the plate's own objective (its
+offset from itself is zero), an objective that is not on the turret, an objective in two documents;
+and at most five objectives in one run (for the held documents too). With nothing held and nothing
+typed the block says `Calibrate the camera at each objective to measure (the button above), or
+give one run document per line.` A pasted path loses one pair of surrounding quotes (Windows'
+*Copy as path* adds them) and a relative path is read from where `smc ui` was started. The held
+documents are read at each redraw of the block (beside the run document) and at *Measure the
+offsets*, the typed ones when the field changes and at *Measure the offsets*, never at each tick.
 
 **Two clicks, and the turret turns only at the second.** *Measure the offsets* reads the
 documents and asks: `Turn the turret to <a>, then <b>, with the plate on the stage? Check that
@@ -424,13 +470,17 @@ says `Written into <path>. The page keeps the offsets it was started with: resta
 these.`: a page that is already connected goes on with the offsets it opened with, and a second
 write is refused by the reference check (the profile now holds a reference).
 
-**Not here.** The calibration documents are made in a terminal (the closed *How to make a
-calibration document* says how: *Change objective*, bring a wall into the image, *Disconnect*,
-`smc run camera-calibration -p <stand> --run-doc cal-<objective>.json`, *Connect* again;
-making them from the page is [#501](https://github.com/EPFL-TOP/smart-microscope-control/issues/501)).
+**Not here.** The block does not calibrate the plate's own objective (that calibration is the run
+document's, made on the Stand screen before the registration), does not turn the turret, and does
+not delete or move a document. A terminal still makes a document too (the closed *Or make a
+document in a terminal* says how: *Change objective*, bring a wall into the image, *Disconnect*,
+`smc run camera-calibration -p <stand> --run-doc cal-<objective>.json`, *Connect* again), and its
+path goes in the field. A folder shared by two stands holds one position's document of whichever
+ran last, and the other stand reads it as `camera-calibration was run on <stand>, this is <stand>`.
 There is no Z offset, no turn back, no `wells`, `search_um`, `max_spread_um` or `settle_ms`
-field (the tool's own section in the expert view has them, with its `confirm_turns` checkbox),
-and no preset for the block. That section's **Run objective-offsets** is not guarded against the
+field (the tool's own section in the expert view has them, with its `confirm_turns` checkbox;
+the calibration button sends the camera calibration's own `step_um` and `settle_ms` typed in its
+form), and no preset for the block. That section's **Run objective-offsets** is not guarded against the
 tool's refusals that depend on the documents, as `smc run` is not: a failed run replaces the
 usable result there. The block is the protected way.
 

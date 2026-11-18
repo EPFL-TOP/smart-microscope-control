@@ -243,7 +243,10 @@ The others come **after the turret has turned**, which stays where it is:
 - **The plate page** has a block for it on the Plate screen (*Measure the offsets between
   objectives*, [the plate page](../ui/plate-page.md#measure-the-offsets-between-objectives),
   #382): it asks before the turret turns and writes the profile after showing what it
-  replaces. The block does not make the calibration documents (#501). A preset never keeps
+  replaces. The block also makes the calibration documents: its *Calibrate the camera at
+  `<objective>`* runs `camera-calibration` into `calibrations/position-<n>.json` beside the run
+  document, and an empty field measures with them (#501, [the
+  documents](../ui/plate-page.md#measure-the-offsets-between-objectives)). A preset never keeps
   `confirm_turns`: the turns are confirmed again at every run.
 
 ## Trying it without a microscope
