@@ -2391,6 +2391,7 @@ def test_the_plate_menu_offers_the_lab_plates(page: PlatePage) -> None:
     """The menu lists ``useq``'s registry, which holds the lab's plates (m3 §22)."""
     view = PlatePageView(page)
     assert "greiner-24-well" in view.plate_select.options
+    assert "greiner-662892-24-well" in view.plate_select.options
 
 
 def test_choosing_another_plate_hides_the_note_too(page: PlatePage) -> None:

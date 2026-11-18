@@ -112,21 +112,35 @@ def worst_well_error(
     rot_true: float,
     a1_fit: tuple[float, float],
     rot_fit: float,
+    fitted_plate: str | None = None,
 ) -> float:
-    """Largest distance between a true and a fitted well centre, over the plate."""
+    """Largest distance between a true and a fitted well centre, over the plate.
+
+    The fitted lattice has the pitch of ``fitted_plate`` (the plate the fit chose),
+    by default the true plate's: a fit that picks another type of the same size
+    places its wells at its own pitch.
+    """
     rows, cols = plate_shape(plate)
     pitch_x, pitch_y = plate_pitch_um(plate)
+    fit_x, fit_y = plate_pitch_um(fitted_plate or plate)
 
     def node(
-        a1: tuple[float, float], rot: float, i: int, j: int
+        a1: tuple[float, float],
+        rot: float,
+        pitch: tuple[float, float],
+        i: int,
+        j: int,
     ) -> tuple[float, float]:
         t = math.radians(rot)
         c, s = math.cos(t), math.sin(t)
-        lx, ly = j * pitch_x, -i * pitch_y
+        lx, ly = j * pitch[0], -i * pitch[1]
         return a1[0] + c * lx - s * ly, a1[1] + s * lx + c * ly
 
     return max(
-        math.dist(node(a1_true, rot_true, i, j), node(a1_fit, rot_fit, i, j))
+        math.dist(
+            node(a1_true, rot_true, (pitch_x, pitch_y), i, j),
+            node(a1_fit, rot_fit, (fit_x, fit_y), i, j),
+        )
         for i in range(rows)
         for j in range(cols)
     )
@@ -158,23 +172,34 @@ def test_the_plate_is_identified_and_located(
     assert err < radius * 0.30, f"{err:.0f} µm is {err / radius:.0%} of a well radius"
 
 
-def test_the_two_24_well_types_are_a_coin_toss_and_the_notes_say_so() -> None:
-    """D7: the default candidates hold the lab's plate; 2.4 % apart, the survey cannot choose.
+_24_WELL_TYPES = {"24-well", "greiner-24-well", "greiner-662892-24-well"}
 
-    The note is the truth, and the operator names the plate. Either fit still
-    places every well well inside it.
+
+@pytest.mark.parametrize("truth", sorted(_24_WELL_TYPES))
+def test_the_24_well_types_are_a_coin_toss_and_the_notes_say_so(truth: str) -> None:
+    """D7: the default candidates hold the lab's plates; 2.6 % apart at most, the survey cannot choose.
+
+    ``24-well`` (19.0 mm), ``greiner-24-well`` (19.45) and the maker's
+    ``greiner-662892-24-well`` (19.5, #541) score within 0.02 of each other,
+    whichever of the three the plate is (measured gaps of 0.008 to 0.017 between
+    the first and the third, against 0.08). The note is the truth, and the operator
+    names the plate. Whichever fit wins still places every well well inside it,
+    at its own pitch (measured at most 26 % of a radius).
     """
     a1, rot = (500.0, -500.0), -0.8
-    fits = fit(survey_for("24-well", a1, rot))
+    fits = fit(survey_for(truth, a1, rot))
 
     best, notes = decide(fits)
 
-    assert {fits[0].plate, fits[1].plate} == {"24-well", "greiner-24-well"}
+    assert {f.plate for f in fits[:3]} == _24_WELL_TYPES
+    assert fits[0].score - fits[2].score < DECISIVE_MARGIN
     assert best is not None
     said = f"{fits[0].plate} ({fits[0].score:.3f}) barely beats {fits[1].plate} ("
     assert any(note.startswith(said) for note in notes), notes
-    err = worst_well_error("24-well", a1, rot, best.a1_center_xy_um, best.rotation_deg)
-    radius = min(well_size_um("24-well")) / 2
+    err = worst_well_error(
+        truth, a1, rot, best.a1_center_xy_um, best.rotation_deg, best.plate
+    )
+    radius = min(well_size_um(truth)) / 2
     assert err < radius * 0.30, f"{err:.0f} µm is {err / radius:.0%} of a well radius"
 
 

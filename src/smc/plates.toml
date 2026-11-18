@@ -11,7 +11,7 @@
 # useq's own (24-well, 96-well, ...).
 
 [plates.greiner-24-well]
-description = "Greiner Bio-One 24-well plate, standard bottom, catalogue reference not read yet; the Ti2-E's plate of sessions 2 and 3"
+description = "Greiner Bio-One 24 Well SensoPlate, glass bottom (the Ti2-E's plate of sessions 2 and 3), with the pitch session 3 measured. Replaced by greiner-662892-24-well, the maker's numbers; kept, with its numbers, for the run documents that name it"
 rows = 4
 columns = 6
 well_spacing_mm = [19.45, 19.45]
@@ -19,3 +19,15 @@ well_size_mm = [15.6, 15.6]
 circular_wells = true
 well_spacing_source = { kind = "measured", note = "Ti2-E session 3, 2026-11-10 (#405, #400): well centres from walls read by hand at 10x; column pitch 19.49 mm (B3 to B5), row pitch 19.43 mm (B3 to C3), plate square to 0.2 deg; 19.45 mm on both axes, the owner's decision" }
 well_size_source = { kind = "assumed", note = "useq's 24-well size; walls read at 10x in session 3 gave 15.28 to 15.61 mm (B3, B5, C3), and session 2 15.60 x 15.40 mm (B3)" }
+
+# The maker's numbers for the same plate (#541): session 5 read the pitch at
+# 19.51 mm, and 19.45 left a registration residual of 90.7 of its 100 um bound.
+[plates.greiner-662892-24-well]
+description = "Greiner Bio-One 24 Well SensoPlate, PS, glass bottom, items 662892 (with lid) and 662896, from the maker's drawing (revision 9, 2024-09-20); the Ti2-E's plate since session 5. Replaces greiner-24-well for new work"
+rows = 4
+columns = 6
+well_spacing_mm = [19.5, 19.5]
+well_size_mm = [15.66, 15.66]
+circular_wells = true
+well_spacing_source = { kind = "maker", note = "Greiner Bio-One drawing '24 Well SensoPlate, PS, Glass Bottom', revision 9 (2024-09-20), items 662892 and 662896: 19.5 mm on both axes. Checked at the Ti2-E, session 5, 2026-11-17 (#198, #541): 19.509 mm between columns (B2 to B5, 3 pitches), 19.496 mm between rows (row B to C3), 19.51 mm from plate-walls' scale_error; session 3's hand reading was 19.49 and 19.43 (#405). plate-walls' residual on B2, B5 and C3 is 19.6 um here, 90.7 um under greiner-24-well" }
+well_size_source = { kind = "maker", note = "Greiner Bio-One drawing '24 Well SensoPlate, PS, Glass Bottom', revision 9 (2024-09-20), items 662892 and 662896: 15.66 mm at the bottom (16.28 mm at the top). Walls read at 10x in session 5 gave 15.52 to 15.64 mm (B2, B5, C3)" }
