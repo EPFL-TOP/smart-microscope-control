@@ -4102,7 +4102,9 @@ second in `controls`, right after `plate_select`; values are m3's
 **D3. The words name A1's corner.** With the directions known, a stage direction
 is `back`/`front` (`back` and its opposite) or `right`/`left`; A1's corner is
 `-X +Y` not turned and `+X -Y` turned (m3 §24 D1), said back-or-front first:
-"A1 at the back left" and "Turned 180°: A1 at the front right" on the Ti2-E.
+"A1 at the back left" and "Turned 180°: A1 at the front right" on a stand whose back
+is +Y and whose operator's right is +X (the demo sample's); the Ti2-E's are the other
+way round, "A1 at the front right" and "Turned 180°: A1 at the back left" (#540).
 Without them, in stage terms: "Not turned: A1 at stage -X +Y" and "Turned 180°: A1
 at stage +X -Y", and the note under the menu says the stand does not say which
 side is the back (`[holder] back`, `right`). The words are never stored.

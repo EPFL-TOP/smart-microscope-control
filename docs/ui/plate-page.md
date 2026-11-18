@@ -732,7 +732,9 @@ plate was placed**, in one of four ways, because a well name read off the map is
 - `96-well: the registered plate, A1 at the back left`: A1 and the rotation come from a
   registration that measured them (`plate-registration`, `plate-walls`, a lattice fit), and
   the title names the corner A1 is at in the stand's words (in stage terms, `A1 at stage -X
-  +Y`, on a stand whose profile does not say its sides).
+  +Y`, on a stand whose profile does not say its sides). The corner depends on the stand and
+  on *Plate lies*: `A1 at the back left` here is a stand whose back is +Y and whose operator's
+  right is +X not turned, or the Ti2-E with *Plate lies* at `Turned 180°`.
 - `96-well: placed from one well (B3), not registered: the rotation is taken from the
   declared orientation, A1 at the back left, not measured`: a registration from one well only
   (a *seed*): A1 is where that well says, the plate lies the way *Plate lies* said, and

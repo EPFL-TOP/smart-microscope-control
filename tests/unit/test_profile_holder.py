@@ -223,6 +223,8 @@ def test_the_ti2_holder_says_back_is_minus_y_and_right_is_minus_x() -> None:
     assert (nikon.back, nikon.right) == ("-Y", "-X")
     assert "2026-11-17" in nikon.directions_measured
     assert "session 5" in nikon.directions_measured
+    assert "#198" in nikon.directions_measured
+    assert "#540" in nikon.directions_measured
     assert "inferred" not in nikon.directions_measured
     assert "not checked" not in nikon.directions_measured
 
