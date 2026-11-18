@@ -114,43 +114,77 @@ def export_dataset(
 ```
 
 - **Refused before anything is written** (exit 2, a `DatasetError` naming
-  the reason): `out` exists and is not an empty folder (the export never
-  overwrites and never deletes); the `scan` slot has no provider, or it is
-  not usable (`RunDocument.unusable("scan", profile=<its own profile>,
-  dry_run=False)`), or it was a dry run; one or more frame files are
-  missing (their count and the first five paths).
+  the reason), in this order: `out` exists and is a file, or is a folder
+  that is not empty (the export never overwrites and never deletes); the
+  `scan` slot has no provider, or it is not usable (`RunDocument.unusable("scan",
+  profile=<its own profile>, dry_run=False)`), or it was a dry run (the
+  refusals of `load_scan`, §3); one or more frame files are missing (their
+  count and the first five paths); on Windows, a destination path of 260
+  characters or more (long paths are not assumed); and, when the free space
+  of `out`'s disk can be read, less than the files to copy need. The scrubbed
+  document (§2.2) is built, and validated, before the first file is
+  written. `out`'s missing parent folders are created.
 - **Written**, in this order: every frame of the scan's result at its own
-  relative path (`shutil.copyfile`, bytes unchanged); the `cells` file when
-  the `cells` slot's provider is `done`, not stale, on the scan's profile
-  (else no cells, and the manifest says why); `run.json`, the scrubbed run
-  document (§2.2), whatever the source's file name; `README.md` (§2.3); and
-  `manifest.json` last, so a folder with no manifest is an interrupted
-  export.
+  relative path; the `cells` file when `load_scan` found cells (the `cells`
+  slot's provider is `done`, not stale, on the scan's profile; else no cells,
+  and the manifest says why); `run.json`, the scrubbed run document (§2.2),
+  whatever the source's file name; `README.md` (§2.3); and `manifest.json`
+  last, so a folder with no manifest is an interrupted export (FM-106). A
+  frame is copied in 1 MiB chunks and hashed as it is read: the manifest
+  holds the hash of the **source's** bytes, so a bad write is found by
+  `check` and not recorded as the truth (hashing the copy afterwards would
+  bake it in, and read the file once more). A file that already exists is
+  never opened for writing.
 - **Kept and not copied**: every other stage record stays in `run.json`
   (staleness reads them), but no other file is copied; the README says so.
 - **Exit codes**: 0 written; 1 an I/O error while writing (the partial
-  folder stays, with no manifest, and the message says so); 2 refused.
-- A progress bar per frame (`rich`) on the CLI; the function takes a
-  callback.
+  folder stays, with no manifest, and the message says how many files were
+  written, and that the folder is to be removed); 2 refused.
+- **Progress**: the function takes a callback `(done, total)` called after
+  each file copied. The CLI prints a line at most once a second, the first
+  and the last always, as `smc run` does: a `rich` bar on a redirected
+  stream draws nothing and leaves an empty line (measured, rich 15).
 
 ### 2.2 What is scrubbed
 
 Host and account names reach a run document only through paths (a model
 path, an output file, an error that quotes a file). In every record's
-`params`, `result`, `checkpoint` and `error`, recursively:
+`params`, `result`, `checkpoint` and `error`, recursively, in string values
+(a key is never rewritten):
 
-- a string that **is** an absolute path (POSIX `/…`, Windows `X:\…` or
-  `X:/…`, UNC `\\…`) becomes its last component
-  (`PureWindowsPath`/`PurePosixPath` `.name`);
-- inside any other string, each substring matching
-  `(?:[A-Za-z]:[\\/]|\\\\|/(?:Users|home)/)[^\s'"]*` becomes its last
-  component;
-- each rewritten value's JSON pointer (`/stages/cells/params/model_path`)
-  goes into the manifest's `scrubbed`.
+- a string that **starts like** an absolute path (POSIX `/…`, Windows `X:\…`
+  or `X:/…`, UNC `\\…`) becomes its last component (split on `/` and `\`);
+- inside any other string, each substring matching one of the three
+  patterns below becomes its last component;
+- a path with no component below its root, its drive, its UNC share or its
+  account folder (`/`, `C:\`, `\\host\share`, `/Users/<name>`,
+  `/home/<name>`, `X:\Users\<name>`) becomes `~`: its last component would be
+  the account;
+- each rewritten value's JSON pointer (`/stages/cells/params/model_path`,
+  RFC 6901: `~` is `~0` and `/` is `~1` in a key) goes into the manifest's
+  `scrubbed`, in the document's order: the stages as the file has them, in a
+  record `params`, `result`, `checkpoint`, `error`, each depth first.
+
+```text
+(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s'"]*     a drive, not the end of a word
+\\\\[^\s'"]*                               a UNC path
+(?<![\w.~:/-])/[^\s'"/]+/[^\s'"]*          a POSIX path of two components or more
+```
+
+Why these three and not `[A-Za-z]:[\\/]` with `/(?:Users|home)/`: a drive
+pattern with no word boundary rewrites the end of any word before `:/`
+(`file:///Users/alice/x.tif` became `filx.tif`), and `/(?:Users|home)/` leaves
+`/mnt/lab/alice/run1` alone inside a sentence, where the `error` of a failed
+`cells` quotes the run folder (`load_cells`); both measured on 2026-11-18,
+planning #565. Known gaps, left as they are: a `file:///` URL, and a
+single-component path such as `/media/<name>` inside a sentence. The rule is
+idempotent: exporting a dataset rewrites nothing (`scrubbed` is empty). On the
+real 10× run document of 2026-11-17 it rewrites no string (§1: it holds no
+path).
 
 Relative paths (`scan/<token>/A1/A1_0003.tif`) are never touched. The TIFFs
-are copied unchanged: their description is the frame's record (m3 §8),
-which holds no path but the relative one.
+are copied unchanged: their description is the frame's record (m3 §8, the
+scan's `ScanFrame`), which holds no path but the relative one.
 
 ### 2.3 The manifest and the README
 
@@ -178,21 +212,39 @@ class DatasetManifest(BaseModel):
 ```
 
 Both models are `extra="forbid"`, `frozen=True`; `files` holds every file
-but `manifest.json`. The generated `README.md` (English, plain) says: what
-the scan is (date, profile, objective, pixel size, image shape, wells,
-frames, cells or why not); the layout; the units and conventions (stage µm
-readbacks, `well_dx_um`/`well_dy_um` as the readback minus the well's
-centre in stage axes, `(dx, dy) = M @ (col, row)` for the matrix, a pixel
-size of 0 is unknown); how to load it (`from smc.data import load_scan`);
-how to check it (`smc dataset check`); and that only the scan's frames and
-the cells file were copied.
+but `manifest.json`, in the order written (frames in the scan's order, the
+cells file, `run.json`, `README.md`). `run.json` and `manifest.json` are
+written as the run document is (`write_stage`'s dump: ASCII, indent 2, a
+final newline), each through `write_atomically` (FM-38). The generated
+`README.md` (English, plain, written before the manifest, so it lists no
+hash) says: what the scan is (date, profile, objective, pixel size, image
+shape, wells, frames, cells or why not); the layout; the units and
+conventions (stage µm readbacks, `well_dx_um`/`well_dy_um` as the readback
+minus the well's centre in stage axes, `(dx, dy) = M @ (d_col, d_row)` for the
+matrix, `(d_col, d_row)` being the pixel offset from the frame's centre as in
+`smc.plugins.geometry`, a pixel size of 0 is unknown); how to load it (`from
+smc.data import load_scan`); how to check it (`smc dataset check`, and that a
+tool that writes a stage into the folder's `run.json` makes `check` report it
+changed: work on a copy); and that only the scan's frames and the cells file
+were copied. Its fixed text is ASCII (`um`, no `µ`), so that any editor reads
+it; the objective's name is the one non-ASCII word it can hold. Neither file
+names the source or the destination folder (FM-50).
 
 ### 2.4 `smc dataset check DIR`
 
-Reads `DIR/manifest.json`, checks every listed file's size and SHA-256,
-then loads `DIR/run.json` with `load_scan`. Exit 0 when all hold; 1 when a
-file is missing or differs (each named); 2 with no readable manifest or
-when `load_scan` refuses.
+`src/smc/data/dataset.py` (`check_dataset`). Reads `DIR/manifest.json` (a
+missing one says this is not a dataset, or an export that did not finish),
+validates it (`utf-8-sig`, a `schema_version` above 1 is a newer smc's), and
+refuses a listed path that is absolute or leaves the folder before it reads
+any file; checks every listed file's size and SHA-256, each read once (FM-39);
+then, only when every file matched, loads `DIR/run.json` with `load_scan`.
+Files of the folder that the manifest does not list are ignored: the
+collaborator's own outputs (§6's drawings) live beside the dataset. Exit 0
+when all hold; 1 when a file is missing or differs (each named, the first 20,
+then a count); 2 with no readable manifest, with a manifest that lists a path
+outside the folder, when `load_scan` refuses, and for an exception `check`
+did not expect: an unexpected exit 1 would read as a verdict, "a file differs"
+(FM-82).
 
 ### 2.5 How a dataset travels
 
@@ -265,9 +317,10 @@ class Scan:
 - **`wells`** is the plan's order; **`geometry`** is `well_geometry(plan,
   well)` for each. The camera is the scan's (`result.matrix_um_per_px`,
   `result.image_shape_px`), never the plan's copy (FM-124).
-- **`image(frame)`** is `ScanResult.load_frame(run_dir, frame)`; its
-  `FileNotFoundError` and `ValueError` become a `DatasetError` naming the
-  frame.
+- **`image(frame)`** is `smc.plugins.slots.load_frame(run_dir, frame)` (a
+  function; `ScanResult` has no such method); its `OSError`, `ValueError` and
+  `tifffile.TiffFileError` (named, not a `ValueError` before tifffile
+  2026.x) become a `DatasetError` naming the frame.
 - **`from_results`** builds a `Scan` from results already read (`route`
   uses it, §5.6); it checks nothing `ctx.upstream` has checked.
 - `cells_of(well=…)` and `cells_of(frame=…)` filter by the cell's `well` and
