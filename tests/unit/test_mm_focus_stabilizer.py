@@ -304,7 +304,9 @@ def test_a_stop_that_fails_is_raised_after_periodic_is_switched_off(
     af, z = stand.require(Autofocus), stand.require(ZStage)
     af.learn_reference()
     z.move_by_um(-5.0)
-    fake_mtb.stabilizer.move_s = 0.3
+    # disengage() sends a Stop only while Action reads the stabilize, and no
+    # Stop ends it here: 1 s of margin for a loaded runner, not 0.3 s (#586).
+    fake_mtb.stabilizer.move_s = 1.0
     focus = fake_mtb.axes["MTBFocus"]
 
     def stop_raises(timeout_ms: int) -> None:
