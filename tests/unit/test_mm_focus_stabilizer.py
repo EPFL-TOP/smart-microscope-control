@@ -299,18 +299,29 @@ def test_disengage_switches_periodic_off_even_when_its_read_fails(
 
 
 def test_a_stop_that_fails_is_raised_after_periodic_is_switched_off(
-    stand: Microscope, fake_mtb: FakeMTB
+    stand: Microscope, fake_mtb: FakeMTB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     af, z = stand.require(Autofocus), stand.require(ZStage)
     af.learn_reference()
     z.move_by_um(-5.0)
-    fake_mtb.stabilizer.move_s = 0.3
+    # disengage() sends a Stop only while Action reads the stabilize, and no
+    # Stop ends it here: 1 s of margin for a loaded runner, not 0.3 s (#586).
+    fake_mtb.stabilizer.move_s = 1.0
     focus = fake_mtb.axes["MTBFocus"]
+
+    def stop_raises(timeout_ms: int) -> None:
+        raise MTBError(f"{MTB_ID}: Stop raised (fake)")
+
     worker = _Thread(af.stabilize_now)
     try:
         _wait_for(lambda: focus.position_um() > Z0 - 5.0, "the stabilize to start")
         fake_mtb.stabilizer.periodic_on = True
-        fake_mtb.stabilizer.fail_next = True  # the Stop raises
+        # Every Stop raises, not only the next one (`fail_next`): the action's
+        # thread can resend the Stop after its command (FM-18), and a resend
+        # that came first would take a one-shot failure, leave disengage()'s
+        # own Stop to succeed, and the test to race (#586). A DF2 that cannot
+        # be stopped fails every Stop.
+        monkeypatch.setattr(fake_mtb.stabilizer, "stop", stop_raises)
         with pytest.raises(HardwareError) as failed:
             af.disengage()
     finally:
