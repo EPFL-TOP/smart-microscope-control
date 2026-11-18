@@ -437,6 +437,16 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "orientation": "turned-180",
         }
     ],
+    "plate-check": [
+        {
+            "wells": ["A1", "H12"],
+            "max_shift_um": 40.0,
+            "calibration": "C:\\runs\\a b\\cal-40x.json",
+            "search_um": 500.0,
+            "settle_ms": 30.0,
+            "save_frames": False,
+        }
+    ],
     "plate-orientation": [{"orientation": "turned-180"}],
     "plate-registration": [
         {
@@ -478,6 +488,8 @@ CASES: dict[str, list[dict[str, Any]]] = {
     "scan": [
         {
             "autofocus": "off",
+            "check_plate": False,
+            "max_plate_shift_um": 40.0,
             "max_failed_in_row": 2,
             "max_unlocked_in_row": 3,
             "landing_tolerance": 0.1,

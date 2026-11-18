@@ -86,6 +86,14 @@ PIXEL_UM = 1.0
 IN_PLACE = "Nikon 10X S Fluor"
 FORTY = "Nikon 40X Plan Fluor ELWD"
 PLAN = {"wells": "A1,A2,B2", "rows": 2, "columns": 2, "clip_to_well": False}
+#: The plate check's line (m3 §27.5), first after the stand's: the plate here is
+#: a seed, whose walls nobody measured, so no scan here checks it, and says so.
+_SEED = (
+    "the plate was not checked: it was registered by seed, which measures no "
+    "well's walls (plate-walls does)"
+)
+#: The same, in a dry run: the check takes frames, so a dry run makes none.
+_DRY = "dry run: the plate was not checked against its registration"
 MUTATING = {
     "engage",
     "disengage",
@@ -507,7 +515,8 @@ def test_the_entry_point_loads_scan() -> None:
     assert entry.plugin.provides == "scan"
     assert entry.plugin.requires == (XYStage, Camera)
     assert entry.plugin.reads == ("scan-plan",)
-    assert entry.plugin.reads_optional == ()
+    # The plate, for the check before the first field (m3 §27.5).
+    assert entry.plugin.reads_optional == ("plate",)
     assert entry.target == "smc.plugins.scan.plugin:ScanPlugin"
 
 
@@ -531,7 +540,7 @@ def test_a_scan_writes_one_tiff_per_field_and_records_the_readback(rig: _Rig) ->
     assert result.pixel_size_um == PIXEL_UM
     assert result.matrix_um_per_px == plan.matrix_um_per_px
     assert result.image_shape_px == SHAPE
-    assert result.assumed == ()
+    assert result.assumed == (_SEED,)
     for frame, planned, readback in zip(
         result.frames, plan.fields, rig.stage.readbacks, strict=True
     ):
@@ -740,6 +749,7 @@ def test_a_parameter_pixel_size_is_not_compared_and_says_so(rig: _Rig) -> None:
     assert result.assumed == (
         "the plan's pixel size was given as a parameter: not compared with the "
         "camera's",
+        _SEED,
     )
 
 
@@ -756,6 +766,7 @@ def test_a_camera_without_a_pixel_size_is_not_compared_and_says_so(
     assert result.assumed == (
         "the camera reports no pixel size: the plan's size and a change during "
         "the scan were not checked",
+        _SEED,
     )
 
 
@@ -1351,7 +1362,7 @@ def test_a_dry_run_with_one_failed_move_among_the_walked_ones_is_done(
 
     assert [f.name for f in result.failed] == ["A1_0002"]
     assert rig.stage.moves == 12
-    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
+    assert result.assumed == (_DRY, "dry run: 12 fields walked, no frame taken")
 
 
 def test_a_snap_that_times_out_is_a_failed_field(rig: _Rig) -> None:
@@ -1798,7 +1809,7 @@ def test_a_dry_run_does_not_compare_the_readback(
 
     assert result.failed == ()
     assert rig.stage.moves == len(plan.fields)
-    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
+    assert result.assumed == (_DRY, "dry run: 12 fields walked, no frame taken")
 
 
 def test_the_same_readback_on_a_real_stand_is_a_failed_field(rig: _Rig) -> None:
@@ -2020,6 +2031,7 @@ def test_an_unlocked_autofocus_is_engaged_once_per_field(rig: _Rig) -> None:
     assert [f.focus for f in result.frames] == ["locked"] * 12
     assert {f.pfs_offset for f in result.frames} == {af.offset}
     assert result.assumed == (
+        _SEED,
         "the autofocus was engaged again on 2 fields and locked on 2 of them",
         _wall_line(3, 3, 3),
     )
@@ -2041,6 +2053,7 @@ def test_a_failed_engage_records_unlocked_frames(rig: _Rig) -> None:
     assert af.calls.count("engage") == 5
     # Item 9: two attempts, one lock: the line counts both.
     assert result.assumed == (
+        _SEED,
         "the autofocus was engaged again on 2 fields and locked on 1 of them",
         _wall_line(3, 3, 3),
     )
@@ -2064,6 +2077,7 @@ def test_an_engage_that_raises_is_the_scans_own_failure_and_is_retried(
     # Field 2's raised, field 3's locked; and the three walls'.
     assert af.calls.count("engage") == 5
     assert result.assumed == (
+        _SEED,
         "the autofocus was engaged again on 2 fields and locked on 1 of them",
         _wall_line(3, 3, 3),
     )
@@ -2099,6 +2113,7 @@ def test_a_lock_the_operator_took_ends_the_scans_own_failure(rig: _Rig) -> None:
         "unlocked"
     ] * 9
     assert result.assumed == (
+        _SEED,
         "the autofocus was engaged again on 1 fields and locked on 0 of them",
         _wall_line(1, 1, 1),
     )
@@ -2151,7 +2166,7 @@ def test_an_autofocus_switched_off_during_the_scan_is_not_engaged_again(
 
     assert af.calls.count("engage") == 1  # A1's wall's, before the switch-off
     assert [f.focus for f in result.frames] == ["locked"] * 2 + ["unlocked"] * 10
-    assert result.assumed == (_wall_line(1, 1, 1),)
+    assert result.assumed == (_SEED, _wall_line(1, 1, 1))
 
     # With the default, the unlocked fields end the scan before the 5th of them.
     rig.camera.snaps = 0
@@ -2395,7 +2410,7 @@ def test_the_autofocus_is_switched_off_before_each_wells_first_field_and_engaged
     assert af.calls.count("disengage") == 3
     assert af.calls.count("engage") == 3
     assert [f.focus for f in result.frames] == ["locked"] * 12
-    assert result.assumed == (_wall_line(3, 3, 3),)
+    assert result.assumed == (_SEED, _wall_line(3, 3, 3))
 
 
 def test_a_lost_lock_inside_a_well_is_counted_apart_from_the_walls(rig: _Rig) -> None:
@@ -2408,6 +2423,7 @@ def test_a_lost_lock_inside_a_well_is_counted_apart_from_the_walls(rig: _Rig) ->
     assert af.calls.count("engage") == 5
     assert [f.focus for f in result.frames] == ["locked"] * 12
     assert result.assumed == (
+        _SEED,
         "the autofocus was engaged again on 2 fields and locked on 2 of them",
         _wall_line(3, 3, 3),
     )
@@ -2432,7 +2448,7 @@ def test_an_autofocus_the_operator_switched_off_is_not_switched_on_at_the_next_w
     assert "disengage" not in after
     assert "engage" not in after
     assert [f.focus for f in result.frames] == ["locked"] * 3 + ["unlocked"] * 9
-    assert result.assumed == (_wall_line(1, 1, 1),)
+    assert result.assumed == (_SEED, _wall_line(1, 1, 1))
 
 
 def test_a_wall_engage_that_fails_leaves_the_next_field_to_engage_as_the_scans_own(
@@ -2449,6 +2465,7 @@ def test_a_wall_engage_that_fails_leaves_the_next_field_to_engage_as_the_scans_o
     assert af.calls.count("engage") == 4
     # A2_0001's engage is §8's: the wall's engage was made at A2_0000.
     assert result.assumed == (
+        _SEED,
         "the autofocus was engaged again on 1 fields and locked on 1 of them",
         _wall_line(3, 3, 2),
     )
@@ -2469,7 +2486,7 @@ def test_a_wells_first_field_off_target_leaves_the_walls_engage_to_the_next(
     cut = _between_moves(af)
     assert cut[1] == []
     assert cut[2][:2] == ["is_locked", "engage"]
-    assert result.assumed == (_wall_line(3, 3, 3),)
+    assert result.assumed == (_SEED, _wall_line(3, 3, 3))
 
 
 def test_a_lock_the_operator_took_after_a_wall_ends_the_walls_claim(
@@ -2492,6 +2509,7 @@ def test_a_lock_the_operator_took_after_a_wall_ends_the_walls_claim(
 
     assert [f.focus for f in result.frames] == ["locked"] * 11
     assert result.assumed == (
+        _SEED,
         "the autofocus was engaged again on 1 fields and locked on 1 of them",
         _wall_line(3, 2, 2),
     )
@@ -2510,7 +2528,7 @@ def test_a_dry_run_never_switches_the_autofocus_off(
 
     assert not {"disengage", "engage"} & set(af.calls)
     assert af.engaged
-    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
+    assert result.assumed == (_DRY, "dry run: 12 fields walked, no frame taken")
 
 
 class _FailingAtWall(_Autofocus):
@@ -2648,6 +2666,7 @@ def test_a_wall_engage_that_raises_is_counted_and_left_to_the_next_field(
     ]
     assert [f.focus for f in result.frames] == ["locked"] * 11
     assert result.assumed == (
+        _SEED,
         "the autofocus was engaged again on 1 fields and locked on 1 of them",
         _wall_line(3, 3, 2),
     )
@@ -2770,7 +2789,7 @@ def test_a_dry_run_scan_writes_nothing(
     assert (after.x_um, after.y_um) == pytest.approx((before.x_um, before.y_um))
     assert result.frames == ()
     assert result.failed == ()
-    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
+    assert result.assumed == (_DRY, "dry run: 12 fields walked, no frame taken")
     assert [p.name for p in tmp_path.rglob("*") if p.is_file()] == ["run.json"]
 
 
@@ -2938,8 +2957,9 @@ def test_a_failed_sweep_is_a_failed_field_and_leaves_the_autofocus_off(
         if r.name == LOGGER and r.levelno == logging.WARNING
     ]
     assert warnings == [
+        _SEED,
         "A1_0000: the focus on the cells failed (DeviceTimeoutError: the camera did "
-        "not answer in 5 s); the autofocus is left off"
+        "not answer in 5 s); the autofocus is left off",
     ]
 
 
@@ -3199,6 +3219,7 @@ def test_a_dry_run_plans_the_focus_and_runs_none(
     assert rig.camera.snaps == 0
     assert not MUTATING & set(af.calls)
     assert result.assumed == (
+        _DRY,
         "dry run: 12 fields walked, no frame taken",
         "dry run: the focus on the cells was planned (11 planes per sweep), not run",
     )
@@ -3303,7 +3324,10 @@ def test_a_relock_after_the_last_field_that_fails_is_said_not_a_failure(
     line = f"the autofocus did not lock again after the last field ({why}): it is off"
     assert len(result.frames) == 12
     assert line in result.assumed
-    assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [line]
+    assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [
+        _SEED,
+        line,
+    ]
     assert af.calls.count("engage") == 13
 
 
@@ -3364,7 +3388,10 @@ def test_cell_focus_with_an_autofocus_left_off_says_so(
         "again and run scan again)"
     )
     assert line in result.assumed
-    assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [line]
+    assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [
+        _SEED,
+        line,
+    ]
     assert not MUTATING & set(af.calls)
 
 
@@ -3483,6 +3510,7 @@ def test_a_translated_plate_is_measured_from_the_plans_centre_not_the_registrati
             (0.0, 0.0), abs=0.05
         )
     assert result.assumed == (
+        _SEED,
         _MOVED.format(p=IN_PLACE, o=FORTY, sx="31.5", sy="-22.5"),
     )
 
@@ -3541,7 +3569,10 @@ def test_a_plate_that_records_no_objective_says_the_offsets_were_not_moved_to_th
 
     result = _result(_scan(rig))
 
-    assert result.assumed == (_NOT_MOVED.format(p="an unknown objective", o=IN_PLACE),)
+    assert result.assumed == (
+        _SEED,
+        _NOT_MOVED.format(p="an unknown objective", o=IN_PLACE),
+    )
     assert all(f.well_dx_um is not None for f in result.frames)
 
 
@@ -3557,6 +3588,7 @@ def test_the_offset_lines_come_after_every_line_the_scan_already_writes(
     result = _result(_scan(rig))
 
     assert result.assumed == (
+        _SEED,
         "the autofocus was engaged again on 2 fields and locked on 2 of them",
         _wall_line(3, 3, 3),
         _NOT_MOVED.format(p="an unknown objective", o=IN_PLACE),
@@ -3606,7 +3638,7 @@ def test_a_dry_run_says_nothing_of_offsets(
     result = _result(_scan(rig))
 
     assert result.frames == ()
-    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
+    assert result.assumed == (_DRY, "dry run: 12 fields walked, no frame taken")
 
 
 def test_a_resume_across_an_older_smc_says_which_frames_carry_no_offsets(
@@ -3642,6 +3674,7 @@ def test_a_resume_across_an_older_smc_says_which_frames_carry_no_offsets(
     # Their TIFFs are untouched: the record never disagrees with its file.
     assert {f.file: (rig.run_dir / f.file).read_bytes() for f in kept} == before
     assert result.assumed == (
+        _SEED,
         "4 of the 4 frames kept from the checkpoint were written before a frame's "
         "offset from its well's centre was recorded: they carry no well_dx_um or "
         "well_dy_um",
@@ -3657,4 +3690,4 @@ def test_a_resume_of_a_scan_that_recorded_the_offsets_says_nothing_of_them(
 
     assert result.frames[:4] == checkpoint.frames
     assert all(f.well_dx_um is not None for f in result.frames)
-    assert result.assumed == ()
+    assert result.assumed == (_SEED,)

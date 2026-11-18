@@ -6,7 +6,8 @@
   for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206
   (2026-10-28), §11.11 for #224 (2026-10-30); §12 for #205 (2026-10-28);
   §13 for #340 (2026-11-05); §8.11 D8 and §12.10's amendments for #407
-  (2026-11-10); §11.12 for #221 (2026-11-14), §11.12.8 for #508 (2026-11-16).
+  (2026-11-10); §11.12 for #221 (2026-11-14), §11.12.8 for #508 (2026-11-16);
+  §12.13 for #539 (2026-11-18).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -4962,6 +4963,238 @@ change no text and no outcome.
   one read's travel each time, until the Z soft limit refuses the next
   (D13). The operator's by-eye focus between two attempts is what prevents
   it.
+
+### 12.13 A first lock at the 40× in water (#539)
+
+Extends §12.10 and §12.11. **Merging this section decides it**: the reads
+that the next visit to the Ti2-E takes to tell apart the causes of F13
+(session 5, #550), the two CLI reads they need (#574, m5 §6.2), and what each
+outcome changes. No Protocol, no signature and no guard changes: the rise
+guard (`first_lock_max_rise_um`, D8) stays as it is.
+
+#### 12.13.1 What is known
+
+Measured in Ti2-E session 5 (2026-11-17, #550), unless labelled. The plate
+is a Greiner 24 Well SensoPlate (glass bottom), with water and 10 µm beads
+in B2, C2, B3, C3; B5 is dry.
+- **F13.** At the 40× (`3-Plan Apo LmbdD0.25 40x`) in C3, PFS off, focused
+  by eye at Z 4160.04 µm: `--floor` (0), then `engage`. There was no lock
+  within 5 s (assumed: `lock_timeout_s` is unset). The WARNING read
+  `in range: no` after the switch-off, and Z read 4160.04 µm after:
+  **Z did not move**. So the offset write 17794 → 0, with PFS off, moved
+  no Z at the 40× either (§4.5).
+- **At the 10× in water, the first lock from the floor locked three
+  times** (C3, C2, C2). Z ended 1238.9–1243.5 µm below the sharp plane, at
+  6.30–6.32 units/µm. Z covered that distance inside the 5 s wait.
+- **Turns.** A turn to the 40× restores offset 17794 every time. In C3 the
+  40×'s by-eye focus lies 59.8 µm under the 10×'s sharp plane (4161.14
+  against 4220.98 µm). With PFS off, Z drifts −1.8 µm in about 10 min.
+- **Session 3** (#405), a plastic-bottom plate, dry as far as is known.
+  At the 40×, the floor locked at C4, 46.9 µm below the focus, and
+  tripped at C3, +56.8 µm. The 40×'s factor is 112.6–117.8 units/µm,
+  measured between offsets 0 and 6973. The stand's 17794 lies outside
+  that range.
+- **Session 1** (#208, the 10×): `PFS in Range` read `In Range` whenever a
+  sample reflected, with PFS on or off, and `Out of Range` with no sample.
+  The profile names that property (`[autofocus] in_range_property`), but
+  until #574 no command reads it with PFS off.
+- **Inferred, not measured:**
+  - PFS drives Z only while its reference is in range, and does not
+    search beyond that. At the 10×, its capture covers the 1240 µm from
+    the focus to the floor's plane. If the capture scales as the offset
+    does (f², §12.10.1), it covers about 1240 / 16 ≈ 80 µm at the 40×.
+  - In session 3's C4 the floor's plane lay 47 µm under the focus, which
+    is inside that range. In water, on a glass bottom, it may lie farther.
+  - A wait that ended with no Z motion at all makes a too-short wait
+    unlikely, but does not exclude it.
+
+The hypotheses that the visit separates:
+- **H1a.** At the by-eye focus, the floor's plane lies outside the 40×'s
+  capture. `in range` then depends on the offset at a fixed Z: it reads
+  `yes` from some offset `V_in` > 0 up, or at offset 0 from some height
+  `d_in` under the focus down.
+- **H1b.** PFS does not see the reference at the 40× in water at all.
+  `in range` reads `no` at every offset and every height tried in the wet
+  well, and `yes` in the dry one.
+- **H2.** 5 s is too short: a first lock with a 60 s wait locks after
+  more than 5 s.
+
+#### 12.13.2 Decisions
+
+**D17. Two reads for the probe, on the CLI only** (#574; m5 §6.2 is amended
+to match).
+- **`smc autofocus get`** appends a clause to what it prints today:
+  - `; in range: yes` or `; in range: no` when `is_in_range()` answers;
+  - nothing when it returns `None` (the profile names no in-range
+    property);
+  - `; in range: ? (<Type>: <message on one line>)` when the read raises a
+    `HardwareError` (FM-170).
+
+  The exit code still follows the state alone (FM-155): the in-range read
+  never makes it 1. The read is `smc.drive.read_in_range(microscope) ->
+  str`, the clause without its `; `.
+- **`smc autofocus engage --timeout-s S`** passes S to `engage(timeout_s=S)`
+  instead of the profile's `lock_timeout_s`. S is bounded by `engage()`
+  itself: finite, in (0, 600] s, and above `settle_s`. That check runs
+  before anything is sent. Its `ValueError` exits 2 with the layer's text,
+  through `_drive_command`'s `refusals`. The bound is written once, so
+  FM-32 holds without a second copy in the CLI. Without the option,
+  nothing changes. `engage_autofocus(microscope, timeout_s=None)` is the
+  drive call, and the page calls it as before.
+- **A lock that `engage_autofocus` gets is logged at INFO** (`smc -v`) as
+  `autofocus engage: locked and settled in <t:.1f> s`. `t` is
+  `time.monotonic()` taken around `engage()`, so it includes `settle_s`
+  and the guard's polls. The outcome text stays `autofocus locked`, on the
+  CLI and on the page.
+- Not chosen:
+  - *The page.* The probe is typed at a console, one read per command,
+    and the page's header does not change.
+  - *A probe tool* that steps the offset and reads the range by itself.
+    It would write the offset in a loop on a stand where nothing has been
+    measured at the 40× in water. The operator's steps, each one read
+    back, are the measurement that such a tool would later be checked
+    against.
+  - *Setting `lock_timeout_s` in the stand's copy of the profile for the
+    visit.* The probe's waits are not the scan's, and the stand's tree
+    stays clean.
+
+**D18. The probe reads before it locks** (§12.13.3).
+1. **Passive reads first, PFS off.** At the by-eye focus, `in range` is
+   read at offsets from 17794 down to 0. No offset write moves Z (§4.5,
+   and §12.13.1 at the 40×). Then, at the floor, it is read at heights
+   below the focus only, away from the sample.
+2. **Then the first locks, each with a 60 s wait:** from the dry well's
+   focus (the control), from the wet well's focus, and, wet, from where
+   the reads put the reference in range.
+3. **Each attempt is the guarded first lock as it is** (D4, D5, D8). A
+   rise trips at R = 5 µm plus one read's travel, and the soft limits
+   bound a drop.
+4. **One attempt per well and start height** (FM-232). A trip is
+   recorded, not retried from where it stopped.
+
+**D19. What each outcome changes.** The rows are read in order, and the
+first one that matches decides. The session report names the row.
+
+| Row | What the probe reads | What changes |
+|---|---|---|
+| H2 | The wet first lock from the focus locks with `--timeout-s 60`, `t` − `settle_s` > 5 s | Profile only: `[autofocus] lock_timeout_s` = 2 × the longest `t` measured, rounded up to a multiple of 5 s and at most 60 s. Its comment holds the reads. The key applies at every objective (FM-214): at the 10× a lock comes well inside 5 s, so a longer wait only lengthens a failed lock. |
+| H1a, offset | `in range` reads `yes` at the wet focus from `V_in` up, `V_in` ≤ 6800, and a first lock from a floor of `V_in` locks with Z below the focus | Profile only: the lower bound of `autofocus_offset_soft_limits` = `V_in`, rounded up to a multiple of 500. 6800 is the lowest 10× sharp offset ever seen (7803, #208) less 1000 units. So at the 10× the new floor's plane stays at least (7803 − 6800) / 5.9 ≈ 170 µm under the focus, and the comment says so (FM-214). |
+| H1a, height | `in range` reads `yes` at the floor from `d_in` under the wet focus, and a first lock from there locks with Z below where it started | No code: a documented first-lock procedure for wet samples at the 40×, in `docs/hardware/nikon-ti2.md` and in the hardware-session skill's checklist. Automating it (a move down until in range, then the engage) is a later issue, built on these numbers. |
+| H1a, `V_in` > 6800 | The offset row's reads, with `V_in` above 6800 | A floor per objective (D4's *later change*): a design section first, filed as a new issue by the write-up. Meanwhile, the height row's procedure, if it locked. |
+| H1b | `in range` never reads `yes` wet, and reads `yes` dry | Documented in `docs/hardware/nikon-ti2.md`: PFS does not hold the 40× in water on this plate. The 40× scans run with `autofocus=off`, and the owner decides on an image-based focus (a new issue). |
+| None | `in range` reads `yes` with no lock in 60 s, or the dry control does not lock | The session stops trying. The report names the reads, and #539 gets a new plan. |
+
+#### 12.13.3 The probe at the next visit
+
+Every command runs with `--profile nikon-ti2`. The hardware-session
+checklist writes each one with its numbers, never a placeholder (#550,
+F9); below, `Z_eye` and the like name the numbers that the guide
+computes. **Never the stand's PFS button**: a turn restores 17794 for the
+40×, and the button engages there. **No Z move above the by-eye focus of
+the well**, at any step.
+
+0. **Before.**
+   - `main` with #574 merged and pulled: `smc autofocus get` ends in
+     `in range: …`, and `smc autofocus engage --help` shows
+     `--timeout-s`.
+   - Without #574, steps 2 and 3 are skipped. Step 4 then runs with
+     `lock_timeout_s = 60.0` in the stand's copy, and `git checkout --
+     profiles/nikon-ti2.toml` restores it right after.
+   - The plate holds a wet well with beads (C3) and a dry well with
+     something to focus on at the 40× (the owner, on #539). It is
+     registered at the 10×, and the 40× is calibrated (the session's
+     checklist).
+   - Every console turn drops Z by 500 µm first, on the same line (F16).
+1. **The 40× in the wet well, PFS off.**
+   - `smc autofocus disengage`, then the drop and the turn.
+   - `smc z move <Z_sharp10 − 80>`: the 40×'s focus lies about 60 µm
+     under the 10×'s sharp plane.
+   - Focus by eye with the knob, on beads, on Live.
+   - `smc z get` gives `Z_eye`. `smc autofocus offset` should read 17794,
+     and `smc autofocus get` should read `autofocus off; in range: …`.
+   - **Stop** if the autofocus reads anything but off:
+     `smc autofocus disengage`, and nothing else.
+2. **In range against the offset**, at `Z_eye`. For V = 17794, 14000,
+   10000, 8000, 6000, 4000, 3000, 2000, 1000, 0:
+   - `smc autofocus offset --to V`, then `smc autofocus get`, then
+     `smc z get`.
+   - Expected: every Z within 0.5 µm of `Z_eye`.
+   - **Stop** if a write moves Z by more than 1 µm: `smc autofocus
+     disengage`, `smc z get`, end of the probe (PFS was on).
+   - `V_in` is the lowest V that reads `yes`; there is none if no V
+     does.
+3. **In range against the height**, at the floor.
+   - `smc autofocus offset --floor`.
+   - For d = 10, 20, 30, 40, 60, 80, 100, 150, 200: `smc z move <Z_eye −
+     d>`, then `smc autofocus get`.
+   - `d_in` is the first d that reads `yes`; stop there.
+   - Then `smc z move <Z_eye − 200>`.
+4. **The dry control.**
+   - `smc autofocus disengage`. Z is at `Z_eye − 200`. `smc stage move`
+     to the dry well.
+   - Focus by eye: `Z_eye_dry`. `smc autofocus get` at 17794 and after
+     `--to 6000`, `--to 2000` and `--floor`.
+   - From `Z_eye_dry`: `smc autofocus offset --floor`, then `smc -v
+     autofocus engage --timeout-s 60`, then `smc z get`.
+   - Expected: locked, with Z below `Z_eye_dry` (session 3's C4: 46.9
+     µm), and the INFO line gives `t`. The knob under lock until sharp,
+     then `smc z get` and `smc autofocus offset`.
+   - A trip: record it, and do not retry here.
+   - Then `smc autofocus disengage` and `smc z move <Z_eye_dry − 200>`.
+5. **The wet first lock from the focus.**
+   - `smc stage move` back to the wet well. `smc z move <Z_eye − 20>`,
+     then the knob to the focus. `smc z get` gives `Z_eye` again.
+   - `smc autofocus offset --floor`, then `smc -v autofocus engage
+     --timeout-s 60`, then `smc z get`.
+   - Locked: Z must lie below `Z_eye`, and `t` decides H2. Go to step 7.
+   - No lock: the WARNING says `in range: …`, and Z must be unchanged
+     within 0.5 µm. Go to step 6.
+   - A trip: `smc z move <Z_eye − 200>`, record it, go to step 6.
+6. **The wet first lock where the reads put the reference in range.** Take
+   the first of these that applies; at most one attempt each.
+   - **`V_in` ≤ 6800.**
+     - Set `autofocus_offset_soft_limits = [V_in, 20000.0]` in the stand's
+       copy, and show `git diff profiles`.
+     - `smc z move <Z_eye>`, `smc autofocus offset --floor` (it writes
+       `V_in`), `smc -v autofocus engage --timeout-s 60`, `smc z get`.
+     - Then `git checkout -- profiles/nikon-ti2.toml` at once.
+     - Expected: locked, with Z below `Z_eye`.
+   - **`d_in` found.**
+     - `smc autofocus offset --floor`, `smc z move <Z_eye − d_in>`,
+       `smc -v autofocus engage --timeout-s 60`, `smc z get`.
+     - Expected: locked, with Z at or below `Z_eye − d_in`.
+   - **Neither**: no wet attempt. Go to step 8.
+7. **Locked in water.**
+   - The knob under lock until the beads are sharp. Then `smc z get`,
+     `smc autofocus offset`, and `smc autofocus get` (`autofocus locked;
+     in range: yes`).
+   - Two knob positions more, each with both reads, give the 40×'s factor
+     in water.
+   - **The scan** (#539's acceptance), with PFS locked in C3: `scan-plan`
+     for C3 and C2 at the 40×, then `scan` with `autofocus=required`.
+     Under H2, the stand's copy first sets `lock_timeout_s` to the value
+     of D19's H2 row, and `git checkout` restores it after the scan.
+   - Expected: both wells locked on every field. A trip ends the scan at
+     that well (m3 §8), by design.
+8. **Recorded**, per well:
+   - `Z_eye`;
+   - step 2's (V, in range) rows and step 3's (d, in range) rows;
+   - each engage's start Z, offset, timeout, outcome, `t` and Z after;
+   - the sharp Z and its offset.
+
+   These are the numbers that D19 reads.
+
+#### 12.13.4 Not verified
+
+- Every read above, at the stand.
+- That `in range` depends on the offset at a fixed Z. Step 2 measures it.
+  If it does not, step 3 alone can show H1a.
+- The 40×'s capture range: about 80 µm is an inference (§12.13.1).
+- That an offset write with PFS off moves no Z at every offset the probe
+  writes. One write at the 40× was measured (17794 → 0); step 2 reads Z
+  after every write.
+- The 40×'s factor above offset 6973. The probe does not need it: no
+  offset is written under lock.
 
 ## 13. Offsets between objectives (#340)
 
