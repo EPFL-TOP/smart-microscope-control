@@ -3065,6 +3065,9 @@ class PlatePageView:
         # screen's two values come from (m5 §17.10.3). A load draws them once, at its end.
         self._draw_calibrate_command()
         self._draw_field_lines()
+        # The Wells screen's *Time* line follows the scan tool's autofocus field (m5
+        # §17.10.3, #549), so it is drawn again here, from the status last drawn.
+        self._draw_wells_known(self._status)
         self._draw_layout_command()
         self._draw_scan_command()
         self._draw_result_lines()
@@ -4320,12 +4323,32 @@ class PlatePageView:
         view = self._view
         plan = None if view is None else view.plan
         self._draw_field_lines()
+        self._draw_wells_known(status)
+        self._say(
+            self.wells_note,
+            plan_selection_note(
+                () if plan is None else plan.well_names, self.page.selection
+            ),
+        )
+
+    def _draw_wells_known(self, status: PageStatus | None) -> None:
+        """The Wells screen's "known" block: objective, fields, time, the plan's assumptions (m5 §17.10.3).
+
+        Its own method because the ``Time`` line follows the ``scan`` tool's ``autofocus``
+        field (m3 §7.4, #549), and a typed field draws this block again without a refresh:
+        the view and its checklist are the last ones read, the status the last one drawn.
+        The mode is the field's text as typed, ``""`` when the page has no ``scan`` tool.
+        """
+        view = self._view
+        plan = None if view is None else view.plan
         item = (
             None
             if view is None
             else next((i for i in view.checklist if i.slot == "scan-plan"), None)
         )
         card = None if view is None else view.cards.get("scan-plan")
+        scan_fields = self.tool_fields.get("scan", {})
+        autofocus = scan_fields.get("autofocus")
         self.wells_known_block.object = "\n".join(
             wells_known_lines(
                 objective=None if status is None else (status.objective or None),
@@ -4336,13 +4359,8 @@ class PlatePageView:
                     else None
                 ),
                 assumed=() if card is None else card.assumed,
+                autofocus="" if autofocus is None else str(autofocus.value),
             )
-        )
-        self._say(
-            self.wells_note,
-            plan_selection_note(
-                () if plan is None else plan.well_names, self.page.selection
-            ),
         )
 
     def _draw_scan_screen(self, status: PageStatus | None) -> None:
