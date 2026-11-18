@@ -346,7 +346,8 @@ def test_the_check_runs_again_on_a_resume(
 def test_a_scan_of_a_plate_that_did_not_move_records_its_check_and_says_so(
     stands: list[Microscope], documents: Documents, tmp_path: Path
 ) -> None:
-    rig = _rig(stands, documents, tmp_path)
+    # Two wells: the check is the attempt's, made in its first well and not again.
+    rig = _rig(stands, documents, tmp_path, wells="A1:A2")
     seen: list[Progress] = []
     before = datetime.now(timezone.utc)
 
@@ -361,8 +362,8 @@ def test_a_scan_of_a_plate_that_did_not_move_records_its_check_and_says_so(
     assert (check.plate_objective, check.objective) == (TEN, TEN)
     assert check.shift_um == (0.0, 0.0)
     assert check.frames == 16
-    assert len(result.frames) == 2
-    assert rig.camera.snaps == 18
+    assert len(result.frames) == 4
+    assert rig.camera.snaps == 16 + 4
     # The check's line first, after the stand's (none here).
     assert result.assumed[0] == (
         f"the plate was checked before the first field: A1 and H12 lie within "
@@ -376,7 +377,7 @@ def test_a_scan_of_a_plate_that_did_not_move_records_its_check_and_says_so(
     # The check comes before the first field, and the scan's progress stays at 0.
     checking = [p for p in seen if p.message.startswith("checking the plate: ")]
     assert len(checking) == 8
-    assert {(p.done, p.total) for p in checking} == {(0, 2)}
+    assert {(p.done, p.total) for p in checking} == {(0, 4)}
     assert seen[0].message == "checking the plate: A1 +X"
     assert seen.index(checking[-1]) == 7
 
