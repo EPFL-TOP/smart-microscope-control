@@ -210,6 +210,7 @@ class RunContext:
     run_dir: Path
     run_doc: Path
     dry_run: bool
+    document: RunDocument  # algorithms.md §5.8, #567
 
     def progress(
         self, done: int, total: int | None = None, message: str = ""
@@ -246,6 +247,12 @@ with a run document under `tmp_path`, never by building a context.
   (FM-50).
 - **`dry_run`** is `microscope.dry_run`, for a plugin that must label what
   it did not do.
+- **`document`** (algorithms.md §5.8, #567) is the run document as the runner
+  read it before `run`, the snapshot that `upstream` reads, never read again.
+  A plugin that hands records to a pure function that wants the document
+  (route's `Scan`) passes it on; a read through it of a slot the plugin did
+  not declare in `reads` is one that staleness does not see, so reads go
+  through `upstream`.
 - **`progress`** builds a `Progress` and hands it to the runner's
   `on_progress`. Not validated (a cosmetic bug must not end a scan). A
   callback that raises an `Exception` is logged once at WARNING and not
@@ -1365,6 +1372,11 @@ class RoutePosition(SlotValue):
 *Amended by §26 (#392)*: `RoutePosition` gains `offset_from_focus:
 OffsetFromFocus | None = None`, last, and `pfs_offset` is the offset of the
 cells' plane for a stop that has one.
+
+*Amended by algorithms.md §5.6 (#567)*: `RoutePosition` gains `score: float |
+None = None` and `measures: dict[str, float] = {}`, after `offset_from_focus`,
+both left out of the JSON when `None` or empty, so a route made by the default
+selector is written as before.
 
 ```python
 class RouteResult(PluginResult):
@@ -4273,6 +4285,12 @@ whose autofocus had lost the sample.
 *Amended by §26 (#392)*: a stop whose frame has a focus step on the cells (§21)
 takes the offset of the cells' plane, derived from the frame's lock offset and
 its `dz_um` with the profile's factor, or none, with `assumed` saying which.
+
+*Amended by algorithms.md §5 (#567)*: `route` chooses the fields through a
+selector and orders them through an orderer, chosen by name (`most-cells` and
+`nearest` are this section's rules, the defaults); `RouteParams` gains
+`selector`, `selector_params`, `orderer` and `orderer_params`; `choose_fields`
+and `order_route` stay as they are, under those two.
 
 **Tests** (hypothesis where marked): `test_no_field_leaves_its_well_or_enters_an_exclusion`
 (hypothesis over margins, exclusions, rotations); `test_chosen_fields_never_overlap`;

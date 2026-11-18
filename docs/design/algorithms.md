@@ -265,9 +265,10 @@ class Scan:
 - **`wells`** is the plan's order; **`geometry`** is `well_geometry(plan,
   well)` for each. The camera is the scan's (`result.matrix_um_per_px`,
   `result.image_shape_px`), never the plan's copy (FM-124).
-- **`image(frame)`** is `ScanResult.load_frame(run_dir, frame)`; its
-  `FileNotFoundError` and `ValueError` become a `DatasetError` naming the
-  frame.
+- **`image(frame)`** is `smc.plugins.slots.load_frame(run_dir, frame)` (a
+  function of the slots module, not a method of `ScanResult`: #564's plan
+  measured it); its `FileNotFoundError`, `ValueError` and `tifffile`'s own
+  error become a `DatasetError` naming the frame.
 - **`from_results`** builds a `Scan` from results already read (`route`
   uses it, §5.6); it checks nothing `ctx.upstream` has checked.
 - `cells_of(well=…)` and `cells_of(frame=…)` filter by the cell's `well` and
@@ -618,6 +619,7 @@ def make_input(
     wells: Sequence[str] = ("B2",),
     plate: str = "96-well",
     field_um: tuple[float, float] = (100.0, 100.0),
+    labels: Sequence[str] = ("single",),
     fields_per_well: int = 10,
     wall_margin_um: float = 0.0,
     exclude_centre_um: float = 0.0,
@@ -625,11 +627,96 @@ def make_input(
 ```
 
 Each cell is `(well, x_um, y_um, label)`, in stage µm; the plate's wells
-come from useq's plate (`plate`, A1 at the origin); the field is a square
-camera with no rotation (`field_um` over a 100 × 100 px frame). It is in
-`smc.selection`, not `smc.testing`, so it never imports `pymmcore_plus`.
-`image()` on such an input raises `DatasetError` (no frames); a selector
-that reads pixels is tested on a run folder written by the test.
+come from useq's plate (`plate`, A1 at the origin); the field is a camera
+with no rotation and no mirror (`field_um`, `(width, height)`, over a
+100 × 100 px frame). `labels` is the input's `labels` (route's default,
+`("single",)`, when not given: planning #567 added it, since a selector that
+counts doublets is tested with them). It is in `smc.selection`, not
+`smc.testing`, so it never imports `pymmcore_plus`. `image()` on such an
+input raises `DatasetError` (no frames); a selector that reads pixels is
+tested on a run folder written by the test.
+
+### 5.8 Refined while planning #567 (2026-11-18)
+
+Measured on the main checkout's `.venv` (Python 3.13.0, pydantic 2.13.5,
+numpy as pinned) with throwaway prototypes, nothing committed; the steps and
+the test names are in the plan of issue #567.
+
+- **How route gets the document.** `Scan.from_results` takes a `RunDocument`
+  (§3) and `RunContext` holds one only privately: the snapshot the runner took
+  before `run`, which `upstream` reads. Decided: `RunContext.document`, a
+  read-only property that returns that snapshot (additive to m3 §1.4, as
+  `run_doc` was for #195). Route hands it to `Scan.from_results`, so a
+  selector sees the same `scan.document` online and on a dataset. It adds no
+  read that the runner has not checked: a selector that reads another stage's
+  record through `scan.document` makes a read that staleness does not see, and
+  the guide (§7.6) says to use the fields of `SelectionInput` and `Scan` only.
+- **One definition of "inside".** `choose_fields` decides that a cell is in a
+  field from the inverse that `_inverse_of` reads from `pixel_of_stage` at one
+  µm along each axis, and `|d_col| <= W/2`, `|d_row| <= H/2` (m3 §11, FM-132).
+  Testing `pixel_of_stage` per cell against the same half-extents disagreed with
+  it on 51 of 800 cells placed on a field's edge. So everything that counts for
+  a selector's choices uses `_inverse_of` and `_pixel_offsets` and never
+  `pixel_of_stage` per cell. `route.algorithm` gains three public functions on
+  them, and `choose_fields` is not changed:
+  `cells_in_field(cells, x_um, y_um, *, matrix, image_shape_px)` (§5.2);
+  `held_counts(cells, centres, *, labels, matrix, image_shape_px)`, one
+  `dict[str, int]` per centre, in order, of the cells of `labels` that no
+  earlier centre holds, zeros included (route's `counts`: on 120 wells,
+  rotated and mirrored, three labels, it gave `choose_fields`' counts with no
+  difference); and `first_overlap(centres, *, matrix, image_shape_px)`, the
+  first pair `(i, j)`, `i < j`, whose fields overlap by §5.5's rule, or
+  `None`, in numpy (a pair loop in Python is 125 000 pairs at 500 fields).
+- **What route does, in this order** (the first progress and the first stop
+  check of m3 §11 stay where tests pin them, per well): the upstreams, the
+  labels and the imaging field as today; the cells file; `ctx.document`; one
+  `select` for every well; `check_choices`; `held_counts` per well, in the
+  selector's order; one `order`; `check_order`; then, for each well of the
+  plan's order, `ctx.raise_if_stopped()`, the stops of that well in visiting
+  order with their focus, and `ctx.progress(done, total, well)`; last, the
+  positions sorted by their place in `order`, numbered `0..n-1`, named
+  `<well>_r<k:03d>` with `k` the stop's rank among its well's stops in
+  visiting order. `select` is one step that a stop cannot interrupt; at the
+  measured 0.3 to 0.45 s a well that is 30 to 45 s for a 96-well plate where
+  every well is dense.
+- **`most-cells` is route's rule to the letter.** It skips a well with no
+  wanted cell (so a lattice too large for such a well is no refusal, as now),
+  takes the well's geometry from `scan.geometry`, derives the step from
+  `candidate_step_fraction * min(fov_um)` of the imaging field, and turns
+  `LatticeTooLarge`, `TooMuchWork` and `ValueError` into `SelectionError` with
+  the plugin's present texts, so the stage's message is `selector most-cells:`
+  followed by them.
+- **`nearest` is route's order to the letter.** Wells in the plan's order; the
+  first well that has a choice starts at the choice nearest its own
+  `first_field`, every later one at the choice nearest the previous well's
+  last stop (a well with no choice sets no reference); ties go to the choice
+  that comes first in `choices`.
+- **What `assumed` says.** The default route's `assumed` is unchanged. With a
+  selector other than `most-cells`, one line is added after the existing
+  ones: `the fields were chosen by selector '<name>', not by route's own rule
+  of most cells: its choice, its score and its measures are its own`. With an
+  orderer other than `nearest`, the line that says the route minimises the
+  Euclidean distance is replaced by `the visiting order is orderer '<name>''s,
+  not route's shortest path: distance_um is the length of that order's path,
+  and whether the stage's move time follows it is not measured`.
+- **The registry.** A name is looked up without importing anything (the
+  entry points' names), so a bad name is refused with the known ones listed
+  and the default `RouteParams()` imports only `most-cells`. `selector(name)`
+  loads only the entries of that name; `selectors()` loads all, and a failure
+  is a logged warning there and a `SelectionError` carrying the reason in
+  `selector(name)` (FM-113). Entry points are metadata written at install
+  time (FM-112): when no selector at all is registered, the message says to
+  run `pip install -e .` in the smc folder. Tests put their own selectors in
+  place of the installed ones by replacing the module's `entry_points`, as
+  `tests/test_cli_presets.py` does for plugins.
+- **`RouteParams`.** The names are checked by field validators (so a bad name
+  and a bad bound are listed together), the params by an `after` model
+  validator, which turns every exception of a selector's `Params` into a
+  `ValueError` that starts with `selector_params:` or `orderer_params:`
+  (FM-128). `selector_params` and `orderer_params` are `dict[str, JsonValue]`:
+  pydantic's `JsonValue` refuses `NaN` and `Infinity` under `allow_inf_nan=False`
+  (measured). A frozen model with a dict field is not hashable (measured), and
+  nothing in `src/` hashes a plugin's params.
 
 ## 6. The drawing (#568)
 
