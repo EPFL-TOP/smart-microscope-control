@@ -665,8 +665,11 @@ def test_a_stand_that_refuses_the_stop_is_not_told_as_stopped(
     assert result.exit_code == 0, result.output
     assert "slow was stopped" not in lines
     [note] = [line for line in lines if line.startswith("slow told to stop; ")]
-    assert note.startswith("slow told to stop; halted, but ")
-    assert "refused the stop" in note
+    assert note.startswith(
+        "slow told to stop; the stand is halted (Resume clears the halt)"
+    )
+    assert "XY refuses a stop on this stand" in note
+    assert "resume()" not in note
     assert lines[-2:] == [note, "slow stopped"]
 
 

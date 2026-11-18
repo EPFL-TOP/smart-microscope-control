@@ -159,6 +159,7 @@ from smc.ui.guide import (
     SCAN_HALTED,
     SELECT_WELLS,
     SELECTION_KEPT_ITS_NAMES,
+    STAND_HALTED,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     CalibrationNote,
@@ -185,10 +186,12 @@ from smc.ui.guide import (
     offsets_no_objective,
     offsets_not_on_turret,
     offsets_plate_refusal,
+    page_words,
     register_objective_refusal,
     replace_note,
     scan_plan_card_lines,
     side_words,
+    stop_refused_text,
     suggested_centres,
     tool_title,
     turret_position,
@@ -363,7 +366,7 @@ LIVE_PERIOD_S = 0.1
 
 #: What ``stop`` says when the stand took the stop: the one wording that may be told
 #: as "stopped" (FM-117).
-_STOP_ACCEPTED = "stopped: the stand is halted (Resume clears the halt)"
+_STOP_ACCEPTED = f"stopped: {STAND_HALTED}"
 
 
 #: Wells built for a plate are kept (339 ms for 1536 of them); a registration
@@ -1137,9 +1140,13 @@ def jog_crossing(
 
 
 def _one_line(error: BaseException) -> str:
-    """The message of ``error`` on one line; an error whose message cannot be built says nothing."""
+    """The message of ``error`` on one line, in the page's words; an error whose message cannot be built says nothing.
+
+    Every line the page builds from an error goes through here, so the layer's advice to a
+    program (``call resume()``) is said once as *press Resume* (``page_words``, FM-254).
+    """
     try:
-        return " ".join(str(error).split())
+        return page_words(" ".join(str(error).split()))
     except (
         Exception
     ):  # a message that cannot be printed is not worth losing the outcome
@@ -1373,7 +1380,7 @@ def _failed_calibration_words(path: Path) -> str | None:
         return None
     if record is None or record.status is not StageStatus.failed or not record.error:
         return None
-    return _cut(error_words(_flat(record.error)), _CARD_TEXT_CHARS)
+    return _cut(page_words(error_words(_flat(record.error))), _CARD_TEXT_CHARS)
 
 
 def _offsets_offer_of(registered: PlateResult | None) -> OffsetsOffer | None:
@@ -1546,7 +1553,7 @@ def _card(
             None
             if record.error is None
             else _cut(
-                _flat(record.error),
+                page_words(_flat(record.error)),
                 _OFFSETS_ERROR_CHARS
                 if record.provides == "objective-offsets"
                 else _CARD_TEXT_CHARS,
@@ -4626,15 +4633,26 @@ class PlatePage:
         if current is not None:
             current[1].set()
         prefix = "" if current is None else f"{tool_title(current[0])} told to stop; "
+        autofocus: str | None = None
         with self._reading() as microscope:
             try:
                 if microscope is None:
                     note = f"{prefix}{NOT_CONNECTED}: nothing to stop"
                 else:
+                    # A dict read, no device and no lock: the label of the autofocus
+                    # the stop switches off first, for the refusal's note below.
+                    autofocus = microscope.roles.get(Role.autofocus)
                     microscope.stop()
                     note = f"{prefix}{_STOP_ACCEPTED}"
             except StopRefusedError as exc:
-                note = f"{prefix}halted, but {_one_line(exc)}"
+                # Built from the error's fields and the profile, never the facade's
+                # sentence: it ends on a call of the API (FM-254). Nothing failed, or
+                # this would not be a refusal, so the autofocus was switched off.
+                note = prefix + stop_refused_text(
+                    exc.refused,
+                    autofocus=autofocus,
+                    segments_um=_stop_segments_um(self._profile.safety),
+                )
             except HardwareError as exc:
                 note = f"{prefix}the stop failed: {_one_line(exc)}"
         # Kept before it is logged: the stop is sent, and a handler that blocks (a
@@ -5287,7 +5305,7 @@ class PlatePage:
             kind=kind,
             done=None if reported is None or reported.total is None else reported.done,
             total=None if reported is None else reported.total,
-            text=record.error or "",
+            text=page_words(record.error or ""),
             resumable=kept is not None,
         )
 

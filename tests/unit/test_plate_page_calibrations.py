@@ -25,7 +25,7 @@ from pymmcore_plus import CMMCorePlus
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveTurret
-from smc.hardware.errors import HardwareError
+from smc.hardware.errors import HardwareError, MicroscopeHaltedError
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.camera_calibration.plugin import (
@@ -1265,6 +1265,27 @@ def test_the_tools_words_of_a_failed_calibration_are_one_line_and_cut_at_the_car
     assert shown.startswith("the frame is dark or flat xxx")
     assert len(shown) == 601
     assert shown.endswith("…")
+
+
+def test_the_reason_of_a_calibration_the_halt_cut_says_press_resume_not_the_api_call(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-254: a calibration started on a halted stand ends failed with the layer's real
+    # words, which end on a call of the API; the list says the page's.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    StubCalibration.fails = " ".join(str(MicroscopeHaltedError()).split())
+    page = _page(fake_microscope, run_doc)
+    try:
+        _calibrate(page, FORTY)
+        held = page.view().calibrations
+    finally:
+        page.close()
+
+    assert held[0].read.problem == calibration_failed(
+        "the microscope was stopped; press Resume to continue"
+    )
+    assert "`" not in (held[0].read.problem or "")
 
 
 def test_a_position_that_cannot_be_looked_at_is_a_line_and_the_others_are_read(

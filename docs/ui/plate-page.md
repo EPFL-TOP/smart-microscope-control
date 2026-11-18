@@ -127,7 +127,7 @@ Connect opened it, is released after. What the command prints last depends on wh
 | What happened | The last lines |
 |---|---|
 | The stand took the stop and the run ended stopped | `<plugin> was stopped`, exit 0 |
-| The stand refused the stop (the Ti2-E's does) | `<title> told to stop; halted, but <why>`, then how the run ended: a move under way runs to its target, so it is never "stopped" by default |
+| The stand refused the stop (the Ti2-E's does) | `<title> told to stop; the stand is halted (Resume clears the halt) and the autofocus (PFS) is switched off. <devices> refuse a stop on this stand: …`, then how the run ended: a move under way runs to its target, so it is never "stopped" by default |
 | The run failed while it was stopped | the stop's line, then `<title> failed: <message>` (the tool's plain title, and no exception type: that is in the log), exit 0 |
 | The run did not end within the wait | the stop's line, then `✗ <plugin> did not end within 10 s`, **exit 1**; the stand is released under a run that is still alive |
 | A Connect was still opening a slow stand | the command waits up to 8 s more, then `connect: <stand> was opened after the page closed, and released` (exit 0), or `✗ connect: <stand> is still opening after 18 s: the process ends now, and whether the stand is left connected is not known` (**exit 1**) |
@@ -176,8 +176,16 @@ holds them all. **Refresh** also forgets how the last run ended, so that a line 
 redraw that a run's end makes keeps it.
 
 **STOP says what it did.** `<title> told to stop; stopped: the stand is halted
-(Resume clears the halt)`, or `halted, but <why the stand refused>`, or `the stop failed:
-<why>`. On a stand whose stages refuse a stop (the Ti2-E's, [#204](https://github.com/EPFL-TOP/smart-microscope-control/issues/204)) the strip also says so: a move already under way
+(Resume clears the halt)`, or, on a stand that refuses a stop in part, `the stand is halted
+(Resume clears the halt) and the autofocus (PFS) is switched off. PFSOffset, XYStage and
+ZDrive refuse a stop on this stand: a move already sent finishes first; a long one ends at the
+end of its current segment (at most 500 µm in XY, 100 µm in Z). Use the stand's own controls
+to stop a move that must not finish.` (the devices are those that refused, the sizes the
+profile's, and the autofocus clause only when the stand has one), or `the stop failed:
+<why>`. The page names no API call in any text it shows: the layer's own advice to a program
+(`call resume()`) is said as *press Resume*, here and in the server's console
+([#544](https://github.com/EPFL-TOP/smart-microscope-control/issues/544)); the command line
+keeps the layer's text. On a stand whose stages refuse a stop (the Ti2-E's, [#204](https://github.com/EPFL-TOP/smart-microscope-control/issues/204)) the strip also says so: a move already under way
 runs to its target, **unless** the profile cuts that role's moves into segments
 (`[safety] max_segment_um`, `max_z_segment_um`): then the strip says `an xy_stage move ends
 at the end of its current segment (sent in segments of at most 500 µm)`, with the size the
