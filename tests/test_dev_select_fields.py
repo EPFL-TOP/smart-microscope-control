@@ -42,6 +42,7 @@ from select_fields_seed import (
 from select_fields_seed import record as write_record
 from smc.plugins.geometry import Matrix2, footprint, stage_of_pixel
 from smc.plugins.route.algorithm import allowed
+from smc.plugins.route.focus import StopFocus
 from smc.plugins.slots import (
     Cell,
     OffsetFromFocus,
@@ -3630,7 +3631,7 @@ def test_selection_json_gives_a_stop_its_offset_next_to_the_frames_reading(
             "no factor to read",
             OBJECTIVE,
             STEPS,
-            (0, 20000),
+            None,
             False,
             {
                 0: (2000.0, 1000.0, None, "no-factor"),
@@ -3685,7 +3686,7 @@ def test_selection_json_names_why_a_stop_has_no_offset(
     reason: str,
     scan_objective: str | None,
     steps: Mapping,
-    limits: tuple[int, int],
+    limits: tuple[int, int] | None,
     with_profile: bool,
     expected: Mapping[int, tuple[float, float, float | None, str]],
 ) -> None:
@@ -3704,6 +3705,80 @@ def test_selection_json_names_why_a_stop_has_no_offset(
             "pfs_offset": offset,
             "outcome": outcome,
         }, reason
+
+
+def test_a_stops_focus_is_the_one_of_its_route_position_not_of_its_frame_number(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B1 lies under A1 at the same x, so its route starts at the frame nearest where
+    # the stage comes from (A1's last stop, the rightmost): B1 visits frames 5, 4 and 3,
+    # and a stop's number runs against its frame's. A1 keeps the frames' order, so a
+    # lookup by the wrong index passes there (found by the review of #516).
+    steps = {
+        (("B1" if well == "A2" else well), k): step for (well, k), step in STEPS.items()
+    }
+    seed = seed_run(
+        tmp_path,
+        cells=_one_cell_in_each_frame,
+        wells=("A1", "B1"),
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        cell_focus_of=steps,
+    )
+    profile = _profile_file(tmp_path)
+    code, _, err = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--profile", str(profile)
+    )
+    assert (code, err) == (0, "")
+    found = _selection_candidates(tmp_path / "selection")
+    # frame: (its stop's number, the stop's Z, offset and outcome), by hand as above.
+    expected = {
+        0: (0, 1000.0, 1662.0, "derived"),
+        1: (1, 1010.0, 2314.0, "derived"),
+        2: (2, 1020.0, 1688.0, "derived"),
+        3: (2, 1030.0, 2182.0, "derived"),
+        4: (1, 1040.0, 2040.0, "recorded"),
+        5: (0, 1050.0, 2050.0, "recorded"),
+    }
+    for frame, (stop, z_um, offset, outcome) in expected.items():
+        assert found[frame]["stop"] == stop
+        assert found[frame]["stop_focus"] == {
+            "z_um": z_um,
+            "pfs_offset": offset,
+            "outcome": outcome,
+        }
+    # The copy names its stops by route number: B1's first is the frame met first.
+    copy = {
+        s.name: (s.z_um, s.pfs_offset)
+        for s in _stops_of(tmp_path / "run-selected.json")
+    }
+    assert copy["B1_r000"] == (1050.0, 2050.0)
+    assert copy["B1_r002"] == (1030.0, 2182.0)
+
+
+def test_a_stop_focus_never_writes_a_number_json_cannot_hold(sf: ModuleType) -> None:
+    # `write_selection` refuses a nan (allow_nan=False), so the entry turns every value
+    # that is not a finite number into null, as the features do.
+    unknown = StopFocus(
+        z_um=math.nan,
+        pfs_offset=math.inf,
+        derived=None,
+        outcome="recorded",
+        refused_offset=None,
+        no_peak=False,
+    )
+    assert sf._stop_focus_entry(unknown) == {
+        "z_um": None,
+        "pfs_offset": None,
+        "outcome": "recorded",
+    }
+    none = StopFocus(None, None, None, "recorded", None, no_peak=False)
+    assert sf._stop_focus_entry(none) == {
+        "z_um": None,
+        "pfs_offset": None,
+        "outcome": "recorded",
+    }
 
 
 def test_a_candidate_that_is_not_a_stop_has_no_stop_focus(
