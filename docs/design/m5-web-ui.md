@@ -3698,8 +3698,12 @@ not validate keeps the generic card, never an exception: FM-125) and takes these
 wells: 2 (B11, B2)
 fields: 72, a grid of 6 × 6 in each well
 field: 512 × 512 µm at Nikon 10X S Fluor, overlap 0.1
-estimate: about 42 s (the moves, refocus and snaps of the timings)
+estimate: about 14 s (the moves, the autofocus locked again in each well, and the snaps of the timings)
 ```
+
+The figure is the demo's 42.16 s (§17.10.1) less the 70 refocuses of 400 ms that #549 no
+longer charges (a lock in each of the two wells, not at each of the 72 fields): derived,
+not run; the `/ui-check` of #549's build shows the measured one.
 
 - `wells: <n> (<names>)`: the names in the plan's order (`result.wells`), at most six,
   then `, … <n - 6> more` inside the parentheses (`wells: 96 (B11, B2, B3, B4, B5, B6, … 90 more)`).
@@ -3710,14 +3714,20 @@ estimate: about 42 s (the moves, refocus and snaps of the timings)
   result's own.
 - `field: <w:g> × <h:g> µm` then ` at <objective>` when it is not `None`, then
   `, overlap <overlap:g>`.
-- `estimate: about <duration_text(estimate_s)> (the moves, refocus and snaps of the
-  timings)` when `estimate_s` is not `None`; otherwise **`estimate: unknown, no usable
-  timing: run timing, then scan-plan again`**. What the figure sums is what
-  `estimate_s()` sums (`scan_plan/algorithm.py`): each move, a refocus when the stand
-  has an autofocus and the timings know its cost, each snap. It does not include a
-  channel change or the cells, the report or the export, and the text says "the moves,
-  refocus and snaps" so as not to claim more. An unknown is not a zero (CLAUDE.md,
-  *unknown beats guessed*): the line says what to run, and says it once.
+- `estimate: about <duration_text(estimate_s)> (<what it sums>)` when `estimate_s` is
+  not `None`; otherwise **`estimate: unknown, no usable timing: run timing, then
+  scan-plan again`**. What the figure sums is what `estimate_s()` sums
+  (`scan_plan/algorithm.py`): each move, each snap and, since #549 (m3 §7.4), one
+  lock of the autofocus in each well when the stand has one and the timings know its
+  cost. `<what it sums>` is, in this order: `the moves, the autofocus locked again in
+  each well, and the snaps of the timings` when `estimate_without_autofocus_s` is not
+  `None` and is below `estimate_s` (a lock is counted); `the moves and snaps of the
+  timings` when it is not `None` and equal (none is); and the text this section gave
+  before #549, `the moves, refocus and snaps of the timings`, when it is `None`: a
+  plan written before #549 charged a refocus at every field, and says so. It does not
+  include a channel change or the cells, the report or the export, and the text says
+  what it sums so as not to claim more. An unknown is not a zero (CLAUDE.md, *unknown
+  beats guessed*): the line says what to run, and says it once.
 
 The `×` is U+00D7; the source carries `# noqa: RUF001` as `scan_plan/plugin.py` does.
 Four lines, never more than `_CARD_LINES`; each goes through `_cut(_flat(...,
@@ -4536,8 +4546,10 @@ Run.
   reason (a checkpoint, a missing capability), `SELECT_WELLS`; a run going says
   `busy_note`.
 - Under the action, a "known" block (§17.10.3): `Objective: <label>, in place`, `Fields:
-  <n> in <w> wells`, `Time: about <duration_text>` from the plan's `estimate_s` (§14.3),
-  then the plan's own `assumed` lines. Before a plan, `Fields: not laid out yet`; a plan
+  <n> in <w> wells`, `Time: about <duration_text>` from the plan's `estimate_s` (§14.3)
+  and, with an autofocus on the stand, the words of §17.10.3 that say which autofocus
+  mode the figure is for (the `autofocus` field right above), then the plan's own
+  `assumed` lines. Before a plan, `Fields: not laid out yet`; a plan
   the run document no longer holds usable says why (`Fields: out of date (<the
   checklist's reason>)`); a plan made with no timing says `Time: not known (no timing
   measured; the expert view's timing tool measures it, then lay out the fields again)`:
@@ -4860,7 +4872,8 @@ class RunClock:
 - **`PlanLayer`** gains, after `fields`, four defaulted fields: `well_names:
   tuple[str, ...] = ()` (the plan's wells in visiting order), `objective: str | None =
   None`, `estimate_s: float | None = None`, and `imaged: tuple[tuple[float, float],
-  ...] = ()`: the `(x_um, y_um)` of the plan's fields that have a frame in the **usable**
+  ...] = ()` (*#549 adds `estimate_without_autofocus_s: float | None = None` after
+  `estimate_s`*, the plan's own, §17.10.3): the `(x_um, y_um)` of the plan's fields that have a frame in the **usable**
   `scan` record of this plan (a field is matched to a frame by its `name`), `()` while
   there is no usable `scan`, when it has no frame (a dry run) and, as `fields`, past
   `MAP_FIELDS_UP_TO`.
@@ -4897,6 +4910,7 @@ def wells_known_lines(
     plan: PlanLayer | None,
     out_of_date: str | None,
     assumed: Sequence[str],
+    autofocus: str = "",  # #549: the scan tool's autofocus field, as typed
 ) -> tuple[str, ...]: ...
 def plan_selection_note(plan_wells: Sequence[str], selection: Sequence[str]) -> str: ...
 def field_source_line(
@@ -4951,10 +4965,29 @@ def plain_default(default: str) -> str: ...
 - `wells_known_lines`, in order, each line only when it applies: `Objective: <label>, in
   place` or `Objective: not known`; `Fields: <n> in <w> wells` (`1 field in 1 well`),
   `Fields: out of date (<out_of_date>)` when the plan is unusable and the checklist says
-  why, else `Fields: not laid out yet`; with a plan, `Time: about <duration_text(estimate_s)>`
+  why, else `Fields: not laid out yet`; with a plan, the `Time` line below
   or `Time: not known (no timing measured; the expert view's timing tool measures it,
   then lay out the fields again)`; then `assumed: <line>` for each of the plan card's
   `assumed` lines. The text is plain (FM-139).
+- **The `Time` line** (#549, m3 §7.4). `wells_known_lines` takes `autofocus: str = ""`,
+  the text of the `scan` tool's `autofocus` field (§17.4.3), which the page passes and
+  redraws when the field changes (`_on_field_changed` draws the known block again; it
+  drew it only at a refresh). The mode is the text stripped: `off` and `required` are
+  themselves, and **every other text, the empty one and a mistyped one included, reads as
+  `if-engaged`**, the tool's default: `scan` refuses a mistyped value when it runs, with
+  its own words. With `on = estimate_s` and `off = estimate_without_autofocus_s`, the
+  line is, the first that holds:
+  - `off` is `None` (a plan written before #549), or equals `on` (no autofocus on the
+    stand, or no lock time known: nothing was charged to leave out):
+    `Time: about <duration_text(on)>`, as before;
+  - mode `off`: `Time: about <duration_text(off)>, with the autofocus not used`;
+  - mode `required`: `Time: about <duration_text(on)>, with the autofocus locked again in
+    each well`;
+  - mode `if-engaged`: `Time: about <duration_text(on)>, with the autofocus locked again
+    in each well; about <duration_text(off)> if it is off at the start`, the clause after
+    the semicolon left out when the two durations read the same (`42 s` and `42 s`):
+    `scan` does not use an autofocus that is off when it starts, and the page cannot know
+    which it will find.
 - `plan_selection_note`: `""` when the two hold the same wells; else `The fields laid out
   are for <wells_text(plan_wells)>; the wells selected now are <wells_text(selection)>.
   Lay out the fields again to scan these.`, and with an empty selection `The fields laid

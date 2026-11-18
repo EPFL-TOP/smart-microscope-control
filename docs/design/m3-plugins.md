@@ -1193,6 +1193,7 @@ class ScanPlanResult(PluginResult):
     columns: int = Field(ge=1)
     fields: tuple[PlannedField, ...]
     estimate_s: float | None = Field(ge=0.0)
+    estimate_without_autofocus_s: float | None = Field(None, ge=0.0)  # #549
 ```
 
 `plate_plan` holds the plate, its registration, the selected wells in
@@ -1200,6 +1201,13 @@ visiting order and the `GridRowsColumns`; `fields` are its image positions
 that survived clipping (§7), in visiting order, `index` counting from 0 in
 each well, `name` useq's (`A1_0003`, gaps included). `fov_um` is `(width,
 height)`, the footprint's extent in stage axes.
+
+*Added by #549 (§7.4)*: `estimate_s` is the time of the scan with the
+autofocus used, and `estimate_without_autofocus_s` the same with none
+(`scan`'s `autofocus="off"`). It defaults to `None`, so that every older
+document loads, where `estimate_s` is the figure of its time (§7.4). A model
+validator refuses a result whose second figure is not `None` while
+`estimate_s` is, or is above it.
 
 ```python
 FocusState = Literal["locked", "unlocked", "off", "none"]
@@ -2719,8 +2727,9 @@ def plan_fields(
     clip_to_well: bool,
 ) -> tuple[useq.WellPlatePlan, tuple[PlannedField, ...]]: ...
 def estimate_s(
-    fields: Sequence[PlannedField], timings: TimingsResult, *, refocus: bool
+    fields: Sequence[PlannedField], timings: TimingsResult, *, refocuses: int
 ) -> float: ...
+def refocus_count(fields: Sequence[PlannedField]) -> int: ...  # #549
 ```
 
 - `grid_size` returns `(rows, columns)`, per axis `max(1, ceil(max(0,
@@ -2749,8 +2758,13 @@ def estimate_s(
   the same set as a 40 × 40 sampling of each footprint tested with
   `WellGeometry.contains`.
 - `estimate_s` sums, over the fields in order, `timings.move_ms(distance
-  from the previous field)` (the first from the first field: 0),
-  `refocus_ms` when `refocus` and known, and `snap_ms`, in seconds.
+  from the previous field)` (the first from the first field: 0) and
+  `snap_ms`, plus `refocuses × refocus_ms` once when `refocus_ms` is known,
+  in seconds. *Replaced by #549 (§7.4)*: the argument was `refocus: bool`
+  and the term was `refocus_ms` at **every field**. `refocuses` is a count,
+  at least 0 (a negative one is a `ValueError`), and `refocus_count(fields)`
+  is the number of distinct wells among the fields: the locks the scan makes
+  once it has switched the autofocus off at each well's wall (§8, #416).
 
 ### 7.3 Plugin
 
@@ -2818,7 +2832,12 @@ class ScanPlanParams(PluginParams):
   profile or a parameter assumes no rotation and never warns.
 - `estimate_s` is `estimate_s(...)` when `timings` is usable, with
   `refocus` true when the stand has an `Autofocus`; else `None` (unknown,
-  not guessed: the page says "run timing for an estimate").
+  not guessed: the page says "run timing for an estimate"). *Replaced by
+  #549 (§7.4)*: with `timings` usable, `estimate_without_autofocus_s` is
+  `estimate_s(fields, timings, refocuses=0)` and `estimate_s` is
+  `estimate_s(fields, timings, refocuses=refocus_count(fields))` when the
+  stand has an `Autofocus`, else the same figure as the first; with no
+  usable `timings` both are `None`.
 
 **Tests**: the ported `test_wells.py` and the geometry of `test_scan.py`,
 with `test_parse_rejects_and_lists_every_item_it_cannot_read`;
@@ -2828,6 +2847,92 @@ with `test_parse_rejects_and_lists_every_item_it_cannot_read`;
 `test_the_matrix_comes_from_a_calibration_of_the_same_objective_only`;
 `test_no_pixel_size_refuses_to_plan`; `test_the_estimate_is_none_without_timings`;
 a non-square camera (FM-73). **Failure modes**: FM-73, FM-104, FM-103.
+
+### 7.4 The estimate and the autofocus (#549)
+
+Fixed by `/plan 549` (2026-11-18) from Ti2-E session 5's numbers (F20; see
+#198 and #513). It replaces §7.2's `refocus: bool` and §7.3's last bullet, as
+marked above.
+
+**What was measured.** Three scans of session 5 ran 2.7 to 3.3 times faster
+than the page said. `timing` at the 10× with PFS locked gave
+`move_overhead_ms` 133.8, `move_ms_per_mm` 63.3, `snap_ms` 165.7 and
+`refocus_ms` 1019.5, and the old `estimate_s` added that last figure at every
+field of a stand that has an autofocus:
+
+| Scan | Fields | `autofocus` | Estimate then | Real | Moves and snaps only |
+| --- | --- | --- | --- | --- | --- |
+| 10×, C3 + C2, coverage 1.0 | 218 | `required` | 310.2 s | 116.3 s | 87.9 s |
+| 40×, C3, 5 × 5 | 25 | `off` | 33.4 s | 10.2 s | 7.9 s |
+| 10×, C2 + C3, coverage 0.3 | 32 | `off` | 46.2 s | 16.5 s | 13.6 s |
+
+The demo does the same (m5 §17.10.1): 72 fields in two wells, `refocus_ms` 400
+assumed, estimated at 42.16 s, 28.8 s of it refocus, and scanned in 18.1 s;
+with one lock per well the figure is 14.16 s.
+
+- **D1. A lock is charged once per well, where the scan makes it.** With the
+  autofocus used, the scan switches it off before each well's first field and
+  the first field engages it again (§8, #416): one `engage()` per well, none
+  per field unless a lock is lost. Measured again on 2026-11-18, on the demo
+  rig: `test_the_autofocus_is_switched_off_before_each_wells_first_field_and_engaged_there`
+  passes with 3 wells of 4 fields and `engage` called 3 times; at the stand, 2
+  relocks for 218 fields. `refocus_ms` is the cost of one such lock: `timing`
+  switches PFS off and times `engage()`. With one lock per well the
+  three scans read 89.9 s (0.77 of the real time), and 0.77 and 0.82 for the
+  other two (those two make none). What is left, 18 to 23 % of the real time,
+  is not modelled and not guessed (*measured beats assumed*): the result says
+  the figure leaves it out (D5), and the issue that finds it opens its own.
+- **D2. `autofocus="off"` charges no lock**: `estimate_without_autofocus_s`.
+  `required` and `if-engaged` charge the locks of D1, `if-engaged` as if the
+  autofocus were on and locked at the start, which the plan cannot know
+  (it is the operator's state when `scan` starts).
+- **D3. The mode enters at the page, not at `scan-plan`.** The plan is made
+  before `scan`'s `autofocus` is chosen and names no mode; a parameter of
+  `scan-plan` would be a second place that says what `scan` reads, free to
+  disagree with it. The result carries both figures; m5 §17.10.3's `Time`
+  line takes the one that the Wells screen's `autofocus` field names, so that
+  it changes as the field does, with no new `scan-plan` run.
+- **D4. The layer cannot tell an autofocus that refocuses at each field from
+  one that holds its lock, so the estimate assumes the second and says so.**
+  `Autofocus` has two kinds since #581 (PFS holds focus; DF2 stabilizes one
+  shot at a time, `learn_reference` and `stabilize_now`) and no call that says
+  which without acting: on DF2 `learn_reference` records a plane and
+  `stabilize_now` moves Z, on PFS both are refused before anything is sent.
+  The scan uses no one-shot autofocus yet (DF2's `engage()` is refused and
+  `is_engaged()` reads its periodic mode, off, so `required` refuses and
+  `if-engaged` does not use it): on the Observer 7 the figure charges one
+  assumed refocus per well that the scan does not make, 0.4 s each. The issue
+  that lets the scan use `stabilize_now` owns the per-field charge,
+  `estimate_s(..., refocuses=len(fields))`, and the flag that tells the kinds
+  apart: `refocuses` is the hook it needs.
+- **D5. `assumed`**, after the timings' lines (the page puts the word
+  `assumed` and a colon before each), when `estimate_s` is not `None`:
+  1. when the stand has an `Autofocus`, `refocus_ms` is known and `refocus_count`
+     is not 0: `estimate: the autofocus holds its lock between fields and locks
+     again once in each well (<n> locks); one that refocuses at each field would
+     take longer`, with `1 lock` for one; 152 characters for `n` up to 9999;
+  2. always, one of two texts: when line 1 is written, `estimate: the timed
+     moves, locks and snaps; it leaves out each frame's write, a lock lost in
+     a well, a channel change, the cells, the report and the export` (155
+     characters); otherwise `estimate: the timed moves and snaps; it leaves
+     out each frame's write, a channel change, the cells, the report and the
+     export` (125 characters).
+  Each is at most `ASSUMED_LINE_CHARS` (160) so that the page shows it whole
+  (FM-205).
+- **D6. An older document.** A `scan-plan` record written before #549 has
+  `estimate_without_autofocus_s` `None` and an `estimate_s` that charged a lock
+  at every field. It loads as it is; the page reads it as before (one figure, no
+  words about the autofocus), and running `scan-plan` again replaces it.
+- **Not here**: the cells' focus (`cell_focus`, §21.6), a channel change, and the
+  frame's write are not charged; the 0.77 of D1; a `scan-plan` parameter for
+  the mode (D3).
+
+**Tests**: `test_a_lock_is_charged_once_per_well_and_none_with_the_autofocus_off`
+(session 5's timings, two wells of two fields: 1.6972 s with none, 3.7362 s
+with two locks, against 5.7752 s that the old model gave); the plugin's two
+figures on the demo; the two `assumed` lines and their bounds; the page's three
+`Time` texts. **Failure modes**: FM-170, FM-205, FM-139, FM-125, FM-107, and a
+new entry (a duration charged per unit where the scan pays it per group).
 
 ## 8. The scan (#213)
 
