@@ -2453,6 +2453,7 @@ TOOL_TITLES: Mapping[str, str] = {
     # the repository ships.
     "focus-on-cells": "Focus on cells",
     "objective-offsets": "Objective offsets",
+    "plate-check": "Plate check",
 }
 
 #: The short names the *Again* note lists (D20).

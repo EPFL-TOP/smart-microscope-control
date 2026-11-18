@@ -31,6 +31,7 @@ from smc.plugins.slots import (
     CellFocusResult,
     CellsFile,
     CellsResult,
+    CheckedWell,
     DensityResult,
     DensityWell,
     FailedField,
@@ -43,6 +44,8 @@ from smc.plugins.slots import (
     OffsetFromFocus,
     OffsetWell,
     PlannedField,
+    PlateCheck,
+    PlateCheckResult,
     PlateResult,
     ReportResult,
     RoutePosition,
@@ -367,6 +370,33 @@ _MEASURED_OFFSET: dict[str, Any] = {
     "objective": "Nikon 10X Plan Fluor",
     "xy_offset_um": [-5.0, 2.5],
 }
+_CHECKED_WELL: dict[str, Any] = {
+    "well": "B3",
+    "registered_xy_um": [10182.0, -10087.9],
+    "expected_xy_um": [10144.5, -10075.65],
+    "fit": {**_WELL_FIT, "recorded_xy_um": [10144.5, -10075.65]},
+    "difference_xy_um": [-14.45, -28.41],
+    "distance_um": 31.87,
+}
+_PLATE_CHECK: dict[str, Any] = {
+    "checked_utc": "2026-11-17T14:05:12+00:00",
+    "plate": "96-well",
+    "plate_objective": "Nikon 10X Plan Fluor",
+    "objective": "Nikon 40X Plan Fluor ELWD",
+    "shift_um": [-37.5, 12.25],
+    "wells": [_CHECKED_WELL],
+    "worst_um": 31.87,
+    "max_shift_um": 25.0,
+    "turn_deg": -0.0562,
+    "slide_xy_um": [-15.57, 0.3],
+    "frames": 16,
+    "folder": "plate-check/0123456789ab",
+    "elapsed_s": 19.8,
+}
+_PLATE_CHECK_RESULT: dict[str, Any] = {
+    "assumed": ["the plate was checked under Nikon 40X Plan Fluor ELWD"],
+    "check": _PLATE_CHECK,
+}
 _OBJECTIVE_OFFSETS: dict[str, Any] = {
     "assumed": ["the offsets are for the magnifier lever as it was during this run"],
     "plate_objective": "Nikon 4X Plan Fluor",
@@ -446,7 +476,7 @@ SAMPLES: dict[type[BaseModel], Sample] = {
     ),
     FailedField: (_FAILED, _FAILED),
     ScanResult: (
-        {**_SCAN, "frames": [_FRAME, _FRAME_FOCUSED]},
+        {**_SCAN, "frames": [_FRAME, _FRAME_FOCUSED], "plate_check": _PLATE_CHECK},
         {**_SCAN, "objective": None, "frames": [], "failed": []},
     ),
     FocusSweep: (
@@ -514,6 +544,24 @@ SAMPLES: dict[type[BaseModel], Sample] = {
     ObjectiveOffsetsResult: (
         _OBJECTIVE_OFFSETS,
         {**_OBJECTIVE_OFFSETS, "assumed": [], "measures": [], "offsets": []},
+    ),
+    CheckedWell: (
+        _CHECKED_WELL,
+        {**_CHECKED_WELL, "fit": {**_WELL_FIT, "walls": []}, "distance_um": 0.0},
+    ),
+    PlateCheck: (
+        _PLATE_CHECK,
+        {
+            **_PLATE_CHECK,
+            "plate_objective": None,
+            "objective": None,
+            "wells": [],
+            "folder": None,
+        },
+    ),
+    PlateCheckResult: (
+        _PLATE_CHECK_RESULT,
+        {**_PLATE_CHECK_RESULT, "assumed": []},
     ),
 }
 
@@ -696,6 +744,11 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (TargetMeasure, ("max_spread_um",), [0.0, -1.0], [1e-6]),
     (TargetMeasure, ("frames",), [-1], [0]),
     (ObjectiveOffsetsResult, ("elapsed_s",), [-0.1], [0.0]),
+    (CheckedWell, ("distance_um",), [-0.1], [0.0]),
+    (PlateCheck, ("worst_um",), [-0.1], [0.0]),
+    (PlateCheck, ("max_shift_um",), [0.0, -1.0], [1e-6]),
+    (PlateCheck, ("frames",), [-1], [0]),
+    (PlateCheck, ("elapsed_s",), [-0.1], [0.0]),
 ]
 
 
@@ -781,6 +834,9 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (TimingsResult, ("refocus_ms",)),
     (TargetMeasure, ("z_after_turn_um",)),
     (TargetMeasure, ("folder",)),
+    (PlateCheck, ("plate_objective",)),
+    (PlateCheck, ("objective",)),
+    (PlateCheck, ("folder",)),
 ]
 
 
@@ -1025,6 +1081,31 @@ def test_a_frame_without_cell_focus_dumps_without_the_key() -> None:
         mode="json"
     )
     assert "cell_focus" not in json.loads(frame.model_dump_json())
+
+
+def test_a_scan_whose_plate_was_not_checked_dumps_without_the_key() -> None:
+    # m3 §27.5 (#542): a scan that made no check, and every scan written before the
+    # check existed, is written exactly as before, so an older smc still reads it:
+    # its model refuses a key it does not know (FM-107).
+    result = ScanResult.model_validate(_SCAN)
+    assert result.plate_check is None
+    assert "plate_check" not in result.model_dump(mode="json")
+    assert "plate_check" not in result.model_dump()
+    assert "plate_check" not in json.loads(result.model_dump_json())
+    assert ScanResult.model_validate(result.model_dump(mode="json")) == result
+    checked = ScanResult.model_validate({**_SCAN, "plate_check": _PLATE_CHECK})
+    dumped = checked.model_dump(mode="json")
+    assert dumped["plate_check"]["checked_utc"] == "2026-11-17T14:05:12Z"
+    assert ScanResult.model_validate(dumped) == checked
+
+
+def test_a_plate_check_refuses_a_time_without_its_zone() -> None:
+    # "When the registration was last confirmed" is read on another PC, in another
+    # zone: a naive time would be read as that PC's own (m3 §27.2 D5).
+    with pytest.raises(ValidationError):
+        PlateCheck.model_validate(
+            {**_PLATE_CHECK, "checked_utc": "2026-11-17T14:05:12"}
+        )
 
 
 _OFFSET_KEYS = {"well_dx_um", "well_dy_um"}
@@ -1301,6 +1382,7 @@ SLOTS_MAP = {
     "CellFocusResult",
     "CellsFile",
     "CellsResult",
+    "CheckedWell",
     "DensityResult",
     "DensityWell",
     "FailedField",
@@ -1316,6 +1398,8 @@ SLOTS_MAP = {
     "OffsetFromFocus",
     "OffsetWell",
     "PlannedField",
+    "PlateCheck",
+    "PlateCheckResult",
     "PlateResult",
     "ReportResult",
     "RoutePosition",

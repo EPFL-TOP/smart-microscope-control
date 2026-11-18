@@ -35,6 +35,8 @@ smc run scan -p <profile> --run-doc run.json --dry-run
 | Parameter | Default | Meaning |
 |---|---|---|
 | `autofocus` | `if-engaged` | `if-engaged`: use it when it is on and locked at the start. `required`: refuse to start unless it is. `off`: never used, and **refused when it is on** (a lock would cross every well's wall): the one read `off` makes is whether it is on. |
+| `check_plate` | true | Before the first field, re-measure two wells `plate-walls` measured and refuse a plate that moved more than `max_plate_shift_um` since ([below](#the-plate-check)); about 20 s at the 10×. |
+| `max_plate_shift_um` | 25 | How far a checked well may lie from its registered centre, in µm (above 0, at most 500). |
 | `max_failed_in_row` | 3 | This many fields failing in a row end the scan (1 to 100). |
 | `max_unlocked_in_row` | 5 | This many fields in a row on which the autofocus would not lock end the scan (1 to 1000). |
 | `landing_tolerance` | 0.05 | How far a field may land from its target, as a fraction of the smaller side of the plan's field of view (above 0, at most 0.5). A field that landed farther is failed, not photographed. 0.05 is 4.8 µm for the demo's 10× (a field of 128 × 96 µm). Read the stand's real agreement at the first hardware session before trusting a fraction. |
@@ -114,6 +116,62 @@ written, and the message says what to do:
    `cell_focus`: the sweep's Z moves would switch it off, and nothing would lock it again
    or say so. This is the same refusal and the same text, the one read `autofocus=off`
    makes of the autofocus.
+10. **The plate check's walk** ([below](#the-plate-check)), when the check is made: the
+    frame must not hold a whole well, the walk must not be too long, and every frame of
+    it must lie inside the stage's soft limits, as for
+    [`plate-walls`](plate-walls.md#what-each-refusal-means). Such a refusal ends with
+    `(the plate check before the first field; nothing moved: check_plate=false scans
+    without it)`.
+
+## The plate check
+
+A plate lifted and put back since it was registered turns and slides, and every frame's
+place in its well is then read against a pose the plate no longer has: at Ti2-E session 5
+(#550, F15) a 40× scan made after the plate had been lifted placed its frames about
+(+19, −50) µm off, and nothing said so. So **every attempt** of the scan (a fresh one and
+every `--resume`: a stop is when a plate is lifted) measures again, in its **first
+well**, the centres of the two wells the registration measured that lie farthest apart,
+with [`plate-walls`](plate-walls.md)' own loop and the plan's camera matrix, and compares
+them with the registered centres moved into the plan's objective's frame. It is
+[`plate-check`](plate-check.md)'s check, made by the scan.
+
+- **When**: after the first well's own checks and its switch-off of the autofocus
+  (below), before its first field. No lock crosses the walls of the check's wells, and
+  the first field engages PFS again as after any wall. The scan's progress says
+  `checking the plate: A1 +X` and so on, at field 0.
+- **A plate that moved** more than `max_plate_shift_um` ends the scan `failed` with **no
+  frame** of this attempt and every number in the reason: `the plate moved since
+  plate-walls registered it: B2 lies 31.9 µm from its registered centre (-14.5, -28.4)
+  and B5 33.5 µm (-16.7, +29.0) under <objective>, more than 25 µm; it turned about
+  -0.056° and slid about (-15.6, +0.3) µm: register it again (plate-walls), then run
+  scan-plan and scan again, without --resume: frames already taken are placed against
+  the old registration`. When the scan had switched PFS off at that well, the reason
+  ends with `; the autofocus was switched off before anything moved and was not engaged
+  again: engage it again on the sample`. A stop, a halt or a fault during the check
+  ends the scan as it would anywhere (`stopped` stays `stopped`), and after that
+  switch-off a WARNING says that nothing engaged PFS again: lock it on the sample before
+  the next scan, since no frame of the attempt records that it was used.
+- **A plate that did not move**: the result's `plate_check` holds the check, with
+  `checked_utc`, and the first line of `assumed` after the stand's says `the plate was
+  checked before the first field: A1 and H12 lie within 0.4 µm of their registered
+  centres under <objective> (bound 25 µm), at 2026-11-18T09:12:33+00:00`. The check's
+  frames are kept as `plate-check/<token>/<well>_<side>.tif`.
+- **When it is not made**, the scan goes on, logs one WARNING and says why in `assumed`,
+  first after the stand's lines, in this order:
+
+  | when | the line |
+  |---|---|
+  | `check_plate=false` | `the plate was not checked against its registration (check_plate=false)` |
+  | a dry run | `dry run: the plate was not checked against its registration` |
+  | the plate record could not be read | `the plate was not checked: plate not read: <why>` |
+  | the plate was registered by `plate-registration`, `plate-finding` or the holder's estimate | `the plate was not checked: it was registered by <method>, which measures no well's walls (plate-walls does)` |
+  | the plan was made from another registration's objective | `the plate was not checked: the plan was made from a registration under <a>, the plate record is under <b>` |
+  | the offset between the plate's objective and the plan's is not measured | `the plate was not checked: the offset between <a> and <b> is not measured (the profile's [objectives]), and a check would read it as a move` |
+  | the plan's camera matrix is the profile's or a parameter | `the plate was not checked: the plan's camera matrix is the <source>'s, and a wall is looked for with a measured one only` |
+
+**The cost** is about 20 s at the 10× per attempt (two wells of 8 frames and the travel
+between them, estimated from session 5's registration; not measured at the stand). **The
+bound**, 25 µm, is chosen and revisited at the stand ([`plate-check`](plate-check.md)).
 
 ## During the scan
 
@@ -332,6 +390,11 @@ The slot `scan` holds a `ScanResult` (`smc.plugins.slots`):
   that landed off target says `StageOffTarget: …`).
 - `objective`, `pixel_size_um`, `matrix_um_per_px`, `image_shape_px`: the plan's,
   copied so that the cells stage needs only `scan`; `exposure_ms` as read at the start.
+- `plate_check`: the check of the plate made before this attempt's first field
+  ([above](#the-plate-check)): `checked_utc`, the wells and their distances, the bound,
+  the turn and the slide. A scan that made no check has no `plate_check` key at all, so
+  it is written exactly as before and still reads in an older smc; one that made it has a
+  key **an older smc refuses**.
 - `assumed`.
 
 Each TIFF is the frame in the camera's own dtype, with the frame's record as its JSON
@@ -393,4 +456,6 @@ to a well's centre reads `(0, 0)` within the stage's readback; and a 40× scan w
 objective offsets applied reads the offsets that the by-eye position agrees with. For
 PFS across walls (#416): the switch-off and the relock per well at the Ti2-E, a 10× then
 a 40× scan of two wells with PFS locked in the first, Z read after each well's first
-lock; and whether a plane moves between wells at the 10×.
+lock; and whether a plane moves between wells at the 10×. For the plate check (#542,
+m3 §27.9): its repeatability with the plate untouched, at the 10× and the 40×; a lifted
+plate refused; its time per attempt against the 20 s above.

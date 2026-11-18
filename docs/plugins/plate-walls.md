@@ -127,6 +127,12 @@ moves a last time, to the last well's fitted centre.
 
 A frame is placed where the stage says it was, never where it was sent.
 
+**A plate lifted and put back is registered again.** The registration is the plate's
+pose when it was made: a plate taken out and put back turns and slides by tens of µm
+without anyone noticing (Ti2-E session 5, #550). The scan re-measures two of these wells
+before its first field and refuses a plate that moved ([`scan`](scan.md#the-plate-check));
+[`plate-check`](plate-check.md) does the same before a drive, a route or an NIS export.
+
 ## What you get
 
 The `plate` slot, as ever (A1's centre, the rotation, the residual, the scale error),
