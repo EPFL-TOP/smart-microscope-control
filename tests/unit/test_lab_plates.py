@@ -145,16 +145,25 @@ def test_the_makers_plate_says_both_its_measures_are_the_makers() -> None:
 
 
 @pytest.mark.parametrize(
-    "module",
-    ["smc", "smc.cli", "smc.plugins.plate_walls.plugin", "smc.ui.controller"],
+    ("module", "name"),
+    [
+        ("smc", "greiner-24-well"),
+        ("smc.cli", "greiner-24-well"),
+        ("smc.plugins.plate_walls.plugin", "greiner-24-well"),
+        ("smc.ui.controller", "greiner-24-well"),
+        # The name the Ti2-E asks for since session 5 (#541).
+        ("smc", "greiner-662892-24-well"),
+    ],
 )
-def test_a_lab_plate_is_seen_by_useq_from_a_fresh_import(module: str) -> None:
+def test_a_lab_plate_is_seen_by_useq_from_a_fresh_import(
+    module: str, name: str
+) -> None:
     """D3: every entry point imports ``smc`` first, so none has to remember to register."""
     code = (
         f"import {module}\n"
         "import useq\n"
-        "plate = useq.WellPlate.from_str('greiner-24-well')\n"
-        "print(plate.well_spacing, 'greiner-24-well' in useq.registered_well_plate_keys())\n"
+        f"plate = useq.WellPlate.from_str({name!r})\n"
+        f"print(plate.well_spacing, {name!r} in useq.registered_well_plate_keys())\n"
     )
     done = subprocess.run(
         [sys.executable, "-c", code],
@@ -166,7 +175,7 @@ def test_a_lab_plate_is_seen_by_useq_from_a_fresh_import(module: str) -> None:
     )
 
     assert done.returncode == 0, done.stderr
-    assert "(19.45, 19.45) True" in done.stdout, done.stderr
+    assert f"{PUBLISHED[name][2]} True" in done.stdout, done.stderr
 
 
 def test_a_bad_plates_file_fails_the_import_of_smc_naming_the_file_and_the_plate() -> (

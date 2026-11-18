@@ -924,6 +924,7 @@ def test_clip_to_well_false_keeps_every_field(
         # The maker's (m3 §22, #541): 19.5 mm between wells, a well 15.66 mm across.
         ("greiner-662892-24-well", 7830.0, (40000.0, -20000.0), (98500.0, -59000.0)),
     ],
+    ids=["greiner-24-well", "greiner-662892-24-well"],
 )
 def test_a_lab_plate_lays_its_fields_inside_its_wells(
     demo_microscope_with_sample: SampleMicroscopeFactory,
@@ -935,9 +936,12 @@ def test_a_lab_plate_lays_its_fields_inside_its_wells(
 ) -> None:
     """A lab plate (m3 §22): its wells sit at its own pitch (19.45 or 19.5 mm), not ``24-well``'s 19.0.
 
-    The default grid is refused on a 15.6 mm well with the demo's 0.5 µm pixel
-    (116 x 68 fields), so 99 x 99, under the cap of 100, clipped to the well.
-    Under ``24-well``'s pitch D6 would be at (96 000, -57 500).
+    The default grid is refused on a 15.6 mm well (15.66 for the maker's plate)
+    with the demo's 0.5 µm pixel (116 x 68 fields), so 99 x 99, under the cap of
+    100, clipped to the well. Under ``24-well``'s pitch D6 would be at
+    (96 000, -57 500). The farthest field centre lies beyond the well's radius
+    (a kept field's frame meets the well) and within a half field of it: a well
+    smaller or larger than ``radius_um`` fails one end or the other.
     """
     _write_plate(tmp_path / "run.json", plate=plate)
     microscope = demo_microscope_with_sample(shape=SHAPE, pixel_size_um=PIXEL_UM)
@@ -949,11 +953,12 @@ def test_a_lab_plate_lays_its_fields_inside_its_wells(
     reach = radius_um + math.hypot(*result.fov_um) / 2.0
     for well, centre in (("B3", b3), ("D6", d6)):
         fields = [f for f in result.fields if f.well == well]
-        assert 0 < len(fields) < 99 * 99  # measured 5903: clipped
+        assert 0 < len(fields) < 99 * 99  # measured 5903 at 15.6 mm: clipped
         mean_x = sum(f.x_um for f in fields) / len(fields)
         mean_y = sum(f.y_um for f in fields) / len(fields)
         assert (mean_x, mean_y) == pytest.approx(centre, abs=1.0)
-        assert max(math.dist((f.x_um, f.y_um), centre) for f in fields) < reach
+        farthest = max(math.dist((f.x_um, f.y_um), centre) for f in fields)
+        assert radius_um < farthest < reach
 
 
 def test_a_derived_grid_over_100_per_axis_is_refused(
