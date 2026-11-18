@@ -16,6 +16,8 @@ filter_turret = "Reflector"
 light_path = "Sideport"
 shutter = "Colibri"
 light_source = "Colibri"
+# Definite Focus 2, a Generic device: the heuristics never pick one (m4 §11.7).
+autofocus = "DefiniteFocus"
 
 [light_source]
 intensity_property = "Intensity"
@@ -30,4 +32,5 @@ stop_refused_by = ["xy_stage", "focus"]
 max_segment_um = 5000.0  # chosen as m2 §11.12 D1: equal to max_jog_um; not measured
 max_z_segment_um = 100.0 # chosen as m2 §11.12 D1: equal to max_z_jog_um; not measured
 # z_soft_limits_um, xy_soft_limits_um and z_away_from_sample: measured at #27,
-# before any move beyond the jog limit.
+# before any move beyond the jog limit. max_engage_excursion_um too: how far
+# one DF2 stabilize moves Z is not measured, so no bound is set (m4 §12).

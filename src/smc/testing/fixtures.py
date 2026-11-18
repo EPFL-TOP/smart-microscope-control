@@ -238,7 +238,9 @@ def zeiss_fake_microscope(fake_mtb: FakeMTB, tmp_path: Path) -> Iterator[Microsc
     The profile's own ``.cfg`` runs, without its PVCAM camera
     (``fake_stand_config``), inside ``session.use_api_factory``, so the stand
     needs neither pythonnet nor a Micro-Manager adapter and leaves no MTB
-    session behind (FM-46). It has no camera and no autofocus.
+    session behind (FM-46). It has no camera. Its autofocus is Definite Focus
+    2 (``MMFocusStabilizer``, m4 §11.7), one shot at a time: it refuses
+    ``engage()`` and a non-zero offset.
     """
     profile = Profile.load(ZEISS_PROFILE)
     cfg = profile.config_path()
