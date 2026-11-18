@@ -24,11 +24,17 @@ sent. The ``microscope`` fixture then puts the stand back where it started.
 (m2 §8.8): a turn can drive an objective into the plate, and a capture
 writes the stand's ``.cfg``. A select of the current objective (which sends
 nothing) and of the current channel are the only selections made there.
+
+**An autofocus holds focus one of two ways** (m4 §11.7): continuously (PFS)
+or one shot at a time (DF2, on ``zeiss-fake``). The way it lacks raises
+``AutofocusUnsupportedError``, and ``Unsupported`` decides what a case does
+then.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
@@ -47,6 +53,7 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
+from smc.hardware.errors import AutofocusUnsupportedError
 from smc.hardware.profile import Profile, SafetySection
 
 if TYPE_CHECKING:
@@ -275,9 +282,58 @@ def dry_microscope(stand: Microscope, envelope: Envelope) -> Microscope:
     )
 
 
-#: The backends whose stand may lack a capability: a real one, and the Zeiss
-#: fake stand, which has no camera and no autofocus (m4 §9.2).
+#: The backends whose stand may lack a capability, or a way of holding focus: a
+#: real one, and the Zeiss fake stand, which has no camera and whose autofocus
+#: (DF2) holds focus one shot at a time (m4 §9.2, §11.7).
 _SKIPS_WHAT_IT_LACKS = frozenset({"hardware", "zeiss-fake"})
+
+
+@dataclass(frozen=True)
+class Unsupported:
+    """What a contract does when the autofocus does not hold focus that way (m4 §11.7).
+
+    PFS holds focus continuously and DF2 one shot at a time; each raises
+    ``AutofocusUnsupportedError`` for the other way, with nothing sent. The
+    one helper the contracts use for it, so that no case decides alone where a
+    missing way is a skip and where it is a failure.
+    """
+
+    backend: str
+
+    @contextmanager
+    def skips(self, *, one_shot: bool = False) -> Iterator[None]:
+        """``AutofocusUnsupportedError`` in the block skips the case where that way may be missing.
+
+        ``engage()`` and a non-zero offset (the continuous way) skip on the
+        backends in ``_SKIPS_WHAT_IT_LACKS`` and fail on ``fake`` and ``demo``,
+        whose autofocus has them. The one-shot way (``one_shot``) skips on
+        every backend: PFS has none.
+        """
+        try:
+            yield
+        except AutofocusUnsupportedError as exc:
+            if one_shot or self.backend in _SKIPS_WHAT_IT_LACKS:
+                pytest.skip(f"this autofocus does not hold focus that way: {exc}")
+            raise
+
+    @contextmanager
+    def passes(self) -> Iterator[None]:
+        """``AutofocusUnsupportedError`` ends the block and the case goes on, where that way may be missing.
+
+        For a case whose subject is something else (the put-back): the step
+        the stand cannot take is left out, the rest still runs.
+        """
+        try:
+            yield
+        except AutofocusUnsupportedError:
+            if self.backend not in _SKIPS_WHAT_IT_LACKS:
+                raise
+
+
+@pytest.fixture
+def unsupported(backend: str) -> Unsupported:
+    """The contracts' one answer to an autofocus that does not hold focus that way."""
+    return Unsupported(backend)
 
 
 def _capability(facade: Microscope, backend: str, capability: type[T]) -> T:

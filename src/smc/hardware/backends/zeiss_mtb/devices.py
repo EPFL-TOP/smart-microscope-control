@@ -27,6 +27,9 @@ Hardware behaviour encoded here (m4 §1):
   ``initialize()``, at every unload and at process exit (through the
   session), and a switch-off that fails is an ERROR saying ``LIGHT MAY STILL
   BE ON``.
+* **Definite Focus 2 is a ``GenericDevice``** of five properties (unicore has
+  no autofocus type, m4 §11.4): its learn, restore and stabilize run on the
+  same kind of worker as a move, and a ``False`` from MTB is a failure.
 
 Only ``MTBError`` (or unicore's own ``ValueError`` for a property value out of
 range) leaves a device; every other exception from the seam is wrapped,
@@ -35,12 +38,15 @@ chained (FM-79, FM-113).
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import threading
 from collections.abc import Callable
 from typing import ClassVar, TypeVar
 
 from pymmcore_plus.experimental.unicore import (
+    GenericDevice,
     ShutterDevice,
     StageDevice,
     StateDevice,
@@ -53,18 +59,29 @@ from smc.hardware.backends.zeiss_mtb.api import (
     CHANGER_TIMEOUT_MS,
     LED_TIMEOUT_MS,
     MTBLED,
+    STABILIZER_OPERATION_MODES,
+    STABILIZER_TIMEOUT_MS,
     AxisInfo,
     ChangerElement,
     MTBAxis,
     MTBChanger,
     MTBError,
+    MTBFocusStabilizer,
     MTBLEDController,
 )
 from smc.hardware.backends.zeiss_mtb.session import LIGHT_MAY_STILL_BE_ON
 
 __all__ = [
+    "IDLE",
+    "LEARN",
+    "OFF",
+    "ON",
+    "RESTORE",
+    "STABILIZE_NOW",
+    "STOP",
     "MTBColibri",
     "MTBCondenserChanger",
+    "MTBDefiniteFocus",
     "MTBFocus",
     "MTBObjectiveChanger",
     "MTBPiezo",
@@ -82,6 +99,13 @@ T = TypeVar("T")
 
 #: The Colibri's ``LED`` value that lights nothing.
 NO_LED = "None"
+
+#: DF2's ``Action`` values (m4 §11.4): it reads the action whose worker runs.
+IDLE, LEARN, STABILIZE_NOW, STOP = "Idle", "Learn", "StabilizeNow", "Stop"
+#: What ``Action`` reads while a restore (a set of ``Reference``) runs.
+RESTORE = "Restore"
+#: ``PiezoFocusUsage`` and ``Periodic``.
+ON, OFF = "On", "Off"
 
 
 def arrived(target_um: float, read_um: float, info: AxisInfo) -> bool:
@@ -148,11 +172,13 @@ class _Mover:
 
     One move at a time: a second one while the first runs is refused. A move
     that failed is kept until the next ``busy()`` after the worker has ended,
-    which raises it once.
+    which raises it once. ``what`` names a job in the log: DF2's are actions
+    (a learn, a stabilize), not moves.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, what: str = "move") -> None:
         self._name = name
+        self._what = what
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._error: MTBError | None = None
@@ -208,7 +234,7 @@ class _Mover:
             )
             if error is not exc:
                 error.__cause__ = exc
-            log.error("%s: the move failed: %s", self._name, error)
+            log.error("%s: the %s failed: %s", self._name, self._what, error)
             with self._lock:
                 self._error = error
 
@@ -907,3 +933,317 @@ class MTBColibri(ShutterDevice):
             self._darken if self._controller is not None else None,
             self._session,
         )
+
+
+def _unless_stopped(cancel: threading.Event, name: str, call: str) -> None:
+    """Raise when a ``Stop`` came before the worker sent ``call``, which is then never sent.
+
+    The set that starts an action returns before its worker reaches MTB, so a
+    ``Stop`` can land in between: MTB then has nothing to stop, and the call
+    sent after it would run in full (a ``StabilizeNow`` drives the focus drive).
+    """
+    if cancel.is_set():
+        raise MTBError(
+            f"{name}: a Stop came before {call} was sent, so it was not sent"
+        )
+
+
+class MTBDefiniteFocus(GenericDevice):
+    """Definite Focus 2 as five properties: learn, restore, stabilize once (m4 §11.4).
+
+    unicore has no autofocus device type, so DF2 is a ``GenericDevice``, and
+    the layer's ``MMFocusStabilizer`` drives it through ``Action``,
+    ``Reference``, ``OperationMode``, ``PiezoFocusUsage`` and ``Periodic``.
+
+    Hardware behaviour encoded here:
+
+    * **Every MTB call of DF2 is synchronous** and may take seconds, so a
+      learn, a restore and a stabilize run on the device's worker (``_Mover``)
+      and the set returns at once; ``busy()`` is ``True`` while one runs and
+      raises its failure once after. Reads never wait behind it.
+    * **A ``False`` from MTB is a failure**, never a success: the predecessor
+      ignored the answers and imaged at the commanded Z. Whether DF2 answers
+      ``False`` on a success is not measured (m4 §12).
+    * **What DF2 held before this process is not this process's to trust**
+      (FM-118): ``Reference`` reads ``""`` after ``initialize()``, from the
+      start of every learn or restore, and after one that failed; while it
+      does, a ``StabilizeNow`` is refused. A raw property set still skips
+      what only the layer checks (the objective, the Z bounds, FM-251).
+    * **A ``Stop`` that lands before the worker reaches MTB** cancels the
+      call, which is then never sent.
+    * **Periodic stabilisation is never switched on**: it would hold one
+      plane while the stage visits others. ``initialize()`` and ``shutdown()``
+      switch it off when another MTB client left it on.
+    * **``SignalQuality`` is not read**: it reads 0 while DF2 works (m4 §11.1).
+    """
+
+    MTB_ID: ClassVar[str] = "MTBFocusStabilizer2"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stabilizer: MTBFocusStabilizer | None = None
+        self._session: mtb_session.MTBSession | None = None
+        self._mover = _Mover(type(self).__name__, "action")
+        #: The reference learned or restored since ``initialize()``, as base64.
+        self._reference = ""
+        cls = type(self)
+        self.register_property(
+            "Action",
+            default_value=IDLE,
+            allowed_values=[IDLE, LEARN, STABILIZE_NOW, STOP],
+            getter=cls._get_action,
+            setter=cls._set_action,
+        )
+        self.register_property(
+            "Reference",
+            default_value="",
+            getter=cls._get_reference,
+            setter=cls._set_reference,
+        )
+        self.register_property(
+            "OperationMode",
+            default_value="Balanced",
+            allowed_values=list(STABILIZER_OPERATION_MODES),
+            getter=cls._get_operation_mode,
+            setter=cls._set_operation_mode,
+        )
+        self.register_property(
+            "PiezoFocusUsage",
+            default_value=OFF,
+            allowed_values=[ON, OFF],
+            getter=cls._get_piezo_focus_usage,
+            is_read_only=True,
+        )
+        self.register_property(
+            "Periodic",
+            default_value=OFF,
+            allowed_values=[ON, OFF],
+            getter=cls._get_periodic,
+            setter=cls._set_periodic,
+        )
+
+    @property
+    def _name(self) -> str:
+        return self.get_label() or type(self).__name__
+
+    def initialize(self) -> None:
+        """Find DF2, read its operation mode, and switch its periodic mode off if on."""
+
+        def setup() -> None:
+            session = mtb_session.shared()
+            stabilizer = session.focus_stabilizer(self.MTB_ID)
+            name = self._name
+            mode = _seam(
+                f"{name}: {self.MTB_ID} operation mode", stabilizer.operation_mode
+            )
+            if _seam(f"{name}: {self.MTB_ID} periodic", stabilizer.periodic):
+                _seam(
+                    f"{name}: StabilizePeriodically(Off)",
+                    lambda: stabilizer.stop_periodic(STABILIZER_TIMEOUT_MS),
+                )
+                log.warning(
+                    "%s: periodic stabilisation was on (another MTB client left it "
+                    "on), and was switched off: smc stabilizes one shot at a time "
+                    "(m4 §11.4)",
+                    name,
+                )
+            self._stabilizer = stabilizer
+            self._session = session
+            self._reference = ""
+            self._mover = _Mover(name, "action")
+            log.info("%s: Definite Focus 2, operation mode %s", name, mode)
+
+        _initialized(self._name, setup)
+
+    def _ready(self) -> MTBFocusStabilizer:
+        if self._stabilizer is None:
+            raise MTBError(f"{self._name} is not initialised")
+        return self._stabilizer
+
+    def _refuse_while_running(self, action: str) -> None:
+        if self._mover.running():
+            raise MTBError(
+                f"{self._name}: {self._mover.target} is running; {action} is "
+                "refused until it ends; nothing was sent"
+            )
+
+    def busy(self) -> bool:
+        """``True`` while an action runs on the worker; then its failure, once."""
+        return self._mover.busy()
+
+    # --- Action ---------------------------------------------------------------
+
+    def _get_action(self) -> str:
+        if self._mover.running():
+            return str(self._mover.target)
+        return IDLE
+
+    def _set_action(self, value: str) -> None:
+        action = str(value)
+        if action == IDLE:
+            return
+        stabilizer = self._ready()
+        if action == STOP:
+            self._send_stop(stabilizer)
+            return
+        self._refuse_while_running(action)
+        name = self._name
+        if action == LEARN:
+            self._reference = ""
+
+            def learn(cancel: threading.Event) -> None:
+                _unless_stopped(cancel, name, "InitOnCurrentFocusPosition")
+                blob = _seam(
+                    f"{name}: InitOnCurrentFocusPosition",
+                    lambda: stabilizer.learn(STABILIZER_TIMEOUT_MS),
+                )
+                if not blob:
+                    raise MTBError(f"{name}: DF2 learned an empty reference")
+                self._reference = base64.b64encode(bytes(blob)).decode("ascii")
+
+            self._mover.start(LEARN, learn)
+            return
+        if not self._reference:
+            # What DF2 held before this process is not its to trust (FM-118):
+            # a StabilizeNow now would drive the focus drive to that plane, past
+            # every check of the layer's MMFocusStabilizer.
+            raise MTBError(
+                f"{name}: no reference was learned or restored since initialize(), "
+                "so StabilizeNow would bring focus to whatever plane DF2 held before; "
+                "learn one (Action Learn) or set Reference first; nothing was sent"
+            )
+
+        def stabilize(cancel: threading.Event) -> None:
+            _unless_stopped(cancel, name, "StabilizeNow")
+            answer = _seam(
+                f"{name}: StabilizeNow",
+                lambda: stabilizer.stabilize_now(STABILIZER_TIMEOUT_MS),
+            )
+            if not answer:
+                after = ", after a Stop was sent during it" if cancel.is_set() else ""
+                raise MTBError(
+                    f"{name}: DF2 answered False to StabilizeNow{after}; the focus "
+                    "drive is where DF2 left it"
+                )
+
+        self._mover.start(STABILIZE_NOW, stabilize)
+
+    def _send_stop(self, stabilizer: MTBFocusStabilizer) -> None:
+        """``Stop``, in the set and not on the worker, even while the worker runs (rule 4)."""
+        running = self._mover.running()
+        if running:
+            self._mover.cancel()
+        _seam(f"{self._name}: Stop", lambda: stabilizer.stop(STABILIZER_TIMEOUT_MS))
+        if running:
+            log.warning(
+                "%s: Stop sent while %s runs; whether DF2 ends a synchronous call "
+                "from another thread is not known (m4 §12)",
+                self._name,
+                self._mover.target,
+            )
+
+    # --- Reference ------------------------------------------------------------
+
+    def _get_reference(self) -> str:
+        return self._reference
+
+    def _set_reference(self, value: str) -> None:
+        """A restore: the text is decoded here, before anything is sent, then sent on the worker."""
+        stabilizer = self._ready()
+        name, text = self._name, str(value)
+        if not text:
+            raise MTBError(
+                f"{name}: an empty Reference is refused: learn one (Action Learn) "
+                "or set one learned before; nothing was sent"
+            )
+        try:
+            blob = base64.b64decode(text, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise MTBError(
+                f"{name}: the Reference is not base64 text ({exc}); nothing was sent"
+            ) from exc
+        if not blob:
+            raise MTBError(
+                f"{name}: the Reference decodes to nothing; nothing was sent"
+            )
+        self._refuse_while_running(RESTORE)
+        self._reference = ""
+
+        def restore(cancel: threading.Event) -> None:
+            _unless_stopped(cancel, name, "InitWithStabilizingData")
+            answer = _seam(
+                f"{name}: InitWithStabilizingData",
+                lambda: stabilizer.restore(blob, STABILIZER_TIMEOUT_MS),
+            )
+            if not answer:
+                raise MTBError(
+                    f"{name}: DF2 answered False to InitWithStabilizingData: the "
+                    "reference was not restored, and DF2 holds none that smc knows"
+                )
+            self._reference = text
+
+        self._mover.start(RESTORE, restore)
+
+    # --- OperationMode, PiezoFocusUsage, Periodic: MTB's, live ----------------
+
+    def _get_operation_mode(self) -> str:
+        stabilizer = self._ready()
+        return _seam(f"{self._name}: GetOperationMode", stabilizer.operation_mode)
+
+    def _set_operation_mode(self, value: str) -> None:
+        stabilizer = self._ready()
+        mode = str(value)
+        self._refuse_while_running(f"OperationMode {mode}")
+        _seam(
+            f"{self._name}: SetOperationMode({mode})",
+            lambda: stabilizer.set_operation_mode(mode),
+        )
+
+    def _get_piezo_focus_usage(self) -> str:
+        stabilizer = self._ready()
+        uses = _seam(f"{self._name}: GetPiezoFocusUsage", stabilizer.piezo_focus_usage)
+        return ON if uses else OFF
+
+    def _get_periodic(self) -> str:
+        stabilizer = self._ready()
+        on = _seam(f"{self._name}: GetStabilizePeriodicallyOnOff", stabilizer.periodic)
+        return ON if on else OFF
+
+    def _set_periodic(self, value: str) -> None:
+        stabilizer = self._ready()
+        if str(value) == ON:
+            raise MTBError(
+                f"{self._name}: smc never switches DF2's periodic stabilisation on: "
+                "it would hold one plane while the stage visits others (m4 §11.2); "
+                "nothing was sent"
+            )
+        _seam(
+            f"{self._name}: StabilizePeriodically(Off)",
+            lambda: stabilizer.stop_periodic(STABILIZER_TIMEOUT_MS),
+        )
+
+    def shutdown(self) -> None:
+        """Stop a running action and wait for it, then periodic off if on; never raises."""
+        name, stabilizer, session = self._name, self._stabilizer, self._session
+        if stabilizer is None:
+            return
+        if session is not None and session._closed:
+            log.debug("%s: unloaded after the MTB logout; nothing to stop", name)
+            return
+        if self._mover.running():
+            try:
+                self._send_stop(stabilizer)
+            except Exception as exc:
+                log.error("%s: Stop at unload failed: %s", name, exc)
+        _shutdown_mover(name, self._mover, STABILIZER_TIMEOUT_MS)
+        try:
+            if stabilizer.periodic():
+                stabilizer.stop_periodic(STABILIZER_TIMEOUT_MS)
+                log.warning("%s: periodic stabilisation switched off at unload", name)
+        except Exception as exc:
+            log.error(
+                "%s: periodic stabilisation could not be read or switched off at "
+                "unload: %s",
+                name,
+                exc,
+            )

@@ -7,7 +7,8 @@ Zeiss software (FM-40). ``fake_stand_config`` writes the profile's own
 Micro-Manager adapter either.
 
 The stand, as m4 §1.1 describes it: the four axes with their ranges, the five
-changers with the stand's element names where they are known, six LEDs. The
+changers with the stand's element names where they are known, six LEDs, and
+Definite Focus 2 acting on the focus drive (``FakeFocusStabilizer``). The
 steps and deviations of the axes are **chosen for the fake**, from the
 predecessor's measurements where it had one (X/Y step 0.25 µm; a piezo
 error of 0.082 µm); they are not MTB's declared values:
@@ -38,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from smc.hardware.backends.zeiss_mtb.api import (
+    STABILIZER_OPERATION_MODES,
     AxisInfo,
     ChangerElement,
     MTBError,
@@ -47,6 +49,7 @@ from smc.hardware.backends.zeiss_mtb.api import (
 __all__ = [
     "FakeAxis",
     "FakeChanger",
+    "FakeFocusStabilizer",
     "FakeLED",
     "FakeLEDController",
     "FakeMTB",
@@ -89,6 +92,7 @@ class FakeAxis:
         self._start_um = position_um
         self._end_um = position_um
         self._started_at: float | None = None
+        self._duration_s = 0.0
         self.move_s = move_s
         self.refuse_next = False
         self.false_next = False
@@ -108,17 +112,47 @@ class FakeAxis:
         self._calls.add(self.mtb_id, "info")
         return self._info
 
+    def _here(self) -> float:
+        """Where the axis is now, on the straight line of a move under way; under the lock."""
+        if self._started_at is None or self._duration_s <= 0:
+            return self._position_um
+        done = min(1.0, (time.monotonic() - self._started_at) / self._duration_s)
+        return self._start_um + (self._end_um - self._start_um) * done
+
     def position_um(self) -> float:
         with self._lock:
-            if self._started_at is None or self.move_s <= 0:
-                return self._position_um
-            done = min(1.0, (time.monotonic() - self._started_at) / self.move_s)
-            return self._start_um + (self._end_um - self._start_um) * done
+            return self._here()
 
     def set_position_um(self, position_um: float) -> None:
         """Put the axis somewhere, as a hand on the stand's knob would."""
         with self._lock:
             self._position_um = position_um
+
+    def glide(
+        self, target_um: float, move_s: float, stop: threading.Event | None = None
+    ) -> bool:
+        """A straight line to ``target_um`` over ``move_s``; ``False`` when ``stop`` ended it.
+
+        A stopped glide ends where the line had got to. The position is kept
+        under the axis's own lock, so a read from another thread (the device
+        of this axis) sees a point of the line while another component (the
+        fake DF2) drives it.
+        """
+        with self._lock:
+            self._start_um = self._here()
+            self._end_um = target_um
+            self._duration_s = move_s
+            self._started_at = time.monotonic()
+        stopped = False
+        if move_s > 0:
+            if stop is None:
+                time.sleep(move_s)
+            else:
+                stopped = stop.wait(move_s)
+        with self._lock:
+            self._position_um = self._here() if stopped else self._end_um
+            self._started_at = None
+        return not stopped
 
     def move_um(self, target_um: float, timeout_ms: int) -> bool:
         self._calls.add(self.mtb_id, "move_um", target_um, timeout_ms)
@@ -132,15 +166,7 @@ class FakeAxis:
             raise MTBError(f"{self.mtb_id}: {target_um} is outside the range (fake)")
         answer = not self.false_next
         self.false_next = False
-        with self._lock:
-            self._start_um = self._position_um
-            self._end_um = target_um + self.deviation_um
-            self._started_at = time.monotonic()
-        if self.move_s > 0:
-            time.sleep(self.move_s)
-        with self._lock:
-            self._position_um = self._end_um
-            self._started_at = None
+        self.glide(target_um + self.deviation_um, self.move_s)
         return answer
 
 
@@ -251,6 +277,125 @@ class FakeLEDController:
         return [led.wavelength_nm for led in self.led_list if led.on]
 
 
+class FakeFocusStabilizer:
+    """Definite Focus 2 (m4 §11.3): learns the focus drive's plane, restores it, stabilizes once.
+
+    It acts on the focus axis it is given, as DF2 corrects through the focus
+    drive on the Observer 7 (m4 §11.1). ``learn`` takes ``move_s``, as DF2
+    measures for a moment, returns a new 9-byte blob at each call (bytes
+    above 0x7F included) and records the focus position as its plane, which
+    it then holds; ``restore`` makes a blob it learned the held one, and answers
+    ``False`` to any other; ``stabilize_now`` moves the focus axis to the held
+    plane as ``FakeAxis`` moves (a straight line over ``move_s``) and answers
+    ``False`` with none held, or when ``stop`` ended it where the axis was.
+
+    Knobs: ``refuse_next`` (answers ``False``, moves nothing; a refused learn
+    gives no blob, an ``MTBError``), ``fail_next`` (raises ``MTBError``),
+    ``piezo_focus_usage_on``, ``periodic_on``, ``stop_ignored`` (a ``stop``
+    that ends nothing). Every call is in the stand's ``calls``.
+    """
+
+    def __init__(self, focus: FakeAxis, calls: _Calls, *, move_s: float = 0.0) -> None:
+        self.mtb_id = "MTBFocusStabilizer2"
+        self._focus = focus
+        self._calls = calls
+        self._lock = threading.Lock()
+        #: Every blob learned, and the focus position it was learned at.
+        self.planes: dict[bytes, float] = {}
+        self.held: bytes | None = None
+        self._stop: threading.Event | None = None
+        self.move_s = move_s
+        self.mode = "Balanced"
+        self.refuse_next = False
+        self.fail_next = False
+        #: Named apart from ``piezo_focus_usage()``, the seam's read of it.
+        self.piezo_focus_usage_on = False
+        self.periodic_on = False
+        self.stop_ignored = False
+
+    def _fail_if_asked(self, call: str) -> None:
+        if self.fail_next:
+            self.fail_next = False
+            raise MTBError(f"{self.mtb_id}: {call} raised (fake)")
+
+    def _refused(self) -> bool:
+        refused, self.refuse_next = self.refuse_next, False
+        return refused
+
+    def learn(self, timeout_ms: int) -> bytes:
+        self._calls.add(self.mtb_id, "learn", timeout_ms)
+        self._fail_if_asked("InitOnCurrentFocusPosition")
+        if self._refused():
+            raise MTBError(
+                f"{self.mtb_id}: InitOnCurrentFocusPosition answered False and gave "
+                "no reference (fake)"
+            )
+        if self.move_s > 0:
+            # DF2 measures for a moment: 0.4 s at the stand (m4 §11.1).
+            time.sleep(self.move_s)
+        with self._lock:
+            blob = bytes((0xDF, 0x02, 0xF0)) + len(self.planes).to_bytes(6, "big")
+            self.planes[blob] = self._focus.position_um()
+            self.held = blob
+        return blob
+
+    def restore(self, reference: bytes, timeout_ms: int) -> bool:
+        self._calls.add(self.mtb_id, "restore", bytes(reference), timeout_ms)
+        self._fail_if_asked("InitWithStabilizingData")
+        with self._lock:
+            if self._refused() or bytes(reference) not in self.planes:
+                # What DF2 holds after a refusal is unknown: here, nothing.
+                self.held = None
+                return False
+            self.held = bytes(reference)
+        return True
+
+    def stabilize_now(self, timeout_ms: int) -> bool:
+        self._calls.add(self.mtb_id, "stabilize_now", timeout_ms)
+        self._fail_if_asked("StabilizeNow")
+        if self._refused():
+            return False
+        with self._lock:
+            if self.held is None:
+                return False
+            plane = self.planes[self.held]
+            stop = self._stop = threading.Event()
+        return self._focus.glide(plane, self.move_s, stop)
+
+    def stop(self, timeout_ms: int) -> None:
+        self._calls.add(self.mtb_id, "stop", timeout_ms)
+        self._fail_if_asked("Stop")
+        if self.stop_ignored:
+            return
+        with self._lock:
+            stop = self._stop
+        if stop is not None:
+            stop.set()
+
+    def operation_mode(self) -> str:
+        return self.mode
+
+    def set_operation_mode(self, mode: str) -> None:
+        self._calls.add(self.mtb_id, "set_operation_mode", mode)
+        if mode not in STABILIZER_OPERATION_MODES:
+            raise MTBError(
+                f"{self.mtb_id}: no operation mode {mode!r}; one of "
+                f"{', '.join(STABILIZER_OPERATION_MODES)} (fake)"
+            )
+        self.mode = mode
+
+    def piezo_focus_usage(self) -> bool:
+        return self.piezo_focus_usage_on
+
+    def periodic(self) -> bool:
+        return self.periodic_on
+
+    def stop_periodic(self, timeout_ms: int) -> None:
+        self._calls.add(self.mtb_id, "stop_periodic", timeout_ms)
+        self._fail_if_asked("StabilizePeriodically(Off)")
+        self.periodic_on = False
+
+
 def _elements(*names: str, empty: tuple[int, ...] = ()) -> tuple[ChangerElement, ...]:
     return tuple(
         ChangerElement(
@@ -330,6 +475,9 @@ class FakeMTB:
             for mtb_id, (elements, position) in changers.items()
         }
         self.colibri = FakeLEDController(self._calls)
+        self.stabilizer = FakeFocusStabilizer(
+            self.axes["MTBFocus"], self._calls, move_s=move_s
+        )
 
     @property
     def calls(self) -> list[tuple[object, ...]]:
@@ -376,6 +524,12 @@ class FakeMTB:
         if mtb_id != self.colibri.mtb_id:
             raise MTBError(f"MTB component {mtb_id!r} is absent")
         return self.colibri
+
+    def focus_stabilizer(self, mtb_id: str) -> FakeFocusStabilizer:
+        self._present(mtb_id)
+        if mtb_id != self.stabilizer.mtb_id:
+            raise MTBError(f"MTB component {mtb_id!r} is absent")
+        return self.stabilizer
 
 
 def fake_stand_config(profile_cfg: Path, out_dir: Path) -> Path:

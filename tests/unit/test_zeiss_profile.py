@@ -6,6 +6,7 @@ from pathlib import Path
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import (
+    Autofocus,
     LightSource,
     ObjectiveTurret,
     Shutter,
@@ -30,6 +31,7 @@ DEVICES = (
     ("Condenser", "MTBCondenserChanger", None),
     ("TLShutter", "MTBTLShutter", None),
     ("Colibri", "MTBColibri", Role.shutter),
+    ("DefiniteFocus", "MTBDefiniteFocus", Role.autofocus),
 )
 
 
@@ -38,7 +40,7 @@ def test_zeiss_cfg_is_ascii() -> None:
     CFG.read_bytes().decode("ascii")
 
 
-def test_zeiss_cfg_declares_the_nine_mtb_devices() -> None:
+def test_zeiss_cfg_declares_the_ten_mtb_devices() -> None:
     lines = CFG.read_text(encoding="utf-8").splitlines()
     declared = [
         tuple(line.removeprefix("#py ").split(",")[1:])
@@ -94,5 +96,21 @@ def test_zeiss_profile_resolves_every_role_on_the_fake_stand(
         ObjectiveTurret,
         Shutter,
         LightSource,
+        Autofocus,
     ):
         assert stand.has(capability), capability.__name__
+
+
+def test_definite_focus_is_assigned_with_the_role_maps_note_and_no_slot(
+    zeiss_fake_microscope: Microscope,
+) -> None:
+    # m4 §11.7: the heuristics never pick a Generic device as an autofocus, so
+    # the profile assigns it, and the role map says so; the core's AutoFocus
+    # slot, which refuses a Generic device, stays empty.
+    stand = zeiss_fake_microscope
+    assert (
+        "autofocus: [roles.assign] names 'DefiniteFocus', a Generic device, but "
+        "autofocus is filled by AutoFocus devices; using it as assigned."
+    ) in stand.roles.warnings
+    assert stand.core.getAutoFocusDevice() == ""
+    assert type(stand.require(Autofocus)).__name__ == "MMFocusStabilizer"

@@ -11,6 +11,7 @@ The behaviours pinned here are the ones the predecessor verified at the stand.
 from __future__ import annotations
 
 import builtins
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,11 @@ from typing import Any, ClassVar
 import pytest
 
 from smc.hardware.backends.zeiss_mtb import dotnet
-from smc.hardware.backends.zeiss_mtb.api import MTBError, MTBSessionError
+from smc.hardware.backends.zeiss_mtb.api import (
+    STABILIZER_TIMEOUT_MS,
+    MTBError,
+    MTBSessionError,
+)
 
 
 class _Modes:
@@ -368,6 +373,342 @@ def test_manual_mode_falls_back_to_the_overload_without_a_timeout() -> None:
     controller.set_manual_mode(10_000)
     assert calls[-1] == ("LEDLight", "Continuous", _Modes.Synchronous)
     assert [led.wavelength_nm for led in controller.leds()] == [385]
+
+
+# -- Definite Focus 2 (m4 §11.3), from the predecessor's FakeStabilizer --------
+
+
+class _OperationModes:
+    """``MTBFocusStabilizer2OperationMode``: members are objects, never ints."""
+
+    Exact = object()
+    Balanced = object()
+    Fast = object()
+
+
+class _OnOff:
+    """``MTBOnOff``: a member's text is the type's name and the member's."""
+
+    On = "MTBOnOff.On"
+    Off = "MTBOnOff.Off"
+
+
+def _df2_namespace(**extra: Any) -> SimpleNamespace:
+    return _namespace(
+        **{
+            "IMTBFocusStabilizer2": _cast,
+            "MTBFocusStabilizer2OperationMode": _OperationModes,
+            "MTBOnOff": _OnOff,
+            **extra,
+        }
+    )
+
+
+class FakeStabilizer:
+    """``IMTBFocusStabilizer2`` with the data overload of the learn.
+
+    pythonnet surfaces a .NET ``out`` parameter by appending it to the return
+    value, so the data overload comes back as a tuple: modelling that shape is
+    the point of this double (the predecessor's ``FakeStabilizer``).
+    """
+
+    def __init__(
+        self, data: bytes = b"\x01\x02\x03\xf4", *, with_data_overload: bool = True
+    ) -> None:
+        self._data = data
+        self._with_data = with_data_overload
+        self.init_calls: list[tuple[Any, ...]] = []
+        self.restore_calls: list[tuple[Any, ...]] = []
+        self.stabilize_calls: list[tuple[Any, ...]] = []
+        self.mode_calls: list[tuple[Any, ...]] = []
+        self.periodic_calls: list[tuple[Any, ...]] = []
+
+    def InitOnCurrentFocusPosition(self, *args: Any) -> Any:
+        self.init_calls.append(args)
+        if self._with_data and args and args[0] is None:
+            return (True, bytearray(self._data))
+        if args and args[0] is None:
+            raise TypeError("no such overload")
+        return True
+
+    def InitWithStabilizingData(self, *args: Any) -> bool:
+        self.restore_calls.append(args)
+        return True
+
+    def GetStabilizerData(self) -> bytearray:
+        return bytearray(self._data)
+
+    def StabilizeNow(self, *args: Any) -> bool:
+        self.stabilize_calls.append(args)
+        return True
+
+    def Stop(self, *args: Any) -> bool:
+        return True
+
+    def GetOperationMode(self) -> str:
+        return "Balanced"
+
+    def SetOperationMode(self, *args: Any) -> bool:
+        self.mode_calls.append(args)
+        return True
+
+    def GetPiezoFocusUsage(self) -> str:
+        return "MTBOnOff.Off"
+
+    def GetStabilizePeriodicallyOnOff(self) -> tuple[str, str]:
+        return ("MTBOnOff.On", "stopped by: nothing")
+
+    def StabilizePeriodically(self, *args: Any) -> bool:
+        self.periodic_calls.append(args)
+        return True
+
+
+def _df2(raw: FakeStabilizer | None = None) -> dotnet.DotNetFocusStabilizer:
+    return dotnet.DotNetFocusStabilizer(
+        "MTBFocusStabilizer2", raw or FakeStabilizer(), _df2_namespace()
+    )
+
+
+def test_focus_stabilizer_without_the_cast_is_an_mtb_error() -> None:
+    # No fallback to IMTBAutoFocus (m4 §11.3): a stand without DF2 fails its
+    # initialize() naming the cast.
+    def refuses(obj: Any) -> Any:
+        raise TypeError("cannot cast")
+
+    ns = _df2_namespace(IMTBFocusStabilizer2=refuses, IMTBAutoFocus=_cast)
+    with pytest.raises(MTBError, match="does not cast to IMTBFocusStabilizer2"):
+        dotnet.DotNetFocusStabilizer("MTBFocusStabilizer2", FakeStabilizer(), ns)
+
+
+def test_focus_stabilizer_learn_takes_the_blob_from_the_out_parameter() -> None:
+    # The data overload first: the mode overload leaves the reference inside
+    # DF2, where only one position can use it.
+    raw = FakeStabilizer()
+    blob = _df2(raw).learn(30_000)
+    assert blob == b"\x01\x02\x03\xf4"
+    assert isinstance(blob, bytes)
+    assert raw.init_calls == [(None, 30_000)]
+
+
+def test_focus_stabilizer_learn_falls_back_to_the_mode_overload_and_its_data() -> None:
+    raw = FakeStabilizer(with_data_overload=False)
+    assert _df2(raw).learn(30_000) == b"\x01\x02\x03\xf4"
+    assert raw.init_calls == [(None, 30_000), (None,), (_Modes.Synchronous, 30_000)]
+
+
+def test_focus_stabilizer_every_shape_failing_names_each_and_chains_the_last() -> None:
+    # pythonnet raises TypeError when no overload takes the arguments: the
+    # only failure after which the next shape is tried.
+    class Unbound(FakeStabilizer):
+        def InitOnCurrentFocusPosition(self, *args: Any) -> Any:
+            self.init_calls.append(args)
+            raise TypeError(f"no overload matches {len(self.init_calls)}")
+
+    with pytest.raises(MTBError) as caught:
+        _df2(Unbound()).learn(30_000)
+    text = str(caught.value)
+    assert text.startswith(
+        "MTBFocusStabilizer2: InitOnCurrentFocusPosition (learn) gave no reference"
+    )
+    # A mode member shows as its type: `object` here, MTBCmdSetModes on .NET.
+    for shape, n in (
+        ("(None, 30000)", 1),
+        ("(None)", 2),
+        ("(object, 30000)", 3),
+        ("(object)", 4),
+    ):
+        assert f"{shape}: TypeError: no overload matches {n}" in text
+    assert str(caught.value.__cause__) == "no overload matches 4"
+
+
+def test_focus_stabilizer_a_call_mtb_ran_is_never_sent_again_with_another_shape() -> (
+    None
+):
+    # A failure that is not pythonnet's TypeError means MTB ran the call: a
+    # StabilizeNow sent again would drive the focus drive a second time.
+    class Dead(FakeStabilizer):
+        def StabilizeNow(self, *args: Any) -> bool:
+            self.stabilize_calls.append(args)
+            raise RuntimeError("lost the surface")
+
+        def InitOnCurrentFocusPosition(self, *args: Any) -> Any:
+            self.init_calls.append(args)
+            raise RuntimeError("no focus signal")
+
+    raw = Dead()
+    with pytest.raises(MTBError) as caught:
+        _df2(raw).stabilize_now(30_000)
+    assert raw.stabilize_calls == [(_Modes.Synchronous, 30_000)]
+    assert str(caught.value) == (
+        "MTBFocusStabilizer2: StabilizeNow failed: (object, 30000): RuntimeError: "
+        "lost the surface"
+    )
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    with pytest.raises(MTBError, match=r"learn\) failed: \(None, 30000\)"):
+        _df2(raw).learn(30_000)
+    assert raw.init_calls == [(None, 30_000)]
+
+
+def test_focus_stabilizer_an_answer_with_an_out_parameter_is_read_by_its_first_item() -> (
+    None
+):
+    # A tuple is never False: (False, <out>) read whole would pass for a success.
+    class Refuses(FakeStabilizer):
+        def StabilizeNow(self, *args: Any) -> Any:
+            return (False, "no surface")
+
+        def InitWithStabilizingData(self, *args: Any) -> Any:
+            return (False, None)
+
+    assert _df2(Refuses()).stabilize_now(30_000) is False
+    assert _df2(Refuses()).restore(b"\x01", 30_000) is False
+
+
+def test_focus_stabilizer_a_learn_with_an_empty_blob_is_an_mtb_error() -> None:
+    raw = FakeStabilizer(b"")
+    with pytest.raises(MTBError, match="gave no reference"):
+        _df2(raw).learn(30_000)
+
+
+def test_extract_bytes_handles_the_shapes_pythonnet_produces() -> None:
+    ex = dotnet._extract_bytes
+    assert ex(None) is None
+    assert ex(True) is None, "a bare bool is an answer, not a blob"
+    assert ex(b"ab") == b"ab"
+    assert ex(bytearray(b"ab")) == b"ab"
+    assert ex((True, bytearray(b"ab"))) == b"ab"
+    assert ex([1, 2, 255]) == b"\x01\x02\xff"
+
+
+def test_focus_stabilizer_restore_sends_the_blob_and_the_mode_member() -> None:
+    raw = FakeStabilizer()
+    assert _df2(raw).restore(b"\x09\x08", 30_000) is True
+    mode, data, timeout = raw.restore_calls[-1]
+    assert mode is _Modes.Synchronous, (
+        "a raw int reached .NET: pythonnet ≥ 3 refuses it"
+    )
+    assert (bytes(data), timeout) == (b"\x09\x08", 30_000)
+
+
+def test_focus_stabilizer_restore_refuses_an_empty_reference() -> None:
+    raw = FakeStabilizer()
+    with pytest.raises(MTBError, match="no stabilizing data"):
+        _df2(raw).restore(b"", 30_000)
+    assert raw.restore_calls == []
+
+
+def test_the_stabilizer_timeout_is_long_enough_for_df2() -> None:
+    # The Micro-Manager wiki recommends 25 s for DF2: a 10 s motion timeout
+    # would abort a good measurement.
+    assert STABILIZER_TIMEOUT_MS >= 25_000
+    raw = FakeStabilizer()
+    _df2(raw).stabilize_now(STABILIZER_TIMEOUT_MS)
+    assert raw.stabilize_calls == [(_Modes.Synchronous, STABILIZER_TIMEOUT_MS)]
+
+
+def test_focus_stabilizer_answers_cross_the_seam_and_a_raise_names_stabilize_now() -> (
+    None
+):
+    class Refuses(FakeStabilizer):
+        def StabilizeNow(self, *args: Any) -> bool:
+            return False
+
+        def InitWithStabilizingData(self, *args: Any) -> bool:
+            return False
+
+    class Dead(FakeStabilizer):
+        def StabilizeNow(self, *args: Any) -> bool:
+            raise RuntimeError("lost the surface")
+
+    assert _df2(Refuses()).stabilize_now(30_000) is False
+    assert _df2(Refuses()).restore(b"\x01", 30_000) is False
+    with pytest.raises(MTBError, match=r"StabilizeNow failed: .*lost the surface"):
+        _df2(Dead()).stabilize_now(30_000)
+
+
+def test_operation_mode_is_set_by_member_name_never_an_int() -> None:
+    raw = FakeStabilizer()
+    df2 = _df2(raw)
+    df2.set_operation_mode("Exact")
+    assert raw.mode_calls == [(_OperationModes.Exact,)]
+    assert not isinstance(raw.mode_calls[0][0], int)
+    assert df2.operation_mode() == "Balanced"
+    with pytest.raises(MTBError, match="'Sharpish'; one of Exact, Balanced, Fast"):
+        df2.set_operation_mode("Sharpish")
+    assert len(raw.mode_calls) == 1
+
+
+def test_on_off_reads_take_the_end_of_the_text_and_the_first_item() -> None:
+    # "MTBOnOff.Off" holds "On" in its type's name: the predecessor's `"on" in`
+    # read it as on.
+    raw = FakeStabilizer()
+    df2 = _df2(raw)
+    assert df2.piezo_focus_usage() is False
+    assert df2.periodic() is True
+    df2.stop_periodic(30_000)
+    assert raw.periodic_calls == [(_OnOff.Off,)]
+
+
+def test_a_learn_answered_false_gives_no_reference_whatever_its_out_parameter_holds() -> (
+    None
+):
+    # What a failed learn leaves in the out-parameter, or in GetStabilizerData,
+    # is not known (m4 §12): a stale blob is no reference.
+    class Fails(FakeStabilizer):
+        def InitOnCurrentFocusPosition(self, *args: Any) -> Any:
+            self.init_calls.append(args)
+            if args[0] is None:
+                return (False, bytearray(b"\x01\x02"))
+            return False
+
+    raw = Fails()
+    with pytest.raises(MTBError, match="gave no reference") as caught:
+        _df2(raw).learn(30_000)
+    assert "(None, 30000): answered False" in str(caught.value)
+    assert "(object, 30000): answered False" in str(caught.value)
+    assert len(raw.init_calls) == 4
+
+
+def test_answers_the_adapter_cannot_take_are_mtb_errors() -> None:
+    # Each of these fails closed: a periodic mode that may still be on, a mode
+    # not set, a piezo reading that would let a stabilize through.
+    class Odd(FakeStabilizer):
+        def StabilizePeriodically(self, *args: Any) -> bool:
+            return False
+
+        def SetOperationMode(self, *args: Any) -> bool:
+            return False
+
+        def GetPiezoFocusUsage(self) -> str:
+            return "MTBOnOff.Unknown"
+
+        def GetOperationMode(self) -> str:
+            return "MTBFocusStabilizer2OperationMode.Sharpish"
+
+    df2 = _df2(Odd())
+    with pytest.raises(MTBError, match=r"StabilizePeriodically\(Off\) answered False"):
+        df2.stop_periodic(30_000)
+    with pytest.raises(MTBError, match=r"SetOperationMode\(Exact\) answered False"):
+        df2.set_operation_mode("Exact")
+    with pytest.raises(MTBError, match="neither on nor off"):
+        df2.piezo_focus_usage()
+    with pytest.raises(MTBError, match=r"Sharpish', not one of Exact, Balanced, Fast"):
+        df2.operation_mode()
+
+
+def test_a_stop_answered_false_is_logged_as_unknown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class Shrugs(FakeStabilizer):
+        def Stop(self, *args: Any) -> bool:
+            return False
+
+    with caplog.at_level(logging.WARNING):
+        _df2(Shrugs()).stop(30_000)
+    assert any(
+        "Stop answered False; whether DF2 stopped is not known" in m
+        for m in caplog.messages
+    )
 
 
 def test_connect_without_pythonnet_is_a_session_error_naming_the_extra(

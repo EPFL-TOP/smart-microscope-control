@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     # For the annotations only; the values come from the fixture.
     from pymmcore_plus import CMMCorePlus
 
-    from conftest import Envelope, PutBack
+    from conftest import Envelope, PutBack, Unsupported
     from smc.testing import FakeCore
 
 
@@ -110,6 +110,7 @@ def test_teardown_puts_the_stand_back_where_it_started(
     microscope: Microscope,
     envelope: Envelope,
     backend: str,
+    unsupported: Unsupported,
 ) -> None:
     xy, z = microscope.get(XYStage), microscope.get(ZStage)
     camera, shutter = microscope.get(Camera), microscope.get(Shutter)
@@ -125,9 +126,11 @@ def test_teardown_puts_the_stand_back_where_it_started(
         if channels is not None:
             channels.select("FITC")
     if autofocus is not None and envelope.offset_native is not None:
-        # With the autofocus off: it moves only the offset lens.
+        # With the autofocus off: it moves only the offset lens. A one-shot
+        # autofocus (DF2) holds no offset to move (m4 §11.6).
         autofocus.disengage()
-        autofocus.set_offset_native(envelope.offset_native - 1.0)
+        with unsupported.passes():
+            autofocus.set_offset_native(envelope.offset_native - 1.0)
     if xy is not None and envelope.xy is not None:
         xy.move_to_um(envelope.xy.x_um + 20, envelope.xy.y_um - 10)
     if z is not None and envelope.z_um is not None:
@@ -139,8 +142,10 @@ def test_teardown_puts_the_stand_back_where_it_started(
         # engaging drives Z to it refuses the engage (m2 §12.2 D1).
         and not microscope.profile.autofocus.engage_drives_z_to_offset
     ):
-        # Left engaged: the put-back switches it off again.
-        autofocus.engage()
+        # Left engaged: the put-back switches it off again. A one-shot autofocus
+        # has nothing to engage.
+        with unsupported.passes():
+            autofocus.engage()
     if camera is not None and envelope.exposure_ms is not None:
         start = envelope.exposure_ms
         camera.set_exposure_ms(30.0 if abs(start - 20.0) <= 1.0 else 20.0)

@@ -238,7 +238,8 @@ class SafetySection(_Section):
     #: The stop is still sent; the declaration changes what the layer says.
     stop_refused_by: tuple[Role, ...] = ()
     #: How far Z may move while the autofocus engages, beyond where it started
-    #: or held its lock; ``None``: only ``z_soft_limits_um`` bound it (m2 §12).
+    #: or held its lock, or a one-shot stabilize moves it (m4 §11.6); ``None``:
+    #: only ``z_soft_limits_um`` bound it (m2 §12).
     max_engage_excursion_um: float | None = None
     #: Which way Z moves away from the sample, seen at the stand, never guessed
     #: (#98); ``None``: unknown, and no first lock from below runs (m2 §12.10).

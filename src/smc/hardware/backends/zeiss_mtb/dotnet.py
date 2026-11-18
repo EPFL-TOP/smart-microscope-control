@@ -19,6 +19,9 @@ this stand daily. What it learned at the stand, kept here:
   mislabelled every objective (2026-09-08).
 * ``SetOnOff`` on an LED failed with three guessed argument shapes; its
   arguments are built from the overload's reflected signature (``_args_for``).
+* Definite Focus 2's members appear after the cast ``IMTBFocusStabilizer2``,
+  and its learn hands the reference back through a ``Byte[]&``
+  out-parameter, which pythonnet appends to the returned tuple (2026-09-11).
 
 The adapters take the .NET objects, the ``ZEISS.MTB.Api`` namespace and
 ``System.Enum`` as arguments, so the tests drive them with duck-typed fakes
@@ -39,6 +42,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from smc.hardware.backends.zeiss_mtb.api import (
+    STABILIZER_OPERATION_MODES,
     AxisInfo,
     ChangerElement,
     MTBApi,
@@ -50,6 +54,7 @@ __all__ = [
     "DEFAULT_MTB_API",
     "DotNetAxis",
     "DotNetChanger",
+    "DotNetFocusStabilizer",
     "DotNetLED",
     "DotNetLEDController",
     "DotNetMTB",
@@ -452,6 +457,288 @@ class DotNetLEDController:
         ) from last
 
 
+def _extract_bytes(result: Any) -> bytes | None:
+    """The ``Byte[]`` of a .NET answer, or ``None``: pythonnet appends out-parameters to a tuple.
+
+    The data overload of ``InitOnCurrentFocusPosition`` comes back as
+    ``(True, Byte[])``; a bare ``bool`` is an answer, never a blob. A .NET
+    ``Byte[]`` is a sequence of ints, so anything with a length that is not
+    text is taken as its bytes (the predecessor's rule).
+    """
+    if result is None or isinstance(result, bool):
+        return None
+    candidates = result if isinstance(result, tuple) else (result,)
+    for item in candidates:
+        if isinstance(item, (bytes, bytearray)):
+            return bytes(item)
+        try:
+            if len(item) and not isinstance(item, str):
+                return bytes(bytearray(item))
+        except Exception:
+            continue
+    return None
+
+
+def _on_off(where: str, call: str, value: Any) -> bool:
+    """An ``MTBOnOff`` answer as a bool; the first item of a tuple (an out-parameter after it).
+
+    Read by the end of its text, never by ``"on" in``: ``"MTBOnOff.Off"``
+    holds ``On`` in its type's name.
+    """
+    if isinstance(value, tuple):
+        value = value[0] if value else None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text.endswith("off") or text == "0":
+        return False
+    if text.endswith("on") or text == "1":
+        return True
+    raise MTBError(f"{where}: {call} answered {value!r}, neither on nor off")
+
+
+def _shape(args: tuple[Any, ...]) -> str:
+    """An argument shape for a message: ``(None, 30000)``, the enum members by type."""
+    shown = [
+        repr(a) if a is None or isinstance(a, (int, float, str)) else type(a).__name__
+        for a in args
+    ]
+    return f"({', '.join(shown)})"
+
+
+def _answer(value: Any) -> Any:
+    """MTB's own answer: the first item when pythonnet appended out-parameters to it.
+
+    A tuple is never ``False``, so ``(False, <out>)`` read whole would pass for
+    a success. Which of DF2's calls have an out-parameter is not known from the
+    stand (m4 §12): every answer is read this way.
+    """
+    if isinstance(value, tuple):
+        return value[0] if value else None
+    return value
+
+
+def _tried(args: tuple[Any, ...], exc: BaseException) -> str:
+    return f"{_shape(args)}: {type(exc).__name__}: {exc}"
+
+
+class DotNetFocusStabilizer:
+    """Definite Focus 2, cast to ``IMTBFocusStabilizer2`` only (m4 §11.3).
+
+    Ported from the predecessor's ``MTBDefiniteFocus``, whose learn ran at the
+    stand (2026-09-11). Its argument shapes are kept, in its order, because
+    the overloads MTB 2.12 offers are known from reflection only; when none
+    binds, the ``MTBError`` names the call and every shape tried, chained from
+    the last failure (FM-113). Unlike the predecessor, the next shape is tried
+    only after pythonnet's ``TypeError`` (no overload takes these arguments):
+    any other failure means MTB ran the call, and a ``StabilizeNow`` sent
+    again would drive the focus drive a second time, after a failure or a
+    ``Stop``. Nothing is swallowed: a learn with no blob, a stop or a mode
+    switch that fails is an ``MTBError``. Its fallback to ``IMTBAutoFocus`` is
+    not ported: a stand without DF2 fails its ``initialize()`` naming the cast.
+    """
+
+    _IFACE = "IMTBFocusStabilizer2"
+
+    def __init__(self, mtb_id: str, component: Any, namespace: Any) -> None:
+        self.mtb_id = mtb_id
+        self._ns = namespace
+        stabilizer = _cast(namespace, component, (self._IFACE,))
+        if stabilizer is None:
+            raise MTBError(
+                f"{mtb_id}: the component does not cast to {self._IFACE}, so it is "
+                "no Definite Focus 2"
+            )
+        self._c = stabilizer
+
+    def _ran(
+        self, call: str, args: tuple[Any, ...], tried: list[str], exc: Exception
+    ) -> MTBError:
+        """The error of a call MTB ran and failed in: never tried again with another shape."""
+        before = f" (after {'; '.join(tried)})" if tried else ""
+        return MTBError(f"{self.mtb_id}: {call} failed: {_tried(args, exc)}{before}")
+
+    def _first_answer(
+        self, call: str, method: Callable[..., Any], shapes: Sequence[tuple[Any, ...]]
+    ) -> Any:
+        """``method`` with each shape until one binds; MTB's answer (``_answer``).
+
+        Only a ``TypeError`` moves on to the next shape. Any other failure is
+        raised at once, chained (see the class).
+        """
+        tried: list[str] = []
+        last: Exception | None = None
+        for args in shapes:
+            try:
+                return _answer(method(*args))
+            except TypeError as exc:
+                tried.append(_tried(args, exc))
+                last = exc
+            except Exception as exc:
+                raise self._ran(call, args, tried, exc) from exc
+        raise MTBError(
+            f"{self.mtb_id}: {call} failed with every argument shape tried: "
+            + "; ".join(tried)
+        ) from last
+
+    def _method(self, name: str) -> Callable[..., Any]:
+        method: Callable[..., Any] = _net(
+            self.mtb_id, name, lambda: getattr(self._c, name)
+        )
+        return method
+
+    def learn(self, timeout_ms: int) -> bytes:
+        """``InitOnCurrentFocusPosition``: the blob from its ``Byte[]&`` out-parameter.
+
+        The data overload first, as the predecessor did, since only it hands
+        the reference back; then the mode overload and ``GetStabilizerData``.
+        """
+        call = "InitOnCurrentFocusPosition (learn)"
+        mode = resolve_mode(self._ns)
+        init = self._method("InitOnCurrentFocusPosition")
+        tried: list[str] = []
+        last: Exception | None = None
+        for args in ((None, int(timeout_ms)), (None,)):
+            try:
+                result = init(*args)
+            except TypeError as exc:
+                tried.append(_tried(args, exc))
+                last = exc
+                continue
+            except Exception as exc:
+                raise self._ran(call, args, tried, exc) from exc
+            if _answer(result) is False:
+                # (False, Byte[]): what fills the out-parameter of a failed
+                # learn is not known (m4 §12); it is no reference.
+                tried.append(f"{_shape(args)}: answered False")
+                continue
+            data = _extract_bytes(result)
+            if data:
+                return data
+            tried.append(f"{_shape(args)}: answered {result!r} with no reference")
+        for args in ((mode, int(timeout_ms)), (mode,)):
+            try:
+                answer = _answer(init(*args))
+            except TypeError as exc:
+                tried.append(_tried(args, exc))
+                last = exc
+                continue
+            except Exception as exc:
+                raise self._ran(call, args, tried, exc) from exc
+            if answer is False:
+                tried.append(f"{_shape(args)}: answered False")
+                continue
+            data = _extract_bytes(
+                _net(self.mtb_id, "GetStabilizerData", self._c.GetStabilizerData)
+            )
+            if data:
+                return data
+            tried.append(f"{_shape(args)}, then GetStabilizerData(): no reference")
+        raise MTBError(
+            f"{self.mtb_id}: InitOnCurrentFocusPosition (learn) gave no reference "
+            f"with any argument shape tried: {'; '.join(tried)}"
+        ) from last
+
+    def restore(self, reference: bytes, timeout_ms: int) -> bool:
+        """``InitWithStabilizingData(mode, data, timeout)``; MTB's answer."""
+        if not reference:
+            raise MTBError(f"{self.mtb_id}: no stabilizing data to restore")
+        mode = resolve_mode(self._ns)
+        payload = bytearray(reference)
+        answer = self._first_answer(
+            "InitWithStabilizingData",
+            self._method("InitWithStabilizingData"),
+            ((mode, payload, int(timeout_ms)), (mode, payload)),
+        )
+        return answer is not False
+
+    def stabilize_now(self, timeout_ms: int) -> bool:
+        """``StabilizeNow(mode, timeout)``; MTB's answer."""
+        mode = resolve_mode(self._ns)
+        answer = self._first_answer(
+            "StabilizeNow",
+            self._method("StabilizeNow"),
+            ((mode, int(timeout_ms)), (mode,)),
+        )
+        return answer is not False
+
+    def stop(self, timeout_ms: int) -> None:
+        """``Stop(mode, timeout)``; a ``False`` is logged, since whether DF2 stopped is unknown."""
+        mode = resolve_mode(self._ns)
+        answer = self._first_answer(
+            "Stop", self._method("Stop"), ((mode, int(timeout_ms)), (mode,))
+        )
+        if answer is False:
+            log.warning(
+                "%s: Stop answered False; whether DF2 stopped is not known", self.mtb_id
+            )
+
+    def operation_mode(self) -> str:
+        """``GetOperationMode()``: the member's name, one of the three."""
+        value = _net(self.mtb_id, "GetOperationMode", self._c.GetOperationMode)
+        if isinstance(value, tuple):
+            value = value[0] if value else None
+        name = str(value).rsplit(".", 1)[-1].strip()
+        if name not in STABILIZER_OPERATION_MODES:
+            raise MTBError(
+                f"{self.mtb_id}: GetOperationMode answered {value!r}, not one of "
+                f"{', '.join(STABILIZER_OPERATION_MODES)}"
+            )
+        return name
+
+    def set_operation_mode(self, mode: str) -> None:
+        """``SetOperationMode`` with the member taken by name (``getattr``), never an int."""
+        if mode not in STABILIZER_OPERATION_MODES:
+            raise MTBError(
+                f"{self.mtb_id}: no operation mode {mode!r}; one of "
+                f"{', '.join(STABILIZER_OPERATION_MODES)}"
+            )
+        try:
+            member = getattr(self._ns.MTBFocusStabilizer2OperationMode, mode)
+        except AttributeError as exc:
+            raise MTBError(
+                f"{self.mtb_id}: MTBFocusStabilizer2OperationMode has no member {mode!r}"
+            ) from exc
+        answer = self._first_answer(
+            f"SetOperationMode({mode})",
+            self._method("SetOperationMode"),
+            ((member,), (None, member)),
+        )
+        if answer is False:
+            raise MTBError(f"{self.mtb_id}: SetOperationMode({mode}) answered False")
+
+    def piezo_focus_usage(self) -> bool:
+        """``GetPiezoFocusUsage()``: ``True`` when DF2 corrects through the piezo."""
+        value = _net(self.mtb_id, "GetPiezoFocusUsage", self._c.GetPiezoFocusUsage)
+        return _on_off(self.mtb_id, "GetPiezoFocusUsage", value)
+
+    def periodic(self) -> bool:
+        """``GetStabilizePeriodicallyOnOff()``: its first item; the reason it stopped follows."""
+        value = _net(
+            self.mtb_id,
+            "GetStabilizePeriodicallyOnOff",
+            self._c.GetStabilizePeriodicallyOnOff,
+        )
+        return _on_off(self.mtb_id, "GetStabilizePeriodicallyOnOff", value)
+
+    def stop_periodic(self, timeout_ms: int) -> None:
+        """``StabilizePeriodically(MTBOnOff.Off)``, the member, then with a period of 0."""
+        try:
+            off = self._ns.MTBOnOff.Off
+        except AttributeError as exc:
+            raise MTBError(f"{self.mtb_id}: MTBOnOff has no member 'Off'") from exc
+        answer = self._first_answer(
+            "StabilizePeriodically(Off)",
+            self._method("StabilizePeriodically"),
+            ((off,), (off, 0)),
+        )
+        if answer is False:
+            raise MTBError(
+                f"{self.mtb_id}: StabilizePeriodically(Off) answered False; periodic "
+                "stabilisation may still be on"
+            )
+
+
 class DotNetMTB:
     """``api.MTBApi`` over ``ZEISS.MTB.Api``; built by :func:`connect`, not logged in."""
 
@@ -512,6 +799,10 @@ class DotNetMTB:
         return DotNetLEDController(
             mtb_id, self._component(mtb_id), self._ns, self._enum
         )
+
+    def focus_stabilizer(self, mtb_id: str) -> DotNetFocusStabilizer:
+        """The component ``mtb_id`` as Definite Focus 2."""
+        return DotNetFocusStabilizer(mtb_id, self._component(mtb_id), self._ns)
 
 
 def connect(dll: Path = DEFAULT_MTB_API) -> MTBApi:

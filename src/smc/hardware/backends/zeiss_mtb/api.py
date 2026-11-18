@@ -20,12 +20,15 @@ __all__ = [
     "CHANGER_TIMEOUT_MS",
     "LED_TIMEOUT_MS",
     "MTBLED",
+    "STABILIZER_OPERATION_MODES",
+    "STABILIZER_TIMEOUT_MS",
     "AxisInfo",
     "ChangerElement",
     "MTBApi",
     "MTBAxis",
     "MTBChanger",
     "MTBError",
+    "MTBFocusStabilizer",
     "MTBLEDController",
     "MTBSessionError",
 ]
@@ -36,6 +39,13 @@ AXIS_TIMEOUT_MS = 60_000
 CHANGER_TIMEOUT_MS = 30_000
 #: The predecessor's, for switching an LED and setting its intensity.
 LED_TIMEOUT_MS = 10_000
+#: Definite Focus 2's calls: the predecessor's, and the Micro-Manager wiki
+#: recommends 25 s for DF2. How long a ``StabilizeNow`` takes is not measured
+#: (m4 §12).
+STABILIZER_TIMEOUT_MS = 30_000
+#: DF2's precision settings, as ``MTBFocusStabilizer2OperationMode`` names them:
+#: slowest and most precise first. Not one shot versus continuous (m4 §11.1).
+STABILIZER_OPERATION_MODES = ("Exact", "Balanced", "Fast")
 
 
 class MTBError(RuntimeError):
@@ -138,6 +148,53 @@ class MTBLEDController(Protocol):
         ...
 
 
+class MTBFocusStabilizer(Protocol):
+    """Definite Focus 2 (``MTBFocusStabilizer2``): learn a plane, restore it, stabilize once.
+
+    A reference is DF2's own blob, opaque to smc. ``restore`` and
+    ``stabilize_now`` return MTB's answer and the device judges it (m4 §11.4);
+    ``learn`` with no blob, or an empty one, is an ``MTBError``.
+    """
+
+    mtb_id: str
+
+    def learn(self, timeout_ms: int) -> bytes:
+        """``InitOnCurrentFocusPosition``: the reference blob of the plane in focus now."""
+        ...
+
+    def restore(self, reference: bytes, timeout_ms: int) -> bool:
+        """``InitWithStabilizingData``: make ``reference`` DF2's; MTB's own answer."""
+        ...
+
+    def stabilize_now(self, timeout_ms: int) -> bool:
+        """``StabilizeNow``: one correction to the plane held; MTB's own answer."""
+        ...
+
+    def stop(self, timeout_ms: int) -> None:
+        """``Stop``: end what DF2 is doing."""
+        ...
+
+    def operation_mode(self) -> str:
+        """``"Exact"``, ``"Balanced"`` or ``"Fast"``, read live."""
+        ...
+
+    def set_operation_mode(self, mode: str) -> None:
+        """Set one of ``STABILIZER_OPERATION_MODES``; any other name is an ``MTBError``."""
+        ...
+
+    def piezo_focus_usage(self) -> bool:
+        """Whether DF2 corrects through the piezo (``True``) or the focus drive."""
+        ...
+
+    def periodic(self) -> bool:
+        """Whether periodic (continuous) stabilisation is on: ``GetStabilizePeriodicallyOnOff``."""
+        ...
+
+    def stop_periodic(self, timeout_ms: int) -> None:
+        """``StabilizePeriodically(Off, 0)``: periodic stabilisation off."""
+        ...
+
+
 class MTBApi(Protocol):
     """One MTB connection: the login and the components."""
 
@@ -159,4 +216,8 @@ class MTBApi(Protocol):
 
     def led_controller(self, mtb_id: str) -> MTBLEDController:
         """The LED controller ``mtb_id``; an ``MTBError`` naming the id when absent."""
+        ...
+
+    def focus_stabilizer(self, mtb_id: str) -> MTBFocusStabilizer:
+        """The focus stabilizer ``mtb_id``; an ``MTBError`` naming the id when absent."""
         ...

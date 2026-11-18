@@ -299,6 +299,20 @@ class AutofocusExcursionError(HardwareError):
         return (type(self), (str(self), self.z_start_um, self.z_um))
 
 
+class AutofocusUnsupportedError(HardwareError):
+    """This autofocus does not hold focus that way, and nothing was sent (m4 §11.5).
+
+    PFS holds focus continuously (``engage``); Definite Focus 2 one shot at a
+    time (``learn_reference``, ``stabilize_now``), with no offset of its own.
+    Each raises this for the other way, before anything reaches the stand.
+
+    Not a ``SafetyRefusedError`` (FM-64): no guard refused a move that the
+    stand could make, so a tool that skips a target on a refusal must not skip
+    on it; a tool that can work either way catches it and uses the other way.
+    One message argument, so it pickles as it is (a worker process).
+    """
+
+
 class MicroscopeBusyError(HardwareError):
     """The microscope lock could not be taken in time (§13, FM-15).
 

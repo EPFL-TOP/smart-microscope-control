@@ -1,4 +1,4 @@
-"""The ``Autofocus`` contract, on every backend (m2 §3.2, §3.13).
+"""The ``Autofocus`` contract, on every backend (m2 §3.2, §3.13, m4 §11.7).
 
 The offset moves at most 1.0 from where it started (``envelope.offset_native``),
 in its own units and in whole units (the Ti2-E's ``PFSOffset`` holds nothing
@@ -8,6 +8,13 @@ at most 2 µm, as in the ``ZStage`` contract. A case that needs a lock skips on
 ``hardware`` when none comes ("no lock on this sample"), or when the engage
 check refuses it (m2 §12.4: an offset the operator has not locked at the
 stand); on ``fake`` and ``demo`` the lock comes at once, so no lock fails it.
+
+An autofocus holds focus continuously (PFS: ``engage``, an offset) or one shot
+at a time (DF2: ``learn_reference``, ``stabilize_now``), and refuses the other
+way with ``AutofocusUnsupportedError``. A case of the continuous way skips on
+it where the stand may lack that way (``zeiss-fake``, ``hardware``) and fails
+on ``fake`` and ``demo``; a case of the one-shot way skips on it everywhere,
+since PFS has none. One contract keeps a stand from skipping both.
 """
 
 from __future__ import annotations
@@ -18,12 +25,12 @@ import pytest
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, Properties, ZStage
-from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.errors import AutofocusUnsupportedError, SafetyRefusedError
 from smc.hardware.roles import Role
 
 if TYPE_CHECKING:
     # For the annotations only; the values come from the fixture.
-    from conftest import Envelope
+    from conftest import Envelope, Unsupported
 
 
 def _offset_start(envelope: Envelope) -> float:
@@ -46,11 +53,20 @@ def _engage(autofocus: Autofocus, backend: str) -> bool:
 
     No contract runs a first lock from below (m2 §12.10.8): it moves Z by what
     the stand decides, and the visit runs it by hand. On ``hardware`` an offset
-    at its floor skips before anything is sent.
+    at its floor skips before anything is sent; an autofocus whose offset holds
+    nothing but zero (DF2, limits ``(0.0, 0.0)``) has no floor to be at, and its
+    ``engage()`` refuses on its own.
+
+    ``AutofocusUnsupportedError`` is the caller's: inside
+    ``unsupported.skips()``, or caught where the other way is tried.
     """
     if backend == "hardware":
         limits = autofocus.offset_limits_native()
-        if limits is not None and autofocus.offset_native() <= limits[0]:
+        if (
+            limits is not None
+            and limits[0] < limits[1]
+            and autofocus.offset_native() <= limits[0]
+        ):
             pytest.skip(
                 "the offset is at its floor: engaging there may be a first lock (m2 "
                 "§12.10), which no contract runs"
@@ -102,10 +118,62 @@ def _with_factors(
     return facade
 
 
-def test_engage_returns_a_bool_and_says_the_truth(
+def test_an_autofocus_holds_focus_one_way_or_the_other(
     autofocus: Autofocus, backend: str
 ) -> None:
-    locked = _engage(autofocus, backend)
+    # m4 §11.7: each way may be unsupported, never both. Without this case a
+    # stand that skipped every case of both would pass with an autofocus that
+    # holds focus no way at all.
+    try:
+        locked = _engage(autofocus, backend)
+    except AutofocusUnsupportedError:
+        pass
+    else:
+        if not locked and backend == "hardware":
+            pytest.skip("no lock on this sample: focus on it by eye, then run again")
+        assert locked, "no lock, on a backend that locks at once"
+        return
+    try:
+        reference = autofocus.learn_reference()
+        done = autofocus.stabilize_now(reference)
+    except AutofocusUnsupportedError as exc:
+        pytest.fail(
+            f"this autofocus holds focus neither way: engage() and the one-shot "
+            f"mode are both unsupported ({exc})"
+        )
+    assert done.reference == reference
+
+
+def test_stabilize_now_returns_to_the_learned_plane_within_1_um(
+    autofocus: Autofocus,
+    z: ZStage,
+    envelope: Envelope,
+    unsupported: Unsupported,
+) -> None:
+    # The stand check that replaces the predecessor's df2_test.py (m4 §12): learn,
+    # a 2 µm move away from the sample, a stabilize. The disturbance (2.0)
+    # differs from the tolerance (1.0), so a stabilize that does nothing fails.
+    z0, tol = _z_start(envelope), envelope.tolerance_um
+    with unsupported.skips(one_shot=True):
+        reference = autofocus.learn_reference()
+    # Absolute: the contracts' Z jog limit is 1 µm.
+    disturbed = z.move_to_um(z0 - 2.0)
+    assert abs(disturbed - (z0 - 2.0)) <= tol
+    done = autofocus.stabilize_now(reference)
+    here = z.position_um()
+    assert abs(here - z0) <= 1.0
+    assert done.reference == reference
+    assert done.z_before_um is not None
+    assert abs(done.z_before_um - disturbed) <= tol
+    assert done.z_um is not None
+    assert abs(done.z_um - here) <= tol
+
+
+def test_engage_returns_a_bool_and_says_the_truth(
+    autofocus: Autofocus, backend: str, unsupported: Unsupported
+) -> None:
+    with unsupported.skips():
+        locked = _engage(autofocus, backend)
     assert isinstance(locked, bool)
     if locked:
         assert autofocus.is_engaged() is True
@@ -116,9 +184,10 @@ def test_engage_returns_a_bool_and_says_the_truth(
 
 
 def test_disengage_switches_it_off_and_twice_is_harmless(
-    autofocus: Autofocus, backend: str
+    autofocus: Autofocus, backend: str, unsupported: Unsupported
 ) -> None:
-    _lock(autofocus, backend)
+    with unsupported.skips():
+        _lock(autofocus, backend)
     autofocus.disengage()
     assert autofocus.is_engaged() is False
     assert autofocus.is_locked() is False
@@ -135,16 +204,18 @@ def test_offset_unit_is_a_string(autofocus: Autofocus) -> None:
 
 
 def test_offset_round_trips_within_tolerance(
-    autofocus: Autofocus, envelope: Envelope
+    autofocus: Autofocus, envelope: Envelope, unsupported: Unsupported
 ) -> None:
     o0, tol = _offset_start(envelope), envelope.offset_tolerance
     autofocus.disengage()
-    assert abs(autofocus.set_offset_native(o0 - 1.0) - (o0 - 1.0)) <= tol
+    with unsupported.skips():
+        landed = autofocus.set_offset_native(o0 - 1.0)
+    assert abs(landed - (o0 - 1.0)) <= tol
     assert abs(autofocus.offset_native() - (o0 - 1.0)) <= tol
 
 
 def test_offset_jog_above_the_limit_is_refused_and_sends_nothing(
-    autofocus: Autofocus, envelope: Envelope
+    autofocus: Autofocus, envelope: Envelope, unsupported: Unsupported
 ) -> None:
     # Whole units only: the Ti2-E's PFSOffset holds whole units (FM-119). From
     # start + 1, a jog of -2 is above the 1.0 limit and lands at start - 1: the
@@ -152,7 +223,8 @@ def test_offset_jog_above_the_limit_is_refused_and_sends_nothing(
     o0, tol = _offset_start(envelope), envelope.offset_tolerance
     assert envelope.max_offset_jog < 2.0
     autofocus.disengage()
-    autofocus.set_offset_native(o0 + 1.0)
+    with unsupported.skips():
+        autofocus.set_offset_native(o0 + 1.0)
     with pytest.raises(SafetyRefusedError) as refused:
         autofocus.offset_by_native(-2.0)
     assert refused.value.how_to_force == "pass force=True"
@@ -179,12 +251,13 @@ def test_the_fake_stand_holds_whole_units(
 
 
 def test_offset_outside_the_soft_limits_is_refused_even_forced(
-    autofocus: Autofocus, envelope: Envelope
+    autofocus: Autofocus, envelope: Envelope, unsupported: Unsupported
 ) -> None:
     o0, tol = _offset_start(envelope), envelope.offset_tolerance
     assert envelope.offset_span < 3.0
     autofocus.disengage()
-    with pytest.raises(SafetyRefusedError) as absolute:
+    # A refusal that is no SafetyRefusedError leaves pytest.raises unmatched.
+    with unsupported.skips(), pytest.raises(SafetyRefusedError) as absolute:
         autofocus.set_offset_native(o0 - 3.0)
     assert absolute.value.how_to_force == ""
     with pytest.raises(SafetyRefusedError) as relative:
@@ -194,28 +267,47 @@ def test_offset_outside_the_soft_limits_is_refused_even_forced(
 
 
 def test_offset_limits_report_the_envelope(
-    autofocus: Autofocus, envelope: Envelope
+    autofocus: Autofocus, envelope: Envelope, unsupported: Unsupported
 ) -> None:
     o0, span = _offset_start(envelope), envelope.offset_span
-    assert autofocus.offset_limits_native() == (o0 - span, o0 + span)
+    limits = autofocus.offset_limits_native()
+    if limits == (0.0, 0.0):
+        # An autofocus whose offset is zero by construction (DF2, m4 §11.6) has
+        # no use for the envelope's limits; it says so by refusing any other
+        # value. On a stand that holds an offset, these limits would refuse
+        # the same value as a SafetyRefusedError, so nothing is ever sent.
+        with unsupported.skips():
+            autofocus.set_offset_native(o0 + 1.0)
+        pytest.fail(f"the offset's limits read {limits}, not the envelope's")
+    assert limits == (o0 - span, o0 + span)
 
 
 def test_z_move_keeps_an_engaged_autofocus_engaged(
-    autofocus: Autofocus, z: ZStage, envelope: Envelope, backend: str
+    autofocus: Autofocus,
+    z: ZStage,
+    envelope: Envelope,
+    backend: str,
+    unsupported: Unsupported,
 ) -> None:
     # On the fake, a Z move switches it off (the Nikon quirk, FM-12): this is
     # the interlock engaging it again.
-    _lock(autofocus, backend)
+    with unsupported.skips():
+        _lock(autofocus, backend)
     z.move_to_um(_z_start(envelope) - 2)
     assert autofocus.is_engaged() is True
     assert autofocus.is_locked() is True
 
 
 def test_z_move_with_keep_autofocus_false_leaves_it_off(
-    autofocus: Autofocus, z: ZStage, envelope: Envelope, backend: str
+    autofocus: Autofocus,
+    z: ZStage,
+    envelope: Envelope,
+    backend: str,
+    unsupported: Unsupported,
 ) -> None:
     z0, tol = _z_start(envelope), envelope.tolerance_um
-    _lock(autofocus, backend)
+    with unsupported.skips():
+        _lock(autofocus, backend)
     assert abs(z.move_to_um(z0 - 2, keep_autofocus=False) - (z0 - 2)) <= tol
     assert autofocus.is_engaged() is False
 
@@ -233,11 +325,16 @@ def test_focus_by_with_the_autofocus_off_moves_z(
 
 
 def test_focus_by_while_locked_without_a_factor_is_refused(
-    stand: Microscope, autofocus: Autofocus, envelope: Envelope, backend: str
+    stand: Microscope,
+    autofocus: Autofocus,
+    envelope: Envelope,
+    backend: str,
+    unsupported: Unsupported,
 ) -> None:
     facade = _with_factors(stand, envelope, {})
     af = facade.require(Autofocus)
-    _lock(af, backend)
+    with unsupported.skips():
+        _lock(af, backend)
     o0, tol = af.offset_native(), envelope.offset_tolerance
     with pytest.raises(SafetyRefusedError) as refused:
         af.focus_by_um(-1.0)
@@ -247,7 +344,11 @@ def test_focus_by_while_locked_without_a_factor_is_refused(
 
 
 def test_focus_by_while_locked_moves_the_offset(
-    stand: Microscope, autofocus: Autofocus, envelope: Envelope, backend: str
+    stand: Microscope,
+    autofocus: Autofocus,
+    envelope: Envelope,
+    backend: str,
+    unsupported: Unsupported,
 ) -> None:
     objective = _objective(stand)
     if backend == "hardware":
@@ -269,7 +370,8 @@ def test_focus_by_while_locked_moves_the_offset(
         facade = _with_factors(stand, envelope, {objective: factor})
         af = facade.require(Autofocus)
         dz_um = -1.0
-    _lock(af, backend)
+    with unsupported.skips():
+        _lock(af, backend)
     o0, tol = af.offset_native(), envelope.offset_tolerance
     assert abs(dz_um * factor) > tol
     step = af.focus_by_um(dz_um)
@@ -281,11 +383,16 @@ def test_focus_by_while_locked_moves_the_offset(
 
 
 def test_dry_run_engage_sends_nothing(
-    dry_autofocus: Autofocus, envelope: Envelope, backend: str
+    dry_autofocus: Autofocus,
+    envelope: Envelope,
+    backend: str,
+    unsupported: Unsupported,
 ) -> None:
     # The engage check runs in dry-run too (m2 §12.4): read the lock first.
     dry_autofocus.is_locked()
-    assert _engage(dry_autofocus, backend) is True  # the commanded outcome
+    with unsupported.skips():
+        locked = _engage(dry_autofocus, backend)
+    assert locked is True  # the commanded outcome
     assert dry_autofocus.is_engaged() is envelope.autofocus_engaged
 
 
@@ -315,8 +422,10 @@ def test_engage_at_an_unseen_offset_is_refused(
 
 
 def test_dry_run_offset_change_returns_the_command(
-    dry_autofocus: Autofocus, envelope: Envelope
+    dry_autofocus: Autofocus, envelope: Envelope, unsupported: Unsupported
 ) -> None:
     o0, tol = _offset_start(envelope), envelope.offset_tolerance
-    assert dry_autofocus.set_offset_native(o0 - 1.0) == o0 - 1.0
+    with unsupported.skips():
+        commanded = dry_autofocus.set_offset_native(o0 - 1.0)
+    assert commanded == o0 - 1.0
     assert abs(dry_autofocus.offset_native() - o0) <= tol

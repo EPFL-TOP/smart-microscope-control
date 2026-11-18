@@ -15,8 +15,8 @@ from __future__ import annotations
 
 from typing import Literal
 
-from smc.hardware.capabilities import FocusStep
-from smc.hardware.errors import CoreError
+from smc.hardware.capabilities import FocusReference, FocusStabilized, FocusStep
+from smc.hardware.errors import AutofocusUnsupportedError, CoreError
 
 __all__ = ["RecordingAutofocus"]
 
@@ -110,3 +110,13 @@ class RecordingAutofocus:
     def focus_by_um(self, dz_um: float, *, force: bool = False) -> FocusStep:
         self.calls.append("focus_by_um")
         raise AssertionError("neither goto-well nor the page's jog focuses")
+
+    def learn_reference(self) -> FocusReference:
+        """PFS's answer (m4 §11.5): it holds focus continuously."""
+        self.calls.append("learn_reference")
+        raise AutofocusUnsupportedError("learn_reference() on the fake: engage()")
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        """PFS's answer (m4 §11.5): it holds focus continuously."""
+        self.calls.append("stabilize_now")
+        raise AutofocusUnsupportedError("stabilize_now() on the fake: engage()")

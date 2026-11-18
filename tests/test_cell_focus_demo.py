@@ -23,8 +23,19 @@ import tifffile
 
 import smc.plugins.cell_focus.plugin as focus_plugin
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Autofocus, FocusStep, Limits, ZStage
-from smc.hardware.errors import MicroscopeHaltedError, SafetyRefusedError
+from smc.hardware.capabilities import (
+    Autofocus,
+    FocusReference,
+    FocusStabilized,
+    FocusStep,
+    Limits,
+    ZStage,
+)
+from smc.hardware.errors import (
+    AutofocusUnsupportedError,
+    MicroscopeHaltedError,
+    SafetyRefusedError,
+)
 from smc.hardware.profile import Profile
 from smc.plugins import PluginRunError, load, run_plugin
 from smc.plugins.cell_focus.plugin import FocusOnCellsParams, FocusOnCellsPlugin
@@ -140,6 +151,12 @@ class _Autofocus:
 
     def focus_by_um(self, dz_um: float, *, force: bool = False) -> FocusStep:
         raise AssertionError("the sweep never focuses through the autofocus")
+
+    def learn_reference(self) -> FocusReference:
+        raise AutofocusUnsupportedError("PFS holds focus continuously (the fake)")
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        raise AutofocusUnsupportedError("PFS holds focus continuously (the fake)")
 
 
 class _StuckAutofocus(_Autofocus):

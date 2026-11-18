@@ -65,11 +65,14 @@ from typing import (
     Protocol,
     TypeVar,
     cast,
+    runtime_checkable,
 )
 
 from smc.hardware.capabilities import (
     XY,
     ChannelPreset,
+    FocusReference,
+    FocusStabilized,
     FocusStep,
     Limits,
     PropertyInfo,
@@ -84,6 +87,7 @@ from smc.hardware.channels import (
 from smc.hardware.errors import (
     AutofocusExcursionError,
     AutofocusLostError,
+    AutofocusUnsupportedError,
     CapabilityMissingError,
     DeviceTimeoutError,
     HardwareError,
@@ -535,10 +539,13 @@ class MMXYStage:
         return (Limits(x_low, x_high), Limits(y_low, y_high))
 
 
+@runtime_checkable
 class ZInterlock(Protocol):
     """What ``MMZStage`` needs of an autofocus to move Z under it (m2 §3.4); internal.
 
-    ``MMAutofocus`` implements it. Both calls run only inside the Z move's
+    ``MMAutofocus`` and ``MMFocusStabilizer`` implement it; the facade
+    interlocks any autofocus that does, whatever its class (m4 §11.7), so it
+    is checked at run time. Both calls run only inside the Z move's
     compound, so no other action comes between the suspend, the move and
     the relock. ``str()`` of an interlock names it in the Z stage's log lines
     (``autofocus PFS``).
@@ -2946,6 +2953,30 @@ class MMAutofocus:
         except Exception as exc:
             logger.debug("autofocus %s: Z read failed (%s)", self._label, _named(exc))
             return None
+
+    # --- the one-shot mode, which this autofocus has not (m4 §11.5) ----------
+
+    def _one_shot_refused(self, call: str) -> AutofocusUnsupportedError:
+        return AutofocusUnsupportedError(
+            f"autofocus {self._label}: {call} is not supported: it holds focus "
+            f"continuously, as PFS does: engage(); nothing was sent"
+        )
+
+    def learn_reference(self) -> FocusReference:
+        """Refused: it holds focus continuously, and learns no reference (m4 §11.5).
+
+        Raises:
+            AutofocusUnsupportedError: Always, before anything is sent.
+        """
+        raise self._one_shot_refused("learn_reference()")
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        """Refused: it holds focus continuously, not one shot at a time (m4 §11.5).
+
+        Raises:
+            AutofocusUnsupportedError: Always, before anything is sent.
+        """
+        raise self._one_shot_refused("stabilize_now()")
 
 
 def _magnification_factor(core: CMMCorePlus, for_what: str) -> float | None:

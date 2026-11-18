@@ -63,6 +63,7 @@ from smc.hardware.backends.mm import (
     as_hardware_errors,
     autofocus_offset_motion,
 )
+from smc.hardware.backends.mm_stabilizer import MMFocusStabilizer
 from smc.hardware.capabilities import (
     XY,
     Autofocus,
@@ -463,9 +464,10 @@ class Microscope:
         log.info(
             "%s: overridden by %s", capability.__name__, type(implementation).__name__
         )
-        if capability is Autofocus:
-            # The interlock trusts only MMAutofocus (_interlock): a Z move on a
-            # Nikon stand now leaves PFS off, or fights it.
+        if capability is Autofocus and not isinstance(implementation, ZInterlock):
+            # The interlock holds only an autofocus that is a ZInterlock
+            # (_interlock): a Z move on a Nikon stand now leaves PFS off, or
+            # fights it.
             log.warning(
                 "Autofocus overridden: Z moves no longer suspend and re-engage it"
             )
@@ -521,6 +523,19 @@ class Microscope:
                 self._objective_label(),
             )
         if capability is Autofocus and (label := get(Role.autofocus)) is not None:
+            if self._is_generic(label):
+                # A one-shot focus stabilizer (DF2): its device type decides,
+                # never a profile key (m4 §11.7, ADR-0007).
+                return MMFocusStabilizer(
+                    core,
+                    label,
+                    executor,
+                    safety,
+                    objective_label=self._objective_label(),
+                    focus=lambda: cast(
+                        "ZStage | None", _owned(owner, "Autofocus")._lookup(ZStage)
+                    ),
+                )
             af = self.profile.autofocus
             return MMAutofocus(
                 core,
@@ -612,13 +627,28 @@ class Microscope:
         """The autofocus a Z move suspends and engages again; ``None`` when there is none.
 
         Asked by the Z stage at each move, so neither build calls the other.
-        An autofocus that ``override`` replaced is not an ``MMAutofocus`` and
-        is not interlocked: a test double cannot be trusted to hold Z. The
+        Any autofocus that is a ``ZInterlock`` is interlocked, whatever its
+        class (m4 §11.7): ``MMAutofocus`` (PFS) and ``MMFocusStabilizer``
+        (DF2), or an override that implements both calls. One that does not
+        is not: a test double without them cannot be trusted to hold Z. The
         cache lock it takes is re-entrant, since this runs during a Z move,
         where a Ctrl-C handler may land (FM-70).
         """
         found = self._lookup(Autofocus)
-        return found if isinstance(found, MMAutofocus) else None
+        return found if isinstance(found, ZInterlock) else None
+
+    def _is_generic(self, label: str) -> bool:
+        """Whether ``label`` is a Generic device: a one-shot focus stabilizer as the autofocus.
+
+        Read from the inventory taken when the facade was built
+        (``self.devices``), not from the core again: the build of a capability
+        contacts nothing, so a device that faults, or a stand closed since, does
+        not make a status read fail here.
+        """
+        return any(
+            device.label == label and device.type == "Generic"
+            for device in self.devices
+        )
 
     def _point_autofocus_slot(self) -> None:
         """Point the core's AutoFocus slot at the ``autofocus`` role, once, at construction.
@@ -632,9 +662,13 @@ class Microscope:
         another type) is a WARNING, not a failed open: every autofocus call
         then refuses, naming both, and so does every Z move, which must know
         whether the autofocus is engaged before it moves.
+
+        A Generic device (a focus stabilizer, m4 §11.7) is left alone: the
+        slot refuses one (``ValueError``, measured on 0.18.1), and
+        ``MMFocusStabilizer`` makes no continuous-focus call.
         """
         label = self.roles.get(Role.autofocus)
-        if label is None:
+        if label is None or self._is_generic(label):
             return
         current = self.core.getAutoFocusDevice()
         if current == label:

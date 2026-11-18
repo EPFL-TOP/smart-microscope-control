@@ -34,6 +34,8 @@ from smc.hardware.capabilities import (
     Autofocus,
     Camera,
     Channels,
+    FocusReference,
+    FocusStabilized,
     FocusStep,
     LightSource,
     ObjectiveTurret,
@@ -42,6 +44,7 @@ from smc.hardware.capabilities import (
 )
 from smc.hardware.errors import (
     AutofocusLostError,
+    AutofocusUnsupportedError,
     CapabilityMissingError,
     DeviceTimeoutError,
     HardwareError,
@@ -795,6 +798,28 @@ def test_disengage_runs_while_halted_and_in_dry_run() -> None:
         stand.af.disengage()
         assert stand.core.log == [OFF]
         assert stand.core.isContinuousFocusEnabled() is False
+
+
+def test_pfs_refuses_the_one_shot_mode_and_sends_nothing() -> None:
+    # m4 §11.5: PFS holds focus continuously; a tool that can work either way
+    # catches the refusal and engages instead, so it is no SafetyRefusedError.
+    reference = FocusReference("PFS", "AAECAwQFBgcI", "10x")
+    with _ti2() as stand:
+        stand.engage_directly()
+        for call, run in (
+            ("learn_reference()", stand.af.learn_reference),
+            ("stabilize_now()", stand.af.stabilize_now),
+            ("stabilize_now()", lambda: stand.af.stabilize_now(reference)),
+        ):
+            with pytest.raises(AutofocusUnsupportedError) as refused:
+                run()
+            assert str(refused.value) == (
+                f"autofocus PFS: {call} is not supported: it holds focus "
+                f"continuously, as PFS does: engage(); nothing was sent"
+            )
+            assert not isinstance(refused.value, SafetyRefusedError)
+        assert stand.core.log == []
+        assert stand.core.isContinuousFocusLocked() is True
 
 
 # --- the offset (m2 §3.2, §3.8) ----------------------------------------------
@@ -4095,6 +4120,14 @@ class _StubAutofocus:
 
     def focus_by_um(self, dz_um: float, *, force: bool = False) -> FocusStep:
         return FocusStep("z", dz_um, None)
+
+    def learn_reference(self) -> FocusReference:
+        self._note("learn_reference")
+        raise AutofocusUnsupportedError("learn_reference() on the stub: engage()")
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        self._note("stabilize_now")
+        raise AutofocusUnsupportedError("stabilize_now() on the stub: engage()")
 
 
 def test_override_of_autofocus_warns_that_z_is_no_longer_interlocked(
