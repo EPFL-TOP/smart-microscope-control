@@ -42,8 +42,10 @@ Decisions that were made on measurements, not on taste:
   autofocus there. So a stop takes its Z and offset from ``route``'s own ``stop_focus``
   on its frame, with the factor and the offset limits of the profile ``--profile``
   names, and says what became of them; with no ``--profile`` a frame that has a
-  distance to convert gets no offset, in the table and on stderr. ``selection.json``'s
-  ``pfs_offset`` stays the frame's reading: it is a candidate's feature, not a stop's.
+  distance to convert gets no offset, in the table and on stderr. ``selection.json``
+  names the frame's reading as one, ``pfs_offset_read`` (a candidate's feature, the
+  lock's on such a scan), and gives each stop its own in ``stop_focus``: the Z, the
+  offset or ``null``, and the outcome, from the same call as the record's (#516).
 * **No matrix product on coordinate arrays** (FM-131): the entries of the inverse are
   written out, as in ``route.algorithm``.
 * **The PNG's canvas is cut to the well**, never to the frames' bounding box
@@ -1407,7 +1409,8 @@ def write_copy(source: Path, target: Path, record: StageRecord) -> None:
 # ================================================================== Command line
 
 _SELECTION_FILE = "selection.json"
-_SCHEMA_VERSION = 1
+#: 2: a candidate's ``pfs_offset`` became ``pfs_offset_read`` and a stop gained ``stop_focus`` (#516).
+_SCHEMA_VERSION = 2
 
 
 class _Parser(argparse.ArgumentParser):
@@ -2114,11 +2117,21 @@ def table_lines(
     return lines
 
 
+def _stop_focus_entry(focus: StopFocus) -> dict[str, Any]:
+    """A stop's Z, its autofocus offset (the cells' plane's, or ``null``) and what became of it, as ``selection.json`` says them."""
+    return {
+        "z_um": _finite(focus.z_um),
+        "pfs_offset": _finite(focus.pfs_offset),
+        "outcome": focus.outcome,
+    }
+
+
 def selection_document(
     *,
     run_name: str,
     request: Request,
     options: Options,
+    scan: ScanResult,
     choices: Sequence[WellChoice],
     orders: Sequence[Sequence[int]],
     pixels: bool,
@@ -2127,9 +2140,17 @@ def selection_document(
 
     Nothing in smc reads it. The run document is named by its file name, never its
     path (FM-50), and no value is ``nan``: an unknown is ``null``.
+
+    A candidate's ``pfs_offset_read`` is what its frame read, a feature. On a scan taken
+    with the focus on the cells that is the lock's offset, ``dz_um`` away from the plane
+    the frame was taken at, so a notebook that built a position list from it would
+    engage the autofocus at the lock's plane (m3 §26). A candidate that is a stop also
+    has ``stop_focus``: the Z and offset the copy's stop carries, from the very
+    ``stop_focuses`` call that writes it, and what became of the offset (``outcome``).
     """
     wells: dict[str, Any] = {}
-    for choice, order in zip(choices, orders, strict=True):
+    focuses = stop_focuses(scan, choices, orders, options)
+    for choice, order, focus_of in zip(choices, orders, focuses, strict=True):
         stop_of = {choice.chosen[i].candidate.frame: k for k, i in enumerate(order)}
         scored = {s.candidate.frame: s for s in choice.scored}
         entries = []
@@ -2142,7 +2163,7 @@ def selection_document(
                     "x_um": c.x_um,
                     "y_um": c.y_um,
                     "z_um": c.z_um,
-                    "pfs_offset": c.pfs_offset,
+                    "pfs_offset_read": c.pfs_offset,
                     "focus": c.focus,
                     "counts": c.counts,
                     "n_all": c.n_all,
@@ -2157,6 +2178,11 @@ def selection_document(
                     "score": s.score if s is not None else None,
                     "parts": s.parts if s is not None else None,
                     "stop": stop_of.get(c.frame),
+                    "stop_focus": (
+                        _stop_focus_entry(focus_of[stop_of[c.frame]])
+                        if c.frame in stop_of
+                        else None
+                    ),
                 }
             )
         wells[choice.well] = {"candidates": entries, "uncovered": choice.uncovered}
@@ -2361,6 +2387,7 @@ def _write_files(
                     run_name=request.run_doc.name,
                     request=request,
                     options=options,
+                    scan=upstream.scan,
                     choices=choices,
                     orders=orders,
                     pixels=request.pixels,

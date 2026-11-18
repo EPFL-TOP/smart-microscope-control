@@ -430,8 +430,18 @@ offset limits of `--profile`:
   error record (`NativeCommandError`) although nothing failed (read from the shell's
   documentation, not run at a stand PC); read the exit code, not the colour.
 - A scan with no focus step is printed and recorded as before: no line, an empty stderr.
-- `selection.json`'s `pfs_offset` is the **frame's** reading, a candidate's feature; a
-  stop's offset is in the record of the copy.
+- `selection.json` keeps the two apart. A candidate's `pfs_offset_read` is what its
+  **frame** read, a feature: on such a scan the lock's offset, `dz_um` away from the
+  cells' plane, so never the offset to engage the autofocus with. An entry that is a
+  stop (`stop` is its route number) also has `stop_focus`, `{"z_um", "pfs_offset",
+  "outcome"}`: what the stop carries in the record of the copy (the same call writes
+  both), with `pfs_offset` `null` and `outcome` the reason when it has none
+  (`no-factor`, `outside-limits`, `implausible`, `no-objective`), `derived` when it is
+  the cells' plane's, `recorded` when it is the frame's reading as the scan recorded
+  it. A candidate that is not a stop has `stop_focus` `null`. A notebook that builds a
+  position list takes the stop's Z and offset from `stop_focus`. Schema version 2
+  renamed `pfs_offset` (version 1) so that a notebook that still reads it fails
+  instead of reading the lock's plane.
 
 Not verified at the stand: that NIS-Elements takes a derived `dPFSOffset` as it takes a
 read one, and the factor at the offsets the stops use ([`m3-plugins.md`](../design/m3-plugins.md)
@@ -470,9 +480,11 @@ read one, and the factor at the offsets the stops use ([`m3-plugins.md`](../desi
 
 - It reads the run document, the cells file and the scan's frames, and never writes
   any of them.
-- `selection.json`: every candidate of every well with its features, score, parts and
-  `stop` (`null` or the route number), the weights and the options. For a notebook;
-  nothing in smc reads it. The run document is named by its file name, not its path.
+- `selection.json`: every candidate of every well with its features (its frame's
+  reading `pfs_offset_read` among them), score, parts, `stop` (`null` or the route
+  number) and `stop_focus` (the stop's Z, offset and outcome, `null` for a candidate
+  that is not a stop), the weights and the options. For a notebook; nothing in smc
+  reads it. The run document is named by its file name, not its path.
 - `<well>.png`: the pictures above. Existing ones are replaced, they are derived.
 - The **copy** of the run document: every stage of the original, plus the
   `route-prototype` record that provides `route`. It is named so and not `route` so that

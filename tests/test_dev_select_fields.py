@@ -42,6 +42,7 @@ from select_fields_seed import (
 from select_fields_seed import record as write_record
 from smc.plugins.geometry import Matrix2, footprint, stage_of_pixel
 from smc.plugins.route.algorithm import allowed
+from smc.plugins.route.focus import StopFocus
 from smc.plugins.slots import (
     Cell,
     OffsetFromFocus,
@@ -1940,7 +1941,8 @@ def test_selection_json_holds_the_printed_numbers(
     data = json.loads(
         (tmp_path / "selection" / "selection.json").read_text(encoding="utf-8")
     )
-    assert data["schema_version"] == 1
+    # 2: a candidate's `pfs_offset` became `pfs_offset_read` (#516)
+    assert data["schema_version"] == 2
     assert data["run_doc"] == "run.json"
     assert data["labels"] == ["single"]
     assert data["weights"] == {
@@ -3557,6 +3559,255 @@ def test_without_a_profile_the_record_says_none_was_given(
     stage = RunDocument.load(tmp_path / "run-selected.json").stages["route-prototype"]
     assert stage.params["offset_profile"] is None
     assert stage.params["offset_limits"] is None
+
+
+# ----------------------------------------------- selection.json's stop focus (#516)
+#
+# `selection.json` is for the owner's notebook. On a scan taken with the focus on the
+# cells a frame's reading is the lock's, `dz_um` away from the cells' plane (m3 §26): a
+# notebook that built a position list from it would engage PFS at the lock's plane.
+# So a candidate's reading is named a reading, and a stop carries its own Z and
+# offset. The numbers are written here from the section above's frames (a lock of
+# 2000 + 10 k, a Z of 1000 + 10 k, a factor of 112.6), never read from the result.
+
+
+def _selection_candidates(folder: Path) -> dict[int, dict]:
+    """Every candidate of every well in ``selection.json``, by the frame's number in the scan."""
+    wells = _selection_json(folder)["wells"].values()
+    return {c["frame"]: c for well in wells for c in well["candidates"]}
+
+
+def test_selection_json_gives_a_stop_its_offset_next_to_the_frames_reading(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _focused(tmp_path)
+    profile = _profile_file(tmp_path)
+    code, _, err = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--profile", str(profile)
+    )
+    assert (code, err) == (0, "")
+    found = _selection_candidates(tmp_path / "selection")
+    # frame: (what the frame read, the stop's Z, the stop's offset, what became of it).
+    # By hand: 2000 - 3.0 x 112.6 = 1662.2, 2010 + 2.7 x 112.6 = 2314.02, 2020 - 2.95 x
+    # 112.6 = 1687.83 and 2030 + 1.35 x 112.6 = 2182.01, each to a whole unit; frame 4's
+    # sweep found no peak and frame 5 is at the lock's plane: both stay as read.
+    expected = {
+        0: (2000.0, 1000.0, 1662.0, "derived"),
+        1: (2010.0, 1010.0, 2314.0, "derived"),
+        2: (2020.0, 1020.0, 1688.0, "derived"),
+        3: (2030.0, 1030.0, 2182.0, "derived"),
+        4: (2040.0, 1040.0, 2040.0, "recorded"),
+        5: (2050.0, 1050.0, 2050.0, "recorded"),
+    }
+    assert sorted(found) == sorted(expected)
+    for frame, (read, z_um, offset, outcome) in expected.items():
+        entry = found[frame]
+        # Both values on one entry: the reading is the lock's, the stop's is the plane's.
+        assert entry["pfs_offset_read"] == read
+        assert entry["stop_focus"] == {
+            "z_um": z_um,
+            "pfs_offset": offset,
+            "outcome": outcome,
+        }
+        # No key that a reader could take for the stop's offset by its name.
+        assert "pfs_offset" not in entry
+    # And the file and the copy that `nis-export` reads say the same about each stop.
+    stops = {s.name: s for s in _stops_of(tmp_path / "run-selected.json")}
+    assert len(stops) == 6
+    wells = _selection_json(tmp_path / "selection")["wells"]
+    for well, document in wells.items():
+        for entry in document["candidates"]:
+            stop = stops[f"{well}_r{entry['stop']:03d}"]
+            assert (stop.z_um, stop.pfs_offset) == (
+                entry["stop_focus"]["z_um"],
+                entry["stop_focus"]["pfs_offset"],
+            )
+
+
+@pytest.mark.parametrize(
+    ("reason", "scan_objective", "steps", "limits", "with_profile", "expected"),
+    [
+        pytest.param(
+            "no factor to read",
+            OBJECTIVE,
+            STEPS,
+            None,
+            False,
+            {
+                0: (2000.0, 1000.0, None, "no-factor"),
+                3: (2030.0, 1030.0, None, "no-factor"),
+                4: (2040.0, 1040.0, 2040.0, "recorded"),
+            },
+            id="no-factor",
+        ),
+        pytest.param(
+            "limits (1663, 2313): 1662 and 2314 are a unit outside",
+            OBJECTIVE,
+            STEPS,
+            (1663, 2313),
+            True,
+            {
+                0: (2000.0, 1000.0, None, "outside-limits"),
+                1: (2010.0, 1010.0, None, "outside-limits"),
+                2: (2020.0, 1020.0, 1688.0, "derived"),
+            },
+            id="outside-limits",
+        ),
+        pytest.param(
+            "the scan recorded no objective",
+            None,
+            STEPS,
+            (0, 20000),
+            True,
+            {
+                0: (2000.0, 1000.0, None, "no-objective"),
+                4: (2040.0, 1040.0, 2040.0, "recorded"),
+            },
+            id="no-objective",
+        ),
+        pytest.param(
+            "frame 0 is 60 um from the lock's plane, past the largest sweep",
+            OBJECTIVE,
+            {**STEPS, ("A1", 0): focus_step(60.0)},
+            (0, 20000),
+            True,
+            {
+                0: (2000.0, 1000.0, None, "implausible"),
+                1: (2010.0, 1010.0, 2314.0, "derived"),
+            },
+            id="implausible",
+        ),
+    ],
+)
+def test_selection_json_names_why_a_stop_has_no_offset(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    reason: str,
+    scan_objective: str | None,
+    steps: Mapping,
+    limits: tuple[int, int] | None,
+    with_profile: bool,
+    expected: Mapping[int, tuple[float, float, float | None, str]],
+) -> None:
+    # A stop that has no offset says why, and still shows what its frame read.
+    seed = _two_wells(tmp_path, cell_focus_of=steps, scan_objective=scan_objective)
+    args = ["--min-spacing-um", "30"]
+    if with_profile:
+        args += ["--profile", str(_profile_file(tmp_path, limits=limits))]
+    code, _, _ = _main(sf, capsys, seed.path, *args)
+    assert code == 0, reason
+    found = _selection_candidates(tmp_path / "selection")
+    for frame, (read, z_um, offset, outcome) in expected.items():
+        assert found[frame]["pfs_offset_read"] == read, reason
+        assert found[frame]["stop_focus"] == {
+            "z_um": z_um,
+            "pfs_offset": offset,
+            "outcome": outcome,
+        }, reason
+
+
+def test_a_stops_focus_is_the_one_of_its_route_position_not_of_its_frame_number(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # B1 lies under A1 at the same x, so its route starts at the frame nearest where
+    # the stage comes from (A1's last stop, the rightmost): B1 visits frames 5, 4 and 3,
+    # and a stop's number runs against its frame's. A1 keeps the frames' order, so a
+    # lookup by the wrong index passes there (found by the review of #516).
+    steps = {
+        (("B1" if well == "A2" else well), k): step for (well, k), step in STEPS.items()
+    }
+    seed = seed_run(
+        tmp_path,
+        cells=_one_cell_in_each_frame,
+        wells=("A1", "B1"),
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        cell_focus_of=steps,
+    )
+    profile = _profile_file(tmp_path)
+    code, _, err = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--profile", str(profile)
+    )
+    assert (code, err) == (0, "")
+    found = _selection_candidates(tmp_path / "selection")
+    # frame: (its stop's number, the stop's Z, offset and outcome), by hand as above.
+    expected = {
+        0: (0, 1000.0, 1662.0, "derived"),
+        1: (1, 1010.0, 2314.0, "derived"),
+        2: (2, 1020.0, 1688.0, "derived"),
+        3: (2, 1030.0, 2182.0, "derived"),
+        4: (1, 1040.0, 2040.0, "recorded"),
+        5: (0, 1050.0, 2050.0, "recorded"),
+    }
+    for frame, (stop, z_um, offset, outcome) in expected.items():
+        assert found[frame]["stop"] == stop
+        assert found[frame]["stop_focus"] == {
+            "z_um": z_um,
+            "pfs_offset": offset,
+            "outcome": outcome,
+        }
+    # The copy names its stops by route number: B1's first is the frame met first.
+    copy = {
+        s.name: (s.z_um, s.pfs_offset)
+        for s in _stops_of(tmp_path / "run-selected.json")
+    }
+    assert copy["B1_r000"] == (1050.0, 2050.0)
+    assert copy["B1_r002"] == (1030.0, 2182.0)
+
+
+def test_a_stop_focus_never_writes_a_number_json_cannot_hold(sf: ModuleType) -> None:
+    # `write_selection` refuses a nan (allow_nan=False), so the entry turns every value
+    # that is not a finite number into null, as the features do.
+    unknown = StopFocus(
+        z_um=math.nan,
+        pfs_offset=math.inf,
+        derived=None,
+        outcome="recorded",
+        refused_offset=None,
+        no_peak=False,
+    )
+    assert sf._stop_focus_entry(unknown) == {
+        "z_um": None,
+        "pfs_offset": None,
+        "outcome": "recorded",
+    }
+    none = StopFocus(None, None, None, "recorded", None, no_peak=False)
+    assert sf._stop_focus_entry(none) == {
+        "z_um": None,
+        "pfs_offset": None,
+        "outcome": "recorded",
+    }
+
+
+def test_a_candidate_that_is_not_a_stop_has_no_stop_focus(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # One field a well: the other frames were candidates and are not imaged again, so
+    # they have a reading and no stop's focus to speak of.
+    seed = _focused(tmp_path)
+    profile = _profile_file(tmp_path)
+    code, _, _ = _main(
+        sf,
+        capsys,
+        seed.path,
+        "--min-spacing-um",
+        "30",
+        "--fields-per-well",
+        "1",
+        "--profile",
+        str(profile),
+    )
+    assert code == 0
+    entries = _selection_candidates(tmp_path / "selection").values()
+    stops = [c for c in entries if c["stop"] is not None]
+    others = [c for c in entries if c["stop"] is None]
+    assert (len(stops), len(others)) == (2, 4)
+    for entry in others:
+        assert entry["stop_focus"] is None
+        assert entry["pfs_offset_read"] == 2000.0 + 10.0 * entry["frame"]
+    assert all(c["stop_focus"] is not None for c in stops)
 
 
 def test_a_profile_of_another_stand_than_the_scans_is_refused(
