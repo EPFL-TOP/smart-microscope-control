@@ -63,6 +63,7 @@ from smc.hardware.backends.mm import (
     as_hardware_errors,
     autofocus_offset_motion,
 )
+from smc.hardware.backends.mm_stabilizer import MMFocusStabilizer
 from smc.hardware.capabilities import (
     XY,
     Autofocus,
@@ -89,7 +90,14 @@ from smc.hardware.errors import (
     stop_notes,
 )
 from smc.hardware.profile import Profile
-from smc.hardware.roles import DeviceInfo, Role, RoleMap, core_roles, devices_from_core
+from smc.hardware.roles import (
+    DeviceInfo,
+    Role,
+    RoleMap,
+    core_roles,
+    device_type_name,
+    devices_from_core,
+)
 from smc.hardware.roles import resolve as resolve_roles
 from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM, Executor, Safety
 
@@ -522,6 +530,19 @@ class Microscope:
                 self._objective_label(),
             )
         if capability is Autofocus and (label := get(Role.autofocus)) is not None:
+            if self._is_generic(label):
+                # A one-shot focus stabilizer (DF2): its device type decides,
+                # never a profile key (m4 §11.7, ADR-0007).
+                return MMFocusStabilizer(
+                    core,
+                    label,
+                    executor,
+                    safety,
+                    objective_label=self._objective_label(),
+                    focus=lambda: cast(
+                        "ZStage | None", _owned(owner, "Autofocus")._lookup(ZStage)
+                    ),
+                )
             af = self.profile.autofocus
             return MMAutofocus(
                 core,
@@ -623,6 +644,14 @@ class Microscope:
         found = self._lookup(Autofocus)
         return found if isinstance(found, ZInterlock) else None
 
+    def _is_generic(self, label: str) -> bool:
+        """Whether ``label`` is a Generic device: a one-shot focus stabilizer as the autofocus.
+
+        Read from the core's inventory, which contacts no device; a type this
+        pymmcore-plus does not know is no Generic device (``device_type_name``).
+        """
+        return device_type_name(self.core.getDeviceType(label)) == "Generic"
+
     def _point_autofocus_slot(self) -> None:
         """Point the core's AutoFocus slot at the ``autofocus`` role, once, at construction.
 
@@ -635,9 +664,13 @@ class Microscope:
         another type) is a WARNING, not a failed open: every autofocus call
         then refuses, naming both, and so does every Z move, which must know
         whether the autofocus is engaged before it moves.
+
+        A Generic device (a focus stabilizer, m4 §11.7) is left alone: the
+        slot refuses one (``ValueError``, measured on 0.18.1), and
+        ``MMFocusStabilizer`` makes no continuous-focus call.
         """
         label = self.roles.get(Role.autofocus)
-        if label is None:
+        if label is None or self._is_generic(label):
             return
         current = self.core.getAutoFocusDevice()
         if current == label:
