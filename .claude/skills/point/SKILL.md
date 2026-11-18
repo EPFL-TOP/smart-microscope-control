@@ -73,6 +73,23 @@ The session ends when the list is posted.
    session the owner runs at the stand (`/hardware-session`, `during`) is a
    lane of its own. The last step of the day is a fresh `/point`.
 
+   **Lanes the owner can follow** (the lanes of 2026-11-18 were hard to
+   follow: S1 stopped in its middle for an owner session, then waited for S2;
+   S3 began with an owner session and stopped at once):
+   - **Lanes do not wait for each other.** Two issues where one waits for the
+     other go in the same lane. An `after S<k>.<n>:` is the exception, at
+     most one in a Point, and never in both directions between two lanes.
+   - **A session with the owner is never in the middle of a lane.** `with
+     you`, `/adr` and `/hardware-session` steps go in a lane of the owner's
+     own (the last lane, which `/lane` does not run: the owner opens those
+     sessions), in the order the owner does them; a lane that `/lane` runs
+     holds only steps that need the owner for a merge or a decision it
+     meets on the way.
+   - **Every open thing has one place.** What a lane's **For /point** lines,
+     the Reports and the reviews raised becomes an issue, a housekeeping
+     step done here, or one line of **For you**: nothing is left for the
+     owner to remember from a lane note.
+
    ```markdown
    **Today**
    0. Only when the CI stops the merges: main is red (run <url>), #N `CI nightly red` is open, or the nightly run <url> failed with no issue: revert or `/develop <n>` for the fix, before any merge.

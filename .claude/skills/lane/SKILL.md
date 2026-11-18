@@ -24,10 +24,17 @@ tracking issue (where the lane is). Memory keeps nothing of it.
    segment with its state, and exactly one `NEXT:` line. Remember the Point's
    comment id from the header: when it differs between two runs, a new Point
    replaced this one; finish nothing new, post a note "a new Point was posted;
-   relaunch `/lane` from it", and end. Exit 1 (an unknown lane, no Point), 2 (a
-   `gh` failure), 4 (a usage error, or a crash of the script: FM-82) or 130
-   (interrupted): say what it printed and end. Exit 3 is the timeout of
-   `--wait`, step 3.
+   relaunch `/lane` from it", and end. Exit 1 (an unknown lane, no Point), 4
+   (a usage error, or a crash of the script: FM-82) or 130 (interrupted): say
+   what it printed and end. Exit 3 is the timeout of `--wait`, step 3.
+
+   **Exit 2 is a `gh` failure, and GitHub's are short** (a 502, a 504,
+   `unexpected end of JSON input`: three lanes stopped on one on 2026-11-18,
+   and each stop cost the owner a relaunch). Run the same command again, up
+   to three times in a row, with no note; a `--wait` that ended with exit 2
+   is started again the same way. Only a third failure in a row ends the
+   lane, with the note `GitHub did not answer three times; resume with
+   /lane <S>`.
 2. `NEXT: session <skill> <arg> <model>` followed by `BRIEF: <text>`: **one**
    `Agent` call with `subagent_type: "general-purpose"`, `model: <model>`,
    `isolation: "worktree"`, `description: "<skill> <arg> (lane <S>)"` and, as
@@ -91,6 +98,35 @@ each lane in the next Point.
 **Next** is what `lane.py` printed next, in a sentence. Two short lines: this
 is a log for the owner and for `/point`, not a report.
 
+**Next asks the owner for one thing, or for nothing.** It is the single
+action that lets this lane go on (`you merge #445`, `you: decide the plan
+deviation <url>`), followed by how to resume when the lane has ended. It never
+holds a list, a "meanwhile", a "whenever convenient", or a thing to do before
+resuming that `lane.py` did not print: on 2026-11-18 such lines grew into a
+tree of side tasks that the owner could not follow.
+
+Everything else a subagent's last lines raise (a decision that blocks nothing
+today, a follow-up to file, a stand check, a label to set, a worktree to
+remove) goes on a third line, **For /point**, which the owner does not act on:
+the next `/point` turns each into an issue, a housekeeping step or a line of
+its list.
+
+```markdown
+## Lane (S3, 2026-11-18)
+
+**Done**: S3.2 `/review 581` (opus): ready to merge, https://github.com/…
+**Next**: you merge #581; the lane waits for it
+**For /point**: m4 §11.3 makes DF2 a hard dependency of opening the stand (#584 item 3), to decide before #27
+```
+
+## Before you end
+
+Whatever ends the session (`owner`, `done`, a timeout, an error), the last
+command is `python scripts/dev/worktree.py clean` from the main checkout: it
+removes the worktrees and branches of merged pull requests, and it is the one
+`git` operation of this session in the main checkout. Do not add its output
+to the note.
+
 ## Cost
 
 Your context holds `lane.py`'s output, the subagents' five-line endings and your
@@ -102,5 +138,8 @@ check a subagent: `lane.py` derives the state from GitHub on the next run.
 - Edit a file, read a diff, merge (`gh pr merge` is denied), decide a verdict or
   a plan deviation, or run a step the Point does not list.
 - Reuse a subagent, fork, or put anything but the `BRIEF:` text in a prompt.
-- Switch branches, pull or run `git` in the main checkout: other sessions share it.
+- Switch branches, pull or run `git` in the main checkout: other sessions share
+  it (`worktree.py clean` before you end is the exception).
+- Ask the owner for two things in one note, or for anything `lane.py` did not
+  print as `NEXT: owner` or as a merge to wait for.
 - Go on past a `NEXT: owner`, whatever you think the owner would answer.
