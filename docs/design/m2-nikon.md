@@ -3162,7 +3162,12 @@ is logged, then raises `RuntimeError('Error in device "<label>":
 Unsupported device command (11)')`, the Ti2-E's text. `busy_devices` is
 left alone, so a busy device stays busy: the move goes on. Through
 `as_hardware_errors`, the error reaches the layer as `xy_stage: stop('XY')
-failed (…)`, measured with a prototype (2026-10-28).
+failed (…)`, measured with a prototype (2026-10-28). With the role declared
+(`as_hardware_errors(core, role, stop_refused=True)`, which the stage, Z and
+offset backends pass from `[safety] stop_refused_by`) a failed `stop` ends at the
+device's text, with no `; check the device: power, cable, …`: the advice is for a
+fault, and the line's declaration note says what happened (Ti2-E session 5, F3,
+#545). Every other call of the role, and an undeclared stop, keeps the hint.
 
 ### 11.9 §3.3.1 on the Ti2-E
 

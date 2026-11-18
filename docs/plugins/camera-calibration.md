@@ -63,8 +63,12 @@ probes see no motion and the plugin says so (the tests use the synthetic plate o
 ```text
 $ smc run camera-calibration -p demo --run-doc run.json
 camera-calibration: 1/3 +X probe
-✗ camera-calibration: the two moves gave parallel shifts: did the stage move?; step 128 µm
+✗ camera-calibration: the two moves gave parallel shifts: the frames probably hold too little texture (a sparse field, a dark or flat frame): try a field with more structure, then the light path, then the stage; the probe frames span 5138 and 5138 counts (1st to 99th percentile); step 128 µm
 ```
+
+The demo's frames carry plenty of contrast (5138 counts), which tells a stand's
+reader that this refusal is not about the light: the image simply did not follow
+the stage.
 
 ## What it leaves
 
@@ -110,9 +114,20 @@ The other three are what the shifts of frames with light say:
 
 - `the frames barely correlate: find a field with texture`: nothing to lock onto.
   A field with light and no texture (a blank well) is this one, not a dark frame.
-- `the two moves gave parallel shifts: did the stage move?`: the image did not
-  follow the stage on one axis (a stage that ignored the command, the wrong
-  camera). It follows frames that carry light: a dark one is named above.
+- `the two moves gave parallel shifts: the frames probably hold too little texture
+  (a sparse field, a dark or flat frame): try a field with more structure, then
+  the light path, then the stage`, then `the probe frames span <a> and <b> counts
+  (1st to 99th percentile)`: the image did not follow the stage on one axis. The
+  frames come first because they are the likelier cause: at the 40x in water, on a
+  field of two 10 µm beads, the stage moved and the dust and shading fixed to the
+  camera won the correlation, so both probes read a shift of zero (Ti2-E session
+  5, F12, #545); the same field with more beads calibrated. The next suspects are
+  the light path and then the stage (a stage that ignored the command, the wrong
+  camera). The two figures are the contrast of the two probe frames, as the
+  dark-frame refusal above quotes it: a dark frame spans a few tens of counts, and a
+  frame whose contrast is a still background can span as much as one with a lit
+  sample, so the figure rules the light out and not the texture. It follows frames
+  that carry light: a dark one is named above.
 - `the shifts do not fit a rigid camera: did each axis move its full command?`:
   the frames agree, but the matrix they give is not a camera, because one axis
   executed a fraction of its command (about a quarter or less of it: a quarter

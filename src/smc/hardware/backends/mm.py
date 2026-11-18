@@ -99,6 +99,7 @@ from smc.hardware.safety import (
     SegmentPlan,
     Step,
     StopLink,
+    line_coords_um,
     segment_targets_um,
 )
 
@@ -184,14 +185,20 @@ class _FaultTranslator:
     """Forwards every call to the core; a ``RuntimeError`` becomes a ``HardwareError``.
 
     Stateless and lock-free on purpose: a stop runs through it from a signal
-    handler (FM-70), so it adds nothing to ``__getattr__``.
+    handler (FM-70), so it adds nothing to ``__getattr__``. ``stop_refused``
+    is fixed at construction, from the profile: a ``stop`` that faults on a
+    role the profile declares to refuse it is no broken device, so its message
+    carries no hint to look at the cable (#545).
     """
 
-    __slots__ = ("_core", "_role")
+    __slots__ = ("_core", "_role", "_stop_refused")
 
-    def __init__(self, core: CMMCorePlus, role: str) -> None:
+    def __init__(
+        self, core: CMMCorePlus, role: str, *, stop_refused: bool = False
+    ) -> None:
         self._core = core
         self._role = role
+        self._stop_refused = stop_refused
 
     def __getattr__(self, name: str) -> Any:
         # copy and pickle probe dunders on a wrapper whose slots are not filled
@@ -226,13 +233,21 @@ class _FaultTranslator:
             self._role == Role.objective_turret.value and _BETWEEN_POSITIONS in text
         )
         hint = _TURRET_HINT if between else _DEVICE_HINT
-        message = f"{self._role}: {name}({shown}) failed ({text}); {hint}"
+        message = f"{self._role}: {name}({shown}) failed ({text})"
+        # A refusal the profile declares is expected, and "power, cable" sent
+        # the operator to a cable for it (Ti2-E session 5, #545; the same hint
+        # misled for a turret in session 3, #406). The stop's own line carries
+        # the declaration; any other call on the role keeps its hint.
+        if not (self._stop_refused and name == "stop"):
+            message += f"; {hint}"
         # An adapter's bytes may not be UTF-8 (FM-05): one lone surrogate and
         # the message can be neither logged nor serialised.
         return message.encode("utf-8", "replace").decode("utf-8")
 
 
-def as_hardware_errors(core: CMMCorePlus, role: str) -> CMMCorePlus:
+def as_hardware_errors(
+    core: CMMCorePlus, role: str, *, stop_refused: bool = False
+) -> CMMCorePlus:
     """``core``, with a device fault raised as a ``HardwareError`` naming ``role`` and the call.
 
     MMCore reports a fault (a serial timeout, a camera that does not answer, an
@@ -241,8 +256,12 @@ def as_hardware_errors(core: CMMCorePlus, role: str) -> CMMCorePlus:
     other exception, passes untouched (design §2, §6; FM-79). The cast keeps
     mypy checking every call on the core; the proxy is stateless and holds no
     lock, so a stop can run through it from a signal handler (FM-70).
+
+    ``stop_refused`` is the profile's declaration for ``role`` (``[safety]
+    stop_refused_by``): the message of a failed ``stop`` then drops the advice
+    to check the device, which is for a fault and not for an expected refusal.
     """
-    return cast("CMMCorePlus", _FaultTranslator(core, role))
+    return cast("CMMCorePlus", _FaultTranslator(core, role, stop_refused=stop_refused))
 
 
 def _motion(
@@ -278,7 +297,7 @@ def autofocus_offset_motion(
     """
     role = Role.autofocus_offset.value
     return _motion(
-        as_hardware_errors(core, role),
+        as_hardware_errors(core, role, stop_refused=stop_refused),
         label,
         f"{role} {label}",
         stoppable=True,
@@ -377,7 +396,8 @@ class MMXYStage:
     def __init__(
         self, core: CMMCorePlus, label: str, executor: Executor, safety: Safety
     ) -> None:
-        self._core = as_hardware_errors(core, Role.xy_stage.value)
+        refused = Role.xy_stage.value in safety.stop_refused_by
+        self._core = as_hardware_errors(core, Role.xy_stage.value, stop_refused=refused)
         self._label = label
         self._executor = executor
         self._safety = safety
@@ -388,7 +408,7 @@ class MMXYStage:
             label,
             f"xy_stage {label}",
             stoppable=True,
-            stop_refused=Role.xy_stage.value in safety.stop_refused_by,
+            stop_refused=refused,
         )
 
     def _read_position(self) -> XY:
@@ -444,7 +464,7 @@ class MMXYStage:
         """
         x_um, y_um = float(x_um), float(y_um)
         self._safety.check_xy_target_um(x_um, y_um)
-        description = f"xy_stage: move_to ({x_um}, {y_um}) µm"
+        description = f"xy_stage: move_to {line_coords_um((x_um, y_um))} µm"
         cap = self._safety.max_segment_um
         if cap is None:
             return self._move(description, lambda: self._step(description, x_um, y_um))
@@ -464,13 +484,13 @@ class MMXYStage:
         """
         dx_um, dy_um = float(dx_um), float(dy_um)
         self._safety.check_jog_um(dx_um, dy_um, force=force)
-        description = f"xy_stage: move_by ({dx_um}, {dy_um}) µm"
+        description = f"xy_stage: move_by {line_coords_um((dx_um, dy_um))} µm"
 
         def target() -> tuple[XY, str, float, float]:
             here = self._read_position()
             x_um, y_um = here.x_um + dx_um, here.y_um + dy_um
             self._safety.check_xy_target_um(x_um, y_um)
-            log = f"xy_stage: move_by ({dx_um}, {dy_um}) µm to ({x_um}, {y_um}) µm"
+            log = f"{description} to {line_coords_um((x_um, y_um))} µm"
             return here, log, x_um, y_um
 
         cap = self._safety.max_segment_um
@@ -552,7 +572,8 @@ class MMZStage:
         *,
         autofocus: Callable[[], ZInterlock | None] = lambda: None,
     ) -> None:
-        self._core = as_hardware_errors(core, Role.focus.value)
+        refused = Role.focus.value in safety.stop_refused_by
+        self._core = as_hardware_errors(core, Role.focus.value, stop_refused=refused)
         self._label = label
         self._executor = executor
         self._safety = safety
@@ -561,7 +582,7 @@ class MMZStage:
             label,
             f"z {label}",
             stoppable=True,
-            stop_refused=Role.focus.value in safety.stop_refused_by,
+            stop_refused=refused,
         )
         self._autofocus = autofocus
 
@@ -597,7 +618,7 @@ class MMZStage:
         """
         z_um = float(z_um)
         self._safety.check_z_target_um(z_um)
-        description = f"z: move_to {z_um} µm"
+        description = f"z: move_to {line_coords_um((z_um,))} µm"
         return self._interlocked(
             description,
             lambda: self._step(description, z_um),
@@ -618,12 +639,13 @@ class MMZStage:
         """
         dz_um = float(dz_um)
         self._safety.check_z_jog_um(dz_um, force=force)
+        description = f"z: move_by {line_coords_um((dz_um,))} µm"
 
         def target() -> tuple[float, str, float]:
             here = self._read_position()
             z_um = here + dz_um
             self._safety.check_z_target_um(z_um)
-            return here, f"z: move_by {dz_um} µm to {z_um} µm", z_um
+            return here, f"{description} to {line_coords_um((z_um,))} µm", z_um
 
         def relative() -> Step[float]:
             _, log, z_um = target()
@@ -633,9 +655,7 @@ class MMZStage:
             here, log, z_um = target()
             return self._plan(log, here, z_um, cap)
 
-        return self._interlocked(
-            f"z: move_by {dz_um} µm", relative, plan, keep_autofocus
-        )
+        return self._interlocked(description, relative, plan, keep_autofocus)
 
     def _plan(
         self, log: str, start: float, z_um: float, cap: float

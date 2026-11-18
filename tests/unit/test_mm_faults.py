@@ -66,9 +66,16 @@ class _Core:
     def configure(self, *args: object, **kwargs: object) -> None:
         raise self.error
 
+    def stop(self, label: str) -> None:
+        raise self.error
 
-def _proxy(error: BaseException, role: str = "xy_stage") -> Any:
-    return as_hardware_errors(cast("Any", _Core(error)), role)
+
+def _proxy(
+    error: BaseException, role: str = "xy_stage", *, stop_refused: bool = False
+) -> Any:
+    return as_hardware_errors(
+        cast("Any", _Core(error)), role, stop_refused=stop_refused
+    )
 
 
 # --- the proxy, on a stub ---------------------------------------------------------
@@ -152,6 +159,34 @@ def test_an_empty_fault_message_names_the_exception_type() -> None:
     assert (
         str(caught.value)
         == f"xy_stage: getXPosition('XY') failed (RuntimeError); {TAIL}"
+    )
+
+
+#: What the Ti2-E's stage answers to every stop (m2 §11.1).
+UNSUPPORTED = 'Error in device "XY": Unsupported device command (11)'
+
+
+def test_a_stop_on_a_declared_role_drops_the_hint_and_other_calls_keep_it() -> None:
+    # #545, F3: the refusal the profile declares is expected, and "power, cable"
+    # sent the operator to a cable for it. Only the stop of that role: a read that
+    # fails on the same stand is a fault, and the same call undeclared is too.
+    refusal = RuntimeError(UNSUPPORTED)
+    with pytest.raises(HardwareError) as declared:
+        _proxy(refusal, stop_refused=True).stop("XY")
+    assert str(declared.value) == f"xy_stage: stop('XY') failed ({UNSUPPORTED})"
+    assert declared.value.__cause__ is refusal
+    assert type(declared.value) is HardwareError
+
+    with pytest.raises(HardwareError) as undeclared:
+        _proxy(refusal).stop("XY")
+    assert str(undeclared.value) == (
+        f"xy_stage: stop('XY') failed ({UNSUPPORTED}); {TAIL}"
+    )
+
+    with pytest.raises(HardwareError) as read:
+        _proxy(refusal, stop_refused=True).getXPosition("XY")
+    assert str(read.value) == (
+        f"xy_stage: getXPosition('XY') failed ({UNSUPPORTED}); {TAIL}"
     )
 
 
