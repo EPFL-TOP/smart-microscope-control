@@ -782,6 +782,32 @@ Microscope.open()` block or `opened()` does. Not verified at a stand: a real
 stand's adapters may deliver notifications from their own threads for longer
 than the demo's.
 
+**A core nobody released is detached at exit (#538).** A core still open when
+the process ends (an `smc` command, `smc ui` quit while connected, a child that
+exits with its stand open) is freed while the interpreter finalizes, and
+`CMMCorePlus.__del__` calls `registerCallback(None)`, which waits for the
+notification MMCore's thread is delivering; that thread can no longer take the
+GIL once finalization has begun, so the process never ends (FM-246). Measured
+on CI 2026-11-17 (PR #543, the MTB session's exit child, 300 runs four at a
+time): 15 and 10 hangs in 300 on Linux py3.13, 3 in 300 on Windows py3.14,
+none in 1000 on macOS; `faulthandler` named `__del__` each time, after the
+child's last `atexit` handler had run. `smc.hardware.core` therefore keeps a
+weak set of the cores `_new_core` built and registers, when it is imported,
+an `atexit` handler that calls `detach_callbacks` on each one still alive:
+from `atexit` the delivering thread can still run, so the wait ends when its
+handler returns, and MMCore calls no Python afterwards (0 hangs in 300 on
+Linux with the detach). Registered at import, so before any MTB login: `atexit`
+runs last in, first out, and the MTB session's handler (darken, LEDs off,
+logout, m4 §8) runs before it. Only a detach: the C++ destructor still unloads
+the devices, as before. A core built elsewhere (`status()`'s throwaway core,
+the discovery children, which end with `os._exit`) is not tracked. Each
+core is tried whatever the others do; a Ctrl-C that lands during one wait is
+raised after the last (FM-49). Not verified at a stand: on the Zeiss PC,
+pythonnet registers its own `unload` at `atexit` when MTB connects, after this
+module's import, so the CLR shuts down before the detach runs; the detach is a
+pymmcore call and touches no device, but an exit of an `smc` command that ends
+with the stand open is to be watched at the next Zeiss session.
+
 **A failed load leaves nothing loaded (#132).** `open_core` does not call
 `unloadAllDevices()` when `loadSystemConfiguration` raises, because MMCore
 has already unloaded what it loaded. Measured 2026-10-19 on macOS
