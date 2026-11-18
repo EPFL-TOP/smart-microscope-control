@@ -17,6 +17,9 @@ from collections.abc import Callable
 import pytest
 
 from smc.hardware import Microscope
+from smc.hardware.backends import mm_stabilizer
+from smc.hardware.backends.mm_stabilizer import MMFocusStabilizer
+from smc.hardware.backends.zeiss_mtb.api import MTBError
 from smc.hardware.capabilities import (
     Autofocus,
     FocusReference,
@@ -195,6 +198,155 @@ def test_a_stabilize_beyond_the_excursion_bound_raises_and_leaves_z(
     with pytest.raises(AutofocusExcursionError, match="outside the Z soft limits"):
         limited.require(Autofocus).stabilize_now(reference)
     assert z.position_um() == pytest.approx(Z0)
+
+
+def test_the_z_guard_bounds_a_move_either_way_and_a_z_it_cannot_read(
+    stand: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Which way DF2 moves Z is not measured (m4 §12): the guard is two-sided.
+    af, z = stand.require(Autofocus), stand.require(ZStage)
+    reference = af.learn_reference()
+    bounded = _with_safety(stand, max_engage_excursion_um=1.0)
+    z.move_by_um(5.0)
+    with pytest.raises(AutofocusExcursionError, match=r"by 5\.000 µm, beyond"):
+        bounded.require(Autofocus).stabilize_now(reference)
+    assert z.position_um() == pytest.approx(Z0)
+    # A landing below the lower soft limit.
+    above = _with_safety(stand, z_soft_limits_um=(Z0 + 1.0, Z0 + 10.0))
+    z.move_by_um(5.0)
+    with pytest.raises(AutofocusExcursionError, match="outside the Z soft limits"):
+        above.require(Autofocus).stabilize_now(reference)
+    # FM-167: a Z that reads NaN after the stabilize is beyond any bound.
+    bounded_z = bounded.require(ZStage)
+    real = bounded_z.position_um
+    reads: list[float] = []
+
+    def nan_after_the_first() -> float:
+        reads.append(real())
+        return reads[0] if len(reads) == 1 else float("nan")
+
+    monkeypatch.setattr(bounded_z, "position_um", nan_after_the_first)
+    with pytest.raises(AutofocusExcursionError, match="to nan µm"):
+        bounded.require(Autofocus).stabilize_now(reference)
+
+
+def test_every_refusal_comes_before_the_restore(
+    stand: Microscope, fake_mtb: FakeMTB
+) -> None:
+    # DF2 holds another plane, so each stabilize below would need a restore:
+    # a refusal after it would already have replaced what DF2 holds.
+    af = stand.require(Autofocus)
+    first = af.learn_reference()
+    af.learn_reference()
+    before = _sent(fake_mtb)
+    with pytest.raises(SafetyRefusedError, match="learned by 'PFS'"):
+        af.stabilize_now(FocusReference("PFS", first.data, first.objective))
+    fake_mtb.stabilizer.piezo_focus_usage_on = True
+    with pytest.raises(SafetyRefusedError, match="PiezoFocusUsage reads On"):
+        af.stabilize_now(first)
+    fake_mtb.stabilizer.piezo_focus_usage_on = False
+    assert stand.require(ObjectiveTurret).select(FORTY_X, confirm=True) == FORTY_X
+    with pytest.raises(SafetyRefusedError, match=f"learned through {TEN_X!r}"):
+        af.stabilize_now(first)
+    assert _sent(fake_mtb) == before
+    # An objective that cannot be read now is no mismatch (m4 §11.6).
+    blind = MMFocusStabilizer(
+        stand.core,
+        DF2,
+        stand._executor,
+        stand._safety,
+        objective_label=lambda: None,
+        focus=lambda: stand.get(ZStage),
+    )
+    assert blind.stabilize_now(first).reference == first
+    assert [c[1] for c in _sent(fake_mtb)][len(before) :] == [
+        "restore",
+        "stabilize_now",
+    ]
+
+
+def test_a_failed_learn_leaves_no_reference_held(
+    stand: Microscope, fake_mtb: FakeMTB
+) -> None:
+    af = stand.require(Autofocus)
+    first = af.learn_reference()
+    fake_mtb.stabilizer.refuse_next = True
+    with pytest.raises(HardwareError, match="answered False"):
+        af.learn_reference()
+    with pytest.raises(SafetyRefusedError, match="none is held"):
+        af.stabilize_now()
+    # DF2's own record went with it: the first reference is restored first.
+    af.stabilize_now(first)
+    assert [c[1] for c in _sent(fake_mtb)][-2:] == ["restore", "stabilize_now"]
+
+
+def test_disengage_switches_periodic_off_even_when_its_read_fails(
+    stand: Microscope, fake_mtb: FakeMTB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    af = stand.require(Autofocus)
+    fake_mtb.stabilizer.periodic_on = True
+    af.disengage()
+    assert [c[1] for c in _sent(fake_mtb)] == ["stop_periodic"]
+    assert af.is_engaged() is False
+
+    def unreadable() -> bool:
+        raise MTBError("GetStabilizePeriodicallyOnOff timed out (fake)")
+
+    # A read that fails counts as on (FM-19): the Off is sent anyway.
+    monkeypatch.setattr(fake_mtb.stabilizer, "periodic", unreadable)
+    af.disengage()
+    assert [c[1] for c in _sent(fake_mtb)] == ["stop_periodic", "stop_periodic"]
+
+
+def test_a_stop_that_fails_is_raised_after_periodic_is_switched_off(
+    stand: Microscope, fake_mtb: FakeMTB
+) -> None:
+    af, z = stand.require(Autofocus), stand.require(ZStage)
+    af.learn_reference()
+    z.move_by_um(-5.0)
+    fake_mtb.stabilizer.move_s = 0.3
+    focus = fake_mtb.axes["MTBFocus"]
+    worker = _Thread(af.stabilize_now)
+    try:
+        _wait_for(lambda: focus.position_um() > Z0 - 5.0, "the stabilize to start")
+        fake_mtb.stabilizer.periodic_on = True
+        fake_mtb.stabilizer.fail_next = True  # the Stop raises
+        with pytest.raises(HardwareError) as failed:
+            af.disengage()
+    finally:
+        worker.join()
+        fake_mtb.stabilizer.move_s = 0.0
+    assert "the switch-off failed (Action Stop:" in str(failed.value)
+    assert "Stop raised (fake)" in str(failed.value)
+    assert "stop_periodic" in [c[1] for c in _sent(fake_mtb)]
+    assert fake_mtb.stabilizer.periodic_on is False
+
+
+def test_an_emergency_stop_that_df2_does_not_honour_is_a_failure(
+    stand: Microscope, fake_mtb: FakeMTB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Whether DF2 ends a synchronous call from another thread is not known
+    # (m4 §12): the stop says it switched DF2 off only when Action reads Idle.
+    monkeypatch.setattr(mm_stabilizer, "STOP_CONFIRM_S", 0.2)
+    af, z = stand.require(Autofocus), stand.require(ZStage)
+    af.learn_reference()
+    z.move_by_um(-5.0)
+    fake_mtb.stabilizer.move_s = 1.0
+    fake_mtb.stabilizer.stop_ignored = True
+    focus = fake_mtb.axes["MTBFocus"]
+    worker = _Thread(af.stabilize_now)
+    try:
+        _wait_for(lambda: focus.position_um() > Z0 - 5.0, "the stabilize to start")
+        with pytest.raises(HardwareError) as failed:
+            stand.stop()
+    finally:
+        worker.join()
+        fake_mtb.stabilizer.move_s = 0.0
+        fake_mtb.stabilizer.stop_ignored = False
+    assert not isinstance(failed.value, StopRefusedError)
+    assert f"the emergency stop failed for Autofocus {DF2!r}" in str(failed.value)
+    assert "Action still reads StabilizeNow 0.2 s after the Stop" in str(failed.value)
+    stand.resume()
 
 
 def test_a_failed_restore_leaves_no_reference_held(

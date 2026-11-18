@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -62,6 +63,11 @@ ACTION, REFERENCE = "Action", "Reference"
 PIEZO_FOCUS_USAGE, PERIODIC = "PiezoFocusUsage", "Periodic"
 IDLE, LEARN, STABILIZE_NOW, STOP = "Idle", "Learn", "StabilizeNow", "Stop"
 ON, OFF = "On", "Off"
+#: How long a switch-off waits for an action under way to end after its
+#: ``Stop``. Short: the emergency stop stops the stages after the autofocus.
+#: Not measured; whether DF2 honours the ``Stop`` at all is not known (m4 §12).
+STOP_CONFIRM_S = 1.0
+_CONFIRM_POLL_S = 0.02
 
 
 def _busy(core: CMMCorePlus, label: str) -> bool:
@@ -73,16 +79,40 @@ def _send_stop(core: CMMCorePlus, label: str) -> None:
     core.setProperty(label, ACTION, STOP)
 
 
+def _still_acting(core: CMMCorePlus, label: str) -> str | None:
+    """What ``Action`` reads ``STOP_CONFIRM_S`` after a ``Stop``; ``None`` once it reads idle.
+
+    A read that fails is no idle (FM-19). Slices of ``_CONFIRM_POLL_S``, so a
+    Ctrl-C lands between them.
+    """
+    deadline = time.monotonic() + STOP_CONFIRM_S
+    while True:
+        try:
+            action = str(core.getProperty(label, ACTION))
+        except Exception as exc:
+            action = f"unreadable ({_named(exc)})"
+        else:
+            if action == IDLE:
+                return None
+        if time.monotonic() >= deadline:
+            return action
+        time.sleep(_CONFIRM_POLL_S)
+
+
 def _switch_off(core: CMMCorePlus, label: str) -> None:
     """Stop what it does, then its periodic mode off; both tried, failures raised together.
 
     A read that fails counts as running, or as on (FM-19): a ``Stop`` or an
-    ``Off`` that was not needed is harmless, one that was skipped is not. A
+    ``Off`` that was not needed is harmless, one that was skipped is not. After
+    a ``Stop`` it reads ``Action`` until it is idle, for ``STOP_CONFIRM_S``:
+    whether DF2 ends a call under way from another thread is not known (m4
+    §12), so the emergency stop says it stopped only when it reads so. A
     function of the core and the label, not a method: the ``SafeCall`` is
     stored on the stabilizer, and one that held a bound method would be a
     reference cycle through the core (#142).
     """
     failures: list[str] = []
+    stop_sent = False
     for prop, idle, value in ((ACTION, IDLE, STOP), (PERIODIC, OFF, OFF)):
         try:
             try:
@@ -91,8 +121,15 @@ def _switch_off(core: CMMCorePlus, label: str) -> None:
                 needed = True
             if needed:
                 core.setProperty(label, prop, value)
+                stop_sent = stop_sent or prop == ACTION
         except Exception as exc:
             failures.append(f"{prop} {value}: {_named(exc)}")
+    if stop_sent and (still := _still_acting(core, label)) is not None:
+        failures.append(
+            f"{ACTION} still reads {still} {STOP_CONFIRM_S:g} s after the Stop: "
+            f"whether it ends a call under way from another thread is not known "
+            f"(m4 §12)"
+        )
     if failures:
         raise HardwareError(
             f"autofocus {label}: the switch-off failed ({'; '.join(failures)}); it "
