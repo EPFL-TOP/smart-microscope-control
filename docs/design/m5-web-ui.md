@@ -4072,7 +4072,9 @@ Read on main at `fcda44b` for this section, with m3 §24.1's measurements:
   operator's right. Session 3 (#405, #414; m3 §22.1) suggests, on the Ti2-E, +Y
   is the back (rows ran towards +Y with row A by the operator) and +X the
   operator's right (A1 at the front right of a plate turned 180°): **inferred,
-  not checked at the stand**.
+  not checked at the stand**. *Measured later, in session 5 (#540): the reverse.*
+  Session 3's plate lay A1 at the back left, so the premise was wrong; the back
+  is -Y and the operator's right -X.
 
 ### 16.2 Decisions
 
@@ -4085,7 +4087,8 @@ an empty provenance with a direction set is refused). A mirrored pair (the stage
 axes left-handed seen from above) is accepted and labelled as it is: the corner
 words of D3 then say where A1 really is. `nikon-ti2.toml`: `back = "+Y"`,
 `right = "+X"`, `directions_measured` saying inferred from session 3 and to be
-checked; `demo-sample.toml`: the same values, "by construction: the demo map's
+checked (session 5 measured `back = "-Y"` and `right = "-X"` and the profile says
+so, #540); `demo-sample.toml`: the first values, "by construction: the demo map's
 +Y is up and +X right, seen from the front". `demo.toml` and `nikon-tie.toml`
 leave them unset.
 
@@ -4099,7 +4102,9 @@ second in `controls`, right after `plate_select`; values are m3's
 **D3. The words name A1's corner.** With the directions known, a stage direction
 is `back`/`front` (`back` and its opposite) or `right`/`left`; A1's corner is
 `-X +Y` not turned and `+X -Y` turned (m3 §24 D1), said back-or-front first:
-"A1 at the back left" and "Turned 180°: A1 at the front right" on the Ti2-E.
+"A1 at the back left" and "Turned 180°: A1 at the front right" on a stand whose back
+is +Y and whose operator's right is +X (the demo sample's); the Ti2-E's are the other
+way round, "A1 at the front right" and "Turned 180°: A1 at the back left" (#540).
 Without them, in stage terms: "Not turned: A1 at stage -X +Y" and "Turned 180°: A1
 at stage +X -Y", and the note under the menu says the stand does not say which
 side is the back (`[holder] back`, `right`). The words are never stored.

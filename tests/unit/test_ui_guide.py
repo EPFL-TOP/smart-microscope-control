@@ -1180,7 +1180,7 @@ def test_the_title_is_plain_text_whatever_the_plate_is_called() -> None:
 def test_the_a1_corner_is_in_the_operators_words_when_the_stand_says_its_sides() -> (
     None
 ):
-    # The Ti2-E: +Y is the back and +X the operator's right.
+    # A stand whose back is +Y and whose operator's right is +X (the demo sample's).
     assert a1_corner("not-turned", "+Y", "+X") == "the back left"
     assert a1_corner("turned-180", "+Y", "+X") == "the front right"
     assert orientation_label("not-turned", "+Y", "+X") == "A1 at the back left"
@@ -1189,11 +1189,12 @@ def test_the_a1_corner_is_in_the_operators_words_when_the_stand_says_its_sides()
         == f"Turned 180{DEG}: A1 at the front right"
     )
     # A stand whose back is +X: a word tied to an axis, or to the sign of Y, would say
-    # the Ti2-E's corner here (FM-73). A1 at -X +Y is the front right of it, and +X -Y
-    # the back left.
+    # the first stand's corner here (FM-73). A1 at -X +Y is the front right of it, and
+    # +X -Y the back left.
     assert a1_corner("not-turned", "+X", "+Y") == "the front right"
     assert a1_corner("turned-180", "+X", "+Y") == "the back left"
-    # A back of -Y and a right of -X: every sign flipped from the Ti2-E.
+    # A back of -Y and a right of -X, the Ti2-E's (#540): every sign flipped from the
+    # first stand.
     assert a1_corner("not-turned", "-Y", "-X") == "the front right"
     assert a1_corner("turned-180", "-Y", "-X") == "the back left"
 

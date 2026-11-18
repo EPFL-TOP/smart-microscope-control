@@ -215,12 +215,18 @@ def test_holder_directions_on_one_axis_are_refused(tmp_path: Path) -> None:
     assert "holder.back" in str(info.value)
 
 
-def test_the_ti2_holder_says_back_is_plus_y_and_right_is_plus_x() -> None:
+def test_the_ti2_holder_says_back_is_minus_y_and_right_is_minus_x() -> None:
     nikon = Profile.load(PROFILES / "nikon-ti2.toml").holder
-    assert (nikon.back, nikon.right) == ("+Y", "+X")
-    # Inferred from session 3, and says it is not checked at the stand.
-    assert "session 3" in nikon.directions_measured
-    assert "not checked at the stand" in nikon.directions_measured
+    # Seen at the stand in session 5 (#198, #540): the joystick moves the field towards
+    # the back at -Y and towards the operator's right at -X. Session 3's inference, +Y
+    # and +X, took the plate for one with A1 at the front right.
+    assert (nikon.back, nikon.right) == ("-Y", "-X")
+    assert "2026-11-17" in nikon.directions_measured
+    assert "session 5" in nikon.directions_measured
+    assert "#198" in nikon.directions_measured
+    assert "#540" in nikon.directions_measured
+    assert "inferred" not in nikon.directions_measured
+    assert "not checked" not in nikon.directions_measured
 
     sample = Profile.load(PROFILES / "demo-sample.toml").holder
     assert (sample.back, sample.right) == ("+Y", "+X")

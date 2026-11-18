@@ -827,10 +827,14 @@ registration on. No cells. The 10× and 40×, the lever at 1.0×.
   at the back left**. A drive to the estimated C5 landed on B2, and the
   reverse; the joystick moves the field towards row A (the back) at −Y and
   towards column 6 (the operator's right) at −X. Measured: `back = "-Y"`,
-  `right = "-X"`, the reverse of the profile (#540). Session 3's raw
-  centres agree, so its plate also lay A1 at the back left. With today's
-  profile the page's `Turned 180°: A1 at the front right` gives the right
-  geometry with the wrong words.
+  `right = "-X"`, the reverse of what session 3 had inferred. Session 3's
+  raw centres agree, so its plate also lay A1 at the back left. The profile
+  says it now (#540). **For a plate with A1 at the back left, ask for
+  `Turned 180°: A1 at the back left` in *Plate lies*** (the other choice
+  reads `A1 at the front right`). The map's sides are named for the stand:
+  the back at the bottom of the map and the operator's right on its left
+  (the map is still drawn in stage terms, #547). The next checklist keeps
+  one line that checks it: a drive to B2 lands on B2.
 - The page draws the map in stage terms, so the operator sees it turned
   from the plate in front of them (#547).
 - `plate-walls` at the 10× on B2, B5, C3: **residual 90.7 µm** against its
