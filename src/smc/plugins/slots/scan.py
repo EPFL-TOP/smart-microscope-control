@@ -24,6 +24,7 @@ from smc.plugins.api import PluginResult
 from smc.plugins.geometry import Matrix2
 from smc.plugins.slots.base import SlotValue
 from smc.plugins.slots.cell_focus import FieldFocus
+from smc.plugins.slots.plate_check import PlateCheck
 from smc.run.files import resolve_in_run, retry_on_permission_error
 
 __all__ = ["FailedField", "FocusState", "ScanFrame", "ScanResult", "load_frame"]
@@ -114,6 +115,12 @@ class ScanResult(PluginResult):
     ``matrix_um_per_px`` and ``pixel_size_um`` are the scan plan's, copied so
     that the cells stage needs only ``scan``. ``folder`` is the frames' folder,
     relative to the run folder.
+
+    ``plate_check`` is the check of the plate against its registration made
+    before this attempt's first field (m3 §27.5): when the registration the
+    frames are placed against was last confirmed. ``None`` when the check was
+    skipped (its line in ``assumed`` says why) and in every scan written before
+    it existed.
     """
 
     folder: str
@@ -124,6 +131,19 @@ class ScanResult(PluginResult):
     exposure_ms: float = Field(ge=0.0)
     frames: tuple[ScanFrame, ...]
     failed: tuple[FailedField, ...]
+    plate_check: PlateCheck | None = None
+
+    @model_serializer(mode="wrap")
+    def _leave_out_a_check_not_made(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> dict[str, Any]:
+        # A scan whose plate was not checked is written exactly as before the
+        # field existed, so an older smc still reads it: its model refuses a key
+        # it does not know (FM-107), as ``ScanFrame``'s fields do.
+        data: dict[str, Any] = handler(self)
+        if self.plate_check is None:
+            data.pop("plate_check", None)
+        return data
 
     def frame_index(self) -> dict[str, list[int]]:
         """Each well mapped to the positions of its frames in ``frames``.
