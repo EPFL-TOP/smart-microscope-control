@@ -34,6 +34,7 @@ from smc.hardware.backends.zeiss_mtb.api import (
     MTBAxis,
     MTBChanger,
     MTBError,
+    MTBFocusStabilizer,
     MTBLEDController,
     MTBSessionError,
 )
@@ -81,6 +82,7 @@ class MTBSession:
         self._controllers: dict[str, MTBLEDController] = {}
         #: The raw controllers, which the exit handler darkens after the logout flag.
         self._raw_controllers: dict[str, MTBLEDController] = {}
+        self._stabilizers: dict[str, MTBFocusStabilizer] = {}
         self._darkeners: dict[str, Callable[[], None]] = {}
         self._closed = False
         self._closing = False
@@ -117,6 +119,15 @@ class MTBSession:
                 self._raw_controllers[mtb_id] = raw
                 self._controllers[mtb_id] = _GuardedController(self, raw)
             return self._controllers[mtb_id]
+
+    def focus_stabilizer(self, mtb_id: str) -> MTBFocusStabilizer:
+        """The focus stabilizer ``mtb_id``, looked up once; an ``MTBError`` naming it when absent."""
+        with self._lock:
+            self._check()
+            if mtb_id not in self._stabilizers:
+                raw = _wrapped(self._api.focus_stabilizer, mtb_id)
+                self._stabilizers[mtb_id] = _GuardedStabilizer(self, raw)
+            return self._stabilizers[mtb_id]
 
     def register_darkener(self, label: str, darken: Callable[[], None]) -> None:
         """Run ``darken`` at process exit, before the logout; one per label."""
@@ -316,6 +327,51 @@ class _GuardedController:
     def set_manual_mode(self, timeout_ms: int) -> None:
         self._session._check()
         self._raw.set_manual_mode(timeout_ms)
+
+
+class _GuardedStabilizer:
+    """A focus stabilizer that refuses every call once the session has logged out."""
+
+    def __init__(self, session: MTBSession, raw: MTBFocusStabilizer) -> None:
+        self._session = session
+        self._raw = raw
+        self.mtb_id = raw.mtb_id
+
+    def learn(self, timeout_ms: int) -> bytes:
+        self._session._check()
+        return self._raw.learn(timeout_ms)
+
+    def restore(self, reference: bytes, timeout_ms: int) -> bool:
+        self._session._check()
+        return self._raw.restore(reference, timeout_ms)
+
+    def stabilize_now(self, timeout_ms: int) -> bool:
+        self._session._check()
+        return self._raw.stabilize_now(timeout_ms)
+
+    def stop(self, timeout_ms: int) -> None:
+        self._session._check()
+        self._raw.stop(timeout_ms)
+
+    def operation_mode(self) -> str:
+        self._session._check()
+        return self._raw.operation_mode()
+
+    def set_operation_mode(self, mode: str) -> None:
+        self._session._check()
+        self._raw.set_operation_mode(mode)
+
+    def piezo_focus_usage(self) -> bool:
+        self._session._check()
+        return self._raw.piezo_focus_usage()
+
+    def periodic(self) -> bool:
+        self._session._check()
+        return self._raw.periodic()
+
+    def stop_periodic(self, timeout_ms: int) -> None:
+        self._session._check()
+        self._raw.stop_periodic(timeout_ms)
 
 
 def _darken_if_logged_in() -> None:

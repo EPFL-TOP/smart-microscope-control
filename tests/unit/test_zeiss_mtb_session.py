@@ -40,6 +40,20 @@ def test_components_are_looked_up_once_and_cached() -> None:
         assert mtb.led_controller("MTBFLLEDController") is mtb.led_controller(
             "MTBFLLEDController"
         )
+        assert mtb.focus_stabilizer("MTBFocusStabilizer2") is mtb.focus_stabilizer(
+            "MTBFocusStabilizer2"
+        )
+
+
+def test_an_absent_focus_stabilizer_is_an_mtb_error_naming_it() -> None:
+    # A stand without DF2: its device fails initialize() with this text (m4 §11.3).
+    fake = FakeMTB()
+    fake.absent.add("MTBFocusStabilizer2")
+    with (
+        session.use_api_factory(lambda: fake),
+        pytest.raises(MTBError, match="'MTBFocusStabilizer2' is absent"),
+    ):
+        session.shared().focus_stabilizer("MTBFocusStabilizer2")
 
 
 def test_concurrent_first_calls_log_in_once() -> None:
@@ -108,6 +122,7 @@ def test_after_logout_every_call_is_refused_with_a_session_error() -> None:
         axis = mtb.axis("MTBFocus")
         changer = mtb.changer("MTBTLShutter")
         led = mtb.led_controller("MTBFLLEDController").leds()[0]
+        df2 = mtb.focus_stabilizer("MTBFocusStabilizer2")
         mtb._close_at_exit()
         assert fake.logouts == 1
         for call in (
@@ -118,6 +133,10 @@ def test_after_logout_every_call_is_refused_with_a_session_error() -> None:
             changer.position,
             led.is_on,
             lambda: led.set_on(True, 1000),
+            lambda: mtb.focus_stabilizer("MTBFocusStabilizer2"),
+            lambda: df2.stabilize_now(1000),
+            lambda: df2.stop(1000),
+            df2.periodic,
         ):
             with pytest.raises(MTBSessionError, match="cannot log in twice"):
                 call()
