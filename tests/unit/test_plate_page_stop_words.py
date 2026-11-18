@@ -79,6 +79,13 @@ class HaltedScan:
             raise MicroscopeHaltedError() from None
 
 
+class MeetsTheHalt(HaltedScan):
+    """``scan`` started on a stand that was halted before: the halt, with no STOP of this run."""
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> NoResult:
+        raise MicroscopeHaltedError()
+
+
 @pytest.fixture(autouse=True)
 def _fresh_state() -> None:
     HaltedScan.started = threading.Event()
@@ -202,11 +209,33 @@ def test_a_failed_stop_says_press_resume_not_call_resume(tmp_path: Path) -> None
     _says_no_api_call(note)
 
 
+def test_a_run_that_meets_a_halt_it_was_not_stopped_by_says_press_resume(
+    tmp_path: Path,
+) -> None:
+    # The `failed` branch of the outcome, not the `stopped by STOP` one: the line carries the
+    # layer's text, so it is the page's words.
+    microscope = _stand(refused=set(), declared=(), segments=False)
+    scan = EntryPoint(name="scan", value=f"{__name__}:MeetsTheHalt", group=GROUP)
+    page = PlatePage(microscope, tmp_path / "run.json", entry_points=[scan])
+    try:
+        page.run("scan", [])
+        assert page.join(BOUND_S)
+        outcome = page.status().outcome
+    finally:
+        page.close()
+        microscope.close()
+    assert (
+        outcome == "Scan failed: the microscope was stopped; press Resume to continue"
+    )
+    _says_no_api_call(outcome)
+
+
 def test_a_live_that_meets_the_halt_ends_without_the_api_call(
     refusing: PlatePage,
 ) -> None:
-    # STOP lands while a frame is in flight: the frame fails on the halt. The outcome says
-    # the layer's cause in the page's words (the type stays: it is the Live's existing line).
+    # A camera that raises the halt's real error (no STOP is pressed here: that the frame
+    # fails on the halt is the stub's doing). The outcome says the layer's cause in the
+    # page's words; the type stays, it is the Live's existing line.
     microscope = refusing._stand()
     camera = microscope.require(Camera)
 

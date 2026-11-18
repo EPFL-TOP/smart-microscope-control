@@ -2387,6 +2387,10 @@ def test_stop_refused_text_agrees_with_the_number_of_devices_and_drops_what_does
     assert stop_refused_text(("xy_stage",), autofocus=None).startswith(
         "the stand is halted (Resume clears the halt). xy_stage refuses a stop"
     )
+    # A label may hold a space: the role word is the first one only.
+    assert stop_refused_text(("xy_stage XY Stage",), autofocus=None).startswith(
+        "the stand is halted (Resume clears the halt). XY Stage refuses a stop"
+    )
     # Two devices: `and`, and the verb follows the number.
     two = stop_refused_text(("xy_stage XY", "z Z"), autofocus="PFS")
     assert "(PFS) is switched off. XY and Z refuse a stop on this stand" in two
