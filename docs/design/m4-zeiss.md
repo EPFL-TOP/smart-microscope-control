@@ -987,10 +987,10 @@ the objective is read live (`getStateLabel`, never the cached `Label`,
 - The contract stand `zeiss-fake` now has an autofocus. In
   `tests/contracts/`, a case that needs `engage()` or a non-zero offset skips
   on `AutofocusUnsupportedError` on `zeiss-fake` and `hardware` (the set
-  `_SKIPS_WHAT_IT_LACKS`) and fails on it on `fake` and `demo`; the cases of
-  the one-shot mode skip on it the same way. A contract holds on every
-  stand: an autofocus holds focus one way or the other (`engage` or
-  `stabilize_now`).
+  `_SKIPS_WHAT_IT_LACKS`) and fails on it on `fake` and `demo`. The cases of
+  the one-shot mode skip on it on every backend, since PFS has no one-shot
+  mode. One contract keeps a stand from skipping both: an autofocus holds
+  focus one way or the other (`engage` or `stabilize_now`), on every stand.
 
 ### 11.8 References in the run document, and who owns Z
 
