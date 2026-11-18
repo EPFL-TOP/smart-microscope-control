@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -17,7 +18,7 @@ from pathlib import Path
 import pytest
 from pymmcore_plus import CMMCorePlus
 
-from smc.hardware.backends.zeiss_mtb import session
+from smc.hardware.backends.zeiss_mtb import devices, session
 from smc.hardware.backends.zeiss_mtb.api import STABILIZER_TIMEOUT_MS, MTBError
 from smc.hardware.core import CoreError, close_core, open_core
 from smc.testing.fake_mtb import FakeMTB
@@ -274,6 +275,64 @@ def test_stop_is_sent_while_the_worker_runs(
         "whether DF2 ends a synchronous call from another thread is not known" in m
         for m in caplog.messages
     )
+
+
+def test_a_stop_before_the_worker_sends_its_call_cancels_it(
+    core: CMMCorePlus, fake: FakeMTB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The set returns before the worker reaches MTB: a Stop in between finds
+    # nothing to stop in MTB, and the StabilizeNow sent after it would run.
+    _learn(core)
+    focus = fake.axes["MTBFocus"]
+    focus.set_position_um(995.0)
+    gate = threading.Event()
+    real_start = devices._Mover.start
+
+    def held_start(
+        mover: devices._Mover,
+        target: object,
+        work: Callable[[threading.Event], None],
+    ) -> None:
+        def held(cancel: threading.Event) -> None:
+            gate.wait(5.0)
+            work(cancel)
+
+        real_start(mover, target, held)
+
+    monkeypatch.setattr(devices._Mover, "start", held_start)
+    core.setProperty(DF2, "Action", "StabilizeNow")
+    core.setProperty(DF2, "Action", "Stop")
+    gate.set()
+    with pytest.raises(MTBError, match="a Stop came before StabilizeNow was sent"):
+        core.waitForDevice(DF2)
+    assert _calls(fake, "stabilize_now") == []
+    assert focus.position_um() == pytest.approx(995.0)
+
+
+def test_stabilize_now_with_no_reference_is_refused_and_sends_nothing(
+    core: CMMCorePlus, fake: FakeMTB
+) -> None:
+    # Another client left DF2 holding a plane: not this process's to trust
+    # (FM-118), and a generic property set must not drive Z to it.
+    fake.stabilizer.learn(STABILIZER_TIMEOUT_MS)
+    focus = fake.axes["MTBFocus"]
+    focus.set_position_um(990.0)
+    before = len(_calls(fake, "learn"))
+    with pytest.raises(MTBError, match="no reference was learned or restored"):
+        core.setProperty(DF2, "Action", "StabilizeNow")
+    assert _calls(fake, "stabilize_now") == []
+    assert core.getProperty(DF2, "Action") == "Idle"
+    assert focus.position_um() == 990.0
+    # A failed re-learn leaves none either: the old blob is no longer held.
+    _learn(core)
+    fake.stabilizer.refuse_next = True
+    core.setProperty(DF2, "Action", "Learn")
+    with pytest.raises(MTBError, match="answered False"):
+        core.waitForDevice(DF2)
+    assert len(_calls(fake, "learn")) == before + 2
+    assert core.getProperty(DF2, "Reference") == ""
+    with pytest.raises(MTBError, match="no reference was learned or restored"):
+        core.setProperty(DF2, "Action", "StabilizeNow")
 
 
 def test_periodic_on_is_refused(core: CMMCorePlus, fake: FakeMTB) -> None:

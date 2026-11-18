@@ -935,6 +935,19 @@ class MTBColibri(ShutterDevice):
         )
 
 
+def _unless_stopped(cancel: threading.Event, name: str, call: str) -> None:
+    """Raise when a ``Stop`` came before the worker sent ``call``, which is then never sent.
+
+    The set that starts an action returns before its worker reaches MTB, so a
+    ``Stop`` can land in between: MTB then has nothing to stop, and the call
+    sent after it would run in full (a ``StabilizeNow`` drives the focus drive).
+    """
+    if cancel.is_set():
+        raise MTBError(
+            f"{name}: a Stop came before {call} was sent, so it was not sent"
+        )
+
+
 class MTBDefiniteFocus(GenericDevice):
     """Definite Focus 2 as five properties: learn, restore, stabilize once (m4 §11.4).
 
@@ -953,7 +966,11 @@ class MTBDefiniteFocus(GenericDevice):
       ``False`` on a success is not measured (m4 §12).
     * **What DF2 held before this process is not this process's to trust**
       (FM-118): ``Reference`` reads ``""`` after ``initialize()``, from the
-      start of every learn or restore, and after one that failed.
+      start of every learn or restore, and after one that failed; while it
+      does, a ``StabilizeNow`` is refused. A raw property set still skips
+      what only the layer checks (the objective, the Z bounds, FM-251).
+    * **A ``Stop`` that lands before the worker reaches MTB** cancels the
+      call, which is then never sent.
     * **Periodic stabilisation is never switched on**: it would hold one
       plane while the stage visits others. ``initialize()`` and ``shutdown()``
       switch it off when another MTB client left it on.
@@ -1074,7 +1091,8 @@ class MTBDefiniteFocus(GenericDevice):
         if action == LEARN:
             self._reference = ""
 
-            def learn(_cancel: threading.Event) -> None:
+            def learn(cancel: threading.Event) -> None:
+                _unless_stopped(cancel, name, "InitOnCurrentFocusPosition")
                 blob = _seam(
                     f"{name}: InitOnCurrentFocusPosition",
                     lambda: stabilizer.learn(STABILIZER_TIMEOUT_MS),
@@ -1085,8 +1103,18 @@ class MTBDefiniteFocus(GenericDevice):
 
             self._mover.start(LEARN, learn)
             return
+        if not self._reference:
+            # What DF2 held before this process is not its to trust (FM-118):
+            # a StabilizeNow now would drive the focus drive to that plane, past
+            # every check of the layer's MMFocusStabilizer.
+            raise MTBError(
+                f"{name}: no reference was learned or restored since initialize(), "
+                "so StabilizeNow would bring focus to whatever plane DF2 held before; "
+                "learn one (Action Learn) or set Reference first; nothing was sent"
+            )
 
         def stabilize(cancel: threading.Event) -> None:
+            _unless_stopped(cancel, name, "StabilizeNow")
             answer = _seam(
                 f"{name}: StabilizeNow",
                 lambda: stabilizer.stabilize_now(STABILIZER_TIMEOUT_MS),
@@ -1141,7 +1169,8 @@ class MTBDefiniteFocus(GenericDevice):
         self._refuse_while_running(RESTORE)
         self._reference = ""
 
-        def restore(_cancel: threading.Event) -> None:
+        def restore(cancel: threading.Event) -> None:
+            _unless_stopped(cancel, name, "InitWithStabilizingData")
             answer = _seam(
                 f"{name}: InitWithStabilizingData",
                 lambda: stabilizer.restore(blob, STABILIZER_TIMEOUT_MS),
