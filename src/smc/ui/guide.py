@@ -123,6 +123,7 @@ __all__ = [
     "REGISTER_ACROSS_A_TURN",
     "REGISTER_FIRST",
     "REGISTER_OBJECTIVES_DIFFER",
+    "RELOCK_NOTE",
     "RESULT_CHOICES",
     "RESULT_NAMES",
     "RESULT_OPTIONAL_READS",
@@ -137,12 +138,14 @@ __all__ = [
     "SCAN_FAILED_UNCOUNTED",
     "SCAN_FIRST",
     "SCAN_HALTED",
+    "SCAN_NEEDS_A_LOCK",
     "SCAN_REPLACES",
     "SCAN_START_AGAIN",
     "SCAN_START_AGAIN_CONFIRM",
     "SCAN_START_AGAIN_CONFIRM_UNCOUNTED",
     "SCAN_STOPPED",
     "SCAN_STOPPED_UNCOUNTED",
+    "SCAN_WITHOUT_A_LOCK",
     "SCREEN_LEADS",
     "SCREEN_TITLES",
     "SELECTION_KEPT_ITS_NAMES",
@@ -239,6 +242,7 @@ __all__ = [
     "register_objective_refusal",
     "register_replace_note",
     "registered_line",
+    "relock_note",
     "replace_note",
     "result_row",
     "results_left",
@@ -247,6 +251,7 @@ __all__ = [
     "scan_again_confirm",
     "scan_end_lines",
     "scan_lead",
+    "scan_lock_note",
     "scan_plan_card_lines",
     "scan_progress_lines",
     "scan_title",
@@ -503,6 +508,26 @@ MEASURE_NOT_IN_A_DRY_RUN = (
 MEASURE_AFTER_THE_SCAN = (
     "Continue the scan or Start again first: laying the fields out again would drop "
     "the stopped scan's checkpoint."
+)
+#: What the Wells screen says under *Measure the time*'s line when the timing left the autofocus
+#: not locked, and what the Scan screen says before a click whose scan would not have one (m5 §20,
+#: #546). The page's own *Autofocus on* locks again at the offset now set when this page read that
+#: offset locked since Connect; ``smc autofocus engage`` opens the stand anew and is refused
+#: whatever a page read (m2 §12.5), so the notes name the button and not the command. Notes, never
+#: waits: no button is disabled by them (FM-169).
+RELOCK_NOTE = (
+    "The autofocus is not locked: Autofocus on, under the image, locks it again at the "
+    "offset now set if this page has read that offset locked since Connect. After a "
+    "Disconnect, or from smc autofocus engage in a terminal, no lock has been read, and "
+    "the engage is refused."
+)
+SCAN_NEEDS_A_LOCK = (
+    "Autofocus is required and it is not locked, so the scan will refuse to start: "
+    "press Autofocus on, under the image, first."
+)
+SCAN_WITHOUT_A_LOCK = (
+    "The autofocus is not locked, so the scan will not use it (if-engaged): press "
+    "Autofocus on, under the image, to scan with it."
 )
 
 
@@ -1653,6 +1678,26 @@ def scan_lead(
     return f"{fields}{at}. {stop}"
 
 
+def scan_lock_note(mode: str, *, autofocus_locked: bool | None, dry_run: bool) -> str:
+    """What the Scan screen says before the click when the scan's ``autofocus`` field wants a lock the stand does not have (m5 §20 D3).
+
+    ``mode`` is the field's value as the click would send it (the typed text stripped, or the
+    tool's default when empty, through ``plain_default``). ``required`` is refused by the
+    scan's own check at the start, and ``if-engaged`` would scan without the autofocus:
+    both are told, and both name the page's button, which the plugin's own refusal text
+    (read on the CLI too) does not (D6). ``off``, an unknown read and a value the tool would
+    refuse say nothing. It is a note and never a wait: the scan's check is the one guard
+    (FM-169). Not on a dry run (D4, FM-182). Plain text (FM-139).
+    """
+    if dry_run or autofocus_locked is not False:
+        return ""
+    if mode == "required":
+        return SCAN_NEEDS_A_LOCK
+    if mode == "if-engaged":
+        return SCAN_WITHOUT_A_LOCK
+    return ""
+
+
 def wells_known_lines(
     *,
     objective: str | None,
@@ -2399,6 +2444,31 @@ def chain_line(chain: ChainStatus | None) -> str:
     if not_run:
         parts.append(f"Not run: {_names(not_run)}.")
     return " ".join(parts)
+
+
+def relock_note(
+    chain: ChainStatus | None, *, autofocus_locked: bool | None, dry_run: bool
+) -> str:
+    """What the Wells screen says under the chain's line once *Measure the time* has ended with the autofocus not locked (m5 §20 D2).
+
+    ``timing`` switches the autofocus off before its probe, so the chain ends with a stand
+    the operator must lock again, and the one button that does it in the connection that
+    read the lock is *Autofocus on* (F10, Ti2-E session 5). The condition is the read
+    (``autofocus_locked is False``), never the tool's own flag or the words of its
+    ``assumed`` line (FM-155): an autofocus the timing found off, or one the operator locked
+    again at the stand's controls since, is drawn as it reads. Not on a dry run, where
+    *Autofocus on* sends nothing (D4, FM-182). Plain text (FM-139).
+    """
+    if (
+        chain is None
+        or not chain.plugins
+        or chain.label != MEASURE_THE_TIME
+        or chain.current is not None
+        or dry_run
+        or autofocus_locked is not False
+    ):
+        return ""
+    return RELOCK_NOTE
 
 
 def files_lines(cards: Mapping[str, ResultCard]) -> tuple[str, ...]:

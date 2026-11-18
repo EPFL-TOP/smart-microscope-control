@@ -64,6 +64,10 @@ from smc.ui.guide import (
     MEASURE_THE_TIME,
     PLATE_NOT_CHOSEN,
     REGISTER_FIRST,
+    RELOCK_NOTE,
+    RUN_ALL_LABEL,
+    SCAN_NEEDS_A_LOCK,
+    SCAN_WITHOUT_A_LOCK,
     SCREEN_LEADS,
     SCREEN_TITLES,
     SELECT_WELLS,
@@ -558,6 +562,8 @@ def test_the_wells_screen_lists_the_wells_box_the_two_fields_and_the_action_befo
         view.measure_time_button,
         view.measure_time_wait,
         view.wells_chain_text,
+        # How to lock the autofocus again, under the chain's line (m5 §20 D2).
+        view.wells_relock_text,
         view.wells_note,
         view.layout_card,
         view.continue_button,
@@ -571,6 +577,8 @@ def test_the_wells_screen_lists_the_wells_box_the_two_fields_and_the_action_befo
     assert scan[2:] == [
         view.scan_button,
         view.scan_wait_text,
+        # A lock the scan's autofocus field wants and the stand has not (m5 §20 D3).
+        view.scan_lock_text,
         # What a scan replaces; after a STOP or a failure, what ended it and the two actions
         # that take *Start the scan*'s place (m5 §17.12 D17).
         view.scan_replaces_text,
@@ -3038,3 +3046,231 @@ def test_the_expert_run_of_a_tool_that_feeds_a_stopped_scan_carries_the_note_und
     )
     Slow.release.set()
     assert page.join(BOUND_S)
+
+
+# --- the lock notes: after Measure the time and before the scan (m5 §20, #546) -------------
+
+
+def _with_status(
+    monkeypatch: pytest.MonkeyPatch, page: PlatePage, **changes: Any
+) -> None:
+    """The page's status with ``changes``, read fresh at each call (the module's way)."""
+    real = PlatePage.status
+    monkeypatch.setattr(
+        page, "status", lambda: dataclasses.replace(real(page), **changes)
+    )
+
+
+def _after_measure_the_time(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> tuple[PlatePage, PlatePageView]:
+    """A view on a page whose *Measure the time* chain has ended, on the demo stand (its autofocus reads off)."""
+    StubTiming.repeats = []
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    page.select_text("B11, B2")
+    view = PlatePageView(page)
+    view.refresh()
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    view.tick()
+    return page, view
+
+
+def test_the_wells_screen_names_autofocus_on_after_measure_the_time(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D2: the note follows the read of the autofocus, under the chain's line, and never the tool's words (FM-155)."""
+    page, view = _after_measure_the_time(make_page, run_doc)
+
+    # The stub timing assumed nothing about the autofocus; the demo stand reads it off.
+    status = page.status()
+    assert status.autofocus_locked is False
+    assert status.chain is not None
+    assert status.chain.current is None
+    assert StubTiming.assumed == ()
+    assert view.wells_chain_text.object.startswith("Done: Timing, Field layout.")
+    assert view.wells_relock_text.object == RELOCK_NOTE
+    assert view.wells_relock_text.visible is True
+    shown = view.screens["wells"]
+    assert shown.index(view.wells_relock_text) == shown.index(view.wells_chain_text) + 1
+    # A note and never a wait: no button changes with it (D3, FM-169). The two buttons are
+    # disabled here for their own reasons (the plan stands), and stay as they are.
+    buttons = (view.layout_button.disabled, view.measure_time_button.disabled)
+
+    # Each other read says nothing, and takes no height.
+    for changes in (
+        {"autofocus_locked": True},
+        {"autofocus_locked": None},
+        {"dry_run": True},
+    ):
+        _with_status(monkeypatch, page, **changes)
+        view.tick()
+        assert view.wells_relock_text.object == "", changes
+        assert view.wells_relock_text.visible is False, changes
+        if "dry_run" not in changes:
+            assert (
+                view.layout_button.disabled,
+                view.measure_time_button.disabled,
+            ) == buttons
+    # The read that said it is drawn again as it reads.
+    _with_status(monkeypatch, page, autofocus_locked=False)
+    view.tick()
+    assert view.wells_relock_text.object == RELOCK_NOTE
+
+    # A chain whose button is not this one's, or one that goes on, has no note on this screen.
+    page._chain = ChainStatus(("timing",), (), None, label=RUN_ALL_LABEL)
+    view.tick()
+    assert view.wells_relock_text.visible is False
+    page._chain = ChainStatus(("timing",), (), "timing", label=MEASURE_THE_TIME)
+    view.tick()
+    assert view.wells_relock_text.visible is False
+
+    # No status, nothing known: nothing said (the ended chain is back, the read is not).
+    page._chain = ChainStatus(("timing",), (), None, label=MEASURE_THE_TIME)
+    view.tick()
+    assert view.wells_relock_text.object == RELOCK_NOTE
+    view._draw_chain_line(None)
+    assert view.wells_relock_text.object == ""
+    assert view.wells_relock_text.visible is False
+
+
+def test_autofocus_on_ends_the_chain_line_and_the_note_goes_with_it(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """A drive action starts an activity, which drops the kept chain: no state keeps the note (#546's plan)."""
+    page, view = _after_measure_the_time(make_page, run_doc)
+    assert view.wells_relock_text.visible is True
+
+    page.autofocus(True)
+    assert page.join(BOUND_S)
+    view.tick()
+
+    assert page.status().autofocus_locked is True
+    assert page.status().chain is None
+    assert view.wells_relock_text.visible is False
+    assert view.wells_chain_text.visible is False
+
+
+def test_the_scan_screen_names_autofocus_on_while_the_scan_needs_a_lock(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D3: for ``required`` and for ``if-engaged`` (the empty field's default), not for ``off`` or a lock that reads locked."""
+    page = make_page()
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    view = PlatePageView(page)
+    view.refresh()
+    view.tick()
+    field = view.tool_fields["scan"]["autofocus"]
+    assert page.status().autofocus_locked is False  # the demo stand reads off
+    shown = view.screens["scan"]
+    assert shown.index(view.scan_lock_text) == shown.index(view.scan_wait_text) + 1
+
+    def drawn(typed: str) -> str:
+        field.value = typed
+        view.tick()
+        # A note and never a wait: *Start the scan* stays enabled whatever it says (FM-169).
+        assert view.scan_button.disabled is False, typed
+        assert view.scan_lock_text.visible is bool(view.scan_lock_text.object), typed
+        return str(view.scan_lock_text.object)
+
+    # The field empty is the tool's default, `if-engaged`, in the words of the placeholder.
+    assert field.placeholder == "if-engaged"
+    assert drawn("") == SCAN_WITHOUT_A_LOCK
+    assert drawn("required") == SCAN_NEEDS_A_LOCK
+    assert drawn("  required  ") == SCAN_NEEDS_A_LOCK  # as the click would send it
+    assert drawn("if-engaged") == SCAN_WITHOUT_A_LOCK
+    assert drawn("off") == ""
+    assert drawn("bogus") == ""  # a value the tool would refuse says nothing
+
+    # The read decides: locked, unknown and a dry-run page say nothing, and the button stays enabled.
+    for changes in (
+        {"autofocus_locked": True},
+        {"autofocus_locked": None},
+        {"dry_run": True},
+    ):
+        _with_status(monkeypatch, page, **changes)
+        assert drawn("required") == "", changes
+    _with_status(monkeypatch, page, autofocus_locked=False)
+    assert drawn("required") == SCAN_NEEDS_A_LOCK
+
+
+def test_the_scan_screen_says_nothing_of_a_lock_while_an_activity_goes(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """During an activity the status is the latest read's: no note, so none flickers in a scan."""
+    page = make_page()
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    view = PlatePageView(page)
+    view.tool_fields["scan"]["autofocus"].value = "required"
+    view.refresh()
+    view.tick()
+    assert view.scan_lock_text.object == SCAN_NEEDS_A_LOCK
+
+    page.run("slow", [])
+    assert Slow.started.wait(BOUND_S)
+    _with_status(monkeypatch, page, autofocus_locked=False)
+    view.tick()
+    assert view.scan_lock_text.object == ""
+    assert view.scan_lock_text.visible is False
+    Slow.release.set()
+    assert page.join(BOUND_S)
+    view.tick()
+    assert view.scan_lock_text.object == SCAN_NEEDS_A_LOCK
+
+
+def test_the_scan_screen_says_nothing_of_a_lock_with_the_stand_closed(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whatever a status says, a click with the stand closed is refused for the stand first."""
+    closed = make_page(connect=False)
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    view = PlatePageView(closed)
+    view.tool_fields["scan"]["autofocus"].value = "required"
+    _with_status(monkeypatch, closed, autofocus_locked=False)
+    view.refresh()
+    view.tick()
+    assert closed.connected is False
+    assert view.scan_lock_text.object == ""
+    assert view.scan_lock_text.visible is False
+
+
+def test_the_scan_screen_says_nothing_of_a_lock_before_the_first_status_and_when_scan_did_not_load(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = make_page()
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    view = PlatePageView(page)
+    view.tool_fields["scan"]["autofocus"].value = "required"
+    view.tick()
+    assert view.scan_lock_text.object == SCAN_NEEDS_A_LOCK
+    # With no status nothing is known, so nothing is said (the view holds none until a tick).
+    view._status = None
+    view._draw_wells_scan_buttons()
+    assert view.scan_lock_text.object == ""
+    assert view.scan_lock_text.visible is False
+
+    # `scan` did not load: its field is not on the screen, and the screen says why.
+    unloaded = make_page(stubs=(Slow,))
+    unloaded_view = PlatePageView(unloaded)
+    _with_status(monkeypatch, unloaded, autofocus_locked=False)
+    unloaded_view.refresh()
+    unloaded_view.tick()
+    assert "scan" not in unloaded_view.tool_runs
+    assert unloaded_view.scan_lock_text.object == ""
+    assert unloaded_view.scan_lock_text.visible is False
