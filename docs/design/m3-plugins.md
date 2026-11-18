@@ -10,7 +10,8 @@
   (2026-11-10); the plate's orientation in its holder, §24, for issues #434
   and #422 (2026-11-11); a run's frames for whoever runs it, §25, for issue
   #447 (2026-11-11); the cells' plane in the route and the export, §26, for
-  issue #392 (2026-11-13).
+  issue #392 (2026-11-13); a registered plate that was taken out and put
+  back, §27, for issue #542 (2026-11-18).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -872,7 +873,8 @@ plate-finding ──────┴─ plate ──► scan-plan ◄────
 | `plate-finding` | `plate` | — | — | `XYStage`, `Camera` | #20 | 6 |
 | `plate-walls` | `plate` | `camera-calibration` | — | `XYStage`, `Camera` | #328 | 17 |
 | `scan-plan` | `scan-plan` | `plate` | `camera-calibration`, `timings` | `Camera` | #21 | 7 |
-| `scan` | `scan` | `scan-plan` | — | `XYStage`, `Camera` | #213 | 8 |
+| `scan` | `scan` | `scan-plan` | `plate` (#542) | `XYStage`, `Camera` | #213 | 8, 27.5 |
+| `plate-check` | `plate-check` | `plate` | `camera-calibration` | `XYStage`, `Camera` | #542 | 27 |
 | `cells` | `cells` | `scan` | — | — | #23 | 9 |
 | `density` | `density` | `scan-plan`, `scan`, `cells` | — | — | #193 | 10 |
 | `route` | `route` | `scan-plan`, `scan`, `cells` | `timings` | — | #194 | 11 |
@@ -9179,3 +9181,442 @@ At the Ti2-E, 40×, after a scan with `cell_focus` (§21.10) and `route`:
   way `PFSOffset` is written.
 - Whether a derived plane lands within the cells' depth of field of the
   scan's frame, per well and per plate.
+
+## 27. A registered plate that was taken out and put back (#542)
+
+At Ti2-E session 5 (#550, F15) the owner registered the plate with
+`plate-walls` at the 10× and scanned, then lifted the plate and put it back.
+Nothing noticed: `objective-offsets` at the 40× refused later only because the
+plate had also turned (a spread of 64.59 µm), and the 40× scan of C3 made in
+between recorded its `well_dx_um` / `well_dy_um` about (+19, −50) µm off. A
+stage position stays true; what goes stale is its reading against the wells.
+Experimenters lift and put back a plate without noticing (the owner).
+
+**The check**: before the scan's first field, and as a tool of its own
+(`plate-check`), re-measure the centres of two wells the registration measured,
+with `plate-walls`' own loop (§20.2) at the objective in place, and compare them
+with the registered centres moved into that objective's frame (§18). Beyond a
+bound the scan refuses before it takes a frame. It is FM-207's case: a
+registration is a reference measured before something else could change.
+
+**Not here**: `goto-well`, `route` and `nis-export` reading the last check (a
+drive is seen on Live; the other two move nothing: the operator runs
+`plate-check` before them, and saying in their `assumed` when the plate was last
+confirmed is a follow-up); the page's button for `plate-check` (m5, a follow-up;
+the page's scans check through the scan's defaults); a plate registered by
+`plate-registration`, `plate-finding` or the holder's estimate (no well was
+measured, and a fit's prediction carries its residual: below); `objective-offsets`'
+own moved-plate control (#389 item 1, which can call §27.4's functions); turning
+the turret back to the registration's objective to check there.
+
+### 27.1 What was measured (2026-11-18, planning #542)
+
+On throwaway prototypes that are not committed; `main` at `b0f8a60`,
+pymmcore-plus 0.18.1, useq-schema 0.9.2, numpy 2.5.3, Python 3.13.
+
+- **Session 5's move, from the run documents** (`local/scans/2026-11-17/`,
+  private; the centres are public in #542 and #550). `run.json`'s
+  `plate-walls` at 11:27 UTC against `run-recheck.json`'s, both at the 10×, 24
+  frames each (2 per side), 27.26 s and 26.71 s for three wells:
+
+  | well | registered (µm) | re-measured (µm) | difference (µm) | distance |
+  |---|---|---|---|---|
+  | B2 | (29 601.8, −9 936.3) | (29 587.35, −9 964.71) | (−14.45, −28.41) | 31.87 |
+  | B5 | (−28 924.5, −9 968.3) | (−28 941.19, −9 939.30) | (−16.69, +29.00) | 33.46 |
+  | C3 | (10 056.7, 9 544.1) | (10 061.54, 9 535.32) | (+4.84, −8.78) | 10.03 |
+
+  A rigid fit (§27.3) of B2 and B5 gives a turn of −0.0562° and a slide of
+  (−15.57, +0.30) µm; of all three, −0.0566° and (−8.77, −2.73) µm. B2 and B5
+  are the pair farthest apart (58.5 mm); C3 alone would have read 10 µm.
+- **The plate's fit cannot be the reference.** The same registration's
+  residual was 90.7 µm against a bound of 100 (F8, #541): the fit's prediction
+  for a well can be that far from its measured centre, so the check compares
+  measured centres with measured centres, as `objective-offsets` does (§20).
+- **On the demo-sample stand** turned as §20.1 (camera 30° and mirrored, plate
+  1.2°, the 10X shifted (5.0, −2.5) and the 40X (−32.5, 9.75)), `plate-walls`
+  at the 10X on A1, H12 and A12 (30 frames, 1.0 s), then `measure_well` (§20.2)
+  on A1 and H12 with the registered centres as the recorded ones:
+  - at the 10X, its own calibration: 8 frames per well (2 per side), the
+    centres within 0.020 µm of the registered ones, 0.53 s for both;
+  - at the 40X, the 40X's calibration from a document of its own, the
+    registered centres plus the 10X → 40X shift (−37.5, 12.25): 8 frames per
+    well, within 0.017 µm, 0.56 s (21 walk offsets with a search of 1000 µm,
+    step 95.9 µm; the first one finds each wall);
+  - at the 40X **without** the shift: 39.46 and 39.44 µm. A check under
+    another objective whose offset is not measured reads the offset as a move.
+- **The registration moved in the record.** `plate-walls`' record rewritten
+  with every position turned about the plate's centre (the origin) and slid,
+  by `write_stage(path, StageRecord.model_validate({**record.model_dump(mode=
+  "json"), "result": moved}))`, stays usable (`unusable("plate", ...)` is
+  `None`). The check then reads, at A1 and H12: turned 0.06°, 61.4 and 61.5
+  µm; slid (50, 0) µm, 50.0 and 50.0 µm; both, 54.6 and 96.7 µm.
+- **The cost at the stand, estimated** (no check was run there): session 5's
+  registration took 1.14 s per frame with its moves (27.26 s, 24 frames, 3
+  wells); two wells of 8 frames and the travel between them (58 mm at 63.35
+  ms/mm plus 133.8 ms per move, the session's `timings`) make **about 20 s at
+  the 10×**. At the 40× a side still takes 2 frames while the wall lies within
+  the first frame (a field of about 390 µm); a plate moved further takes up to
+  21 frames per side.
+
+### 27.2 Decisions
+
+**D1. Two wells the registration measured, at the objective in place.** By
+default the pair of `plate.walls.wells` farthest apart (the first such pair in
+the registration's order on a tie): one well sees a slide and not a turn about
+itself, and the farthest pair sees a turn at its longest lever. `plate-check`
+takes `wells` (two to six) to choose others; the scan always takes the default.
+Each well is measured by `measure_well` (§20.2): four walls, the frame centred
+on each, the circle and its refusals, unchanged. *Not chosen*: every registered
+well (half as much again for a third well that adds no lever); the scan's own
+first well (its predicted centre carries the fit's residual, §27.1).
+
+**D2. Against the registered centres, in the objective's frame.** The expected
+centre of a well is `walls.wells[i].center_xy_um + shift`, `shift` the
+translation of §18 into the objective in place: `(0, 0)` under the plate's own
+objective, the profile's offset under another. **An unknown shift is not
+guessed** (§27.1: 39.4 µm on the demo for a plate that did not move): the scan
+skips the check and says so, `plate-check` refuses. The calibration is the
+objective's own: the scan's plan's matrix when it was measured
+(`matrix_source == "camera-calibration"`), never the profile's rotation 0,
+which finds no wall on a turned camera (§17.1).
+
+**D3. The verdict: the farther well's distance against a bound of 25 µm.**
+Per well, `difference = measured − expected` and its length; the check refuses
+when the largest length is above `max_shift_um`, default **25 µm** (`gt 0`, `le
+500`). Session 5's move reads 31.9 and 33.5 µm at its farthest pair: refused.
+What the bound leaves room for: the scatter of one objective's offset across
+wells, up to 10.9 µm at session 5 (F17: wet wells against a dry one), whose mean
+is the profile's, and the re-measure's own repeatability at the stand, not yet
+measured (0.02 µm on the demo). What it lets through: 25 µm is 6 % of the 40×
+field. A chosen value, revisited at the stand (§27.9). The turn and the slide
+of §27.3 are said, never judged: the verdict is the distance a well moved.
+
+**D4. Where it runs: at the start of every scan attempt, and as a tool.**
+- **The scan** (fresh runs and `--resume` alike: a stop is when a plate is
+  lifted) checks once per attempt, after every refusal before anything moves,
+  in the first well of the attempt after that well's switch-off of the
+  autofocus (§8, #416) and before its first field, so that no lock crosses a
+  wall and the first field's engage is the one the scan already makes after
+  every wall. A plate that moved ends the scan `failed` with no frame of this
+  attempt. `check_plate=false` skips it, said in `assumed`.
+- **`plate-check`** (`smc run plate-check`) does the same alone and fills the
+  slot `plate-check`, for before a drive, a route or an NIS export. It refuses
+  where the scan skips (it has nothing else to do), and switches an engaged
+  autofocus off once as `plate-walls` does (§5.7 D1, D3).
+- *Not chosen*: a check in `goto-well` (20 s before every drive); the scan
+  reading the last `plate-check` (a check is true when it is made, and a run
+  document cannot say the plate stayed put since); turning the turret to the
+  plate's objective (a confirmed turn, FM-14, that a scan never makes, §8).
+
+**D5. The record says when the registration was last confirmed.**
+`PlateCheck.checked_utc` (the clock when the last well was measured), in
+`ScanResult.plate_check` and in the slot `plate-check`. A refused check has no
+result: its reason carries every number.
+
+### 27.3 Algorithm — `plate_check/algorithm.py` (new)
+
+Pure: numpy and `math` only.
+
+```python
+#: How far a wall may lie from where the registered centre puts it, at most.
+DEFAULT_SEARCH_UM = 1000.0
+#: The largest distance a well may have moved (D3). Chosen; revisited at the stand.
+DEFAULT_MAX_SHIFT_UM = 25.0
+
+
+def farthest_pair(
+    centres: Sequence[tuple[str, tuple[float, float]]],
+) -> tuple[str, str]: ...
+
+
+def rigid_motion(
+    expected: Sequence[tuple[float, float]],
+    measured: Sequence[tuple[float, float]],
+) -> tuple[float, tuple[float, float]]: ...
+```
+
+- `farthest_pair`: the two names whose centres are farthest apart, in the
+  order given; on a tie, the first pair met in the order `(i, j)`, `i < j`.
+  Fewer than two centres: `ValueError`.
+- `rigid_motion`: the least-squares turn (degrees) and slide that carry
+  `expected` onto `measured`, the 2-D form of Kabsch: with both sets centred on
+  their means, `turn_deg = degrees(atan2(Σ (e_x m_y − e_y m_x), Σ (e_x m_x +
+  e_y m_y)))` and `slide = mean(measured) − mean(expected)`. For two wells the
+  turn is the angle between the two vectors that join them. Fewer than two
+  points, lengths that differ, or a non-finite value: `ValueError`.
+
+### 27.4 The slot and the loop — `slots/plate_check.py`, `plate_check/loop.py` (new)
+
+```python
+class CheckedWell(SlotValue):
+    well: str
+    registered_xy_um: tuple[float, float]
+    expected_xy_um: tuple[float, float]
+    fit: WellFit
+    difference_xy_um: tuple[float, float]
+    distance_um: float = Field(ge=0.0)
+
+
+class PlateCheck(SlotValue):
+    checked_utc: AwareDatetime
+    plate: str
+    plate_objective: str | None
+    objective: str | None
+    shift_um: tuple[float, float]
+    wells: tuple[CheckedWell, ...]
+    worst_um: float = Field(ge=0.0)
+    max_shift_um: float = Field(gt=0.0)
+    turn_deg: float
+    slide_xy_um: tuple[float, float]
+    frames: int = Field(ge=0)
+    folder: str | None
+    elapsed_s: float = Field(ge=0.0)
+
+
+class PlateCheckResult(PluginResult):
+    check: PlateCheck
+```
+
+`registered_xy_um` is the registration's `center_xy_um`; `expected_xy_um` it
+plus `shift_um`; `fit` is `measure_well`'s; `difference_xy_um` is the fit's
+centre minus `expected_xy_um`; `turn_deg` and `slide_xy_um` are `rigid_motion`'s
+of the expected and the measured centres; `folder` is run-relative
+(`plate-check/<token>`) or `None`. All three are exported by
+`smc.plugins.slots`. `ScanResult` (§3.4) gains `plate_check: PlateCheck | None
+= None` (older documents and every skipped check: `None`).
+
+```python
+@dataclass(frozen=True, slots=True)
+class CheckSetup:
+    plate: str
+    plate_objective: str | None
+    objective: str | None
+    shift_um: tuple[float, float]
+    refs: tuple[WellRef, ...]
+    registered: tuple[tuple[float, float], ...]
+    walk: WallWalk
+    offsets: tuple[float, ...]
+    max_shift_um: float
+    again: str
+    assumed: tuple[str, ...]
+
+
+def prepare_check(
+    stage: str,
+    xy: XYStage,
+    plate: PlateResult,
+    wells: tuple[str, ...],
+    *,
+    objective: str | None,
+    shift_um: tuple[float, float],
+    matrix: Matrix2,
+    pixel_size_um: float,
+    shape: tuple[int, int],
+    max_shift_um: float,
+    search_um: float | None,
+    settle_s: float,
+    folder: Path | None,
+    folder_text: str | None,
+    again: str,
+) -> CheckSetup: ...
+
+
+def run_check(
+    setup: CheckSetup,
+    xy: XYStage,
+    camera: Camera,
+    ctx: RunContext,
+    on_side: Callable[[str], None],
+) -> PlateCheck: ...
+```
+
+- **`prepare_check`** moves nothing, and each refusal is a `PluginRunError`
+  of `stage`, in this order: `plate.method != "wall-images"` or `walls` is
+  `None`; `wells` empty means `farthest_pair` of the registration's wells, and
+  a given well the registration did not measure is refused (`<well> was not
+  measured by the registration: give wells among <list>`), so is one given
+  twice (after `normalise_well`) and fewer than two; `check_frame` (§20.2) with
+  the well's diameter; `checked_search(stage, search_um, r,
+  default_um=min(DEFAULT_SEARCH_UM, r))`; the step `STEP_FRACTION × min(shape) ×
+  pixel_size_um` and `check_walk_size`; `walk_offsets_um`; `check_soft_limits`
+  with the expected centres, whose line becomes `assumed`. `refs` are the
+  expected centres as `WellRef`s, in the order measured (the pair's order).
+  The walk's `no_wall_hint`: `check that the light is on, and that the plate
+  lies as it was registered: a plate moved by more than <search> µm since
+  plate-walls registered it hides {well}'s wall from this check; <again>`.
+- **`run_check`**: `xy.wait()`, the start read, the clock; each well through
+  `measure_well` (its refusals unchanged, `walk.stage` the caller's); then the
+  differences, `rigid_motion`, and `checked_utc = datetime.now(timezone.utc)`.
+  Above the bound, after the last well, the refusal (`PluginRunError` of the
+  stage, raised outside any handler, FM-98):
+  `the plate moved since plate-walls registered it: <w1> lies <d1:.1f> µm from
+  its registered centre (<dx:+.1f>, <dy:+.1f>) and <w2> <d2:.1f> µm (<dx:+.1f>,
+  <dy:+.1f>) under <objective>, more than <bound:g> µm; it turned about
+  <turn:+.3f>° and slid about (<sx:+.1f>, <sy:+.1f>) µm: <again>` (`<objective>`
+  is `no turret` when `None`; with more wells, each is named in order). On any
+  exception during the moves, `warn_left(stage, ctx, xy, start, where)` and the
+  exception goes on (FM-88, FM-64), as `plate-walls`. Nothing touches the
+  autofocus, the turret or Z: the caller decides (D4).
+- `again`: the scan's is `register it again (plate-walls), then run scan-plan
+  and scan again, without --resume: frames already taken are placed against the
+  old registration`; `plate-check`'s is `register it again (plate-walls) before
+  a scan, a drive to a well, a route or an NIS export`.
+
+### 27.5 In the scan — `scan/plugin.py`
+
+`ScanParams` gains, after `autofocus`:
+
+```python
+check_plate: bool = Field(
+    True,
+    description=(
+        "Before the first field, re-measure two wells plate-walls measured and "
+        "refuse a plate that moved more than max_plate_shift_um since (about 20 s "
+        "at the 10x)."
+    ),
+)
+max_plate_shift_um: float = Field(
+    DEFAULT_MAX_SHIFT_UM,
+    gt=0.0,
+    le=500.0,
+    description="How far a checked well may lie from its registered centre, in µm.",
+)
+```
+
+`reads_optional = ("plate",)`. **Before anything moves**, after `_check_disk`
+and the focus step's checks, `_prepare_plate_check(...) -> tuple[CheckSetup |
+None, str | None]`: a setup, or the line that says why there is none. In this
+order, each a skip, logged once at WARNING, its line in `assumed`:
+
+| condition | line |
+|---|---|
+| `check_plate` is false | `the plate was not checked against its registration (check_plate=false)` |
+| a dry run | `dry run: the plate was not checked against its registration` |
+| `plate` not read | `the plate was not checked: plate not read: <ctx.why_not_read("plate")>` |
+| not `wall-images` | `the plate was not checked: it was registered by <method>, which measures no well's walls (plate-walls does)` |
+| `plan.plate_objective != plate.objective` | `the plate was not checked: the plan was made from a registration under <a>, the plate record is under <b>` |
+| `plan.objective_shift_um` is `None` | `the plate was not checked: the offset between <plate objective> and <plan objective> is not measured (the profile's [objectives]), and a check would read it as a move` |
+| `plan.matrix_source != "camera-calibration"` | `the plate was not checked: the plan's camera matrix is the <source>'s, and a wall is looked for with a measured one only` |
+
+Otherwise `prepare_check(_NAME, xy, plate, (), objective=plan.objective,
+shift_um=plan.objective_shift_um, matrix=plan.matrix_um_per_px, pixel_size_um=
+plan.pixel_size_um, shape=plan.image_shape_px, max_shift_um=params.
+max_plate_shift_um, search_um=None, settle_s=0.0, folder=ctx.run_dir /
+"plate-check" / token, folder_text=f"plate-check/{token}", again=<the scan's>)`,
+`token = new_token()`; its refusals refuse the scan before anything moves.
+
+**In the loop**, for the first well of the attempt only, after `_check_well`
+and `_switch_off_at_wall`: `run_check(setup, xy, camera, ctx, on_side)`, whose
+`on_side` calls `ctx.progress(done, total, f"checking the plate: {text}")`. A
+`PluginRunError` from it, when that switch-off returned `True`, is raised again
+after the handler with `AUTOFOCUS_LEFT_OFF` (§5.7 D3) appended; otherwise it
+passes. The first field then engages the autofocus as after any wall
+(`after_wall`), unchanged.
+
+**The result**: `plate_check` is the check, and its line comes first after
+`stand.assumed`: `the plate was checked before the first field: <w1> and <w2>
+lie within <worst:.1f> µm of their registered centres under <objective> (bound
+<b:g> µm), at <checked_utc to the second>`, or the skip's line. A save error
+of a check frame adds the walk's own line (§17.4 step 4).
+
+**For #549** (the scan's time estimate): the check adds about 20 s at the 10×
+to every attempt (§27.1).
+
+### 27.6 The tool — `plate_check/plugin.py` (new)
+
+Entry point `plate-check = "smc.plugins.plate_check.plugin:PlateCheckPlugin"`.
+
+```python
+class PlateCheckParams(PluginParams):
+    wells: tuple[str, ...] = Field((), max_length=6)
+    max_shift_um: float = Field(DEFAULT_MAX_SHIFT_UM, gt=0.0, le=500.0)
+    calibration: Path | None = None
+    search_um: float | None = Field(None, gt=0.0, le=MAX_XY_OFFSET_UM)
+    settle_ms: float = Field(0.0, ge=0.0, le=10_000.0)
+    save_frames: bool = True
+```
+
+`requires = (XYStage, Camera)`, `reads = ("plate",)`, `reads_optional =
+("camera-calibration",)`, `provides = "plate-check"`. No checkpoint. Its `run`
+is its body through `run_saying_autofocus_left_off` (§5.7 D3). **Before
+anything moves**, each a `PluginRunError` and nothing moved: a dry run (`a dry
+run cannot image the walls; run it without --dry-run`); `objective_for(_NAME,
+None, turret)`; `plate_for_objective(plate, objective, turret)`, whose
+`shift_um` `None` is refused: `the offset between <a> and <b> is not measured
+(the profile's [objectives]): check the plate with <a> in place, or measure the
+offsets (objective-offsets)`; the calibration — `calibration` given:
+`calibration_from(_NAME, path, ...)` (§20.3); else the run document's
+`camera-calibration` (`upstream_or_none`); none: `no camera calibration of
+<objective>: give calibration=<a run document whose camera-calibration was made
+with it in place> (m5 §18.6)` — then `check_calibration` (§20.2) against the
+objective in place and the camera's shape; `prepare_check`. Then
+`ctx.raise_if_stopped()`, `switch_off_autofocus` (its line first in
+`assumed`), `run_check`, and one move to the last well's fitted centre (as
+`plate-walls`, §17.4 *The end*). `assumed`: the autofocus line, the soft-limits
+line, the saving line, then `the plate was checked under <objective>: <w1> and
+<w2> within <worst:.1f> µm of their registered centres (bound <b:g> µm)`.
+
+### 27.7 Docs
+
+- `docs/plugins/plate-check.md` (new): what it measures, when to run it (after
+  the plate was handled, before a drive, a route or an NIS export), its cost,
+  the bound and the refusal, under another objective (the profile's offset).
+- `docs/plugins/scan.md`: the check at every attempt, `check_plate`,
+  `max_plate_shift_um`, the skips.
+- `docs/plugins/plate-walls.md`: one line beside the registration: a plate
+  lifted and put back is registered again, and the scan checks it.
+- `docs/design/failure-modes.md`, FM-207: the case at the stand, and this check.
+
+### 27.8 Tests
+
+- **Pure** (`tests/test_plate_check_algorithm.py`):
+  `test_session_5s_move_reads_as_a_turn_of_minus_0_056_degrees` (B2 and B5 of
+  §27.1: −0.0562° within 0.0005°, the slide within 0.01 µm),
+  `test_a_pure_slide_reads_no_turn`,
+  `test_the_pair_farthest_apart_is_chosen_and_a_tie_keeps_the_registrations_order`,
+  `test_rigid_motion_refuses_fewer_than_two_points_and_a_nan`.
+- **The tool on the demo-sample stand** (`tests/test_plate_check_demo.py`,
+  §20.1's stand and documents): `test_a_plate_that_did_not_move_passes_under_its_own_objective`
+  (worst below 0.1 µm, 16 frames, `checked_utc` between the clock before and
+  after); `test_a_plate_that_did_not_move_passes_under_the_40x_with_the_profiles_offset`;
+  `test_a_plate_moved_50_um_in_the_record_is_refused_naming_both_wells` and
+  `test_a_plate_turned_0_06_degrees_in_the_record_is_refused` (the record moved
+  as §27.1); `test_an_unmeasured_offset_is_refused_before_anything_moves`;
+  `test_a_plate_registered_by_eye_is_refused_before_anything_moves`;
+  `test_a_well_the_registration_did_not_measure_is_refused`;
+  `test_a_dry_run_is_refused`;
+  `test_an_engaged_autofocus_is_switched_off_before_the_first_move_and_said_first`
+  (`RecordingAutofocus`).
+- **The scan** (`tests/test_scan_plate_check_demo.py`):
+  `test_the_scan_refuses_a_plate_moved_50_um_in_the_record_before_its_first_frame`
+  and `test_the_scan_refuses_a_plate_turned_0_06_degrees_in_the_record_before_its_first_frame`
+  (no frame file, the reason names both wells and the bound);
+  `test_a_scan_of_a_plate_that_did_not_move_records_its_check_and_says_so`;
+  `test_the_check_runs_again_on_a_resume` (a stop after the first well, the
+  record moved, `--resume` refused);
+  `test_check_plate_false_skips_the_check_and_says_so`;
+  `test_a_dry_run_scan_does_not_check_the_plate_and_says_so`;
+  `test_a_scan_under_an_objective_with_no_measured_offset_skips_the_check_and_says_so`;
+  `test_a_plate_registered_by_plate_registration_is_not_checked_and_said`;
+  `test_with_a_locked_autofocus_the_check_walks_with_it_off_and_the_first_field_engages_it_again`
+  and `test_a_refused_check_after_the_switch_off_says_the_autofocus_was_left_off`
+  (`RecordingAutofocus`: the switch-off before the check's first move).
+
+The moved records differ from the bound by far (50.0 and 61.4 µm against 25);
+the unmoved plate reads 0.02 µm.
+
+**Failure modes**: FM-19, FM-64, FM-73, FM-88, FM-98, FM-125, FM-142, FM-165,
+FM-207, FM-216, FM-223.
+
+### 27.9 Not verified (for the owner)
+
+At the Ti2-E, next visit:
+- **The re-measure's repeatability**: `plate-check` twice in a row at the 10×
+  with the plate untouched, then at the 40× (with its own calibration and a
+  measured offset): the distances it reads are the floor of the bound.
+- **A lifted plate**: lift it, put it back, `plate-check`: refused, and its
+  numbers against a `plate-walls` recheck's.
+- **The cost**: the time of `plate-check` at the 10× and the 40× against
+  §27.1's 20 s.
+- **The walls at the 40× with PFS off at the plane PFS held**: found, as
+  `objective-offsets` found them at session 5.
