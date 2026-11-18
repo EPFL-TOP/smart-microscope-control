@@ -41,6 +41,8 @@ from smc.hardware.capabilities import (
     XY,
     Autofocus,
     Camera,
+    FocusReference,
+    FocusStabilized,
     FocusStep,
     Limits,
     ObjectiveOffset,
@@ -50,6 +52,7 @@ from smc.hardware.capabilities import (
 )
 from smc.hardware.errors import (
     AutofocusExcursionError,
+    AutofocusUnsupportedError,
     CoreError,
     DeviceTimeoutError,
     HardwareError,
@@ -89,6 +92,8 @@ MUTATING = {
     "set_offset_native",
     "offset_by_native",
     "focus_by_um",
+    "learn_reference",
+    "stabilize_now",
 }
 
 
@@ -305,6 +310,16 @@ class _Autofocus:
     def focus_by_um(self, dz_um: float, *, force: bool = False) -> FocusStep:
         self.calls.append("focus_by_um")
         raise AssertionError("the scan never focuses")
+
+    def learn_reference(self) -> FocusReference:
+        """PFS's answer (m4 §11.5): it holds focus continuously."""
+        self.calls.append("learn_reference")
+        raise AutofocusUnsupportedError("learn_reference() on the fake: engage()")
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        """PFS's answer (m4 §11.5): it holds focus continuously."""
+        self.calls.append("stabilize_now")
+        raise AutofocusUnsupportedError("stabilize_now() on the fake: engage()")
 
 
 @dataclass

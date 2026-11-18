@@ -38,6 +38,8 @@ __all__ = [
     "Camera",
     "ChannelPreset",
     "Channels",
+    "FocusReference",
+    "FocusStabilized",
     "FocusStep",
     "LightSource",
     "Limits",
@@ -81,6 +83,41 @@ class FocusStep:
     z_um: float | None
     #: The offset afterwards, in its own units, when ``via == "offset"``; else ``None``.
     offset_native: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class FocusReference:
+    """A focal plane as the autofocus records it (m4 §11.5); opaque to the layer.
+
+    Definite Focus 2 learns a plane as a blob of its own (9 bytes on the
+    Observer 7) and brings focus back to it later, at any position: one per
+    position is how a run keeps several heights in focus. The layer never
+    reads inside it; it checks only whose it is and through which objective
+    it was learned, because a plane learned through another objective is not
+    the one in focus now (FM-223).
+    """
+
+    #: The autofocus device that learned it; another device refuses it.
+    device: str
+    #: The device's own bytes as base64 (ASCII): a run document holds it as text.
+    data: str
+    #: The objective in place when it was learned; ``None``: no turret.
+    objective: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class FocusStabilized:
+    """What one ``Autofocus.stabilize_now`` did (m4 §11.5).
+
+    Both Z readings are the focus drive's, so a caller sees how far the
+    autofocus moved it: on the Observer 7, DF2 corrects through the focus
+    drive, and its own move is the only record of it.
+    """
+
+    reference: FocusReference
+    #: The focus drive before and after; ``None``: the stand has no focus drive.
+    z_before_um: float | None
+    z_um: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,13 +332,20 @@ class Shutter(Protocol):
 
 @runtime_checkable
 class Autofocus(Protocol):
-    """A continuous (hardware) autofocus: Nikon PFS, Zeiss Definite Focus (m2 §3).
+    """A hardware autofocus: Nikon PFS, Zeiss Definite Focus 2 (m2 §3, m4 §11.5).
 
-    Engaged, it holds the focal plane by driving the focus drive itself, at
-    an *offset* in the device's own units, which no profile can convert to
-    µm without a measurement. So every value in those units ends in
-    ``_native``, and ``focus_by_um`` takes µm and converts only through a
-    factor the profile states as measured (``[autofocus] offset_per_um``).
+    It holds focus one of two ways, and each stand's says which by raising
+    ``AutofocusUnsupportedError`` (nothing sent) for the other:
+
+    * **Continuously** (PFS): ``engage`` switches it on and it holds the
+      focal plane by driving the focus drive itself, at an *offset* in the
+      device's own units, which no profile can convert to µm without a
+      measurement. So every value in those units ends in ``_native``, and
+      ``focus_by_um`` takes µm and converts only through a factor the
+      profile states as measured (``[autofocus] offset_per_um``).
+    * **One shot at a time** (DF2): ``learn_reference`` records the plane in
+      focus, and ``stabilize_now`` brings focus back to it once and leaves
+      it there. Its offset is zero by construction.
 
     ``engage`` returns ``False`` when no lock came, and the autofocus is then
     off: one left searching can move Z with no action holding the
@@ -395,6 +439,35 @@ class Autofocus(Protocol):
         Off: a Z move. Locked: an offset change of ``dz_um`` times the
         profile's measured factor for the current objective, then a relock.
         On but not locked, or locked with no factor: refused, not forceable.
+        """
+        ...
+
+    def learn_reference(self) -> FocusReference:
+        """Record the plane in focus now as the reference; nothing moves.
+
+        The reference is held from then on, for ``stabilize_now()`` without
+        one. In dry-run nothing is sent and its ``data`` is ``""``.
+
+        Raises:
+            AutofocusUnsupportedError: This autofocus holds focus
+                continuously (PFS); nothing was sent.
+        """
+        ...
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        """Bring focus to ``reference`` (else the one held) once, and leave it there.
+
+        It moves the focus drive by itself: the move is read after it, never
+        stopped during it (m4 §11.6).
+
+        Raises:
+            AutofocusUnsupportedError: This autofocus holds focus
+                continuously (PFS); nothing was sent.
+            SafetyRefusedError: No reference, one of another device or
+                objective, or one the stand cannot correct to; not
+                forceable, and nothing was sent.
+            AutofocusExcursionError: It moved Z beyond the profile's bound
+                and left it there.
         """
         ...
 

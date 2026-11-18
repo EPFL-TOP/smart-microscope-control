@@ -70,6 +70,8 @@ from typing import (
 from smc.hardware.capabilities import (
     XY,
     ChannelPreset,
+    FocusReference,
+    FocusStabilized,
     FocusStep,
     Limits,
     PropertyInfo,
@@ -84,6 +86,7 @@ from smc.hardware.channels import (
 from smc.hardware.errors import (
     AutofocusExcursionError,
     AutofocusLostError,
+    AutofocusUnsupportedError,
     CapabilityMissingError,
     DeviceTimeoutError,
     HardwareError,
@@ -2926,6 +2929,30 @@ class MMAutofocus:
         except Exception as exc:
             logger.debug("autofocus %s: Z read failed (%s)", self._label, _named(exc))
             return None
+
+    # --- the one-shot mode, which this autofocus has not (m4 §11.5) ----------
+
+    def _one_shot_refused(self, call: str) -> AutofocusUnsupportedError:
+        return AutofocusUnsupportedError(
+            f"autofocus {self._label}: {call} is not supported: it holds focus "
+            f"continuously (PFS): engage(); nothing was sent"
+        )
+
+    def learn_reference(self) -> FocusReference:
+        """Refused: it holds focus continuously, and learns no reference (m4 §11.5).
+
+        Raises:
+            AutofocusUnsupportedError: Always, before anything is sent.
+        """
+        raise self._one_shot_refused("learn_reference()")
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        """Refused: it holds focus continuously, not one shot at a time (m4 §11.5).
+
+        Raises:
+            AutofocusUnsupportedError: Always, before anything is sent.
+        """
+        raise self._one_shot_refused("stabilize_now()")
 
 
 def _magnification_factor(core: CMMCorePlus, for_what: str) -> float | None:

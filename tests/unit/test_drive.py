@@ -21,6 +21,8 @@ from smc.hardware import Microscope
 from smc.hardware.capabilities import (
     XY,
     Autofocus,
+    FocusReference,
+    FocusStabilized,
     FocusStep,
     LightSource,
     Limits,
@@ -30,7 +32,11 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
-from smc.hardware.errors import HardwareError, SafetyRefusedError
+from smc.hardware.errors import (
+    AutofocusUnsupportedError,
+    HardwareError,
+    SafetyRefusedError,
+)
 from smc.hardware.microscope import MicroscopeState, autofocus_known, describe_autofocus
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
@@ -172,6 +178,12 @@ class NeverLocks:
 
     def focus_by_um(self, dz_um: float, *, force: bool = False) -> FocusStep:
         raise NotImplementedError
+
+    def learn_reference(self) -> FocusReference:
+        raise AutofocusUnsupportedError("learn_reference() on the stub: engage()")
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        raise AutofocusUnsupportedError("stabilize_now() on the stub: engage()")
 
 
 class StuckLight:

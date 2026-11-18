@@ -11,6 +11,8 @@ from smc.hardware.capabilities import (
     Autofocus,
     ChannelPreset,
     Channels,
+    FocusReference,
+    FocusStabilized,
     FocusStep,
     LightSource,
     ObjectiveOffset,
@@ -19,6 +21,7 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
+from smc.hardware.errors import AutofocusUnsupportedError
 
 
 def test_value_types_are_frozen() -> None:
@@ -114,10 +117,23 @@ class _AutofocusWithoutFocusBy:
     def offset_limits_native(self) -> tuple[float, float] | None:
         return None
 
+    def learn_reference(self) -> FocusReference:
+        raise AutofocusUnsupportedError("learn_reference() on a test double")
+
+    def stabilize_now(self, reference: FocusReference | None = None) -> FocusStabilized:
+        raise AutofocusUnsupportedError("stabilize_now() on a test double")
+
 
 class _AutofocusWithFocusBy(_AutofocusWithoutFocusBy):
     def focus_by_um(self, dz_um: float, *, force: bool = False) -> FocusStep:
         return FocusStep("z", dz_um, None)
+
+
+class _AutofocusWithoutOneShot(_AutofocusWithFocusBy):
+    """Every ``Autofocus`` method of m2 §3, and none of m4 §11.5."""
+
+    learn_reference = None  # type: ignore[assignment]
+    stabilize_now = None  # type: ignore[assignment]
 
 
 def test_a_class_without_focus_by_um_is_not_an_autofocus() -> None:
@@ -125,6 +141,21 @@ def test_a_class_without_focus_by_um_is_not_an_autofocus() -> None:
     # only the native offset calls must not pass for an Autofocus.
     assert not isinstance(_AutofocusWithoutFocusBy(), Autofocus)
     assert isinstance(_AutofocusWithFocusBy(), Autofocus)
+
+
+def test_a_class_without_the_one_shot_mode_is_not_an_autofocus() -> None:
+    # m4 §11.5: Microscope.override checks isinstance, so a double written for
+    # m2 alone must say how it answers learn_reference and stabilize_now.
+    assert not isinstance(_AutofocusWithoutOneShot(), Autofocus)
+
+
+def test_focus_reference_and_stabilized_are_frozen() -> None:
+    reference = FocusReference("DefiniteFocus", "AAECAwQFBgcI", "Fluar 10x/0.50")
+    done = FocusStabilized(reference, 1000.0, 1000.02)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        reference.data = ""  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        done.z_um = 0.0  # type: ignore[misc]
 
 
 def test_focus_step_is_frozen() -> None:
