@@ -96,6 +96,11 @@ them if it is not the one you run on.
      Literal` line **before** the annotation, or the formatter (ruff UP037)
      reads the strings as forward references and strips their quotes
      (#331, #341); a module-level alias also works.
+   - **Commit only when no `pytest` of this worktree is running**: the
+     pre-commit hook stashes the unstaged files for the time of the commit,
+     so a test that reads the tree (a docs-reading test, a mutant's file)
+     can see them missing or changed. Wait for the background run to end,
+     then commit (#487, #513, #514).
 
 ## Implement
 
