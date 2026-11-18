@@ -777,7 +777,8 @@ def test_the_lock_count_is_the_number_of_wells_not_of_fields() -> None:
     assert refocus_count(many) == 3
     assert len(many) == 6
     assert refocus_count(tuple(_field_in("B4", i, 0.0, 0.0) for i in range(5))) == 1
-    # The scan groups by well: a well visited twice is locked twice (A1, A2, A1).
+    # A well that appears twice in the order is locked once: the scan groups its
+    # fields by well (A1, A2, A1 is two wells, not three runs).
     again = (
         _field_in("A1", 0, 0.0, 0.0),
         _field_in("A2", 0, 0.0, 0.0),

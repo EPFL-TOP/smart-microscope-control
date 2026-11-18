@@ -1118,6 +1118,19 @@ def test_the_scan_plan_card_says_what_its_estimate_sums_in_each_of_three_cases()
     assert scan_plan_card_lines(_scan_plan(estimate_s=None))[-1] == (
         "estimate: unknown, no usable timing: run timing, then scan-plan again"
     )
+    # A figure of 0 is a figure (FM-170): a second one of 0 under 2 s is a counted lock,
+    # and two of 0 are none, neither read as the older plan's missing figure.
+    zero_without = scan_plan_card_lines(
+        _scan_plan(estimate_s=2.0, estimate_without_autofocus_s=0.0)
+    )[-1]
+    assert zero_without == (
+        "estimate: about 2 s (the moves, the autofocus locked again in each well, "
+        "and the snaps of the timings)"
+    )
+    both_zero = scan_plan_card_lines(
+        _scan_plan(estimate_s=0.0, estimate_without_autofocus_s=0.0)
+    )[-1]
+    assert both_zero == "estimate: about 0 s (the moves and snaps of the timings)"
 
 
 def test_scan_plan_card_names_the_wells_in_the_plans_order_and_cuts_after_six() -> None:
@@ -2482,6 +2495,30 @@ def test_the_time_line_is_the_plain_figure_when_there_is_nothing_to_say_about_th
     # Unknown stays unknown: never `0 s` (FM-170).
     unknown = _plan(estimate_s=None)
     assert time_line(unknown, autofocus) == TIME_NOT_KNOWN
+
+
+@pytest.mark.parametrize("autofocus", ["off", "required", "if-engaged", ""])
+def test_a_measured_zero_is_a_time_and_not_an_unknown(autofocus: str) -> None:
+    # FM-170 both ways: 0 is a figure (a plan of nothing, or a stand whose scan without
+    # the autofocus costs nothing), and only `None` is not known.
+    assert time_line(_plan(estimate_s=0.0), autofocus) == "Time: about 0 s"
+    assert (
+        time_line(_plan(estimate_s=0.0, estimate_without_autofocus_s=0.0), autofocus)
+        == "Time: about 0 s"
+    )
+    # A second figure of 0 under a first of 2 s is a lock counted, not an absent figure.
+    plan = _plan(estimate_s=2.0, estimate_without_autofocus_s=0.0)
+    expected = {
+        "off": "Time: about 0 s, with the autofocus not used",
+        "required": f"Time: about 2 s, {LOCKED_EACH_WELL}",
+        "if-engaged": (
+            f"Time: about 2 s, {LOCKED_EACH_WELL}; about 0 s if it is off at the start"
+        ),
+        "": (
+            f"Time: about 2 s, {LOCKED_EACH_WELL}; about 0 s if it is off at the start"
+        ),
+    }
+    assert time_line(plan, autofocus) == expected[autofocus]
 
 
 def test_the_if_engaged_clause_is_left_out_when_the_two_durations_read_the_same() -> (

@@ -974,8 +974,14 @@ def test_a_second_estimate_above_the_first_is_refused() -> None:
     assert ScanPlanResult.model_validate(equal).estimate_s == 10.0
 
 
-def test_a_second_estimate_without_a_first_is_refused() -> None:
-    sample = {**_SCAN_PLAN, "estimate_s": None, "estimate_without_autofocus_s": 1.0}
+@pytest.mark.parametrize("without", [1.0, 0.0])
+def test_a_second_estimate_without_a_first_is_refused(without: float) -> None:
+    # A figure of 0 is a figure (FM-170): refused as 1.0 is, not read as absent.
+    sample = {
+        **_SCAN_PLAN,
+        "estimate_s": None,
+        "estimate_without_autofocus_s": without,
+    }
     with pytest.raises(ValidationError) as raised:
         ScanPlanResult.model_validate(sample)
     (error,) = raised.value.errors()
