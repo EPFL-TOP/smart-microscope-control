@@ -281,9 +281,10 @@ class FakeFocusStabilizer:
     """Definite Focus 2 (m4 §11.3): learns the focus drive's plane, restores it, stabilizes once.
 
     It acts on the focus axis it is given, as DF2 corrects through the focus
-    drive on the Observer 7 (m4 §11.1). ``learn`` returns a new 9-byte blob at
-    each call (bytes above 0x7F included) and records the focus position as
-    its plane; ``restore`` makes a blob it learned the held one, and answers
+    drive on the Observer 7 (m4 §11.1). ``learn`` takes ``move_s``, as DF2
+    measures for a moment, returns a new 9-byte blob at each call (bytes
+    above 0x7F included) and records the focus position as its plane, which
+    it then holds; ``restore`` makes a blob it learned the held one, and answers
     ``False`` to any other; ``stabilize_now`` moves the focus axis to the held
     plane as ``FakeAxis`` moves (a straight line over ``move_s``) and answers
     ``False`` with none held, or when ``stop`` ended it where the axis was.
@@ -329,6 +330,9 @@ class FakeFocusStabilizer:
                 f"{self.mtb_id}: InitOnCurrentFocusPosition answered False and gave "
                 "no reference (fake)"
             )
+        if self.move_s > 0:
+            # DF2 measures for a moment: 0.4 s at the stand (m4 §11.1).
+            time.sleep(self.move_s)
         with self._lock:
             blob = bytes((0xDF, 0x02, 0xF0)) + len(self.planes).to_bytes(6, "big")
             self.planes[blob] = self._focus.position_um()
