@@ -156,3 +156,11 @@ session may refuse the `git -c url…insteadOf` form: write the https URL out),
 because the worktree starts at the main checkout's local `HEAD`, which can lag
 `origin/main`. A plan that needs a live walk with the owner is not a lane
 step: `/point` writes it "with you".
+
+## Before you end
+
+A plan session that the owner opened (not a lane's subagent: the lane cleans
+when it ends) finishes with `python scripts/dev/worktree.py clean` from the
+main checkout, after the plan is posted. It removes the worktrees and
+branches of merged pull requests; the worktree of the design PR this session
+opened stays until that PR is merged.
