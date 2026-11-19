@@ -32,8 +32,12 @@ _STARTS_ABSOLUTE = re.compile(r"/|[A-Za-z]:[\\/]|\\\\")
 #: ``file:///`` and ``http://`` are not drives), a UNC path, and a POSIX path of
 #: two components or more that does not continue a word, a URL or a relative
 #: path (``a/b/c``, ``~/x`` and ``ratio and/or`` stay as they are). Each runs
-#: to the next blank or quote, so a path with spaces inside a sentence loses
-#: only its first words' worth of context: known gaps, see the design.
+#: to the next blank or quote. Known gap, pinned in
+#: ``test_the_known_gaps_are_pinned``: a folder name with a blank in it, in a
+#: sentence (``C:\Users\Jane Doe\x``), is cut at the blank and the rest of the
+#: name stays. Design §2.2 does not list it (it lists ``file:///`` and
+#: ``/media/<name>``); the plan deviation on #565 asks the owner whether to
+#: accept it or to close it in the rule.
 _INSIDE = re.compile(
     r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^\s'\"]*"
     r"|\\\\[^\s'\"]*"

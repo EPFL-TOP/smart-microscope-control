@@ -304,6 +304,76 @@ def test_an_unreadable_file_is_a_problem_not_a_crash(
     assert checked == list(manifest.files)  # the others were still checked
 
 
+def _fail_for(
+    monkeypatch: pytest.MonkeyPatch, name: str, target: Path, error: OSError
+) -> None:
+    """Make ``Path.<name>`` raise ``error`` for ``target`` only, as a share that drops does."""
+    original = getattr(Path, name)
+
+    def refuse(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == target:
+            raise error
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, name, refuse)
+
+
+def test_a_folder_that_cannot_be_examined_is_not_a_folder_to_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-116: `is_dir` of a share that dropped raises; the refusal is the one of
+    # a path that is not a folder, not a traceback.
+    _, out, _ = _exported(tmp_path)
+    _fail_for(
+        monkeypatch,
+        "is_dir",
+        out,
+        OSError(64, "The specified network name is no longer available"),
+    )
+
+    with pytest.raises(DatasetError, match="is not a folder") as caught:
+        check_dataset(out)
+    assert str(out) in str(caught.value)
+
+
+def test_a_manifest_that_cannot_be_read_is_a_refusal_that_starts_with_its_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, out, _ = _exported(tmp_path)
+    _fail_for(
+        monkeypatch,
+        "read_bytes",
+        out / "manifest.json",
+        OSError(5, "Input/output error"),
+    )
+
+    with pytest.raises(DatasetError) as caught:
+        check_dataset(out)
+    assert str(caught.value).startswith(str(out / "manifest.json"))
+    assert "cannot be read (Input/output error)" in str(caught.value)
+    assert isinstance(caught.value.__cause__, OSError)
+
+
+def test_a_file_whose_stat_fails_is_a_problem_and_the_others_are_still_checked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed, out, manifest = _exported(tmp_path)
+    locked = _frames(seed)[3]
+    original = Path.stat
+
+    def refuses_one(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.as_posix().endswith("/" + locked):
+            raise PermissionError(13, "Permission denied")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", refuses_one)
+    result = check_dataset(out)
+
+    assert result.problems == (f"{locked}: cannot be read (Permission denied)",)
+    assert result.scan is None
+    assert result.manifest == manifest
+
+
 def test_progress_is_called_once_per_listed_file(tmp_path: Path) -> None:
     _, out, manifest = _exported(tmp_path)
     calls: list[tuple[int, int]] = []

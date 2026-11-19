@@ -29,6 +29,13 @@ WHOLE = {
     "/Users/alice/My Models/m.pt": "m.pt",
     "/Volumes/lab/alice/x.pt": "x.pt",
     r"D:\data\alice\x.pt": "x.pt",
+    # A blank in the account's own name, and a root written in another case: a
+    # whole string is one path whatever it holds (adversarial review of #565).
+    r"C:\Users\Alice Smith\models\m.pt": "m.pt",
+    r"\\server\Alice Smith\x.pt": "x.pt",
+    r"c:\users\alice\m.pt": "m.pt",
+    r"C:\USERS\alice\m.pt": "m.pt",
+    "/USERS/alice/x.pt": "x.pt",
 }
 
 #: A path inside a sentence: each becomes its last component and the words stay.
@@ -53,6 +60,12 @@ TILDES = [
     "C:\\",
     "/Users",
     "/home/",
+    # The account root is case-insensitive: a mutant that compares it as written
+    # writes `alice` for these (Windows paths are often typed in lower case).
+    r"c:\users\alice",
+    "/USERS/alice",
+    "/Home/alice/",
+    r"C:\Users\Alice Smith",
 ]
 
 #: Text that is not a path, and must come back as it went in.
@@ -66,6 +79,15 @@ NOT_PATHS = [
     "x /y z",
     "",
     "µm",
+    # Each character of the POSIX pattern's lookbehind keeps one of these whole:
+    # a relative path (`.`), a host and a path (`:`), a word and a dash (`-`),
+    # and of the drive pattern's, a digit before the letter.
+    "./models/m.pt",
+    "../data/alice/x.tif",
+    "see ./data/run/x.pt",
+    "host:/b/c",
+    "a-/b/c",
+    r"id3e:\x",
 ]
 
 
@@ -97,6 +119,15 @@ def test_text_that_is_not_a_path_is_left_alone(text: str) -> None:
         # files, so the name survives whole or in a sentence.
         ("/media/alice", "alice"),
         ("see /media/alice here", "see alice here"),
+        # A blank inside a folder name, in a sentence: the path inside the text
+        # runs to the next blank, so the rest of the name stays. A whole string
+        # is not affected (`C:\Users\Alice Smith\x` is in WHOLE). Found by the
+        # adversarial review of #565, and not in design §2.2's list of gaps.
+        (r"run folder C:\Users\Jane Doe\smc\run1", r"run folder ~ Doe\smc\run1"),
+        (
+            r"cannot open \\labserver\home dirs\alice\m.pt: not found",
+            r"cannot open ~ dirs\alice\m.pt: not found",
+        ),
     ],
 )
 def test_the_known_gaps_are_pinned(text: str, as_scrubbed: str) -> None:
@@ -245,6 +276,23 @@ def test_scrub_document_lists_the_pointers_of_the_rewritten_values_in_order() ->
     assert scan.result == {"assumed": ["m.pt", "a plain line"]}
     assert scan.error == "cannot open x.tif: not found"
     assert document.stages["cells"].checkpoint == {"out": "t.json"}
+
+
+def test_a_failed_stage_lists_its_checkpoint_before_its_error() -> None:
+    # The order of the manifest's `scrubbed` is a contract (params, result,
+    # checkpoint, error): a failed `cells` stage has both a checkpoint and an
+    # error that quote a path, and no other stage of the document does.
+    document = _document(
+        _record(
+            "cells",
+            "cells",
+            status=StageStatus.failed,
+            checkpoint={"out": "/home/alice/cells/t.json"},
+            error="cannot open /home/alice/x.tif: not found",
+        )
+    )
+    _, pointers = scrub_document(document)
+    assert pointers == ("/stages/cells/checkpoint/out", "/stages/cells/error")
 
 
 def test_a_stage_name_with_a_slash_is_escaped_in_its_pointer() -> None:

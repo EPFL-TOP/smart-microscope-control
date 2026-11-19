@@ -264,7 +264,8 @@ def readme_text(
         "",
         '    scan = load_scan("run.json")',
         "    scan.wells                      # the wells, in the plan's order",
-        '    frame = scan.frames("A1")[0]',
+        # The scan's own first well: a scan of other wells than A1 must run this too.
+        f'    frame = scan.frames("{manifest.wells[0] if manifest.wells else "A1"}")[0]',
         "    pixels = scan.image(frame)      # a numpy array, (height, width)",
         "    scan.cells                      # the cells, or None: scan.cells_absent says why",
         "",
@@ -290,8 +291,9 @@ def readme_text(
         "but the files those stages wrote (reports, drawings, exports) are not here.",
         "",
         "Paths in the parameters, results and errors of run.json were cut to their",
-        "last component, so that no account or host name travels with the dataset;",
-        'manifest.json lists the values it rewrote under "scrubbed".',
+        "last component, which removes the account and host names they held; one",
+        "exception is known: a folder name with a blank in it, inside a sentence, is",
+        'cut at the blank. manifest.json lists the values it rewrote under "scrubbed".',
         "",
     ]
     return "\n".join(lines)
@@ -343,23 +345,51 @@ def _check_out(out: Path) -> Path:
 
 
 def _frame_sources(run_doc: Path, scan: Scan) -> list[tuple[str, Path, int]]:
-    """Each frame's relative path, its source file and its size; a refusal naming the ones that are missing.
+    """Each frame's relative path, its source file and its size; a refusal naming the ones that are missing, or that the disk will not say.
 
     A frame whose path cannot be resolved inside the run folder (a ``..``, an
-    absolute path from another PC) counts as missing, and is never read.
+    absolute path from another PC) counts as missing, and is never read. A
+    frame that the file system *cannot answer for* (a share that dropped:
+    ``resolve_in_run`` turns the ``OSError`` of ``resolve`` into a ``ValueError``
+    chained to it, and ``stat`` raises it itself) is told apart from a missing
+    one (FM-116): the operator is not told that a night's scan was moved or
+    deleted when retrying would work.
     """
     found: list[tuple[str, Path, int]] = []
     missing: list[str] = []
+    unreadable: list[tuple[str, str, Exception]] = []
     for frame in scan.result.frames:
         try:
             source = resolve_in_run(scan.run_dir, frame.file)
             size = source.stat().st_size if source.is_file() else None
-        except (ValueError, OSError):
+        except FileNotFoundError:
             size = None
+        except ValueError as exc:
+            if isinstance(exc.__cause__, OSError):
+                cause = exc.__cause__
+                unreadable.append((frame.file, str(cause.strerror or cause), exc))
+                continue
+            size = None
+        except OSError as exc:
+            unreadable.append((frame.file, str(exc.strerror or exc), exc))
+            continue
         if size is None:
             missing.append(frame.file)
             continue
         found.append((frame.file, source, size))
+    if unreadable:
+        named = ", ".join(name for name, _, _ in unreadable[:_MISSING_NAMED])
+        more = (
+            f" (and {len(unreadable) - _MISSING_NAMED} more)"
+            if len(unreadable) > _MISSING_NAMED
+            else ""
+        )
+        raise DatasetError(
+            f"{run_doc}: {len(unreadable)} of {len(scan.result.frames)} frame "
+            f"files cannot be read now ({unreadable[0][1]}): {named}{more}; the "
+            f"run folder is on a disk or a share that does not answer: try again "
+            f"when it does"
+        ) from unreadable[0][2]
     if missing:
         named = ", ".join(missing[:_MISSING_NAMED])
         more = (
@@ -477,7 +507,9 @@ def export_dataset(
         DatasetError: Refused; nothing was written (the missing parents of
             ``out`` are not made either).
         DatasetWriteError: An I/O error part-way; ``out`` holds part of the
-            dataset and no ``manifest.json``, and nothing was deleted.
+            dataset and no ``manifest.json``, and nothing was deleted. When
+            ``out`` itself could not be made nothing was written, and the
+            message says so.
     """
     run_doc = Path(run_doc)
     out = Path(out)
@@ -552,6 +584,13 @@ def export_dataset(
         where = _MANIFEST
         write_atomically(root / _MANIFEST, _json_bytes(final))
     except OSError as exc:
+        if where == "the folder itself":
+            # The first `mkdir` failed (a drive that is not there): no folder, no
+            # file; "holds part of the dataset: remove it" would be false.
+            raise DatasetWriteError(
+                f"{out}: cannot be created ({exc.strerror or exc}); nothing was "
+                f"written: name a folder on a disk that answers"
+            ) from exc
         raise DatasetWriteError(
             f"{out}: stopped after {len(files)} of {total} files at {where}: "
             f"{exc.strerror or exc}; {out} holds part of the dataset and has no "

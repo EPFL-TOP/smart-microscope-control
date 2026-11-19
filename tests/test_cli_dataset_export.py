@@ -209,6 +209,21 @@ def test_the_progress_printer_is_paced_and_prints_the_last_line(
     assert printed == ["copied: 1/10", "copied: 4/10", "copied: 10/10"]
 
 
+def test_the_progress_printer_prints_a_call_exactly_one_second_after_the_last(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The interval itself: a line is due *at* a second, not only after it.
+    now = [100.0]
+    show = _progress_printer("copied", clock=lambda: now[0])
+
+    show(1, 10)
+    now[0] += 1.0
+    show(2, 10)
+
+    printed = [line for line in capsys.readouterr().out.splitlines() if line]
+    assert printed == ["copied: 1/10", "copied: 2/10"]
+
+
 def test_check_exits_0_1_and_2_and_never_1_for_a_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -278,6 +293,25 @@ def test_check_names_at_most_twenty_files_and_counts_the_rest(tmp_path: Path) ->
     assert failures[20] == "✗ and 5 more"
     assert failures[21].startswith("✗ 25 of 35 files are missing or changed")
     assert not any(seed.scan.frames[20].file in line for line in failures)
+
+
+def test_check_names_exactly_twenty_files_and_says_nothing_about_more(
+    tmp_path: Path,
+) -> None:
+    # The limit itself: `>` and not `>=` would print "and 0 more".
+    seed = _source(tmp_path / "src", rows=4, columns=4)
+    out = tmp_path / "out"
+    export_dataset(seed.path, out)
+    for frame in seed.scan.frames[:20]:
+        (out / frame.file).unlink()
+
+    code, lines = _check(out)
+
+    assert code == 1
+    failures = [line for line in lines if "✗" in line]
+    assert len(failures) == 20 + 1
+    assert not any(line.startswith("✗ and ") for line in failures)
+    assert failures[-1].startswith("✗ 20 of 35 files are missing or changed")
 
 
 def test_check_does_not_print_a_success_line_for_a_damaged_dataset(

@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import textwrap
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from smc.data.dataset import (
     _check_names,
     _copy_and_hash,
     _sha256_of,
+    check_dataset,
     export_dataset,
     readme_text,
 )
@@ -532,6 +534,173 @@ def test_export_takes_the_boundary_values_it_names_exactly(
     assert (tmp_path / "unknown" / "manifest.json").is_file()
 
 
+def _record_free_space(monkeypatch: pytest.MonkeyPatch, free: int) -> list[Path]:
+    """``disk_usage`` as the OS answers it: an error for a path that does not exist.
+
+    The paths it is asked about are kept, so that a test sees *which* folder the
+    export measured, which a stand-in that ignores its argument cannot tell.
+    """
+    asked: list[Path] = []
+
+    def usage(path: Path) -> SimpleNamespace:
+        asked.append(Path(path))
+        if not Path(path).exists():
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return SimpleNamespace(total=free * 2, used=free, free=free)
+
+    monkeypatch.setattr(dataset_module.shutil, "disk_usage", usage)
+    return asked
+
+
+def test_the_free_space_is_asked_of_the_nearest_folder_that_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `out` does not exist yet, the normal case, and `disk_usage` of a path that
+    # is not there is an error that the export reads as "unknown": a mutant that
+    # asks about `out` itself is never refused (adversarial review of #565).
+    seed = _source(tmp_path)
+    need = _need_of(seed)
+    out = tmp_path / "a" / "b"
+
+    asked = _record_free_space(monkeypatch, need - 1)
+    with pytest.raises(DatasetError, match="MB free"):
+        export_dataset(seed.path, out)
+    assert asked == [tmp_path]
+    assert not (tmp_path / "a").exists()
+
+    asked = _record_free_space(monkeypatch, need)
+    export_dataset(seed.path, out)
+    assert asked == [tmp_path]
+    assert (out / "manifest.json").is_file()
+
+
+def _fail_for(
+    monkeypatch: pytest.MonkeyPatch, name: str, target: Path, error: OSError
+) -> None:
+    """Make ``Path.<name>`` raise ``error`` for ``target`` only, as a share that drops does."""
+    original = getattr(Path, name)
+
+    def refuse(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self == target:
+            raise error
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, name, refuse)
+
+
+@pytest.mark.parametrize("call", ["resolve", "is_dir", "iterdir", "exists"])
+def test_an_out_that_cannot_be_examined_is_a_refusal_naming_it(
+    call: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-116: a share that drops answers each of these with an OSError, and an
+    # export that lets it out ends on a traceback instead of the refusal.
+    seed = _source(tmp_path)
+    out = tmp_path / "out"
+    if call == "iterdir":
+        out.mkdir()  # only an existing folder is listed
+    _fail_for(
+        monkeypatch,
+        call,
+        out,
+        OSError(64, "The specified network name is no longer available"),
+    )
+    monkeypatch.setattr(dataset_module, "_copy_and_hash", _no_copy)
+
+    with pytest.raises(DatasetError) as caught:
+        export_dataset(seed.path, out)
+
+    message = str(caught.value)
+    assert message.startswith(str(out))
+    assert "cannot be examined" in message
+    assert "network name is no longer available" in message
+
+
+class _Refused:
+    """A frame's source file whose ``stat`` the file system refuses: what ``Path`` is on a share that errs."""
+
+    def is_file(self) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+
+def test_a_frame_that_cannot_be_examined_is_not_a_crash_and_not_a_missing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed = _source(tmp_path)
+    frames = _frame_files(seed)
+    real = dataset_module.resolve_in_run
+
+    def refuses_the_first(base: Path, relative: str) -> Any:
+        return _Refused() if relative == frames[0] else real(base, relative)
+
+    monkeypatch.setattr(dataset_module, "resolve_in_run", refuses_the_first)
+    monkeypatch.setattr(dataset_module, "_copy_and_hash", _no_copy)
+
+    with pytest.raises(DatasetError) as caught:
+        export_dataset(seed.path, tmp_path / "out")
+
+    message = str(caught.value)
+    assert "1 of 8 frame files cannot be read now (Permission denied)" in message
+    assert frames[0] in message
+    assert "are missing" not in message
+    assert isinstance(caught.value.__cause__, PermissionError)
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_run_folder_that_stops_answering_is_not_reported_as_missing_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-116: `resolve_in_run` says ValueError for an OSError of `resolve` and
+    # chains it; read as "not there", a dropped share told the operator that the
+    # scan's folder was moved or partly deleted, and a night's scan looked lost.
+    seed = _source(tmp_path)
+    frames = _frame_files(seed)
+    real = dataset_module.resolve_in_run
+    dropped = OSError(64, "The specified network name is no longer available")
+
+    def share_dropped(base: Path, relative: str) -> Path:
+        if relative in frames:
+            raise ValueError(
+                f"{relative}: cannot be resolved ({dropped.strerror})"
+            ) from dropped
+        return real(base, relative)
+
+    monkeypatch.setattr(dataset_module, "resolve_in_run", share_dropped)
+    monkeypatch.setattr(dataset_module, "_copy_and_hash", _no_copy)
+
+    with pytest.raises(DatasetError) as caught:
+        export_dataset(seed.path, tmp_path / "out")
+
+    message = str(caught.value)
+    assert "8 of 8 frame files cannot be read now" in message
+    assert "network name is no longer available" in message
+    assert ", ".join(frames[:5]) in message
+    assert "(and 3 more)" in message
+    assert "try again" in message
+    assert "are missing" not in message
+    assert "moved" not in message
+    assert str(seed.path) in message
+    assert not (tmp_path / "out").exists()
+
+
+def test_five_missing_frames_are_all_named_and_nothing_is_said_to_be_more(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The limit itself: `>` and not `>=` would write "(and 0 more)".
+    seed = _source(tmp_path)
+    frames = _frame_files(seed)
+    for name in frames[:5]:
+        (seed.path.parent / name).unlink()
+    monkeypatch.setattr(dataset_module, "_copy_and_hash", _no_copy)
+
+    with pytest.raises(DatasetError) as caught:
+        export_dataset(seed.path, tmp_path / "out")
+
+    message = str(caught.value)
+    assert "5 of 8 frame files are missing" in message
+    assert ", ".join(frames[:5]) in message
+    assert "(and" not in message
+
+
 def test_missing_frames_are_counted_and_the_first_five_are_named(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -801,3 +970,86 @@ def test_progress_is_called_once_per_file_copied(tmp_path: Path) -> None:
 
     n = len(_frame_files(seed)) + 1
     assert calls == [(k, n) for k in range(1, n + 1)]
+
+
+def test_an_out_that_cannot_be_made_says_that_nothing_was_written(
+    tmp_path: Path,
+) -> None:
+    # A drive that is not there (an unplugged stick) fails at the first `mkdir`,
+    # before any file exists: "holds part of the dataset ... remove it" would
+    # send the operator to a folder that is not there (adversarial review of #565).
+    seed = _source(tmp_path)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, not a folder", encoding="utf-8")
+    out = blocker / "dataset"
+
+    with pytest.raises(DatasetWriteError) as caught:
+        export_dataset(seed.path, out)
+
+    message = str(caught.value)
+    assert message.startswith(str(out))
+    assert "cannot be created" in message
+    assert "nothing was written" in message
+    assert "holds part of the dataset" not in message
+    assert isinstance(caught.value.__cause__, OSError)
+    assert not out.exists()
+
+
+def _load_it_block(readme: str) -> str:
+    """The code that the README's "Load it" section shows, dedented, ready to run."""
+    lines = readme.splitlines()
+    section = lines[lines.index("## Load it") + 1 : lines.index("## Check it")]
+    code = [line for line in section if line.startswith("    ") or not line.strip()]
+    return textwrap.dedent("\n".join(code))
+
+
+def test_the_readme_of_an_export_says_what_this_scan_is_and_its_example_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Wells that are not A1, with cells: the README that `export_dataset` writes
+    # must say this scan's date, cells file and classes (a mutant that passes
+    # `None` for each still passes a test of `readme_text` on a hand-made
+    # manifest), and the example it shows must run on this scan, which has no A1.
+    seed = _source(
+        tmp_path,
+        wells=("B1", "B2"),
+        cells=[cell_at("B1", 1.0, 1.0, "single"), cell_at("B2", 2.0, 1.0, "doublet")],
+    )
+    out = tmp_path / "out"
+    export_dataset(seed.path, out)
+    text = (out / "README.md").read_text(encoding="utf-8")
+
+    started = RunDocument.load(seed.path).provider("scan")
+    assert started is not None
+    day = started.started_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    lines = [line.split() for line in text.splitlines()]
+    assert ["scanned", *day.split(), "UTC"] in lines
+    assert (
+        f"detected, listed in {_cells_file(seed)} "
+        f"(classes: {', '.join(seed.result.classes)})"
+    ) in text
+    assert "none:" not in text
+    assert "B1, B2 (the order of the scan plan)" in text
+
+    monkeypatch.chdir(out)
+    exec(compile(_load_it_block(text), "README.md", "exec"), {})
+
+
+def test_a_non_ascii_objective_is_escaped_in_the_json_and_whole_in_the_readme(
+    tmp_path: Path,
+) -> None:
+    # run.json and manifest.json are ASCII on purpose (the arguments of
+    # `write_stage`), and nothing else in the export carries a non-ASCII
+    # string: the flag that makes it so is read here, not in a table.
+    objective = "Plan Apo \N{GREEK SMALL LETTER LAMDA} 20x"
+    seed = _source(tmp_path, scan_objective=objective)
+    out = tmp_path / "out"
+
+    manifest = export_dataset(seed.path, out)
+
+    assert manifest.objective == objective
+    for name in ("run.json", "manifest.json"):
+        assert (out / name).read_bytes().isascii(), name
+    assert objective in (out / "README.md").read_text(encoding="utf-8")
+    assert load_scan(out / "run.json").profile == "demo"
+    assert check_dataset(out).problems == ()
