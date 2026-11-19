@@ -10,6 +10,7 @@ nothing is wrapped (FM-37), a one-line refusal must stay one line in a log.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -415,6 +416,18 @@ def _wells_asked(text: str | None) -> list[str] | None:
     return wells
 
 
+def _quietly(tell: Callable[[str], None], text: str) -> None:
+    """``tell(text)``, or nothing when the console is gone: the pictures do not depend on it (FM-30).
+
+    A reader that goes away (``| more``, then q, or a PowerShell pipeline that ends
+    early) makes the next write raise ``OSError``, or ``ValueError`` on a closed
+    stream; a command that has drawn for minutes must still write every picture and
+    end with the exit code of what it did, not of what it could say.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        tell(text)
+
+
 def _count_text(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
@@ -443,8 +456,8 @@ def draw(
         typer.Option(
             "--wells",
             metavar="WELLS",
-            help="The wells to draw, separated by commas, as A1,B2. Without it, "
-            "every well of the scan.",
+            help='The wells to draw, separated by commas, as "A1,B2" (quote the '
+            "list in PowerShell). Without it, every well of the scan.",
         ),
     ] = None,
     max_px: Annotated[
@@ -469,15 +482,22 @@ def draw(
     """
     low, high = _DRAW_MAX_PX_RANGE
     if not low <= max_px <= high:
-        _fail(f"--max-px must be an integer from {low} to {high}")
+        _quietly(_fail, f"--max-px must be an integer from {low} to {high}")
         raise typer.Exit(code=_EXIT_REFUSED)
     try:
         named = _wells_asked(wells)
     except ValueError as exc:
-        _fail(f"--wells: {exc}")
+        _quietly(_fail, f"--wells: {exc}")
         raise typer.Exit(code=_EXIT_REFUSED) from None
     folder = out if out is not None else run_doc.parent / "draw"
     printer = _progress_printer("drawing")
+
+    def progress(done: int, total: int, _well: str) -> None:
+        # Every picture is written whatever becomes of the console (FM-30): a reader
+        # that goes away (a pipe closed, then q) must not end the wells after it.
+        with contextlib.suppress(OSError, ValueError):
+            printer(done, total)
+
     try:
         # Pillow is imported here and not at the top: every other command starts
         # without it.
@@ -498,21 +518,17 @@ def draw(
             else f"{len(scan.cells)} detected"
         )
         for line in _aligned([["route", route_text], ["cells", cells_text]]):
-            _say(line)
+            _quietly(_say, line)
         drawing = drawing_module.draw_scan(
-            scan,
-            folder,
-            wells=named,
-            max_px=max_px,
-            progress=lambda done, total, _well: printer(done, total),
+            scan, folder, wells=named, max_px=max_px, progress=progress
         )
     except DatasetError as exc:
-        _fail(str(exc))
+        _quietly(_fail, str(exc))
         raise typer.Exit(code=_EXIT_REFUSED) from None
     except Exception as exc:
         # Not a verdict: an uncaught exception would exit 1, which is "a picture was
         # not written" (FM-82), so whatever the drawing did not expect is a refusal.
-        _fail(f"unexpected {type(exc).__name__}: {exc}")
+        _quietly(_fail, f"unexpected {type(exc).__name__}: {exc}")
         raise typer.Exit(code=_EXIT_REFUSED) from None
     for line in _aligned(
         [
@@ -528,17 +544,18 @@ def draw(
             for picture in drawing.pictures
         ]
     ):
-        _say(line)
+        _quietly(_say, line)
     for note in drawing.notes:
-        _say(note)
+        _quietly(_say, note)
     unwritten = [picture for picture in drawing.pictures if not picture.written]
     for picture in unwritten:
-        _fail(f"{picture.path} was not written: {picture.error}")
+        _quietly(_fail, f"{picture.path} was not written: {picture.error}")
     written = len(drawing.pictures) - len(unwritten)
     if unwritten:
-        _fail(
+        _quietly(
+            _fail,
             f"{written} of {len(drawing.pictures)} pictures written to {folder}; "
-            f"run again once the files can be written"
+            f"run again once the files can be written",
         )
         raise typer.Exit(code=_EXIT_PARTIAL)
-    _ok(f"{_count_text(written, 'picture')} written to {folder}")
+    _quietly(_ok, f"{_count_text(written, 'picture')} written to {folder}")

@@ -29,6 +29,7 @@ from select_fields_seed import (
     PIXEL_UM,
     SHAPE,
     UPRIGHT,
+    Seed,
     cell_at,
     load_script,
     matrix_of,
@@ -1471,3 +1472,243 @@ def test_the_scan_is_the_one_the_picture_says_it_is_when_a_well_has_no_frame(
     (picture,) = drawing.pictures
     assert (picture.frames, picture.placed, picture.unreadable) == (0, 0, 0)
     assert picture.written
+
+
+def _from_results(tmp_path: Path, seed: Seed, **changes: Any) -> Scan:
+    """A scan built in memory from the seed's results, with the changes given (``Scan.from_results`` checks none of them)."""
+    arguments: dict[str, Any] = {
+        "plan": seed.plan,
+        "result": seed.scan,
+        "cells_result": seed.result,
+        "cells": seed.cells,
+    }
+    arguments.update(changes)
+    return Scan.from_results(tmp_path, RunDocument.load(seed.path), **arguments)
+
+
+def test_the_longest_side_may_be_as_large_as_4000(tmp_path: Path) -> None:
+    # A well with no frame: only the canvas is that large (64 MB), nothing is placed.
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    scan = _from_results(
+        tmp_path, seed, result=seed.scan.model_copy(update={"frames": ()})
+    )
+    image = _picture(draw.draw_scan(scan, tmp_path / "out", max_px=4000), "A1")
+    assert max(image.size) == 4000
+
+
+def test_a_scan_with_no_well_is_refused_and_not_drawn_as_nothing(
+    tmp_path: Path,
+) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    scan = replace(load_scan(seed.path), wells=())
+    with pytest.raises(DatasetError, match="this scan has no well"):
+        draw.draw_scan(scan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_pixel_size_that_is_not_a_size_is_a_dataset_error_naming_the_camera(
+    tmp_path: Path,
+) -> None:
+    # `ScanResult.pixel_size_um` only has to be above 0: infinity gets through.
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    scan = _from_results(
+        tmp_path, seed, result=seed.scan.model_copy(update={"pixel_size_um": math.inf})
+    )
+    with pytest.raises(
+        DatasetError, match="the scan's camera cannot be drawn: the pixel size"
+    ):
+        draw.draw_scan(scan, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_cell_far_outside_the_picture_is_not_drawn_and_raises_nothing(
+    tmp_path: Path,
+) -> None:
+    # FM-74, FM-75: Pillow raises SystemError for an ellipse at 1e300.
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    cells = [
+        cell_at("A1", 1e300, 0.0),
+        cell_at("A1", 1e9, 0.0),
+        cell_at("A1", -1e9, 1e9),
+        cell_at("A1", 0.0, 0.0),
+    ]
+    scan = _from_results(tmp_path, seed, cells=cells)
+    image = _picture(draw.draw_scan(scan, tmp_path / "out", max_px=800), "A1")
+    canvas = draw.canvas_of(scan.geometry["A1"], 800)
+    assert image.getpixel(_pixel_of(canvas, 1000.0, -500.0)) == draw.CLASS_COLOURS[0][1]
+
+
+def test_the_cells_line_counts_the_labels_it_lists_past_eight_and_says_the_rest(
+    tmp_path: Path,
+) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    cells = [cell_at("A1", 10.0 * k, 0.0, f"x{k}") for k in range(9)]
+    scan = _from_results(tmp_path, seed, cells=cells)
+    line = draw.caption_lines(scan, "A1", None, "none", stops=0, frames=1)[-1]
+    assert line.endswith("x7 (white) 1, 1 more label (white)")
+    assert "x8" not in line
+    ten = _from_results(
+        tmp_path, seed, cells=[cell_at("A1", 10.0 * k, 0.0, f"x{k}") for k in range(10)]
+    )
+    assert draw.caption_lines(ten, "A1", None, "none", stops=0, frames=1)[-1].endswith(
+        "x7 (white) 1, 2 more labels (white)"
+    )
+
+
+def test_the_note_on_stops_in_other_wells_lists_eight_and_says_there_are_more(
+    tmp_path: Path,
+) -> None:
+    stops = tuple(_stop(k, f"C{k + 1}", 0, 50.0, 50.0) for k in range(9))
+    scan = _seed_with_route(tmp_path, stops)
+    (note,) = draw.draw_scan(scan, tmp_path / "out", max_px=256).notes
+    assert note == (
+        "the route holds 9 stops in wells the scan does not have "
+        "(C1, C2, C3, C4, C5, C6, C7, C8, ...): not drawn"
+    )
+
+
+def test_a_caption_is_cut_before_it_is_measured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-74: a record string of a million characters costs a million measurements
+    # if it is not cut first; the length wrap_text is given is the proof, not a clock.
+    seen: list[int] = []
+    real = draw.wrap_text
+
+    def spy(pen: Any, text: str, font: Any, width: float) -> list[str]:
+        seen.append(len(text))
+        return real(pen, text, font, width)
+
+    monkeypatch.setattr(draw, "wrap_text", spy)
+    _render(stops=[], caption="z" * 1_000_000, max_px=300)
+    assert seen == [2000]
+
+
+# ----------------------------------------------- what the picture is made of
+
+
+def test_the_picture_draws_the_mosaic_the_scripts_read_pixels_makes(
+    tmp_path: Path, renders: list[dict[str, Any]]
+) -> None:
+    # Overlapping noise frames: the order they are placed in, and the pixel size the
+    # reduction is made from, change the picture.
+    matrix = matrix_of(PIXEL_UM, 30.0, True)
+    seed = seed_run(
+        tmp_path, cells=[], rows=2, columns=2, matrix=matrix, frame_pixels=_noise
+    )
+    scan = load_scan(seed.path)
+    draw.draw_scan(scan, tmp_path / "out", max_px=800)
+    expected = (
+        load_script()
+        .read_pixels(
+            tmp_path,
+            scan.result,
+            {"A1": scan.geometry["A1"]},
+            mosaic=True,
+            png_max_px=800,
+        )
+        .grey["A1"]
+    )
+    assert np.array_equal(renders[0]["grey"], expected)
+    assert (expected != draw.UNPLACED_GREY).sum() > 1000
+
+
+def test_the_caption_names_the_first_frame_that_could_not_be_read(
+    tmp_path: Path, renders: list[dict[str, Any]]
+) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=2)
+    scan = load_scan(seed.path)
+    first, second = scan.frames("A1")[:2]
+    _rewrite(scan.run_dir / first.file, "missing")
+    _rewrite(scan.run_dir / second.file, "garbage")
+    draw.draw_scan(scan, tmp_path / "out", max_px=800)
+    (line,) = [
+        text
+        for text in renders[0]["caption"].split("\n")
+        if "could not be read" in text
+    ]
+    assert line.startswith(f"2 of {len(scan.frames('A1'))} frames could not be read; ")
+    assert f"first: {first.file}: the file is missing" in line
+    assert second.file not in line
+
+
+def test_equal_orders_keep_the_records_order_whatever_the_names_say() -> None:
+    result = _route((_stop(4, "A1", 1), _stop(4, "A1", 0), _stop(3, "A1", 2)))
+    stops = draw.stops_of_well(draw.RouteView("route", None, None, result), "A1")
+    assert [s.name for s in stops] == ["A1_r002", "A1_r001", "A1_r000"]
+
+
+def test_a_stops_number_is_centred_on_the_footprints_centre() -> None:
+    # The centre of a "0" (a symmetric glyph) is the centre of its ink.
+    canvas, image = _render(stops=[("0", 1000.0, -500.0)], caption="")
+    column, row = _pixel_of(canvas, 1000.0, -500.0)
+    ink = [
+        (c, r)
+        for c in range(column - 10, column + 11)
+        for r in range(row - 10, row + 11)
+        if _clear_green(image, (c, r, c + 1, r + 1))
+    ]
+    assert len(ink) > 10
+    assert sum(c for c, _ in ink) / len(ink) == pytest.approx(column, abs=2.0)
+    assert sum(r for _, r in ink) / len(ink) == pytest.approx(row, abs=2.0)
+
+
+def test_a_stop_five_pixels_off_the_picture_is_drawn_and_fifty_are_left_out(
+    tmp_path: Path, renders: list[dict[str, Any]]
+) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    canvas = draw.canvas_of(load_scan(seed.path).geometry["A1"], 800)
+    right = canvas.x_min_um + canvas.width_px * canvas.um_per_px
+
+    def beyond(pixels: float) -> float:
+        return right + pixels * canvas.um_per_px
+
+    stops = (
+        _stop(0, "A1", 0, 1000.0, -500.0),
+        _stop(1, "A1", 1, beyond(5), -500.0),
+        _stop(2, "A1", 2, beyond(50), -500.0),
+    )
+    _write_route(seed.path, _route(stops), params=CHOSE)
+    scan = load_scan(seed.path)
+    (picture,) = draw.draw_scan(scan, tmp_path / "out", max_px=800).pictures
+    assert (picture.stops, picture.off_picture) == (3, 1)
+    assert [text for text, _, _ in renders[0]["stops"]] == ["1", "2"]
+    assert "1 stop outside the picture is not drawn" in renders[0]["caption"]
+
+
+# ------------------------------------------------------------- the run folder
+
+
+def test_the_run_folder_in_every_spelling_is_replaced_and_a_dot_is_not(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    folder = Path("runs") / "a b"
+    folder.mkdir(parents=True)
+    resolved = str(folder.resolve())
+    # One spelling at a time, so that dropping one is seen where it differs from the
+    # others: ``as_posix`` and ``str`` are the same string on POSIX and differ on
+    # Windows, where this test runs it (FM-43).
+    for spelling in (str(folder), folder.as_posix(), resolved):
+        assert draw.scrub_run_folder(f"x {spelling} y", folder) == "x <run folder> y"
+    # A folder written as a dot or two is not a path to look for: every dot would go.
+    for dots in (".", ".."):
+        assert draw.scrub_run_folder("a.b ..c", Path(dots)) == "a.b ..c"
+    # ... but the absolute path of the folder it stands for still is.
+    here = str(tmp_path.resolve())
+    assert draw.scrub_run_folder(f"in {here}", Path(".")) == "in <run folder>"
+
+
+def test_a_run_document_in_the_current_folder_keeps_its_cells_line_readable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `cd <run folder>` then `smc dataset draw run.json`: the folder is Path(".").
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    (tmp_path / seed.result.file).unlink()
+    monkeypatch.chdir(tmp_path)
+    scan = load_scan(Path("run.json"))
+    assert scan.run_dir == Path()
+    line = draw.caption_lines(scan, "A1", None, "none", stops=0, frames=1)[-1]
+    assert line == (
+        "cells: none (cells file cells/t1.json is missing from the run folder .)"
+    )

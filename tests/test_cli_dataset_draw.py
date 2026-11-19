@@ -72,8 +72,13 @@ def _stop(order: int, well: str, index: int, x_um: float, y_um: float) -> RouteP
     )
 
 
-def _write_route(path: Path, *, params: dict[str, Any] | None = None) -> None:
-    """A ``route`` record, ``done``, with three stops: A1 has two, B2 one, the order plate-wide."""
+def _write_route(
+    path: Path,
+    *,
+    params: dict[str, Any] | None = None,
+    extra: tuple[RoutePosition, ...] = (),
+) -> None:
+    """A ``route`` record, ``done``, with three stops: A1 has two, B2 one, the order plate-wide; ``extra`` stops follow."""
     result = RouteResult(
         objective="Nikon 10X S Fluor",
         matrix_um_per_px=UPRIGHT,
@@ -84,6 +89,7 @@ def _write_route(path: Path, *, params: dict[str, Any] | None = None) -> None:
             _stop(0, "A1", 0, 1000.0, -500.0),
             _stop(1, "A1", 1, 1300.0, -500.0),
             _stop(2, "B2", 0, 10000.0, -9500.0),
+            *extra,
         ),
         uncovered={"A1": 0, "B2": 0},
         distance_um=300.0,
@@ -108,7 +114,13 @@ def _write_route(path: Path, *, params: dict[str, Any] | None = None) -> None:
     )
 
 
-def _source(folder: Path, *, route: bool = True, **changes: object) -> Seed:
+def _source(
+    folder: Path,
+    *,
+    route: bool = True,
+    extra: tuple[RoutePosition, ...] = (),
+    **changes: object,
+) -> Seed:
     folder.mkdir(exist_ok=True)
     arguments: dict[str, object] = {
         "cells": [
@@ -122,7 +134,11 @@ def _source(folder: Path, *, route: bool = True, **changes: object) -> Seed:
     arguments.update(changes)
     seed = seed_run(folder, **arguments)  # type: ignore[arg-type]
     if route:
-        _write_route(seed.path, params={"selector": "most-cells", "orderer": "nearest"})
+        _write_route(
+            seed.path,
+            params={"selector": "most-cells", "orderer": "nearest"},
+            extra=extra,
+        )
     return seed
 
 
@@ -143,7 +159,9 @@ def test_draw_writes_a_picture_per_well_and_says_what_it_drew(tmp_path: Path) ->
         "stops",
     ]
     assert _words(lines, "cells") == ["cells", "2", "detected"]
-    assert _words(lines, "A1") == [
+    # The path ends the line and may hold a space (a Windows user name does): the
+    # words before it are compared, and the line must end with the path.
+    assert _words(lines, "A1")[:9] == [
         "A1",
         "1",
         "of",
@@ -153,8 +171,9 @@ def test_draw_writes_a_picture_per_well_and_says_what_it_drew(tmp_path: Path) ->
         "stops",
         "1",
         "cell",
-        str(out / "A1.png"),
     ]
+    (well_line,) = [line for line in lines if line.startswith("A1 ")]
+    assert well_line.endswith(f"  {out / 'A1.png'}")
     assert _words(lines, "B2")[1:9] == [
         "1",
         "of",
@@ -383,3 +402,85 @@ def test_the_commands_numbers_are_the_drawings_and_the_command_does_not_import_i
         draw_module.MAX_MAX_PX,
     )
     assert not hasattr(data_cli, "draw_module")
+
+
+def test_the_command_accepts_the_two_ends_of_the_max_px_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 4000 pixels is a 64 MB canvas a well: the end is checked against a recorder.
+    seed = _source(tmp_path / "src")
+    given: list[int] = []
+
+    def record(scan: Any, out: Path, **kwargs: Any) -> draw_module.Drawing:
+        given.append(kwargs["max_px"])
+        picture = draw_module.WellPicture(
+            "A1", out / "A1.png", True, None, 1, 1, 0, 0, 0, 0
+        )
+        return draw_module.Drawing(out, (picture,), None, "none", True, ())
+
+    monkeypatch.setattr(draw_module, "draw_scan", record)
+    for end in ("256", "4000"):
+        code, lines = _draw(seed.path, "--max-px", end)
+        assert code == 0, lines
+    assert given == [256, 4000]
+
+
+def test_draw_says_the_stops_of_a_well_the_scan_does_not_have(tmp_path: Path) -> None:
+    seed = _source(tmp_path / "src", extra=(_stop(3, "C3", 0, 50.0, 50.0),))
+    code, lines = _draw(seed.path)
+    assert code == 0, lines
+    assert (
+        "the route holds 1 stops in wells the scan does not have (C3): not drawn"
+        in lines
+    )
+    assert _words(lines, "route")[-2:] == ["4", "stops"]
+
+
+def test_draw_says_why_a_scan_has_no_cells_and_still_draws(tmp_path: Path) -> None:
+    seed = _source(tmp_path / "src")
+    (tmp_path / "src" / seed.result.file).unlink()
+    code, lines = _draw(seed.path)
+    assert code == 0, lines
+    (cells,) = [line for line in lines if line.startswith("cells ")]
+    assert cells.split(None, 2)[1] == "none:"
+    assert "is missing from the run folder" in cells
+    assert _words(lines, "A1")[7:9] == ["0", "cells"]
+    assert (tmp_path / "src" / "draw" / "A1.png").is_file()
+
+
+class _GoneConsole:
+    """A console whose reader went away after ``alive`` writes, as a pipe closed by ``| more`` then q (FM-30)."""
+
+    def __init__(self, alive: int) -> None:
+        self.alive = alive
+
+    def print(self, *args: Any, **kwargs: Any) -> None:
+        if self.alive <= 0:
+            raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+        self.alive -= 1
+
+
+@pytest.mark.parametrize("alive", [0, 2, 3])
+def test_a_console_that_goes_away_does_not_cost_a_picture_or_change_the_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alive: int
+) -> None:
+    # The route and cells lines are two writes, then each well's progress line: the
+    # wells after the one that found the pipe closed must still be drawn.
+    seed = _source(tmp_path / "src", wells=("A1", "B2", "B1"))
+    monkeypatch.setattr(data_cli, "console", _GoneConsole(alive))
+    result = CliRunner(
+        env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None}
+    ).invoke(app, ["dataset", "draw", str(seed.path)])
+    assert result.exit_code == 0, result.output
+    out = tmp_path / "src" / "draw"
+    assert sorted(p.name for p in out.iterdir()) == ["A1.png", "B1.png", "B2.png"]
+
+
+def test_a_console_that_goes_away_still_ends_a_refusal_with_exit_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(data_cli, "console", _GoneConsole(0))
+    result = CliRunner(
+        env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None}
+    ).invoke(app, ["dataset", "draw", str(tmp_path / "nowhere.json")])
+    assert result.exit_code == 2

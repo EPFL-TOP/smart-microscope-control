@@ -724,7 +724,8 @@ def _cells_line(scan: Scan, well: str) -> str:
         for label in strangers[:_LABELS_LISTED]
     ]
     if len(strangers) > _LABELS_LISTED:
-        parts.append(f"{len(strangers) - _LABELS_LISTED} more labels (white)")
+        more = len(strangers) - _LABELS_LISTED
+        parts.append(f"{more} more {'label' if more == 1 else 'labels'} (white)")
     return "cells: " + ", ".join(parts)
 
 
@@ -972,6 +973,8 @@ def _wells_to_draw(scan: Scan, wells: Sequence[str] | None) -> tuple[str, ...]:
     """The scan's own names of the wells asked for, in the plan's order, each once; a well the scan lacks is a refusal."""
     if wells is None:
         chosen = list(scan.wells)
+        if not chosen:
+            raise DatasetError("this scan has no well: its scan plan names none")
     else:
         if not wells:
             raise DatasetError("no well was asked for: name wells, or none for all")
