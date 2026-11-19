@@ -37,15 +37,24 @@ _BLUE = (90, 90, 255)
 _GREEN = (0, 255, 0)
 _ROUTE = (255, 255, 160)
 _WHITE = (255, 255, 255)
-#: The classes, in the cells stage's order: gold, cyan, red, light green, magenta, white.
-_CLASS_COLOURS = (
-    (255, 215, 0),
-    (0, 200, 255),
-    (255, 80, 80),
-    (120, 255, 120),
-    (255, 120, 255),
-    _WHITE,
+_BLACK = (0, 0, 0)
+#: The classes' colours as ``(name, rgb)`` in the cells stage's order, the one definition
+#: of the picture and of its legend: a class past the sixth takes the first's again.
+CLASS_COLOURS: tuple[tuple[str, tuple[int, int, int]], ...] = (
+    ("gold", (255, 215, 0)),
+    ("cyan", (0, 200, 255)),
+    ("red", (255, 80, 80)),
+    ("light green", (120, 255, 120)),
+    ("magenta", (255, 120, 255)),
+    ("white", _WHITE),
 )
+#: A stop's number is drawn when its centre is within this many pixels of the picture.
+#: Pillow's ``text`` raises ``SystemError`` at x = 1e300 (measured, Pillow 13), and a
+#: number whose centre is that far away is not on the picture anyway.
+_TEXT_REACH_PX = 10.0
+#: A caption longer than this is cut: a string of a million characters is a record that
+#: is not ours (FM-74), and measuring it character by character is not free.
+_CAPTION_LIMIT = 2000
 
 
 def reduction_factor(
@@ -259,7 +268,7 @@ def render_png(
     cells: Sequence[Cell],
     classes: Sequence[str],
     wanted: Sequence[str],
-    stops: Sequence[tuple[int, float, float]],
+    stops: Sequence[tuple[int | str, float, float]],
     matrix: Matrix2,
     image_shape_px: tuple[int, int],
     caption: str,
@@ -267,10 +276,18 @@ def render_png(
     """The picture of a well: the mosaic, the wall, the cells, the chosen fields numbered in route order.
 
     Blue is the wall; each cell is a 3-pixel dot coloured by its class (the classes in
-    the cells stage's order), with a second, larger ring when its label is wanted; a
-    chosen field is its footprint, a closed 2-pixel green line (turned or mirrored as
-    the camera is) with its number at the centre; the route is a thin yellow line
-    through the stops. ``stops`` are ``(number, x_um, y_um)`` in route order.
+    the cells stage's order, ``CLASS_COLOURS``), with a second, larger ring when its
+    label is wanted; a chosen field is its footprint, a closed 2-pixel green line
+    (turned or mirrored as the camera is) with its number at the centre; the route is
+    a thin yellow line through the stops. ``stops`` are ``(number, x_um, y_um)`` in
+    route order; the number is drawn as ``str(number)``, so a caller that has a score
+    to show formats the text itself.
+
+    Every text has a 1-pixel black stroke (a mosaic can be white), the caption is
+    written as ASCII and wrapped to the picture's width (the bitmap font of a Pillow
+    built without FreeType raises on a Greek letter), and a number whose centre is not
+    within 10 pixels of the picture is not drawn (Pillow raises ``SystemError`` for a
+    text at 1e300): the footprint's line clips and is harmless.
     """
     image = Image.fromarray(np.stack([grey, grey, grey], axis=-1))
     draw = ImageDraw.Draw(image)
@@ -281,7 +298,7 @@ def render_png(
 
     draw.line([at(x, y) for x, y in _outline_of(well)], fill=_BLUE, width=1)
     colours = {
-        label: _CLASS_COLOURS[k % len(_CLASS_COLOURS)]
+        label: CLASS_COLOURS[k % len(CLASS_COLOURS)][1]
         for k, label in enumerate(classes)
     }
     wanted_labels = set(wanted)
@@ -306,15 +323,84 @@ def render_png(
     font = _font(max(12, round(max(width, height) / 80)))
     for number, x, y in stops:
         col, row = at(x, y)
-        left, top, right, bottom = draw.textbbox((0, 0), str(number), font=font)
+        # Written so that a ``nan`` is outside: every comparison with it is false.
+        if not (
+            -_TEXT_REACH_PX <= col <= width + _TEXT_REACH_PX
+            and -_TEXT_REACH_PX <= row <= height + _TEXT_REACH_PX
+        ):
+            continue
+        text = ascii_text(str(number))
+        left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
         draw.text(
             (col - (right - left) / 2.0 - left, row - (bottom - top) / 2.0 - top),
-            str(number),
+            text,
             fill=_GREEN,
             font=font,
+            stroke_width=1,
+            stroke_fill=_BLACK,
         )
-    draw.text((4, 4), caption, fill=_WHITE, font=font)
+    text = ascii_text(caption)
+    if len(text) > _CAPTION_LIMIT:
+        text = text[: _CAPTION_LIMIT - 3] + "..."
+    draw.multiline_text(
+        (4, 4),
+        "\n".join(wrap_text(draw, text, font, max(1.0, width - 8.0))),
+        fill=_WHITE,
+        font=font,
+        stroke_width=1,
+        stroke_fill=_BLACK,
+    )
     return image
+
+
+def ascii_text(text: str) -> str:
+    """``text`` with everything that is not ASCII written as a Python escape (a lambda is ``u03bb`` after a backslash).
+
+    Pillow's bitmap default font, which is what a build without FreeType gives,
+    raises ``UnicodeEncodeError`` on a Greek letter (measured), and an objective's
+    name may hold one; the FreeType font draws it, and a picture that is read on
+    three platforms says the same thing on each (FM-20).
+    """
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def wrap_text(
+    draw: ImageDraw.ImageDraw, text: str, font: Any, width_px: float
+) -> list[str]:
+    """``text`` as lines no wider than ``width_px`` when drawn in ``font``, broken at spaces and at newlines.
+
+    Greedy by words. A word that is wider than the picture on its own is cut where it
+    reaches the width, by accumulating characters, so that the work is linear in its
+    length: a record that holds a string of a million characters costs a
+    million measurements and not a million squared (FM-74). A line always takes at
+    least one character, so a width smaller than one glyph still ends.
+    """
+
+    def fits(line: str) -> bool:
+        return bool(draw.textlength(line, font=font) <= width_px)
+
+    lines: list[str] = []
+    for paragraph in text.split("\n"):
+        line = ""
+        for word in paragraph.split(" "):
+            joined = f"{line} {word}" if line else word
+            if fits(joined):
+                line = joined
+                continue
+            if line:
+                lines.append(line)
+            start = 0
+            while True:
+                end = start + 1
+                while end < len(word) and fits(word[start : end + 1]):
+                    end += 1
+                if end >= len(word):
+                    break
+                lines.append(word[start:end])
+                start = end
+            line = word[start:]
+        lines.append(line)
+    return lines
 
 
 def _font(size: int) -> Any:
