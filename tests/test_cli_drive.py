@@ -452,6 +452,180 @@ def test_autofocus_get_decides_from_the_state_and_not_from_the_words(
     assert result.output.splitlines()[-1] == "autofocus ? (reworded)"
 
 
+# --- smc autofocus get: in range; smc autofocus engage: --timeout-s (m2 §12.13, #574) ---
+
+
+def _write_autofocus_profile(path: Path, body: str) -> Path:
+    path.write_text(
+        f'[microscope]\nname = "af"\n\n[autofocus]\n{body}', encoding="utf-8"
+    )
+    return path
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize(
+    ("values", "line"),
+    [
+        ('["Demo auto-focus adapter"]', "autofocus off; in range: yes"),
+        ('["Out of Range"]', "autofocus off; in range: no"),
+    ],
+    ids=["yes", "no"],
+)
+def test_autofocus_get_says_in_range_when_the_profile_names_the_property(
+    tmp_path: Path, values: str, line: str
+) -> None:
+    # The demo DAutoFocus has a read-only Description property: a stand-in for
+    # PFS's "PFS in Range" that the profile names.
+    profile = _write_autofocus_profile(
+        tmp_path / "range.toml",
+        f'in_range_property = "Description"\nin_range_values = {values}\n',
+    )
+
+    result = runner.invoke(app, ["autofocus", "get", "-p", str(profile)])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-1] == line
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_get_without_an_in_range_property_prints_the_state_only() -> None:
+    result = runner.invoke(app, ["autofocus", "get"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-1] == "autofocus off"
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_get_with_a_failed_range_read_keeps_the_states_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-155: the exit code follows the state; a range read that failed is a `?`
+    # with its cause, and a known state is still a state.
+    monkeypatch.setattr(
+        cli, "read_in_range", lambda microscope: "in range: ? (HardwareError: x)"
+    )
+
+    result = runner.invoke(app, ["autofocus", "get"])
+
+    assert result.exit_code == 0, result.output
+    assert (
+        result.output.splitlines()[-1]
+        == "autofocus off; in range: ? (HardwareError: x)"
+    )
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_get_of_an_unknown_state_exits_1_with_the_clause_after_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = "autofocus ? (autofocus: HardwareError: autofocus 'PFS': cannot read)"
+    monkeypatch.setattr(
+        cli,
+        "read_autofocus",
+        lambda microscope: AutofocusReading(text, None, False),
+    )
+    monkeypatch.setattr(cli, "read_in_range", lambda microscope: "in range: no")
+
+    result = runner.invoke(app, ["autofocus", "get"])
+
+    assert result.exit_code == 1, result.output
+    assert result.output.splitlines()[-1] == f"✗ {text}; in range: no"
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize(
+    ("given", "text"),
+    [
+        ("0", "timeout_s must be finite and in (0, 600] s, got 0.0"),
+        ("nan", "timeout_s must be finite and in (0, 600] s, got nan"),
+        ("601", "timeout_s must be finite and in (0, 600] s, got 601.0"),
+    ],
+)
+def test_autofocus_engage_timeout_s_out_of_bounds_exits_2_with_the_layers_text(
+    given: str, text: str
+) -> None:
+    result = runner.invoke(app, ["autofocus", "engage", "--timeout-s", given])
+
+    assert result.exit_code == 2, result.output
+    assert result.output.splitlines()[-1] == f"✗ {text}"
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_engage_timeout_s_not_above_settle_s_exits_2(
+    tmp_path: Path,
+) -> None:
+    profile = _write_autofocus_profile(tmp_path / "settle.toml", "settle_s = 1.0\n")
+
+    result = runner.invoke(
+        app, ["autofocus", "engage", "--timeout-s", "1", "-p", str(profile)]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert result.output.splitlines()[-1] == (
+        "✗ the lock timeout (1 s) must be above [autofocus] settle_s (1 s), since it "
+        "bounds the settling too"
+    )
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_engage_passes_timeout_s_to_the_drive_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[float | None] = []
+
+    def recorder(microscope: object, timeout_s: float | None = None) -> DriveResult:
+        seen.append(timeout_s)
+        return DriveResult("autofocus locked")
+
+    monkeypatch.setattr(cli, "engage_autofocus", recorder)
+
+    given = runner.invoke(app, ["autofocus", "engage", "--timeout-s", "60"])
+    default = runner.invoke(app, ["autofocus", "engage"])
+
+    assert given.exit_code == 0, given.output
+    assert default.exit_code == 0, default.output
+    assert seen == [60.0, None]
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_verbose_autofocus_engage_logs_the_lock_time() -> None:
+    result = runner.invoke(app, ["-v", "autofocus", "engage", "--timeout-s", "30"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert any(
+        re.fullmatch(r"INFO autofocus engage: locked and settled in \d+\.\d s", line)
+        for line in lines
+    ), result.output
+    assert lines[-1] == "autofocus locked"
+
+
+def test_autofocus_engage_help_names_the_timeout_option() -> None:
+    result = runner.invoke(app, ["autofocus", "engage", "--help"])
+
+    plain = " ".join(_ANSI.sub("", result.output).split())
+    assert "--timeout-s" in plain
+    assert "(0, 600]" in plain
+    # Rich reads a bare `[autofocus]` as markup and drops it from the help.
+    assert "above [autofocus] settle_s" in plain
+
+
+def test_autofocus_get_help_names_the_in_range_clause() -> None:
+    result = runner.invoke(app, ["autofocus", "get", "--help"])
+
+    plain = " ".join(_ANSI.sub("", result.output).split())
+    assert "`; in range: yes`" in plain
+    assert "autofocus.in_range_property" in plain
+
+
 # --- smc autofocus offset (m2 §12.10.6) ---------------------------------------------
 
 

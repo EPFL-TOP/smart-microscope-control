@@ -47,6 +47,7 @@ from smc.drive import (
     move_z,
     read_autofocus,
     read_autofocus_offset,
+    read_in_range,
     set_autofocus_offset,
     set_objective,
     switch_light,
@@ -1888,25 +1889,54 @@ def objective_set(
 
 @autofocus_app.command("get")
 def autofocus_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
-    """Print whether the autofocus is off, on, or locked; a read that fails exits 1 with its cause."""
+    """Print whether the autofocus is off, on, or locked, and whether its reference is in range.
+
+    When the profile names the in-range property (autofocus.in_range_property),
+    the line ends with `; in range: yes` or `; in range: no`; a range read
+    that fails says `in range: ?` with its cause. A state that cannot be read
+    exits 1 with its cause: the exit code follows the state only.
+    """
     with _Reported(ctx), Microscope.open(profile) as microscope:
         microscope.require(Autofocus)
         reading = read_autofocus(microscope)
+        in_range = read_in_range(microscope)
+    text = f"{reading.text}; {in_range}" if in_range else reading.text
     if not reading.known:
         # Unknown is not off: a script must not read it as a state (as `smc z get`).
-        _fail(reading.text)
+        _fail(text)
         raise typer.Exit(code=_EXIT_ERROR)
-    _say(reading.text)
+    _say(text)
 
 
 @autofocus_app.command("engage")
 def autofocus_engage(
     ctx: typer.Context,
+    timeout_s: Annotated[
+        float | None,
+        typer.Option(
+            "--timeout-s",
+            # ``\[`` is rich's escape: a bare ``[autofocus]`` is read as markup and
+            # vanishes from the help.
+            help="How long to wait for the lock, in seconds: in (0, 600] and above "
+            "\\[autofocus] settle_s. Default: the profile's lock_timeout_s, else 5 s "
+            "(assumed).",
+        ),
+    ] = None,
     dry_run: SwitchDryRunOption = False,
     profile: ProfileOption = DEMO_NAME,
 ) -> None:
-    """Engage the autofocus and wait for the lock (the profile's lock timeout)."""
-    _drive_command(ctx, profile, dry_run, Autofocus, engage_autofocus)
+    """Engage the autofocus and wait for the lock (--timeout-s, else the profile's lock timeout)."""
+    # No bound of its own: engage() checks before it sends anything, with one
+    # text, and its ValueError is a refusal (exit 2). Only engage_autofocus is
+    # inside the lambda: refusals turns *any* ValueError of the action into one.
+    _drive_command(
+        ctx,
+        profile,
+        dry_run,
+        Autofocus,
+        lambda microscope: engage_autofocus(microscope, timeout_s=timeout_s),
+        refusals=(ValueError,),
+    )
 
 
 @autofocus_app.command("disengage")
