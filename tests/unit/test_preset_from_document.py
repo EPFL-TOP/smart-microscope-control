@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import sys
 from datetime import datetime, timedelta, timezone
+from importlib.metadata import EntryPoint
 from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_core import to_jsonable_python
 
 from smc.plugins import discover
@@ -33,6 +34,8 @@ from smc.plugins.presets import (
     preset_from_document,
 )
 from smc.run import RunDocument, StageRecord, StageStatus
+from smc.selection import registry
+from smc.selection.api import OrdererParams, SelectorParams
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -54,6 +57,54 @@ MODELS: dict[str, Any] = {
     name: entry.plugin.Params for name, entry in _REGISTRY.items()
 }
 PROVIDES = {name: entry.plugin.provides for name, entry in _REGISTRY.items()}
+
+
+class _DenseParams(SelectorParams):
+    min_density_per_mm2: float = 0.0
+    tags: list[str] = Field(default_factory=list)
+
+
+class _Dense:
+    name = "dense"
+    summary = "A selector with parameters of its own."
+    Params = _DenseParams
+
+    def select(self, data: Any, params: _DenseParams) -> list[Any]:
+        return []
+
+
+class _WindowParams(OrdererParams):
+    window: int = 3
+
+
+class _Windowed:
+    name = "windowed"
+    summary = "An orderer with a parameter of its own."
+    Params = _WindowParams
+
+    def order(self, choices: Any, data: Any, params: _WindowParams) -> list[int]:
+        return list(range(len(choices)))
+
+
+@pytest.fixture(autouse=True)
+def _the_algorithms_of_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The built-in selector and orderers and two with parameters, in place of the installed ones: ``RouteParams`` loads the algorithm it names, so a non-default one must be registered."""
+    here = __name__
+    groups = {
+        registry.SELECTOR_GROUP: [
+            EntryPoint(
+                "most-cells", "smc.selection.builtin:MostCells", "smc.selectors"
+            ),
+            EntryPoint("dense", f"{here}:_Dense", "smc.selectors"),
+        ],
+        registry.ORDERER_GROUP: [
+            EntryPoint("nearest", "smc.selection.builtin:Nearest", "smc.orderers"),
+            EntryPoint("as-chosen", "smc.selection.builtin:AsChosen", "smc.orderers"),
+            EntryPoint("windowed", f"{here}:_Windowed", "smc.orderers"),
+        ],
+    }
+    monkeypatch.setattr(registry, "entry_points", lambda *, group: list(groups[group]))
+
 
 #: One lone surrogate, as an objective label read from a ``.cfg`` saved in cp1252
 #: leaves in a run document (FM-05). Built, not written, so no editor decodes it.
@@ -483,7 +534,15 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "wall_margin_um": 5.0,
             "objective": "Nikon 10X S Fluor",
             "candidate_step_fraction": 0.5,
-        }
+        },
+        # Another selector and orderer, each with parameters of its own as JSON (FM-190);
+        # min_cells and candidate_step_fraction are most-cells' and stay at their default.
+        {
+            "selector": "dense",
+            "selector_params": {"min_density_per_mm2": 20.0, "tags": ["a", "é"]},
+            "orderer": "windowed",
+            "orderer_params": {"window": 4},
+        },
     ],
     "scan": [
         {
