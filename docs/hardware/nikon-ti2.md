@@ -1,6 +1,6 @@
-# Nikon Ti2-E — PC survey, sessions 0, 1 and 2
+# Nikon Ti2-E — PC survey and the sessions at the stand (0, 1, 2, 3 and 5)
 
-Four visits are curated here. The **PC survey** (2026-09-25, below down to
+Six visits are curated here. The **PC survey** (2026-09-25, below down to
 *Surprises*) read the PC without initialising anything. **Session 0**
 (2026-10-07, state re-read 2026-10-14; [its section](#session-0--the-stand-through-pymmcore))
 initialised the stand through pymmcore and moved nothing. Session 0
@@ -9,7 +9,11 @@ answers most of the survey's surprises; each one says so. **Session 1**
 moved the stand through the layer, ran the contracts and read PFS.
 **Session 2** (2026-11-03, #334; [its section](#session-2--a-24-well-plate-at-10-the-reads-the-page))
 put a 24-well plate under the 10× and used the plate page for the first
-time.
+time. **Session 3** (2026-11-10, #405; [its section](#session-3--first-locks-from-the-floor-three-calibrations-a-40-jump))
+locked PFS from the floor at the 10× and the 40× and calibrated the camera
+at three objectives. **Session 5** (2026-11-17, #550; [its section](#session-5--segments-at-the-stand-a-10-scan-with-pfs-the-40-in-water))
+ran a 10× scan with PFS, took the 40× into a well with water and loaded the
+export's positions in NIS-Elements.
 
 Curated by the design session from the raw survey in `local/surveys/nikon-ti2/` (private, never committed)
 (issue #16), collected 2026-09-25 with the hardware connected and the
