@@ -1400,6 +1400,84 @@ def test_a_route_with_a_derived_stop_is_refused_by_a_model_without_the_field() -
     ]
 
 
+def test_a_stop_without_a_score_or_measures_dumps_without_the_keys() -> None:
+    # Algorithms §5.6: the default selector gives neither, and its route is written
+    # exactly as before they existed, so every run document already on disk reads
+    # and writes unchanged (FM-107), in every dump and nested in a result.
+    stop = RoutePosition.model_validate(_STOP)
+    assert stop.score is None
+    assert stop.measures == {}
+    for dump in (
+        stop.model_dump(),
+        stop.model_dump(mode="json"),
+        json.loads(stop.model_dump_json()),
+    ):
+        assert set(dump) == set(_STOP)
+    # An explicit None and an empty dict are the same stop, and the same dump.
+    explicit = RoutePosition.model_validate({**_STOP, "score": None, "measures": {}})
+    assert explicit == stop
+    assert set(explicit.model_dump(mode="json")) == set(_STOP)
+    route = RouteResult.model_validate({**_ROUTE, "positions": [_STOP, _STOP_DERIVED]})
+    assert all(
+        {"score", "measures"}.isdisjoint(position)
+        for position in route.model_dump(mode="json")["positions"]
+    )
+    assert "score" not in route.model_dump_json()
+    assert "measures" not in route.model_dump_json()
+
+
+def test_a_route_made_with_no_score_reads_in_a_model_that_does_not_know_them() -> None:
+    # The pattern of the derived offset above: a route by the default selector is
+    # read by an smc from before the fields, whose model refuses a key it does not
+    # know, and one with a score is not (as intended: that smc would drop it).
+    route = RouteResult.model_validate({**_ROUTE, "positions": [_STOP]})
+    (plain,) = route.model_dump(mode="json")["positions"]
+    _OlderStop.model_validate(plain)
+    scored = RoutePosition.model_validate(
+        {**_STOP, "score": 0.5, "measures": {"density_per_mm2": 12.0}}
+    )
+    with pytest.raises(ValidationError) as raised:
+        _OlderStop.model_validate(scored.model_dump(mode="json"))
+    assert {tuple(e["loc"]) for e in raised.value.errors()} == {
+        ("score",),
+        ("measures",),
+    }
+
+
+def test_a_score_and_measures_round_trip() -> None:
+    stop = RoutePosition.model_validate(
+        {
+            **_STOP,
+            "score": 0.5,
+            "measures": {"density_per_mm2": 12.0, "nn_median_um": 0.0},
+        }
+    )
+
+    dump = stop.model_dump(mode="json")
+
+    assert dump["score"] == 0.5
+    assert dump["measures"] == {"density_per_mm2": 12.0, "nn_median_um": 0.0}
+    assert RoutePosition.model_validate(dump) == stop
+    assert RoutePosition.model_validate_json(stop.model_dump_json()) == stop
+    route = RouteResult.model_validate({**_ROUTE, "positions": [stop.model_dump()]})
+    assert RouteResult.model_validate(route.model_dump(mode="json")) == route
+    # A score of 0.0 is a score, and a measure of 0.0 is a measure: only None and {} are left out.
+    zero = RoutePosition.model_validate({**_STOP, "score": 0.0})
+    assert zero.model_dump(mode="json")["score"] == 0.0
+    assert "measures" not in zero.model_dump(mode="json")
+    only_measures = RoutePosition.model_validate({**_STOP, "measures": {"a": 0.0}})
+    assert "score" not in only_measures.model_dump(mode="json")
+    assert only_measures.model_dump(mode="json")["measures"] == {"a": 0.0}
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_a_non_finite_score_or_measure_is_refused(bad: float) -> None:
+    with pytest.raises(ValidationError, match="score"):
+        RoutePosition.model_validate({**_STOP, "score": bad})
+    with pytest.raises(ValidationError, match="measures"):
+        RoutePosition.model_validate({**_STOP, "measures": {"density_per_mm2": bad}})
+
+
 def _imports_of(path: Path) -> set[str]:
     """Every module a source file imports, by its dotted name.
 
