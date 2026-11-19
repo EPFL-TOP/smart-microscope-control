@@ -114,6 +114,14 @@ class TwoReader(Base):
     offline = True
 
 
+class WithOptional(Base):
+    name = provides = "with-optional"
+    summary = "Reads up, and side when it is usable; never drives the stand."
+    reads = ("up",)
+    reads_optional = ("side",)
+    offline = True
+
+
 class Solo(Base):
     name = provides = "solo"
     summary = "Reads nothing; never drives the stand."
@@ -464,7 +472,16 @@ def test_offline_refuses_a_recorded_profile_that_is_a_path(
     _register(monkeypatch, Up, Reader)
     # os.sep is the platform's own separator: "\\" is one on Windows only, where
     # Profile.load reads it as a path too.
-    for recorded in ("profiles/demo.toml", "demo.toml", f"..{os.sep}demo"):
+    # "sub/demo" holds only the forward slash (no .toml), which is a separator on
+    # every platform; "D:evil" is a drive-relative name, which Windows joins to
+    # the search folder as `D:evil.toml`, outside it.
+    for recorded in (
+        "profiles/demo.toml",
+        "demo.toml",
+        "sub/demo",
+        f"..{os.sep}demo",
+        "D:evil",
+    ):
         doc = _seed(tmp_path, _stage("up", profile=recorded))
 
         result = _run("run", "reader", "--offline", "--run-doc", str(doc))
@@ -488,7 +505,12 @@ def test_offline_says_which_profile_the_document_recorded_when_it_is_not_on_the_
     assert result.exit_code == 2, result.output
     text = _plain(result)
     assert "the run document was made on profile 'not-a-profile': " in text
-    assert "not-a-profile" in text.split("the run document was made on profile")[1]
+    # What Profile.load says follows, as it says it on a stand: where it looked
+    # and what exists, so a collaborator can fix the folder they run from. Phrases
+    # that hold no option name, no path and no list of installed profiles.
+    assert "No profile named 'not-a-profile'" in text
+    assert "looked for not-a-profile.toml in:" in text
+    assert "Available profiles:" in text
     assert _stored_names(tmp_path) == ["up"]
 
 
@@ -522,6 +544,25 @@ def test_offline_takes_the_profile_of_the_stages_the_plugin_reads_only(
 
     assert result.exit_code == 0, result.output
     assert _stored(tmp_path, "reader").profile == "demo"
+
+
+def test_offline_does_not_take_the_profile_of_an_optional_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # An optional slot made on another profile is unusable and left out on a stand
+    # (`route`'s `timings` is one); it must not decide the profile or refuse the
+    # run offline either: the profile comes from `reads` only.
+    _register(monkeypatch, Up, Side, WithOptional)
+    doc = _seed(
+        tmp_path, _stage("up", profile="demo"), _stage("side", profile="nikon-ti2")
+    )
+
+    result = _run("run", "with-optional", "--offline", "--run-doc", str(doc))
+
+    assert result.exit_code == 0, result.output
+    stored = _stored(tmp_path, "with-optional")
+    assert stored.profile == "demo"
+    assert stored.reads["side"] is None
 
 
 # --- the run document ----------------------------------------------------------

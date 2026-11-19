@@ -236,7 +236,11 @@ given, as a run on a stand does, so work on a copy and keep the original as it w
 reads, looked up by name like any `--profile`. Run from the repository folder, where
 `profiles/` is, or set `SMC_PROFILES` to the folders that hold the profiles (separated by `:`
 on macOS and Linux, `;` on Windows). `--profile` (or `SMC_PROFILE`) may be given, and must then be that
-profile: a different one is refused, naming both. No Micro-Manager configuration is read, so
+profile: a different one is refused, naming both. A profile whose file is not named after its
+`[microscope] name` (`ti2-lab.toml` holding `name = "Ti2 lab"`) is not found by the recorded name: give
+its file, `-p profiles/ti2-lab.toml`, which is accepted when its name is the recorded one. The copy of the
+profile on this computer is what the run reads (its `[camera] pixel_size_um`, its autofocus factors): keep it
+as the stand's, since the record names the profile and not its version. No Micro-Manager configuration is read, so
 the profile's `[camera] pixel_size_um` is the only stand knowledge a plugin takes from it:
 `route --param objective=...` scales the field from that table, to the same result as on the
 stand, and an objective that is not in it is refused naming the table.

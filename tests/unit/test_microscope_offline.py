@@ -170,7 +170,8 @@ def test_creating_an_offline_microscope_does_not_import_pymmcore_plus() -> None:
     )
 
     done = subprocess.run(
-        [sys.executable, "-I", "-c", code],
+        # -X utf8: stdout and stderr are read as UTF-8, whatever the console's code page.
+        [sys.executable, "-I", "-X", "utf8", "-c", code],
         capture_output=True,
         encoding="utf-8",
         timeout=60,

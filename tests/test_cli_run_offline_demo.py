@@ -258,7 +258,10 @@ def test_an_offline_run_leaves_pymmcore_plus_out_of_the_process(
     )
 
     done = subprocess.run(
-        [sys.executable, "-I", "-c", code, str(copied)],
+        # -X utf8 after -I: the child's stdout holds "—" and "µ", and on Windows a
+        # redirected stream is cp1252, which -I (it implies -E) cannot be told
+        # otherwise through the environment (FM-20, FM-23, FM-42).
+        [sys.executable, "-I", "-X", "utf8", "-c", code, str(copied)],
         capture_output=True,
         encoding="utf-8",
         timeout=120,

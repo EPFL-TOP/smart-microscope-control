@@ -26,7 +26,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TextIO
 
@@ -2312,7 +2312,14 @@ def _offline_profile(
         )
     (name,) = recorded
     # The rule of Profile.load: a ".toml" or a separator is a path, not a name.
-    if name.endswith(".toml") or "/" in name or os.sep in name:
+    # A drive-relative name ("D:evil") is no path to Profile.load either, but
+    # Windows joins it to the search folder as "D:evil.toml", outside it.
+    if (
+        name.endswith(".toml")
+        or "/" in name
+        or os.sep in name
+        or PureWindowsPath(name).drive
+    ):
         raise typer.BadParameter(
             f"the run document names the profile {name!r}, which is not a profile name",
             param_hint="--run-doc",
@@ -2567,11 +2574,11 @@ def run_command(
     its values that does not apply on this stand or run document is printed and
     left out, and --param wins over the preset. The stage's record names it.
 
-    A plugin that never drives the stand (smc run --list shows which) runs on a
-    run folder copied to a machine with no Micro-Manager when --offline is
-    given: no stand is opened, the profile is the one the run document
-    recorded, and the stage's record says it was made offline. The run document
-    must exist, with a stage made at a stand upstream of the plugin.
+    A plugin that never drives the stand (cells, density, route, report and
+    nis-export) runs on a run folder copied to a machine with no Micro-Manager
+    when --offline is given: no stand is opened, the profile is the one the run
+    document recorded, and the stage's record says it was made offline. The run
+    document must exist, with a stage made at a stand upstream of the plugin.
     """
     with _Reported(ctx, after_report=_print_unsaved_result):
         if list_plugins:

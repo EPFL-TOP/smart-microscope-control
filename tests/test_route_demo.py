@@ -944,6 +944,21 @@ def test_an_objective_that_cannot_be_scaled_is_refused(
     )
 
 
+def test_a_turret_with_no_label_keeps_the_stands_refusal_text_with_no_name(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stand's text is as it was before `route` could run offline: an empty
+    # list of names stays empty there ("none" is the offline map's word only).
+    _seed(tmp_path, scan_objective=FORTY)
+    turret = demo_microscope.require(ObjectiveTurret)
+    monkeypatch.setattr(turret, "labels", lambda: ["", ""])
+
+    assert _refused(demo_microscope, tmp_path, objective=IN_PLACE).reason == (
+        f"objective {IN_PLACE!r} is not on the turret: ; give one of them, or leave "
+        f"objective unset"
+    )
+
+
 def test_another_objective_offline_gives_the_stands_result(
     demo_microscope: Microscope, tmp_path: Path
 ) -> None:
