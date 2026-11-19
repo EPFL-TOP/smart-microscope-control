@@ -8,16 +8,23 @@ at least 5 pixels from any text, because a text has a black stroke.
 
 from __future__ import annotations
 
+import errno
 import itertools
 import math
+import os
+import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
 import pytest
+import tifffile
 from PIL import Image, ImageDraw, ImageFont
 
+import smc.data.scan as scan_module
 from select_fields_seed import (
     PIXEL_UM,
     SHAPE,
@@ -28,8 +35,8 @@ from select_fields_seed import (
     record,
     seed_run,
 )
-from smc.data import Scan, draw, load_scan
-from smc.plugins.geometry import Matrix2, footprint
+from smc.data import DatasetError, Scan, draw, load_scan
+from smc.plugins.geometry import Matrix2, footprint, stage_of_pixel
 from smc.plugins.slots import (
     Cell,
     RoutePosition,
@@ -40,6 +47,7 @@ from smc.plugins.slots import (
     well_geometry,
 )
 from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
+from smc.run.files import AtomicWriteError
 
 HEIGHT, WIDTH = SHAPE
 GREEN = (0, 255, 0)
@@ -860,3 +868,606 @@ def test_a_scan_that_found_no_cell_shows_zeros_and_not_none(tmp_path: Path) -> N
     scan = load_scan(seed.path)
     line = draw.caption_lines(scan, "A1", None, "none", stops=0, frames=1)[-1]
     assert line == "cells: single (gold) 0, doublet (cyan) 0, debris (red) 0"
+
+
+# -------------------------------------------------------------- draw_well / draw_scan
+
+
+@pytest.fixture
+def renders(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """What ``draw_well`` hands ``render_png``, call by call: the caption and the stops are not in the PNG as data."""
+    real = draw.render_png
+    calls: list[dict[str, Any]] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Image.Image:
+        calls.append({"grey": args[0], "canvas": args[1], **kwargs})
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(draw, "render_png", spy)
+    return calls
+
+
+def _picture(drawing: draw.Drawing, well: str) -> Image.Image:
+    """A well's PNG as it was written, read back with Pillow."""
+    (found,) = [p for p in drawing.pictures if p.well == well]
+    assert found.written, found.error
+    image = Image.open(found.path)
+    image.load()
+    return image.convert("RGB")
+
+
+def _anywhere(image: Image.Image, colour: tuple[int, int, int]) -> bool:
+    """Whether ``colour`` is on the picture at all."""
+    return bool((np.asarray(image) == colour).all(axis=-1).any())
+
+
+def _has(image: Image.Image, colour: tuple[int, int, int], x: int, y: int) -> bool:
+    """Whether ``colour`` is within one pixel of ``(x, y)``: a line is 1 to 2 pixels wide."""
+    return any(
+        image.getpixel((x + dx, y + dy)) == colour
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+    )
+
+
+def _edge_midpoints(
+    x_um: float, y_um: float, matrix: Matrix2, shape: tuple[int, int]
+) -> list[tuple[float, float]]:
+    corners = footprint(x_um, y_um, matrix=matrix, image_shape_px=shape)
+    return [
+        ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+        for a, b in zip(corners, corners[1:] + corners[:1], strict=True)
+    ]
+
+
+def _seed_with_route(
+    tmp_path: Path, stops: tuple[RoutePosition, ...], **route_options: Any
+) -> Scan:
+    seed = seed_run(
+        tmp_path,
+        cells=[cell_at("A1", 1500.0, 1000.0)],
+        wells=("A1", "B2"),
+        rows=1,
+        columns=1,
+    )
+    _write_route(seed.path, _route(stops, **route_options), params=CHOSE)
+    return load_scan(seed.path)
+
+
+def test_draw_scan_draws_the_stops_of_each_well_as_footprints_numbered_in_their_well(
+    tmp_path: Path, renders: list[dict[str, Any]]
+) -> None:
+    stops = (
+        _stop(0, "A1", 0, 1000.0, -500.0),
+        _stop(1, "A1", 1, 1600.0, -300.0, score=0.82345),
+        _stop(2, "B2", 0, 10000.0, -9500.0),
+    )
+    scan = _seed_with_route(tmp_path, stops)
+    drawing = draw.draw_scan(scan, tmp_path / "out", max_px=1600)
+    assert [(p.well, p.stops, p.off_picture, p.written) for p in drawing.pictures] == [
+        ("A1", 2, 0, True),
+        ("B2", 1, 0, True),
+    ]
+    assert (drawing.route, drawing.route_absent) == ("route", None)
+    # B2's only stop is rank 1, though its order in the route is 2; A1's second carries its score.
+    texts = {c["caption"].split(":")[0]: [s[0] for s in c["stops"]] for c in renders}
+    assert texts == {"A1": ["1", "2 (0.823)"], "B2": ["1"]}
+    canvas = draw.canvas_of(scan.geometry["A1"], 1600)
+    first = _picture(drawing, "A1")
+    for x, y in _edge_midpoints(1000.0, -500.0, UPRIGHT, SHAPE):
+        assert _has(first, GREEN, *_pixel_of(canvas, x, y))
+    for x, y in _edge_midpoints(1600.0, -300.0, UPRIGHT, SHAPE):
+        assert _has(first, GREEN, *_pixel_of(canvas, x, y))
+    # The path is the yellow line between the two stops' centres, at its middle.
+    middle = _pixel_of(canvas, 1300.0, -400.0)
+    assert _has(first, (255, 255, 160), *middle)
+
+
+def test_the_wanted_labels_of_the_route_are_ringed_and_the_others_are_not(
+    tmp_path: Path,
+) -> None:
+    cells = [cell_at("A1", 0.0, 0.0, "single"), cell_at("A1", 400.0, 0.0, "doublet")]
+    seed = seed_run(tmp_path, cells=cells, wells=("A1",), rows=1, columns=1)
+    _write_route(
+        seed.path,
+        _route((_stop(0, "A1", 0, 1000.0, -2000.0),), labels=("single",)),
+        params=CHOSE,
+    )
+    scan = load_scan(seed.path)
+    image = _picture(draw.draw_scan(scan, tmp_path / "out", max_px=800), "A1")
+    canvas = draw.canvas_of(scan.geometry["A1"], 800)
+    gold, cyan = draw.CLASS_COLOURS[0][1], draw.CLASS_COLOURS[1][1]
+    for dx, colour, ringed in ((0.0, gold, True), (400.0, cyan, False)):
+        column, row = _pixel_of(canvas, 1000.0 + dx, -500.0)
+        assert image.getpixel((column, row)) == colour
+        assert (image.getpixel((column + 5, row)) == colour) is ringed
+
+
+@pytest.mark.parametrize("case", ["none", "stale", "other profile", "not a result"])
+def test_without_a_usable_route_the_picture_has_the_frames_and_the_cells_and_the_caption_says_why(
+    tmp_path: Path, renders: list[dict[str, Any]], case: str
+) -> None:
+    if case == "none":
+        scan = _scan_of_run(tmp_path, wells=("A1",))
+    elif case == "stale":
+        scan = _stale_route(tmp_path)
+    elif case == "other profile":
+        scan = _scan_of_run(
+            tmp_path,
+            wells=("A1",),
+            route=_route((_stop(0, "A1", 0, 1000.0, -500.0),)),
+            profile="stand-b",
+        )
+    else:
+        broken = _route((_stop(0, "A1", 0, 1000.0, -500.0),)).model_dump(mode="json")
+        broken["positions"] = "not a list of stops"
+        scan = _scan_of_run(tmp_path, wells=("A1",), route=broken)
+    drawing = draw.draw_scan(scan, tmp_path / "out", max_px=800)
+    _, why = draw.route_of(scan)
+    assert drawing.route is None
+    assert drawing.route_absent == why
+    assert why is not None
+    # The caption's first line says no route was drawn and its second says why.
+    caption = renders[0]["caption"].split("\n")
+    assert caption[0] == "A1: no route drawn"
+    assert caption[1] == why
+    assert renders[0]["stops"] == []
+    image = _picture(drawing, "A1")
+    canvas = draw.canvas_of(scan.geometry["A1"], 800)
+    # The mosaic and the cell are there: the frame's stretch puts a pixel of it above
+    # the dark grey, the cell is a gold dot, and nothing is the route's green.
+    assert not _anywhere(image, GREEN)
+    column, row = _pixel_of(canvas, 1000.0, -500.0)
+    assert image.getpixel((column, row)) == draw.CLASS_COLOURS[0][1]
+    assert drawing.pictures[0].stops == 0
+
+
+def test_a_stop_is_drawn_with_the_routes_own_field_and_not_the_scans(
+    tmp_path: Path,
+) -> None:
+    # FM-124: the route's camera is a quarter of the scan's area and its frame is
+    # transposed; the footprint drawn is the route's.
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    matrix: Matrix2 = ((2.5, 0.0), (0.0, -2.5))
+    shape = (80, 60)
+    _write_route(
+        seed.path,
+        _route(
+            (_stop(0, "A1", 0, 1000.0, -500.0),),
+            matrix=matrix,
+            shape=shape,
+            fov_um=(150.0, 200.0),
+        ),
+        params=CHOSE,
+    )
+    scan = load_scan(seed.path)
+    image = _picture(draw.draw_scan(scan, tmp_path / "out", max_px=1600), "A1")
+    canvas = draw.canvas_of(scan.geometry["A1"], 1600)
+    for x, y in _edge_midpoints(1000.0, -500.0, matrix, shape):
+        assert _has(image, GREEN, *_pixel_of(canvas, x, y))
+    for x, y in footprint(1000.0, -500.0, matrix=UPRIGHT, image_shape_px=SHAPE):
+        assert not _has(image, GREEN, *_pixel_of(canvas, x, y))
+
+
+@pytest.mark.parametrize("name", ["upright", "mirrored", "turned 30"])
+def test_the_frames_the_cells_and_the_wall_are_where_the_stage_says(
+    tmp_path: Path, name: str
+) -> None:
+    matrix = {
+        "upright": UPRIGHT,
+        "mirrored": matrix_of(PIXEL_UM, 0.0, True),
+        "turned 30": matrix_of(PIXEL_UM, 30.0, False),
+    }[name]
+
+    def marked(frame: ScanFrame) -> np.ndarray:
+        # A 15 x 15 pixel block (rows 5-19, columns 55-69) is the only thing the stretch
+        # maps to white: off the axes and the frame's centre on purpose (FM-73).
+        data = np.full(SHAPE, 100, dtype=np.uint16)
+        data[5:20, 55:70] = 4000
+        return data
+
+    seed = seed_run(
+        tmp_path,
+        cells=[cell_at("A1", 1500.0, 1000.0)],
+        wells=("A1",),
+        rows=1,
+        columns=1,
+        matrix=matrix,
+        frame_pixels=marked,
+    )
+    scan = load_scan(seed.path)
+    image = _picture(draw.draw_scan(scan, tmp_path / "out", max_px=256), "A1")
+    canvas = draw.canvas_of(scan.geometry["A1"], 256)
+    frame = seed.scan.frames[0]
+    marker = stage_of_pixel(
+        frame.x_um, frame.y_um, 62.0, 12.0, matrix=matrix, image_shape_px=SHAPE
+    )
+    assert image.getpixel(_pixel_of(canvas, *marker)) == (255, 255, 255)
+    # The point of the frame opposite through its centre is the dark background.
+    opposite = stage_of_pixel(
+        frame.x_um, frame.y_um, 17.0, 47.0, matrix=matrix, image_shape_px=SHAPE
+    )
+    assert image.getpixel(_pixel_of(canvas, *opposite)) == (0, 0, 0)
+    assert image.getpixel(_pixel_of(canvas, 2500.0, 500.0)) == draw.CLASS_COLOURS[0][1]
+    for dx, dy in ((3200.0, 0.0), (-3200.0, 0.0), (0.0, 3200.0), (0.0, -3200.0)):
+        assert _has(image, (90, 90, 255), *_pixel_of(canvas, 1000.0 + dx, -500.0 + dy))
+
+
+def test_a_cell_is_coloured_by_the_class_the_legend_names(
+    tmp_path: Path, renders: list[dict[str, Any]]
+) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    labels = ("single", "doublet", "debris", "mystery")
+    cells = [
+        cell_at("A1", 400.0 * k - 600.0, 1000.0, label)
+        for k, label in enumerate(labels)
+    ]
+    scan = Scan.from_results(
+        tmp_path,
+        RunDocument.load(seed.path),
+        plan=seed.plan,
+        result=seed.scan,
+        cells_result=seed.result,
+        cells=cells,
+    )
+    image = _picture(draw.draw_scan(scan, tmp_path / "out", max_px=800), "A1")
+    canvas = draw.canvas_of(scan.geometry["A1"], 800)
+    legend = renders[0]["caption"].split("\n")[-1]
+    colours = [rgb for _, rgb in draw.CLASS_COLOURS[:3]] + [(255, 255, 255)]
+    names = [name for name, _ in draw.CLASS_COLOURS[:3]] + ["white"]
+    for cell, colour, name in zip(cells, colours, names, strict=True):
+        column, row = _pixel_of(canvas, cell.x_um, cell.y_um)
+        assert image.getpixel((column, row)) == colour, cell.label
+        assert f"{cell.label} ({name})" in legend
+
+
+def test_a_scan_with_no_cells_draws_the_frames_and_the_stops_and_says_why(
+    tmp_path: Path, renders: list[dict[str, Any]]
+) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    (tmp_path / seed.result.file).unlink()
+    _write_route(seed.path, _route((_stop(0, "A1", 0, 1000.0, -500.0),)), params=CHOSE)
+    scan = load_scan(seed.path)
+    assert scan.cells is None
+    drawing = draw.draw_scan(scan, tmp_path / "out", max_px=800)
+    assert drawing.cells is False
+    assert drawing.pictures[0].cells == 0
+    assert renders[0]["caption"].split("\n")[-1].startswith("cells: none (cells file ")
+    image = _picture(drawing, "A1")
+    canvas = draw.canvas_of(scan.geometry["A1"], 800)
+    for x, y in _edge_midpoints(1000.0, -500.0, UPRIGHT, SHAPE):
+        assert _has(image, GREEN, *_pixel_of(canvas, x, y))
+
+
+def _first_frame_file(scan: Scan) -> Path:
+    return scan.run_dir / scan.frames("A1")[0].file
+
+
+def _rewrite(path: Path, how: str) -> None:
+    if how == "missing":
+        path.unlink()
+    elif how == "garbage":
+        path.write_bytes(b"this is not a tiff at all")
+    elif how == "empty":
+        path.write_bytes(b"")
+    elif how == "wrong shape":
+        tifffile.imwrite(path, np.full((40, 40), 1000, dtype=np.uint16))
+    else:
+        nan = np.full(SHAPE, 1000.0, dtype=np.float32)
+        nan[3, 3] = np.nan
+        tifffile.imwrite(path, nan)
+
+
+@pytest.mark.parametrize("how", ["missing", "garbage", "empty", "wrong shape", "nan"])
+def test_an_unreadable_frame_is_counted_and_never_ends_the_drawing(
+    tmp_path: Path, renders: list[dict[str, Any]], how: str
+) -> None:
+    # The run folder has a space and a bracket in its name (FM-50, FM-36): none of it
+    # may reach the caption.
+    folder = tmp_path / "run [1] a b"
+    folder.mkdir()
+    seed = seed_run(folder, cells=[cell_at("A1", 0.0, 0.0)], wells=("A1",), rows=2)
+    scan = load_scan(seed.path)
+    first = scan.frames("A1")[0]
+    _rewrite(_first_frame_file(scan), how)
+    drawing = draw.draw_scan(scan, tmp_path / "out", max_px=800)
+    (picture,) = drawing.pictures
+    assert picture.written
+    assert picture.frames == len(scan.frames("A1")) >= 2
+    assert (picture.unreadable, picture.placed) == (1, picture.frames - 1)
+    caption = renders[0]["caption"].split("\n")
+    line = next(line for line in caption if "could not be read" in line)
+    assert line.startswith(f"1 of {picture.frames} frames could not be read; first: ")
+    assert f"first: {first.file}: " in line
+    assert str(folder) not in line
+    assert "run [1]" not in line
+    assert "a b" not in line
+    assert line.isascii()
+
+
+def test_a_reason_that_quotes_the_run_folder_is_scrubbed_before_it_reaches_the_caption(
+    tmp_path: Path, renders: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-50: a picture is shared, and a decoder's message may quote the PC's path.
+    folder = tmp_path / "run [1] a b"
+    folder.mkdir()
+    seed = seed_run(folder, cells=[], wells=("A1",), rows=2)
+    scan = load_scan(seed.path)
+    first = scan.frames("A1")[0]
+    real = scan_module.load_frame
+
+    def quoting(run_dir: Path, frame: ScanFrame) -> np.ndarray:
+        if frame.name == first.name:
+            raise ValueError(f"cannot decode {run_dir / frame.file} in {run_dir}")
+        return real(run_dir, frame)
+
+    monkeypatch.setattr(scan_module, "load_frame", quoting)
+    draw.draw_scan(scan, tmp_path / "out", max_px=800)
+    lines = renders[0]["caption"].split("\n")
+    line = next(text for text in lines if "could not" in text)
+    assert str(folder) not in line
+    assert folder.name not in line
+    assert "cannot decode <run folder>" in line
+
+
+def test_a_stop_far_outside_the_well_is_counted_and_left_out_and_raises_nothing(
+    tmp_path: Path, renders: list[dict[str, Any]]
+) -> None:
+    # FM-74, FM-75: Pillow raises SystemError for a text at 1e300. The ranks are the
+    # well's whole list's, so the third stop stays 3 when the second is left out.
+    stops = (
+        _stop(0, "A1", 0, 1000.0, -500.0),
+        _stop(1, "A1", 1, 1e300, -500.0),
+        _stop(2, "A1", 2, 1600.0, -500.0),
+        _stop(3, "A1", 3, 1e9, 1e9),
+    )
+    scan = _seed_with_route(tmp_path, stops)
+    drawing = draw.draw_scan(scan, tmp_path / "out", wells=["A1"], max_px=800)
+    (picture,) = drawing.pictures
+    assert (picture.stops, picture.off_picture) == (4, 2)
+    assert [s[0] for s in renders[0]["stops"]] == ["1", "3"]
+    assert [s[1] for s in renders[0]["stops"]] == [1000.0, 1600.0]
+    caption = renders[0]["caption"].split("\n")
+    assert "2 stops outside the picture are not drawn" in caption
+    assert caption[0].startswith("A1: 4 stops;")
+    # No line is drawn to a left-out stop: the path's colour appears only between the
+    # two stops on the picture.
+    image = _picture(drawing, "A1")
+    canvas = draw.canvas_of(scan.geometry["A1"], 800)
+    row_of_path = _pixel_of(canvas, 1300.0, -500.0)
+    assert _has(image, (255, 255, 160), *row_of_path)
+    assert _anywhere(image, (255, 255, 160))
+    far_right = [
+        image.getpixel((c, r))
+        for c in range(image.size[0] - 30, image.size[0])
+        for r in range(image.size[1])
+    ]
+    assert (255, 255, 160) not in far_right
+
+
+def test_a_matrix_that_cannot_be_inverted_is_a_dataset_error_naming_the_scan(
+    tmp_path: Path,
+) -> None:
+    # FM-125: nothing checks that the matrix of a loaded scan can be inverted.
+    seed = seed_run(
+        tmp_path,
+        cells=[],
+        wells=("A1",),
+        rows=1,
+        columns=1,
+        matrix=((1.0, 1.0), (1.0, 1.0)),
+        plan_matrix=UPRIGHT,
+    )
+    scan = load_scan(seed.path)
+    out = tmp_path / "out"
+    with pytest.raises(DatasetError, match="the scan's camera cannot be drawn"):
+        draw.draw_scan(scan, out)
+    assert not out.exists()
+
+
+def test_the_picture_is_the_wells_box_and_never_the_frames(tmp_path: Path) -> None:
+    # FM-136: a frame whose readback is 1e9 um away places nothing and does not grow the picture.
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    far = seed.scan.frames[0].model_copy(update={"x_um": 1e9})
+    result = seed.scan.model_copy(update={"frames": (far,)})
+    scan = Scan.from_results(
+        tmp_path,
+        RunDocument.load(seed.path),
+        plan=seed.plan,
+        result=result,
+        cells_result=seed.result,
+        cells=[],
+    )
+    image = _picture(draw.draw_scan(scan, tmp_path / "out", max_px=512), "A1")
+    canvas = draw.canvas_of(scan.geometry["A1"], 512)
+    assert image.size == (canvas.width_px, canvas.height_px)
+    # The frame is read and placed nowhere: the well's centre is still the dark grey
+    # of a pixel no frame reached, not the (0, 0, 0) a flat frame would stretch to.
+    assert image.getpixel(_pixel_of(canvas, 1000.0, -500.0)) == (40, 40, 40)
+
+
+def test_max_px_is_the_longest_side(tmp_path: Path) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",), rows=1, columns=1)
+    scan = load_scan(seed.path)
+    square = WellGeometry(
+        well="A1",
+        center_um=(1000.0, -500.0),
+        size_um=(4000.0, 2500.0),
+        circular=False,
+        rotation_deg=17.0,
+    )
+    turned = replace(scan, geometry=MappingProxyType({"A1": square}))
+    for max_px in (256, 1600):
+        round_picture = _picture(
+            draw.draw_scan(scan, tmp_path / "r", max_px=max_px), "A1"
+        )
+        assert max(round_picture.size) == max_px
+        other = _picture(draw.draw_scan(turned, tmp_path / "s", max_px=max_px), "A1")
+        assert max(other.size) == max_px
+        assert min(other.size) < max_px
+
+
+def _plain_scan(tmp_path: Path, wells: tuple[str, ...] = ("A1", "B2", "B1")) -> Scan:
+    seed = seed_run(tmp_path, cells=[], wells=wells, rows=1, columns=1)
+    return load_scan(seed.path)
+
+
+def test_draw_scan_writes_one_picture_per_well_in_the_plans_order_and_touches_nothing_else(
+    tmp_path: Path,
+) -> None:
+    scan = _plain_scan(tmp_path)
+    out = tmp_path / "out"
+    (out / "sub").mkdir(parents=True)
+    keep = {
+        out / "notes.txt": b"my notes",
+        out / "Z9.png": b"not ours",
+        out / "sub" / "A1.png": b"in a folder",
+    }
+    for path, content in keep.items():
+        path.write_bytes(content)
+    (out / "A1.png").write_bytes(b"sentinel")
+    drawing = draw.draw_scan(scan, out, wells=("b2", "A1", "B02"), max_px=256)
+    assert [p.well for p in drawing.pictures] == ["A1", "B2"]
+    assert all(p.path == out / f"{p.well}.png" and p.written for p in drawing.pictures)
+    for path, content in keep.items():
+        assert path.read_bytes() == content
+    assert not (out / "B1.png").exists()
+    with Image.open(out / "A1.png") as new:
+        new.load()
+        assert new.format == "PNG"
+    assert sorted(p.name for p in out.iterdir()) == [
+        "A1.png",
+        "B2.png",
+        "Z9.png",
+        "notes.txt",
+        "sub",
+    ]
+
+
+def test_every_well_is_drawn_when_none_are_named_and_progress_follows_each_well(
+    tmp_path: Path,
+) -> None:
+    scan = _plain_scan(tmp_path)
+    seen: list[tuple[int, int, str]] = []
+    drawing = draw.draw_scan(
+        scan, tmp_path / "out", max_px=256, progress=lambda *step: seen.append(step)
+    )
+    assert [p.well for p in drawing.pictures] == ["A1", "B2", "B1"]
+    assert seen == [(1, 3, "A1"), (2, 3, "B2"), (3, 3, "B1")]
+    assert drawing.route is None
+    assert drawing.cells is True
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"wells": ["Z9"]}, "well 'Z9' is not in this scan (A1, B2, B1)"),
+        ({"wells": ["A1", "C3"]}, "well 'C3' is not in this scan"),
+        ({"wells": []}, "no well was asked for"),
+        ({"max_px": 255}, "max_px must be an integer from 256 to 4000"),
+        ({"max_px": 4001}, "max_px must be an integer from 256 to 4000"),
+        ({"max_px": True}, "max_px must be an integer from 256 to 4000"),
+        ({"max_px": 800.0}, "max_px must be an integer from 256 to 4000"),
+    ],
+)
+def test_an_unknown_well_or_a_bad_max_px_is_refused_before_any_file_is_written(
+    tmp_path: Path, renders: list[dict[str, Any]], kwargs: dict[str, Any], message: str
+) -> None:
+    scan = _plain_scan(tmp_path)
+    out = tmp_path / "out"
+    with pytest.raises(DatasetError, match=re.escape(message)):
+        draw.draw_scan(scan, out, **kwargs)
+    assert not out.exists()
+    assert renders == [], "no frame was read: nothing was drawn"
+
+
+def test_an_out_dir_that_is_a_file_is_refused_and_the_file_is_not_touched(
+    tmp_path: Path,
+) -> None:
+    scan = _plain_scan(tmp_path)
+    target = tmp_path / "out"
+    target.write_bytes(b"a file")
+    with pytest.raises(DatasetError, match="is a file, not a folder"):
+        draw.draw_scan(scan, target)
+    assert target.read_bytes() == b"a file"
+
+
+def test_a_picture_that_cannot_be_written_does_not_stop_the_others(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-34: a viewer that holds B2.png open is B2's error and not the scan's.
+    scan = _plain_scan(tmp_path)
+    real = draw.write_atomically
+
+    def flaky(path: Path, data: bytes, **kwargs: Any) -> None:
+        if path.name == "B2.png":
+            raise AtomicWriteError(OSError(errno.EIO, "disk"))
+        real(path, data, **kwargs)
+
+    monkeypatch.setattr(draw, "write_atomically", flaky)
+    out = tmp_path / "out"
+    drawing = draw.draw_scan(scan, out, max_px=256)
+    by_well = {p.well: p for p in drawing.pictures}
+    assert (out / "A1.png").is_file()
+    assert (out / "B1.png").is_file()
+    assert not (out / "B2.png").exists()
+    assert by_well["A1"].written
+    assert by_well["B1"].written
+    assert not by_well["B2"].written
+    assert by_well["B2"].error == "disk"
+    assert str(tmp_path) not in (by_well["B2"].error or "")
+
+
+def test_a_picture_is_replaced_whole_or_not_at_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-38: the old picture stays when the new one cannot be put in its place.
+    scan = _plain_scan(tmp_path, wells=("A1",))
+    out = tmp_path / "out"
+    draw.draw_scan(scan, out, max_px=256)
+    old = (out / "A1.png").read_bytes()
+
+    def refuse(src: object, dst: object) -> None:
+        raise PermissionError(errno.EACCES, "in use")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    drawing = draw.draw_scan(scan, out, max_px=512)
+    assert not drawing.pictures[0].written
+    assert (out / "A1.png").read_bytes() == old
+
+
+def test_stops_in_wells_the_scan_does_not_have_are_a_note_and_the_rest_is_drawn(
+    tmp_path: Path,
+) -> None:
+    stops = (
+        _stop(0, "A1", 0, 1000.0, -500.0),
+        _stop(1, "C3", 0, 50.0, 50.0),
+        _stop(2, "C3", 1, 60.0, 60.0),
+    )
+    scan = _seed_with_route(tmp_path, stops)
+    drawing = draw.draw_scan(scan, tmp_path / "out", max_px=256)
+    assert drawing.notes == (
+        "the route holds 2 stops in wells the scan does not have (C3): not drawn",
+    )
+    assert drawing.pictures[0].stops == 1
+
+
+def test_the_scan_is_the_one_the_picture_says_it_is_when_a_well_has_no_frame(
+    tmp_path: Path,
+) -> None:
+    # A well of the plan with no frame (every field failed) is a picture of the wall
+    # and the cells, not an error.
+    seed = seed_run(tmp_path, cells=[cell_at("A1", 0.0, 0.0)], wells=("A1",), rows=1)
+    result = seed.scan.model_copy(update={"frames": ()})
+    scan = Scan.from_results(
+        tmp_path,
+        RunDocument.load(seed.path),
+        plan=seed.plan,
+        result=result,
+        cells_result=seed.result,
+        cells=seed.cells,
+    )
+    drawing = draw.draw_scan(scan, tmp_path / "out", max_px=256)
+    (picture,) = drawing.pictures
+    assert (picture.frames, picture.placed, picture.unreadable) == (0, 0, 0)
+    assert picture.written

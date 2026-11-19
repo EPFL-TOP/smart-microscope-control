@@ -10,10 +10,12 @@ test helpers, the page or the CLI (``tests/test_kit_imports.py`` keeps it so), a
 from __future__ import annotations
 
 import contextlib
+import io
 import math
+import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +24,7 @@ import numpy.typing as npt
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import ValidationError
 
-from smc.data.scan import Scan
+from smc.data.scan import DatasetError, Scan
 from smc.plugins.geometry import Matrix2, footprint
 from smc.plugins.slots import (
     Cell,
@@ -31,6 +33,7 @@ from smc.plugins.slots import (
     WellGeometry,
     normalise_well,
 )
+from smc.run.files import write_atomically
 
 # The mosaic is for *looking*, not for measuring: a frame is reduced by block means,
 # placed on the canvas by the nearest pixel, and a later frame overwrites an earlier
@@ -720,9 +723,11 @@ def _cells_line(scan: Scan, well: str) -> str:
 
 
 def _classes_of(scan: Scan, well: str) -> tuple[str, ...]:
-    """The classes in the cells stage's order; a scan built with no cells result has the labels its cells hold, sorted."""
+    """The classes in the cells stage's order; a scan built with cells and no cells result has the labels its cells hold, sorted; one with no cells has none."""
     if scan.cells_result is not None:
         return tuple(scan.cells_result.classes)
+    if scan.cells is None:
+        return ()
     return tuple(sorted({cell.label for cell in scan.cells_of(well=well)}))
 
 
@@ -761,3 +766,309 @@ def caption_lines(
             else f"{off_picture} stops outside the picture are not drawn"
         )
     return lines
+
+
+# ====================================================================== The pictures
+
+#: The longest side of a picture, in pixels: the default and the bounds of ``max_px``.
+#: The canvas, its 8-bit stretch and the PNG's encoding grow with the square of it
+#: (165 MB of RSS at 1600 px, 2.5 GB at 8000: measured), so it is bounded above (FM-74).
+DEFAULT_MAX_PX = 1600
+MIN_MAX_PX = 256
+MAX_MAX_PX = 4000
+
+#: What a well's name may hold to be the name of a file: a well of a plate is letters and
+#: digits, and a name from a record never goes up a folder or into another one.
+_FILE_NAME = re.compile(r"[A-Za-z0-9_-]+")
+
+
+@dataclass(frozen=True, slots=True)
+class WellPicture:
+    """What was drawn of one well, and whether its file was written.
+
+    ``frames`` is the well's frames and ``placed`` those that were read and put on the
+    mosaic (``unreadable`` the others). ``stops`` is the route's stops in the well, as
+    the caption counts them, of which ``off_picture`` are not drawn. ``cells`` is the
+    well's cells of every class. ``error`` is what the file system said, never a path.
+    """
+
+    well: str
+    path: Path
+    written: bool
+    error: str | None
+    frames: int
+    placed: int
+    unreadable: int
+    stops: int
+    off_picture: int
+    cells: int
+
+
+@dataclass(frozen=True, slots=True)
+class Drawing:
+    """What ``draw_scan`` did: one ``WellPicture`` per well in the plan's order, and what it says about the whole.
+
+    ``route`` is the plugin of the route that was drawn and ``route_absent`` why none
+    was (exactly one of the two is set); ``cells`` says whether the scan has cells.
+    ``notes`` are the sentences that belong to no well.
+    """
+
+    out_dir: Path
+    pictures: tuple[WellPicture, ...]
+    route: str | None
+    route_absent: str | None
+    cells: bool
+    notes: tuple[str, ...]
+
+
+def _on_picture(canvas: Canvas, x_um: float, y_um: float) -> bool:
+    """Whether a stage point is within 10 pixels of the picture; a point that is not finite is not (FM-74, FM-75)."""
+    column, row = canvas.px_of(x_um, y_um)
+    return (
+        -_TEXT_REACH_PX <= column <= canvas.width_px + _TEXT_REACH_PX
+        and -_TEXT_REACH_PX <= row <= canvas.height_px + _TEXT_REACH_PX
+    )
+
+
+def _read_problem(frame: ScanFrame, exc: DatasetError, run_dir: Path) -> str:
+    """Why ``Scan.image`` refused a frame, in the words of its cause and without the PC's paths (FM-50).
+
+    ``Scan.image`` wraps the cause in a message that starts with the frame's name and
+    file, and ``frame_problem`` names the file itself; the cause is what the system
+    said (``strerror``, not a path), and a refusal with none is its own text less that
+    prefix.
+    """
+    cause = exc.__cause__
+    if isinstance(cause, Exception):
+        return frame_problem(frame, cause, run_dir)
+    prefix = f"frame {frame.name} ({frame.file}): "
+    return frame_problem(frame, ValueError(str(exc).removeprefix(prefix)), run_dir)
+
+
+def _camera_error(exc: ValueError) -> DatasetError:
+    return DatasetError(
+        f"the scan's camera cannot be drawn: {exc}; its record in the run document "
+        f"holds a pixel size or a matrix that is not one"
+    )
+
+
+def draw_well(
+    scan: Scan,
+    well: str,
+    view: RouteView | None,
+    route_absent: str | None,
+    *,
+    max_px: int = DEFAULT_MAX_PX,
+) -> tuple[Image.Image, WellPicture]:
+    """The picture of one well and what it holds: the frames, the wall, the cells and the route's stops of that well.
+
+    Each frame is read once, in the scan's order, and a later one overwrites an
+    earlier where they overlap. A frame that cannot be read, is not the scan's shape
+    or (a float) holds a value that is not finite is **counted and skipped**: a
+    picture with a hole in it and a caption that says so is worth more than none
+    (failures are findings). A stop whose centre is not within 10 pixels of the
+    picture is left out altogether (no footprint, no number, no vertex of the path)
+    and counted, and the stops keep the ranks of the well's whole list, so a third
+    stop stays ``3`` when the second is left out.
+
+    The picture's path is only the file's name; ``draw_scan`` puts it in its folder.
+
+    Raises:
+        DatasetError: The scan's camera cannot be drawn (a pixel size that is not a
+            size, a matrix that cannot be inverted): every well would fail the same way.
+    """
+    geometry = scan.geometry[well]
+    frames = scan.frames(well)
+    try:
+        mosaic = Mosaic(
+            geometry,
+            max_px=max_px,
+            pixel_size_um=scan.pixel_size_um,
+            matrix_um_per_px=scan.matrix_um_per_px,
+            image_shape_px=scan.image_shape_px,
+        )
+    except ValueError as exc:
+        raise _camera_error(exc) from exc
+    unreadable = 0
+    first_problem: str | None = None
+    for frame in frames:
+        problem: str | None = None
+        try:
+            pixels = scan.image(frame)
+        except DatasetError as exc:
+            problem = _read_problem(frame, exc, scan.run_dir)
+        else:
+            if (
+                np.issubdtype(pixels.dtype, np.floating)
+                and not np.isfinite(pixels).all()
+            ):
+                problem = frame_problem(
+                    frame,
+                    ValueError("the frame holds values that are not finite"),
+                    scan.run_dir,
+                )
+        if problem is not None:
+            unreadable += 1
+            first_problem = first_problem or problem
+            continue
+        try:
+            mosaic.add(pixels, frame.x_um, frame.y_um)
+        except ValueError as exc:
+            raise _camera_error(exc) from exc
+
+    cells = scan.cells_of(well=well) if scan.cells is not None else ()
+    every = stops_of_well(view, well) if view is not None else ()
+    shown = [s for s in every if _on_picture(mosaic.canvas, s.x_um, s.y_um)]
+    off_picture = len(every) - len(shown)
+    caption = caption_lines(
+        scan,
+        well,
+        view,
+        route_absent,
+        stops=len(every),
+        frames=len(frames),
+        unreadable=unreadable,
+        first_problem=first_problem,
+        off_picture=off_picture,
+    )
+    image = render_png(
+        mosaic.grey(),
+        mosaic.canvas,
+        geometry,
+        cells=cells,
+        classes=_classes_of(scan, well),
+        wanted=view.result.labels if view is not None else (),
+        stops=[(label_of(s.rank, s.score), s.x_um, s.y_um) for s in shown],
+        matrix=(
+            view.result.matrix_um_per_px if view is not None else scan.matrix_um_per_px
+        ),
+        image_shape_px=(
+            view.result.image_shape_px if view is not None else scan.image_shape_px
+        ),
+        caption="\n".join(caption),
+    )
+    picture = WellPicture(
+        well=well,
+        path=Path(f"{well}.png"),
+        written=False,
+        error=None,
+        frames=len(frames),
+        placed=len(frames) - unreadable,
+        unreadable=unreadable,
+        stops=len(every),
+        off_picture=off_picture,
+        cells=len(cells),
+    )
+    return image, picture
+
+
+def _wells_to_draw(scan: Scan, wells: Sequence[str] | None) -> tuple[str, ...]:
+    """The scan's own names of the wells asked for, in the plan's order, each once; a well the scan lacks is a refusal."""
+    if wells is None:
+        chosen = list(scan.wells)
+    else:
+        if not wells:
+            raise DatasetError("no well was asked for: name wells, or none for all")
+        known = {normalise_well(name): name for name in scan.wells}
+        wanted: set[str] = set()
+        for well in wells:
+            key = normalise_well(well)
+            if key not in known:
+                raise DatasetError(
+                    f"well {well!r} is not in this scan ({', '.join(scan.wells)})"
+                )
+            wanted.add(key)
+        chosen = [name for name in scan.wells if normalise_well(name) in wanted]
+    for name in chosen:
+        if _FILE_NAME.fullmatch(name) is None:
+            raise DatasetError(
+                f"the scan's well {name!r} is not a name this command can write "
+                f"a file for"
+            )
+    return tuple(chosen)
+
+
+def _stops_in_other_wells(scan: Scan, view: RouteView) -> str | None:
+    """A sentence for the route's stops in wells the scan does not have, or ``None``: they are not drawn, and not silently."""
+    known = {normalise_well(name) for name in scan.wells}
+    strangers = [
+        p.well for p in view.result.positions if normalise_well(p.well) not in known
+    ]
+    if not strangers:
+        return None
+    names = sorted(set(strangers))
+    listed = ", ".join(_record_text(name) for name in names[:_LABELS_LISTED])
+    if len(names) > _LABELS_LISTED:
+        listed += ", ..."
+    return (
+        f"the route holds {len(strangers)} stops in wells the scan does not have "
+        f"({listed}): not drawn"
+    )
+
+
+def draw_scan(
+    scan: Scan,
+    out_dir: Path,
+    *,
+    wells: Sequence[str] | None = None,
+    max_px: int = DEFAULT_MAX_PX,
+    progress: Callable[[int, int, str], None] | None = None,
+) -> Drawing:
+    """Draw each well of a scan to ``<out_dir>/<well>.png``, with the route's stops when the scan has a usable one.
+
+    The wells come in the plan's order whatever order ``wells`` named them. A well the
+    scan lacks, a ``max_px`` outside ``MIN_MAX_PX`` to ``MAX_MAX_PX`` (a ``bool`` is
+    not one) and an ``out_dir`` that is a file are refused **before any frame is read
+    or any folder made**. ``out_dir`` is made, with its parents, when the first picture
+    is written. Each PNG is encoded to bytes and written with ``write_atomically``:
+    replaced whole or not at all (FM-38), the rename retried when a viewer holds the old
+    picture on Windows (FM-24). Nothing else in ``out_dir`` is touched. An ``OSError``
+    on one picture is its ``WellPicture.error`` and the others are still written
+    (FM-34). ``progress(done, total, well)`` is called after each well.
+
+    Raises:
+        DatasetError: A refusal above, or the scan's camera cannot be drawn.
+    """
+    if (
+        isinstance(max_px, bool)
+        or not isinstance(max_px, int)
+        or not MIN_MAX_PX <= max_px <= MAX_MAX_PX
+    ):
+        raise DatasetError(
+            f"max_px must be an integer from {MIN_MAX_PX} to {MAX_MAX_PX}, "
+            f"got {max_px!r}"
+        )
+    chosen = _wells_to_draw(scan, wells)
+    try:
+        is_file = out_dir.exists() and not out_dir.is_dir()
+    except OSError:
+        is_file = False  # the write says what is wrong, with its own reason
+    if is_file:
+        raise DatasetError(f"{out_dir} is a file, not a folder: name a folder")
+    view, absent = route_of(scan)
+    notes = [] if view is None else [_stops_in_other_wells(scan, view)]
+    pictures: list[WellPicture] = []
+    for done, well in enumerate(chosen, start=1):
+        image, picture = draw_well(scan, well, view, absent, max_px=max_px)
+        path = out_dir / f"{well}.png"
+        buffer = io.BytesIO()
+        image.save(buffer, "PNG")
+        try:
+            write_atomically(path, buffer.getvalue())
+        except OSError as exc:
+            picture = replace(
+                picture, path=path, error=exc.strerror or type(exc).__name__
+            )
+        else:
+            picture = replace(picture, path=path, written=True)
+        pictures.append(picture)
+        if progress is not None:
+            progress(done, len(chosen), well)
+    return Drawing(
+        out_dir=out_dir,
+        pictures=tuple(pictures),
+        route=view.plugin if view is not None else None,
+        route_absent=absent,
+        cells=scan.cells is not None,
+        notes=tuple(note for note in notes if note is not None),
+    )
