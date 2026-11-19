@@ -56,7 +56,7 @@ and switches the autofocus off and on).
 ```text
 smc run --list
 smc run NAME --show-params
-smc run NAME [-p PROFILE] --run-doc PATH [--preset NAME|PATH] [--param KEY=VALUE]... [--dry-run] [--resume]
+smc run NAME [-p PROFILE] --run-doc PATH [--preset NAME|PATH] [--param KEY=VALUE]... [--dry-run] [--resume] [--offline]
 smc presets list [-p PROFILE]
 smc presets show NAME|PATH [-p PROFILE] [--run-doc PATH]
 smc presets save NAME --run-doc PATH [-p PROFILE] [--overwrite]
@@ -212,6 +212,52 @@ scan: autofocus=off
 scan-plan: coverage=0.4
 $ smc run scan-plan -p demo-sample --preset weekly --run-doc next.json   # next.json has its plate registered
 ```
+
+## Offline: a copied run folder
+
+`smc run NAME --offline --run-doc RUN_DOC` runs a plugin that never drives the stand on a run
+folder copied to another computer, with no Micro-Manager and no stand opened, so that a
+collaborator runs the same tools as the stand on a dataset. The five plugins that do it are
+`cells`, `density`, `route`, `report` and `nis-export` (`smc run --list` does not mark them; a
+plugin's class sets `offline = True`, and a third-party plugin may).
+
+```text
+$ smc run cells --offline --param detector=blobs --run-doc copy/run.json
+offline: no stand is opened; the profile, nikon-ti2, is the run document's
+...
+$ smc run density --offline --run-doc copy/run.json
+$ smc run route --offline --param objective="Nikon 40X Plan Fluor ELWD" --run-doc copy/run.json
+```
+
+**Copy the run folder first.** An offline run writes its stage into the run document it is
+given, as a run on a stand does, so work on a copy and keep the original as it was made.
+
+**The profile is the one the run document recorded**: the `profile` of the stages the plugin
+reads, looked up by name like any `--profile`. Run from the repository folder, where
+`profiles/` is, or set `SMC_PROFILES` to the folders that hold the profiles (separated by `:`
+on macOS and Linux, `;` on Windows). `--profile` (or `SMC_PROFILE`) may be given, and must then be that
+profile: a different one is refused, naming both. No Micro-Manager configuration is read, so
+the profile's `[camera] pixel_size_um` is the only stand knowledge a plugin takes from it:
+`route --param objective=...` scales the field from that table, to the same result as on the
+stand, and an objective that is not in it is refused naming the table.
+
+**What the record says.** The stage's record holds `"offline": true`, written only then: a
+stage made at a stand keeps no such key, so an older smc still reads the document, and the
+stages made at the stand are left as they were. Nothing reads the key yet; it says where the
+result was made.
+
+**Refused (usage error, exit 2), before anything is written:**
+
+- a plugin that drives the stand (`scan`, `plate-registration`, ...): the message lists the
+  ones that run offline;
+- `--dry-run`: an offline run opens no stand, so there is nothing to rehearse;
+- a `--profile` that is not the recorded one, or a recorded profile that is not on the search
+  path (the message carries where it looked), or one that names a file instead of a profile;
+- a run document that does not exist (it is never created), or whose upstream stages were made on
+  two profiles, or that has no stage upstream of the plugin.
+
+`--resume`, `--param` and `--preset` behave as on a stand. The design is in
+[`docs/design/algorithms.md`](../design/algorithms.md) section 4.
 
 ## Plate names
 
