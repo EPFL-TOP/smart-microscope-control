@@ -378,13 +378,13 @@ def _github(wt, monkeypatch, table: dict[str, list[dict]] | None = None, fail=""
     """A stubbed `gh api commits/<sha>/pulls`: the table's answer, else GitHub's 422."""
     monkeypatch.setattr(wt.shutil, "which", lambda name: "/usr/bin/gh")
     real = wt.run_note
-    asked: list[str] = []
+    asked: list[tuple[list[str], Path]] = []
 
     def fake(args, cwd):
         if args[0] != "gh":
             return real(args, cwd)
         line = " ".join(args)
-        asked.append(line)
+        asked.append((list(args), cwd))
         if fail:
             return False, fail
         sha = line.split("/commits/")[1].split("/")[0]
@@ -454,7 +454,11 @@ def test_clean_removes_a_detached_clean_worktree_at_the_head_of_a_merged_pr(
     asked = _github(wt, monkeypatch, {sha: [_pull(sha, merged=merged)]})
     assert wt.clean_worktrees(repo, repo, dry_run=False) == 1
     assert not path.exists()
-    assert f"commits/{sha}/pulls" in asked[0]
+    # the whole call, as gh gets it: `{owner}` and `{repo}` are gh's to fill from the
+    # repository it runs in, so the call is made from the repository's root
+    assert asked == [
+        (["gh", "api", f"repos/{{owner}}/{{repo}}/commits/{sha}/pulls"], repo)
+    ]
 
 
 def test_a_branch_worktree_of_a_closed_pr_is_still_kept(wt, repo, monkeypatch) -> None:

@@ -7,6 +7,7 @@ afternoon Point on #51, copied as a string (FM-101).
 import importlib.util
 import inspect
 import json
+import re
 import subprocess
 import sys
 import textwrap
@@ -1156,6 +1157,44 @@ class _Gh:
 @pytest.mark.parametrize("stderr", FAILURES_OF_2026_11_18)
 def test_the_three_failures_of_2026_11_18_are_transient(stderr) -> None:
     assert lane.is_transient(stderr)
+
+
+# One text per row of the classifier that no other row matches (a rule table held as data:
+# break each row, FM-43): the three above each match several rows and hide a dropped one.
+ONE_ROW_EACH = [
+    "HTTP 503",
+    "502 Bad Gateway",
+    "Service Unavailable",
+    "Gateway Time-out",  # mixed case, and a hyphen: neither is the row of `timeout`
+    "gh: Server Error",
+    "unexpected EOF",
+    'Post "https://api.github.com/graphql": EOF',
+    "request timed out",
+    "net/http: TLS handshake timeout",
+    "context deadline exceeded",
+    "read tcp 10.0.0.2:5555: connection reset by peer",
+    # Go's wording on Windows (documented, not measured there)
+    "wsarecv: An existing connection was forcibly closed by the remote host.",
+    "connectex: A connection attempt failed because the connected party did not respond",
+    "wsasend: An established connection was aborted by the software in your host machine.",
+]
+
+
+@pytest.mark.parametrize("stderr", ONE_ROW_EACH)
+def test_every_row_of_the_classifier_catches_its_own_text(stderr) -> None:
+    assert lane.is_transient(stderr)
+
+
+def test_every_row_of_the_classifier_has_a_text_that_only_it_catches() -> None:
+    # the table is `_TRANSIENT`'s alternatives: each has its own text above, so that a
+    # row dropped from the pattern loses one, and a text that two rows catch is a bug here
+    rows = lane._TRANSIENT.pattern.split("|")
+    owned = set()
+    for text in [*ONE_ROW_EACH, FAILURES_OF_2026_11_18[2]]:
+        hits = [r for r in rows if re.search(r, text, re.IGNORECASE)]
+        assert len(hits) == 1, (text, hits)
+        owned.add(hits[0])
+    assert owned == set(rows)
 
 
 @pytest.mark.parametrize(

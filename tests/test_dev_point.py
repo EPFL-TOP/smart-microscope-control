@@ -1,6 +1,8 @@
 """scripts/dev/point.py feeds /point; pin the parsing it relies on."""
 
 import importlib.util
+import io
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -875,6 +877,7 @@ def test_a_prs_reviews_and_comments_past_the_cap_are_read_again(point) -> None:
     }
     calls: list[str] = []
     ready = "## Review (design session, 2026-11-02)\n\n**Verdict: ready to merge**"
+    asked = "## Review (design session, 2026-11-01)\n\n**Verdict: changes requested**"
 
     def get(*args: str):
         assert args[:2] == ("api", "--paginate")
@@ -885,6 +888,8 @@ def test_a_prs_reviews_and_comments_past_the_cap_are_read_again(point) -> None:
                     {"body": f"r{i}", "submitted_at": "2026-11-01T01:00:00Z"}
                     for i in range(100)
                 ],
+                # an older "changes requested" first: only the dates tell the newest
+                {"body": asked, "submitted_at": "2026-11-01T02:00:00Z", "state": "X"},
                 {"body": ready, "submitted_at": "2026-11-02T08:00:00Z", "state": "X"},
                 {"body": "", "submitted_at": None, "state": "PENDING"},
             ]
@@ -898,6 +903,7 @@ def test_a_prs_reviews_and_comments_past_the_cap_are_read_again(point) -> None:
     # the verdict was the 101st review: the listing could not show it
     assert point.verdict(point.review_texts(pr)) == "ready to merge"
     assert pr["comments"][0]["createdAt"] == "2026-11-03T00:00:00Z"
+    assert pr["reviews"][100]["submittedAt"] == "2026-11-01T02:00:00Z"
     assert pr["reviews"][-1]["submittedAt"] == ""  # a pending review has no date
 
 
@@ -967,16 +973,23 @@ def test_a_for_point_line_with_the_colon_inside_the_bold_is_read(point) -> None:
     assert point.field("**Done:** x\n**Next**: y", "Next") == ["y"]
 
 
-def test_a_for_point_line_is_one_short_ascii_line(point) -> None:
+def test_a_for_point_line_is_one_short_line(point) -> None:
     long = "word " * 80
-    note = _note(
-        "S1", "2026-11-18T09:00:00Z", f"**For /point**: {long} \N{RIGHTWARDS ARROW} end"
-    )
+    note = _note("S1", "2026-11-18T09:00:00Z", f"**For /point**: {long}end")
     (line,) = point.for_point_lines([note], "")
     assert "\n" not in line
-    assert line.isascii()
     assert len(line) < 300
     assert line.endswith("...")
+
+
+def test_a_for_point_line_is_ascii_whatever_the_subagent_wrote(point) -> None:
+    # The arrow and the dash sit inside the first characters: a long text would clip
+    # them away before the transliteration is asked for (FM-20).
+    text = "go \N{RIGHTWARDS ARROW} on \N{EM DASH} #5 \N{GREEK SMALL LETTER MU}m"
+    note = _note("S1", "2026-11-18T09:00:00Z", f"**For /point**: {text}", "u1")
+    assert point.for_point_lines([note], "") == [
+        "- S1 (2026-11-18T09:00:00Z): go -> on - #5 ?m u1"
+    ]
 
 
 def test_the_report_lists_the_for_point_lines_under_their_own_heading(
@@ -1016,3 +1029,83 @@ def test_the_for_point_section_says_none_without_a_line(
     assert point.main() == 0
     section = capsys.readouterr().out.split("## For /point")[1]
     assert section.split("\n## ")[0].strip().splitlines()[1:] == ["- none"]
+
+
+# --- the whole report is ASCII; every `gh` child has a timeout (#591) ----------------
+
+
+def test_a_report_with_an_arrow_in_any_text_does_not_end_on_a_cp1252_stdout(
+    point, monkeypatch
+) -> None:
+    # A Report, a fix round's follow-ups and an owner note are written by subagents or
+    # typed by the owner, and a redirected stdout on Windows is cp1252 with strict errors:
+    # the colon inside the bold is read since #591, and one arrow lost the whole report
+    # (the older `**Follow-ups**:` form already did, FM-20).
+    arrow = "\N{RIGHTWARDS ARROW}"
+    work = {
+        **_issue(5, "feat: y", ["status: in-progress"]),
+        "comments": [
+            _c(
+                f"## Report (develop session)\n\n**Friction:** {arrow} slow",
+                "2026-11-10",
+            ),
+            _c("is the \N{GREEK SMALL LETTER MU}m stage free?", "2026-11-11"),
+        ],
+    }
+    merged = {
+        "number": 9,
+        "title": "feat: x",
+        "mergedAt": "2026-11-10T00:00:00Z",
+        "reviews": [],
+        "comments": [
+            _c(
+                f"## Review addressed (develop session)\n\n**Follow-ups:** {arrow} track it",
+                "2026-11-10T01:00:00Z",
+            )
+        ],
+    }
+    base = _canned([], [work], [])
+
+    def fake(*args: str):
+        if args[:2] == ("pr", "list") and "merged" in args:
+            return [merged]
+        return base(*args)
+
+    monkeypatch.setattr(point, "gh_json", fake)
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252", errors="strict", newline="\n")
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert point.main() == 0  # a UnicodeEncodeError here is the bug
+    stream.flush()
+    out = raw.getvalue().decode("cp1252")
+    assert out.isascii()
+    assert "- #9 fix round, follow-up: -> track it" in out
+    assert "- #5 report, Friction: -> slow" in out
+    assert "- #5 owner note: is the ?m stage free?" in out
+
+
+def test_every_gh_child_of_the_point_has_no_console_a_timeout_and_utf8(
+    point, monkeypatch
+) -> None:
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs, cmd=cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="[1]", stderr="")
+
+    monkeypatch.setattr(point.subprocess, "run", fake_run)
+    assert point.gh_json("issue", "list") == [1]
+    assert seen["cmd"] == ["gh", "issue", "list"]
+    assert seen["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    assert seen["encoding"] == "utf-8"
+    assert seen["errors"] == "replace"
+    assert seen["timeout"] == point.GH_TIMEOUT_S
+    assert seen["stdin"] == subprocess.DEVNULL
+
+    def hang(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, point.GH_TIMEOUT_S)
+
+    monkeypatch.setattr(point.subprocess, "run", hang)
+    with pytest.raises(SystemExit, match="timed out"):
+        point.gh("api", "--paginate", "repos/o/r/issues/51/comments")

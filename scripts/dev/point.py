@@ -27,6 +27,10 @@ ROOT = Path(__file__).resolve().parents[2]
 TRACKING_TITLE = "Point: next steps"
 STATUS = "status: "
 MAX_LINE = 220
+# Every `gh` child has a timeout (FM-31), and none shares the console, which can change
+# its code page (FM-22): `gh api --paginate` walks several pages in one child.
+GH_TIMEOUT_S = 120
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _DEPENDS = re.compile(r"\*\*Depends on\*\*:?\s*(.*)", re.IGNORECASE)
 _REF = re.compile(r"#(\d+)")
 # The lane a note belongs to: the `S<k>` right after the header's opening parenthesis.
@@ -433,13 +437,21 @@ def status_of(issue: dict[str, Any]) -> str:
 
 
 def gh(*args: str) -> str:
-    proc = subprocess.run(
-        ["gh", *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=GH_TIMEOUT_S,
+            creationflags=_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"gh {' '.join(args[:2])} timed out after {GH_TIMEOUT_S} s"
+        ) from None
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise SystemExit(f"gh {' '.join(args[:2])} failed ({proc.returncode})")
@@ -743,7 +755,10 @@ def main() -> int:
         out.append(
             f"- {ms['title']}: {ms['closed_issues']} closed, {ms['open_issues']} open"
         )
-    print("\n".join(out))
+    # One pass over the whole report: a Report, a review or an owner note is written by a
+    # subagent, which uses arrows freely, and a redirected stdout on Windows is cp1252 with
+    # strict errors, so one arrow in any of them would lose the whole report (FM-20, #591).
+    print(ascii_only("\n".join(out)))
     return 0
 
 

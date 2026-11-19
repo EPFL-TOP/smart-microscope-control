@@ -703,12 +703,16 @@ GH_PAUSES_S = (5, 15)
 
 # What `gh` printed on 2026-11-18 (`HTTP 504: 504 Gateway Timeout (.../graphql)`, `gh:
 # Server Error (HTTP 502)`, `unexpected end of JSON input`) and the same families (a
-# client timeout, a connection reset). A 4xx (a missing issue, a refused token, a rate
-# limit) is no hiccup: asking again gives the same answer, so it is not listed.
+# client timeout, a connection reset). Go words a network failure by the OS: the Windows
+# wordings (`forcibly closed`, `connection attempt failed`, `connection was aborted`) are
+# Go's `net` texts as documented, not measured on a Windows PC. A 4xx (a missing issue, a
+# refused token, a rate limit) is no hiccup: asking again gives the same answer, so it is
+# not listed.
 _TRANSIENT = re.compile(
     r"HTTP 5\d\d|bad gateway|service unavailable|gateway time-?out|server error|"
-    r"unexpected end of JSON input|unexpected EOF|timed out|timeout|"
-    r"deadline exceeded|connection reset",
+    r"unexpected end of JSON input|unexpected EOF|: EOF\b|timed out|timeout|"
+    r"deadline exceeded|connection reset|forcibly closed|connection attempt failed|"
+    r"connection was aborted",
     re.IGNORECASE,
 )
 
