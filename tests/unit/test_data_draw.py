@@ -10,15 +10,23 @@ from __future__ import annotations
 
 import itertools
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
 from PIL import Image, ImageDraw, ImageFont
 
-from select_fields_seed import SHAPE, UPRIGHT, load_script
+from select_fields_seed import (
+    PIXEL_UM,
+    SHAPE,
+    UPRIGHT,
+    load_script,
+    matrix_of,
+    seed_run,
+)
 from smc.data import draw
 from smc.plugins.geometry import Matrix2, footprint
-from smc.plugins.slots import Cell, WellGeometry
+from smc.plugins.slots import Cell, ScanFrame, WellGeometry, load_frame, well_geometry
 
 HEIGHT, WIDTH = SHAPE
 GREEN = (0, 255, 0)
@@ -297,3 +305,103 @@ def test_the_stops_of_the_script_are_drawn_as_before() -> None:
             for dr in (-1, 0, 1)
         }
         assert GREEN in around, k
+
+
+# ---------------------------------------------------------------------- Mosaic
+
+
+def _noise(frame: ScanFrame) -> np.ndarray:
+    """A frame that is different at every pixel and from every other frame: nothing a placement error could hide in."""
+    rng = np.random.default_rng(frame.index + 1)
+    return rng.integers(100, 4000, size=SHAPE).astype(np.uint16)
+
+
+def test_the_mosaic_is_what_the_scripts_read_pixels_makes(tmp_path: Path) -> None:
+    matrix = matrix_of(PIXEL_UM, 30.0, True)
+    seed = seed_run(
+        tmp_path, cells=[], rows=2, columns=2, matrix=matrix, frame_pixels=_noise
+    )
+    geometry = well_geometry(seed.plan.plate_plan, "A1")
+    expected = (
+        load_script()
+        .read_pixels(tmp_path, seed.scan, {"A1": geometry}, mosaic=True, png_max_px=300)
+        .grey["A1"]
+    )
+    mosaic = draw.Mosaic(
+        geometry,
+        max_px=300,
+        pixel_size_um=seed.scan.pixel_size_um,
+        matrix_um_per_px=matrix,
+        image_shape_px=SHAPE,
+    )
+    for frame in seed.scan.frames:
+        mosaic.add(load_frame(tmp_path, frame), frame.x_um, frame.y_um)
+    assert mosaic.reduction > 1, "the frames are reduced, so the tile's matrix matters"
+    assert np.array_equal(mosaic.grey(), expected)
+    # Not a blank canvas: four frames placed, the rest of the well dark grey.
+    placed = mosaic.grey() != draw.UNPLACED_GREY
+    assert 100 < placed.sum() < placed.size
+
+
+def test_a_mosaics_tile_matrix_is_the_cameras_times_the_reduction() -> None:
+    matrix = matrix_of(PIXEL_UM, 30.0, True)
+    mosaic = draw.Mosaic(
+        SMALL_WELL,
+        max_px=100,
+        pixel_size_um=PIXEL_UM,
+        matrix_um_per_px=matrix,
+        image_shape_px=SHAPE,
+    )
+    k = mosaic.reduction
+    assert k == round(mosaic.canvas.um_per_px / PIXEL_UM)
+    for row in range(2):
+        for col in range(2):
+            assert mosaic.tile_matrix_um_per_px[row][col] == pytest.approx(
+                matrix[row][col] * k
+            )
+    # The canvas is the well's: the frames never grow it (FM-136).
+    assert mosaic.canvas == draw.canvas_of(SMALL_WELL, 100)
+
+
+def test_a_frame_far_from_the_well_places_nothing_and_raises_nothing() -> None:
+    mosaic = draw.Mosaic(
+        SMALL_WELL,
+        max_px=100,
+        pixel_size_um=PIXEL_UM,
+        matrix_um_per_px=UPRIGHT,
+        image_shape_px=SHAPE,
+    )
+    before = mosaic.grey().copy()
+    frame = np.full(SHAPE, 3000, dtype=np.uint16)
+    for far in (1e9, -1e9, 1e300):
+        mosaic.add(frame, far, -500.0)
+    assert np.array_equal(mosaic.grey(), before)
+    assert mosaic.grey().shape == (mosaic.canvas.height_px, mosaic.canvas.width_px)
+
+
+@pytest.mark.parametrize("pixel_size_um", [0.0, -1.0, math.nan, math.inf])
+def test_a_pixel_size_that_is_not_a_size_is_refused_not_defaulted(
+    pixel_size_um: float,
+) -> None:
+    with pytest.raises(ValueError, match="pixel size"):
+        draw.Mosaic(
+            SMALL_WELL,
+            max_px=100,
+            pixel_size_um=pixel_size_um,
+            matrix_um_per_px=UPRIGHT,
+            image_shape_px=SHAPE,
+        )
+
+
+def test_a_camera_matrix_that_cannot_be_inverted_is_refused_when_a_frame_is_added() -> (
+    None
+):
+    mosaic = draw.Mosaic(
+        SMALL_WELL,
+        max_px=100,
+        pixel_size_um=PIXEL_UM,
+        matrix_um_per_px=((1.0, 1.0), (1.0, 1.0)),
+        image_shape_px=SHAPE,
+    )
+    with pytest.raises(ValueError, match="cannot be inverted"):
+        mosaic.add(np.zeros(SHAPE, dtype=np.uint16), 1000.0, -500.0)

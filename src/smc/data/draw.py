@@ -232,6 +232,64 @@ def stretch_to_uint8(pixels: npt.NDArray[np.float32]) -> npt.NDArray[np.uint8]:
     return grey
 
 
+class Mosaic:
+    """One well's mosaic: a canvas that frames are added to, one at a time, and read back as 8 bits.
+
+    It is the canvas, the reduction and the tile's matrix of
+    ``scripts/dev/select_fields.py``'s ``read_pixels``, kept together so that a
+    frame is read, reduced and dropped and only the canvas of the well being drawn
+    is held. The camera is the **scan's** (its matrix and its shape: FM-124), the
+    tile's matrix is the camera's times the reduction factor, and the canvas is cut to
+    the well and never to the frames (FM-136).
+
+    Raises:
+        ValueError: From the constructor, the pixel size is not finite and positive
+            (``reduction_factor``); from ``add``, the camera's matrix cannot be
+            inverted (``place_frame``). Both propagate: they are the scan's, not a
+            frame's.
+    """
+
+    def __init__(
+        self,
+        geometry: WellGeometry,
+        *,
+        max_px: int,
+        pixel_size_um: float,
+        matrix_um_per_px: Matrix2,
+        image_shape_px: tuple[int, int],
+    ) -> None:
+        self.canvas = canvas_of(geometry, max_px)
+        self.reduction = reduction_factor(
+            self.canvas.um_per_px, pixel_size_um, image_shape_px
+        )
+        (m00, m01), (m10, m11) = matrix_um_per_px
+        k = self.reduction
+        self.tile_matrix_um_per_px: Matrix2 = ((m00 * k, m01 * k), (m10 * k, m11 * k))
+        self._pixels = self.canvas.blank()
+
+    def add(self, frame: npt.NDArray[Any], x_um: float, y_um: float) -> None:
+        """Reduce ``frame`` by block means and place it, centred at the stage point ``(x_um, y_um)``.
+
+        A later frame overwrites an earlier one where they overlap, as the script's.
+        A frame far away places nothing and raises nothing (``place_frame`` clamps
+        its box on floats first).
+        """
+        place_frame(
+            self._pixels,
+            block_mean(frame, self.reduction),
+            x_um,
+            y_um,
+            matrix=self.tile_matrix_um_per_px,
+            x_min_um=self.canvas.x_min_um,
+            y_max_um=self.canvas.y_max_um,
+            um_per_px=self.canvas.um_per_px,
+        )
+
+    def grey(self) -> npt.NDArray[np.uint8]:
+        """The canvas stretched to 8 bits, a pixel no frame reached dark grey (``stretch_to_uint8``)."""
+        return stretch_to_uint8(self._pixels)
+
+
 def _outline_of(well: WellGeometry) -> list[tuple[float, float]]:
     """The well's wall as a closed polyline in stage um: a disc as 128 segments, a square well as its turned rectangle."""
     cx, cy = well.center_um
