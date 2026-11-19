@@ -15,10 +15,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-#: What the subprocess imports; #568 adds its own (``smc.data.draw``). The
-#: selection package is there by every module, and ``route``'s plugin, which
-#: imports it, is there too: a selector is loaded inside the plugin, and the
-#: plugin must not pull the Micro-Manager bindings in by it.
+#: What the subprocess imports. The selection package is there by every module,
+#: and ``route``'s plugin, which imports it, is there too: a selector is loaded
+#: inside the plugin, and the plugin must not pull the Micro-Manager bindings in
+#: by it.
 KIT_MODULES = [
     "smc.data",
     "smc.data.cli",
@@ -116,6 +116,31 @@ def test_kit_never_imports_pymmcore_plus(tmp_path: Path) -> None:
         "smc.plugins.route.plugin",
     } <= set(KIT_MODULES)
     assert _loaded_hardware_modules(KIT_MODULES, tmp_path) == []
+
+
+def test_importing_the_cli_does_not_load_pillow(tmp_path: Path) -> None:
+    # Pillow is a declared dependency, but only the drawing needs it: `smc dataset
+    # draw` imports `smc.data.draw` inside its command, so that every other command
+    # (and `import smc.data` for a collaborator's script) starts without it.
+    code = (
+        "import json, sys\n"
+        "import smc.cli\n"
+        "import smc.data\n"
+        "import smc.data.cli\n"
+        "print(json.dumps(sorted(m for m in sys.modules "
+        "if m.split('.')[0] == 'PIL')))\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=tmp_path,
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == []
 
 
 def test_kit_modules_never_import_the_hardware_layer() -> None:
