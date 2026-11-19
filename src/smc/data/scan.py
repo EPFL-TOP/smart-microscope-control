@@ -13,11 +13,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, TypeVar
 
 import numpy as np
 import tifffile
 from numpy.typing import NDArray
+from pydantic import BaseModel, ValidationError
 
 from smc.plugins.geometry import Matrix2
 from smc.plugins.slots import (
@@ -27,13 +28,16 @@ from smc.plugins.slots import (
     ScanPlanResult,
     ScanResult,
     WellGeometry,
+    load_cells,
     load_frame,
     normalise_well,
     well_geometry,
 )
-from smc.run import RunDocument
+from smc.run import RunDocument, RunDocumentError, StageRecord
 
-__all__ = ["DatasetError", "Scan", "cells_table"]
+__all__ = ["DatasetError", "Scan", "cells_table", "load_scan"]
+
+M = TypeVar("M", bound=BaseModel)
 
 #: What ``Scan.cells_absent`` says when no ``cells`` record was given or found.
 _NO_CELLS_RECORD = "no cells record"
@@ -233,6 +237,125 @@ def _make_scan(
         cells_result=cells_result,
         cells_absent=cells_absent,
     )
+
+
+def load_scan(run_doc: Path | str) -> Scan:
+    """Load the scan a run document holds, with its cells when there are usable ones.
+
+    ``run_doc`` is the run document's file (not its folder): the frames and the
+    cells file are read from its folder, at the paths the records name. Nothing
+    is read of a frame here: ``Scan.image`` reads one when it is asked.
+
+    A document that does not hold a usable scan is refused, because an
+    algorithm that runs on a scan that is half there decides on nothing: the
+    document is unreadable (never read as an empty scan, FM-229), has no
+    ``scan`` or ``scan-plan`` record, or its last run did not end ``done``
+    (a ``stopped``, ``running`` or ``failed`` scan is never read as finished,
+    FM-106), is stale, or was a dry run. The ``cells`` record never refuses:
+    when it is missing, stale or unreadable, ``Scan.cells`` is ``None`` and
+    ``cells_absent`` says why, since a scan is worth loading before its cells
+    are detected.
+
+    Every refusal names the file, ``path: reason``, with the reason the run
+    document itself gives where it has one (and the fix: which stage to run
+    again).
+
+    Raises:
+        DatasetError: The document cannot be read or does not hold a usable
+            scan and plan.
+    """
+    path = Path(run_doc)
+    if path.is_dir():
+        hint = "is a folder, not a run document; name a file"
+        inside = path / "run.json"
+        if inside.is_file():
+            hint += f" (did you mean {inside}?)"
+        raise DatasetError(f"{path}: {hint}")
+    try:
+        document = RunDocument.load(path)
+    except RunDocumentError as exc:
+        # Its text already starts with the path.
+        raise DatasetError(str(exc)) from exc
+    scan_record = document.provider("scan")
+    profile = "" if scan_record is None else scan_record.profile
+    for slot in ("scan", "scan-plan"):
+        reason = document.unusable(slot, profile=profile, dry_run=False)
+        if reason is not None:
+            raise DatasetError(f"{path}: {reason}")
+    plan_record = document.provider("scan-plan")
+    assert scan_record is not None  # `unusable` refused a missing provider
+    assert plan_record is not None
+    result = _slot_result(path, scan_record, ScanResult, "scan")
+    plan = _slot_result(path, plan_record, ScanPlanResult, "scan-plan")
+    run_dir = path.parent
+    cells_result, cells, absent = _read_cells(document, profile, run_dir)
+    return _make_scan(
+        run_dir,
+        document,
+        profile=profile,
+        plan=plan,
+        result=result,
+        cells_result=cells_result,
+        cells=cells,
+        cells_absent=absent,
+    )
+
+
+def _slot_result(path: Path, record: StageRecord, model: type[M], slot: str) -> M:
+    """The record's result as ``model``, or a refusal that names the file, the slot and what to run again."""
+    problem = "it holds no result"
+    if record.result is not None:
+        try:
+            return model.model_validate(record.result)
+        except ValidationError as exc:
+            problem = _first_problem(exc)
+    # Raised outside the handler: the validation error's text is the problem, not a cause.
+    raise DatasetError(f"{path}: {_not_a_result(slot, problem, record.plugin)}")
+
+
+def _not_a_result(slot: str, problem: str, plugin: str) -> str:
+    return (
+        f"the {slot} record is not a {slot} result this smc reads ({problem}); "
+        f"run {plugin} again"
+    )
+
+
+def _first_problem(error: ValidationError) -> str:
+    """``<where>: <what>`` of the first validation error, on one line."""
+    first = error.errors()[0]
+    where = ".".join(str(part) for part in first["loc"]) or "result"
+    return f"{where}: {first['msg']}"
+
+
+def _read_cells(
+    document: RunDocument, profile: str, run_dir: Path
+) -> tuple[CellsResult | None, tuple[Cell, ...] | None, str | None]:
+    """The cells result and the cells, or ``(None, None, why not)``: cells never refuse a load.
+
+    A ``cells`` record is read only when it is usable on the scan's profile, as
+    any consumer of the slot reads it, and its file is the one the result
+    counted (``load_cells`` checks). Every way it is not is a sentence, so that
+    ``Scan.cells_absent`` can say it.
+    """
+    record = document.provider("cells")
+    if record is None:
+        return None, None, _NO_CELLS_RECORD
+    reason = document.unusable("cells", profile=profile, dry_run=False)
+    if reason is not None:
+        return None, None, reason
+    problem = "it holds no result"
+    if record.result is not None:
+        try:
+            result = CellsResult.model_validate(record.result)
+        except ValidationError as exc:
+            problem = _first_problem(exc)
+        else:
+            try:
+                return result, load_cells(run_dir, result), None
+            except ValueError as exc:
+                # "cells file <file> is missing ...", "... differs from the result ...".
+                return None, None, str(exc)
+    return None, None, _not_a_result("cells", problem, record.plugin)
 
 
 def cells_table(cells: Sequence[Cell]) -> dict[str, NDArray[Any]]:

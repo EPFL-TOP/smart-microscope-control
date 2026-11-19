@@ -11,6 +11,6 @@ package is a library first, and ``smc.cli`` is what loads the commands.
 
 from __future__ import annotations
 
-from smc.data.scan import DatasetError, Scan, cells_table
+from smc.data.scan import DatasetError, Scan, cells_table, load_scan
 
-__all__ = ["DatasetError", "Scan", "cells_table"]
+__all__ = ["DatasetError", "Scan", "cells_table", "load_scan"]
