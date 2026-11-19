@@ -60,6 +60,11 @@ smc run route -p <profile> --run-doc run.json --param selector=my-selector --par
 smc run route -p <profile> --run-doc run.json --param orderer=as-chosen
 ```
 
+`selector_params` and `orderer_params` are JSON objects, like `labels` is a JSON
+list: in `cmd.exe` and PowerShell 5.1 the quotes need the escaping of the
+[`smc run`](README.md#running-a-plugin-smc-run) page, or the run is refused with
+`'selector_params' takes JSON`.
+
 - **Where they come from.** Two entry-point groups, `smc.selectors` and
   `smc.orderers`, as plugins have `smc.plugins`: an algorithm is a class registered
   under its name in a package that is installed next to smc. The entry points are

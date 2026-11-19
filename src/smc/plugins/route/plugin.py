@@ -75,8 +75,9 @@ import operator
 import os
 import sys
 import traceback
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 from pydantic import (
@@ -138,8 +139,10 @@ _NAME = "route"
 #: The names of the built-ins that ``route``'s own parameters and lines of ``assumed`` speak of.
 _MOST_CELLS = "most-cells"
 _NEAREST = "nearest"
-#: A message of an algorithm's exception is cut here: a third party's error may carry a whole table.
-_MAX_MESSAGE = 400
+#: A message that comes from an algorithm is cut here: a third party's error may carry a whole
+#: table, and the stage's record keeps it. The layer's own sentences are far shorter (the
+#: longest lists the plan's wells).
+_MAX_MESSAGE = 1000
 
 T = TypeVar("T")
 M = TypeVar("M", bound=BaseModel)
@@ -364,8 +367,16 @@ def _validated(model: type[M], raw: dict[str, JsonValue], field: str) -> M:
 
 
 def _one_line(error: BaseException) -> str:
-    """An error's message on one line, cut short: a third party's may be a table."""
-    text = " ".join(str(error).split())
+    """An error's message on one line, cut short: a third party's may be a table, and may not print at all.
+
+    The message of an algorithm's error is built inside a handler, so one whose
+    ``__str__`` raises would end the stage (or a ``RouteParams``) with that
+    error and not with a refusal (FM-113).
+    """
+    try:
+        text = " ".join(str(error).split())
+    except Exception:
+        return "(the message cannot be printed)"
     return text if len(text) <= _MAX_MESSAGE else text[: _MAX_MESSAGE - 1] + "…"
 
 
@@ -483,25 +494,49 @@ class RoutePlugin:
         selector, orderer, selector_params, orderer_params = _algorithms_of(params)
 
         ctx.raise_if_stopped()
-        choices = _guarded(
+        # No more than the plan can hold is read of a selector's answer: a lazy one
+        # that never ends is refused at the bound and not drained (FM-74).
+        most = params.fields_per_well * len(dataset.wells)
+        answered = _guarded(
             "selector",
             selector.name,
             selector,
-            lambda: _as_list(selector.select(data, selector_params), "select"),
+            lambda: _as_list(
+                selector.select(data, selector_params),
+                "select",
+                most,
+                f"more than {most} choices (fields_per_well={params.fields_per_well} "
+                f"in each of the scan's {len(dataset.wells)} wells); its answer was "
+                f"not read further",
+            ),
         )
         _guarded(
-            "selector", selector.name, selector, lambda: check_choices(choices, data)
+            "selector", selector.name, selector, lambda: check_choices(answered, data)
         )
+        # What is checked is what is used: the checked choices are copied (a
+        # `measures` dict is a mapping the selector may still hold) and nothing
+        # after this reads the list the selector gave (FM-125).
+        choices = tuple(_frozen(choice) for choice in answered)
         by_well = _by_well(choices, scanned, selector.name)
         counts_of = _counts_of(choices, by_well, cells, params, imaging, shape)
 
         order: list[int] = []
         if choices:
+            # The orderer is given a view of its own, immutable all the way down:
+            # one that sorts, replaces or appends in place would otherwise change
+            # what was checked, and the counts above were keyed on.
+            view = tuple(_frozen(choice) for choice in choices)
             order = _guarded(
                 "orderer",
                 orderer.name,
                 orderer,
-                lambda: _as_list(orderer.order(choices, data, orderer_params), "order"),
+                lambda: _as_list(
+                    orderer.order(view, data, orderer_params),
+                    "order",
+                    len(choices),
+                    f"the order is not a permutation of 0..{len(choices) - 1}: "
+                    f"it has more than {len(choices)} items",
+                ),
             )
             _guarded(
                 "orderer",
@@ -755,7 +790,7 @@ def _guarded(kind: str, name: str, owner: object, call: Callable[[], T]) -> T:
     try:
         return call()
     except SelectionError as exc:
-        problem = f"{kind} {name}: {exc}"
+        problem = f"{kind} {name}: {_one_line(exc)}"
     except Exception as exc:
         problem = (
             f"{kind} {name}: {type(exc).__name__}: {_one_line(exc)}"
@@ -779,15 +814,35 @@ def _raised_at(error: BaseException, owner: object) -> str:
     return "" if found is None else f" (at {found[0]}:{found[1]})"
 
 
-def _as_list(raw: Iterable[T] | None, method: str) -> list[T]:
-    """What an algorithm returned as a list; ``None`` is refused in words, since ``list(None)`` would say "not iterable"."""
+def _as_list(raw: Iterable[T] | None, method: str, most: int, too_many: str) -> list[T]:
+    """What an algorithm returned as a list, read up to ``most`` items and no further.
+
+    ``None`` is refused in words, since ``list(None)`` would say "not iterable".
+    A lazy answer (a generator over a far too fine lattice) is not drained to
+    count it: one item past ``most`` is enough to refuse it with ``too_many``, and
+    an endless one ends there too (FM-74).
+    """
     if raw is None:
         raise SelectionError(f"{method} returned None, not a list")
-    return list(raw)
+    items = list(itertools.islice(raw, most + 1))
+    if len(items) > most:
+        raise SelectionError(too_many)
+    return items
+
+
+def _frozen(choice: Choice) -> Choice:
+    """A copy of a checked choice whose ``measures`` is a read-only mapping of its own."""
+    return Choice(
+        choice.well,
+        choice.x_um,
+        choice.y_um,
+        choice.score,
+        MappingProxyType(dict(choice.measures)),
+    )
 
 
 def _by_well(
-    choices: list[Choice], scanned: list[str], selector: str
+    choices: Sequence[Choice], scanned: list[str], selector: str
 ) -> dict[str, list[int]]:
     """The indices of the choices in each well, in the selector's order; a choice in a well the cells stage did not scan is refused, not dropped.
 
@@ -808,7 +863,7 @@ def _by_well(
 
 
 def _counts_of(
-    choices: list[Choice],
+    choices: Sequence[Choice],
     by_well: dict[str, list[int]],
     cells: tuple[Cell, ...],
     params: RouteParams,

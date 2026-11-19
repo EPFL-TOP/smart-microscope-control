@@ -130,6 +130,51 @@ def test_most_cells_chooses_in_each_well_what_choose_fields_chooses() -> None:
     assert all(isinstance(c, Choice) for c in chosen)
 
 
+def test_most_cells_keeps_to_the_excluded_centre_and_to_min_cells() -> None:
+    centre = CENTRES["B2"]
+    cluster_at_the_centre = [
+        ("B2", centre[0] + dx, centre[1], "single")
+        for dx in (-20.0, 0.0, 20.0, 40.0, -40.0)
+    ]
+    far_cluster = [
+        ("B2", centre[0] + 1500.0 + dx, centre[1], "single")
+        for dx in (-10.0, 0.0, 10.0)
+    ]
+    lone_cell = [("B2", centre[0] - 1500.0, centre[1] + 700.0, "single")]
+    # Two cells 3000 µm from the centre of a well 3200 µm in radius: a field holds them
+    # only if its corner may come within 200 µm of the wall.
+    near_the_wall = [
+        ("B2", centre[0] + 3000.0, centre[1] + dy, "single") for dy in (-5.0, 5.0)
+    ]
+    cells = cluster_at_the_centre + far_cluster + lone_cell + near_the_wall
+
+    def chosen(
+        exclude_centre_um: float, min_cells: int, wall_margin_um: float = 0.0
+    ) -> list[tuple[float, float]]:
+        data = make_input(
+            cells,
+            field_um=(100.0, 100.0),
+            exclude_centre_um=exclude_centre_um,
+            wall_margin_um=wall_margin_um,
+        )
+        params = MostCellsParams(min_cells=min_cells, candidate_step_fraction=0.5)
+        return [(c.x_um, c.y_um) for c in MostCells().select(data, params)]
+
+    kept = chosen(exclude_centre_um=100.0, min_cells=2)
+
+    # Not a field over the well's centre (it would hold the five cells there), and
+    # not one for a cell that is alone: the far cluster and the pair at the wall.
+    assert len(kept) == 2
+    assert sorted(round(x - centre[0], -2) for x, _ in kept) == [1500.0, 3000.0]
+    # Each parameter alone changes the answer: with no excluded centre the centre's
+    # cluster is chosen as well, with min_cells 1 the lone cell is, and a wall margin
+    # of 300 µm takes the pair at the wall out.
+    assert len(chosen(exclude_centre_um=0.0, min_cells=2)) == 3
+    assert len(chosen(exclude_centre_um=100.0, min_cells=1)) == 3
+    assert len(chosen(exclude_centre_um=100.0, min_cells=2, wall_margin_um=300.0)) == 1
+    assert len(chosen(exclude_centre_um=0.0, min_cells=1)) == 4
+
+
 def test_most_cells_counts_only_the_wanted_labels() -> None:
     # Debris alone in one cluster and singles in another: only the singles are chosen.
     cells = [

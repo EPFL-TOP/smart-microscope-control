@@ -126,6 +126,9 @@ def test_cells_in_filters_by_well_and_by_labels_and_defaults_to_the_inputs_label
         (9030.0, "single"),
     ]
     assert seen(data.cells_in(18000.0, -9000.0, "B3")) == [(18000.0, "single")]
+    # The well filter is the well's and not only the field's: a field over B2's cells,
+    # asked for in B3, holds none of B2's.
+    assert data.cells_in(*B2, "B3") == ()
     # A field of another place holds none of them.
     assert data.cells_in(B2[0] + 1000.0, B2[1], "B2") == ()
 

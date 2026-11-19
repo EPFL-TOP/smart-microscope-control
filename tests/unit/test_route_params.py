@@ -75,6 +75,29 @@ class Raising:
         return []
 
 
+class UnprintableError(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("str fails")
+
+
+class UnprintableParams(SelectorParams):
+    @model_validator(mode="before")
+    @classmethod
+    def _boom(cls, data: Any) -> Any:
+        raise UnprintableError
+
+
+class UnprintableSelector:
+    name = "unprintable"
+    summary = "A selector whose parameters raise an error that cannot be printed."
+    Params = UnprintableParams
+
+    def select(
+        self, data: SelectionInput, params: UnprintableParams
+    ) -> Sequence[Choice]:
+        return []
+
+
 class WindowParams(OrdererParams):
     window: int = Field(3, ge=1)
 
@@ -106,6 +129,7 @@ def algorithms(monkeypatch: pytest.MonkeyPatch) -> None:
             own("bounded", "Bounded", registry.SELECTOR_GROUP),
             own("anything", "Anything", registry.SELECTOR_GROUP),
             own("raising", "Raising", registry.SELECTOR_GROUP),
+            own("unprintable", "UnprintableSelector", registry.SELECTOR_GROUP),
         ],
         registry.ORDERER_GROUP: [
             builtin("nearest", "Nearest", registry.ORDERER_GROUP),
@@ -232,7 +256,7 @@ def test_an_unknown_selector_or_orderer_is_a_params_error_that_lists_the_known_n
 
     assert (
         "selector: Value error, selector 'nope' is not registered; known: "
-        "anything, bounded, most-cells, raising"
+        "anything, bounded, most-cells, raising, unprintable"
     ) in str(selector.value)
     assert (
         "orderer: Value error, orderer 'nope' is not registered; known: "
@@ -321,13 +345,17 @@ def test_selector_params_come_from_text_as_json_and_a_bare_word_is_not_json(
 @pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity"])
 def test_nan_in_selector_params_is_refused(algorithms: None, bad: str) -> None:
     # FM-32: JSON that Python reads as a float that is not a number never reaches a selector.
-    with pytest.raises(ParamsError, match="selector_params"):
+    # Both name a finite number: `anything` takes any key and `windowed` takes `window`,
+    # so it is the value that is refused and not an unknown key.
+    with pytest.raises(ParamsError, match=r"selector_params.*finite number"):
         parse_params(
             RouteParams,
             ["selector=anything", f'selector_params={{"min_density_per_mm2": {bad}}}'],
         )
-    with pytest.raises(ParamsError, match="orderer_params"):
-        parse_params(RouteParams, [f'orderer_params={{"window": {bad}}}'])
+    with pytest.raises(ParamsError, match=r"orderer_params.*finite number"):
+        parse_params(
+            RouteParams, ["orderer=windowed", f'orderer_params={{"window": {bad}}}']
+        )
 
 
 def test_most_cells_keeps_min_cells_and_the_step_on_route_and_refuses_them_in_selector_params(
@@ -391,6 +419,27 @@ def test_a_selectors_params_that_raise_something_else_than_a_value_error_are_sti
         match="selector_params: TypeError: boom: not a ValueError",
     ):
         parse_params(RouteParams, ["selector=raising"])
+    # FM-98: the refusal is raised outside the handler that caught the TypeError,
+    # so it keeps neither that error nor its traceback (the helper every refusal goes through).
+    # The helper is called directly, on parameters made without validation: through
+    # `RouteParams()` the validator raises a fresh error of its own outside its handler.
+    unvalidated = RouteParams.model_construct(selector="raising", selector_params={})
+    with pytest.raises(ValueError, match="selector_params: TypeError: boom") as raised:
+        selector_params_of(unvalidated, registry.selector("raising"))
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_params_that_raise_an_error_that_cannot_be_printed_are_still_a_params_error(
+    algorithms: None,
+) -> None:
+    # FM-113: the text of a third party's error is built inside a handler; one whose
+    # `__str__` raises must not end the construction of RouteParams.
+    with pytest.raises(
+        ParamsError,
+        match=r"selector_params: UnprintableError: \(the message cannot be printed\)",
+    ):
+        parse_params(RouteParams, ["selector=unprintable"])
 
 
 def test_selector_params_survive_format_param_and_parse_params(

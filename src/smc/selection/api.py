@@ -141,6 +141,12 @@ class SelectionInput:
         choices. A test of the cell's pixel against the half-extents would
         disagree on cells exactly on an edge (FM-132).
 
+        The cost is per call and on the whole scan: the cells of the plate are
+        filtered and turned into arrays each time (5 ms at 300 000 cells), so a
+        selector that asks it for thousands of candidates a well should group the
+        cells by well once itself and use ``route.algorithm.held_counts`` or
+        ``cells_in_field`` on that. ``select`` is one step that nothing can stop.
+
         Raises:
             SelectionError: ``well`` is not a well of the scan, or the scan has no cells.
         """

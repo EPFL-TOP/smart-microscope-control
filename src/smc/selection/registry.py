@@ -58,6 +58,9 @@ ORDERER_GROUP = "smc.orderers"
 
 _log = logging.getLogger("smc.selection")
 
+#: A reason that comes from a third party's exception is cut here.
+_MAX_REASON = 1000
+
 
 @dataclass(frozen=True, slots=True)
 class _Kind:
@@ -251,5 +254,16 @@ def _problem(kind: _Kind, instance: Any, entry_name: str) -> str | None:
 
 
 def _text_of(error: BaseException) -> str:
-    """``Type: message`` on one line."""
-    return f"{type(error).__name__}: {' '.join(str(error).split())}"
+    """``Type: message`` on one line, cut short, and never an exception.
+
+    It is called inside the handler that guards a third party's code, so an
+    error whose ``__str__`` raises must not end the listing of the others
+    (FM-113), and a message of megabytes must not reach a log line or a record.
+    """
+    try:
+        message = " ".join(str(error).split())
+    except Exception:
+        message = "the message cannot be printed"
+    if len(message) > _MAX_REASON:
+        message = message[: _MAX_REASON - 1] + "…"
+    return f"{type(error).__name__}: {message}"

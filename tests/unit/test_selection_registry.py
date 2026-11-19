@@ -140,6 +140,30 @@ class FailsToCreate(Good):
         raise ValueError("line one\nline two")
 
 
+class _UnprintableError(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("str fails")
+
+
+class FailsToPrint(Good):
+    name = "fails-to-print"
+
+    def __init__(self) -> None:
+        raise _UnprintableError
+
+
+class FailsWithAHugeMessage(Good):
+    name = "huge-message"
+
+    def __init__(self) -> None:
+        raise ValueError("word " * 10_000)
+
+
+class CarriageReturnSummary(Good):
+    name = "carriage-return"
+    summary = "First line.\rSecond line."
+
+
 class Interrupts(Good):
     name = "interrupts"
 
@@ -281,6 +305,17 @@ def test_a_lookup_imports_only_the_entries_of_that_name(
             "FailsToCreate",
             "could not be created with no argument: ValueError: line one line two",
         ),
+        (
+            "fails-to-print",
+            "FailsToPrint",
+            "could not be created with no argument: _UnprintableError: the message "
+            "cannot be printed",
+        ),
+        (
+            "carriage-return",
+            "CarriageReturnSummary",
+            "has a summary of more than one line",
+        ),
         ("good", "Missing", "could not be imported: AttributeError"),
         ("good", "NOT_A_CLASS", "names a NotAClass, not a class"),
     ],
@@ -322,6 +357,21 @@ def test_a_selector_that_breaks_a_rule_is_a_finding_not_an_exception_of_the_list
     # The reason is text and the error carries no traceback of the algorithm (FM-98).
     assert found.value.__cause__ is None
     assert found.value.__context__ is None
+
+
+def test_a_reason_from_a_huge_message_is_cut_and_still_one_line(
+    installed: dict[str, list[EntryPoint]],
+) -> None:
+    installed[SELECTOR_GROUP] += [_entry("huge-message", "FailsWithAHugeMessage")]
+
+    with pytest.raises(SelectionError) as found:
+        selector("huge-message")
+
+    text = str(found.value)
+    assert "could not be created with no argument: ValueError: word word" in text
+    assert text.endswith("…")
+    assert len(text) < 1100
+    assert "\n" not in text
 
 
 def test_an_orderer_that_breaks_a_rule_is_a_finding_like_a_selector(

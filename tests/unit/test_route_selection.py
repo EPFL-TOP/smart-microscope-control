@@ -50,6 +50,7 @@ from smc.selection import registry
 from smc.selection.api import (
     Choice,
     OrdererParams,
+    SelectionError,
     SelectionInput,
     SelectorParams,
 )
@@ -418,7 +419,17 @@ def test_the_selector_is_given_what_route_read(
 ) -> None:
     matrix = matrix_of(PIXEL_UM, 17.0, True)
     cells = _random_cells(7, ("single", "doublet"))
-    seed = _seed(tmp_path, cells, matrix=matrix)
+    # The plan was laid for another camera and frame than the scan took (FM-124): the
+    # selector reads the scan's, never the plan's copy.
+    seed = _seed(
+        tmp_path,
+        cells,
+        matrix=matrix,
+        plan_matrix=matrix_of(3.0, 0.0, False),
+        plan_shape=(48, 64),
+    )
+    assert seed.plan.image_shape_px != SHAPE
+    assert seed.plan.matrix_um_per_px != matrix
     given: list[SelectionInput] = []
 
     def record(data: SelectionInput) -> list[Choice]:
@@ -456,6 +467,7 @@ def test_the_selector_is_given_what_route_read(
     assert data.objective == seed.scan.objective
     assert data.matrix_um_per_px == matrix
     assert data.image_shape_px == SHAPE
+    assert data.fov_um == pytest.approx(extent_of(matrix, SHAPE))
     assert data.scan.run_dir == tmp_path
     assert data.first_field("B1") == next(
         (f.x_um, f.y_um) for f in seed.plan.fields if f.well == "B1"
@@ -682,6 +694,153 @@ def test_where_an_exception_was_raised_is_found_when_the_modules_file_differs_in
     text = _refused(offline, tmp_path, selector="scripted")
 
     assert re.search(r"\(at test_route_selection\.py:\d+\)$", text), text
+
+
+def _sorts_in_place(choices: Any, data: SelectionInput) -> list[int]:
+    choices.sort(key=lambda c: -c.x_um)
+    return [0, 1]
+
+
+def _replaces_one(choices: Any, data: SelectionInput) -> list[int]:
+    choices[1] = Choice("A1", 5e6, 5e6)
+    return [0, 1]
+
+
+def _appends_one(choices: Any, data: SelectionInput) -> list[int]:
+    choices.append(Choice("A1", 5e6, 5e6))
+    return [0, 1, 2]
+
+
+def _edits_a_measure(choices: Any, data: SelectionInput) -> list[int]:
+    choices[0].measures["density_per_mm2"] = 99.0
+    return [0, 1]
+
+
+@pytest.mark.parametrize(
+    "orderer",
+    [_sorts_in_place, _replaces_one, _appends_one, _edits_a_measure],
+    ids=["sorts", "replaces", "appends", "edits-a-measure"],
+)
+def test_an_orderer_that_edits_the_choices_it_is_given_is_refused_and_changes_nothing(
+    tmp_path: Path, offline: Microscope, orderer: Callable[..., list[int]]
+) -> None:
+    # The orderer gets a view it cannot change (FM-125): what was checked is what is
+    # used, so a field 5 000 km from every well cannot slip in after the check, and the
+    # counts, which were keyed on the checked list, cannot end up on another field.
+    _seed(tmp_path, [cell_at("A1", 0.0, 0.0)], wells=("A1",))
+    SCRIPT["select"] = lambda data: [
+        Choice("A1", A1[0], A1[1], measures={"density_per_mm2": 1.0}),
+        _far(600.0),
+    ]
+    SCRIPT["order"] = lambda choices, data: orderer(choices, data)
+
+    text = _refused(offline, tmp_path, selector="scripted", orderer="scripted-order")
+
+    assert re.fullmatch(
+        r"orderer scripted-order: (TypeError|AttributeError): .* "
+        r"\(at test_route_selection\.py:\d+\)",
+        text,
+    ), text
+
+
+def test_what_the_selector_still_holds_cannot_change_a_route_it_gave(
+    tmp_path: Path, offline: Microscope
+) -> None:
+    # The selector keeps a reference to a `measures` dict and edits it while the
+    # orderer runs: the checked copy is what the stop says.
+    _seed(tmp_path, [cell_at("A1", 0.0, 0.0)], wells=("A1",))
+    held: dict[str, float] = {"density_per_mm2": 1.0}
+    SCRIPT["select"] = lambda data: [Choice("A1", A1[0], A1[1], measures=held)]
+
+    def order(choices: Sequence[Choice], data: SelectionInput) -> list[int]:
+        held["density_per_mm2"] = math.nan
+        return [0]
+
+    SCRIPT["order"] = order
+
+    result = _result(
+        _run(offline, tmp_path, selector="scripted", orderer="scripted-order")
+    )
+
+    assert [p.measures for p in result.positions] == [{"density_per_mm2": 1.0}]
+
+
+def test_a_lazy_answer_is_read_as_far_as_the_bound_and_no_further(
+    tmp_path: Path, offline: Microscope
+) -> None:
+    # FM-74: a generator over a lattice too fine to hold is refused at one item past
+    # what the plan can hold, and an endless one does not hang the stage.
+    _seed(tmp_path, [cell_at("A1", 0.0, 0.0)], wells=("A1",))
+    pulled: list[int] = []
+
+    def endless(data: SelectionInput) -> Any:
+        for k in itertools.count():
+            pulled.append(k)
+            yield _far(10.0 * k)
+
+    SCRIPT["select"] = endless
+
+    text = _refused(offline, tmp_path, selector="scripted", fields_per_well=2)
+
+    assert text == (
+        "selector scripted: more than 2 choices (fields_per_well=2 in each of the "
+        "scan's 1 wells); its answer was not read further"
+    )
+    assert len(pulled) == 3  # the bound, and the one item that shows it is passed
+
+    pulled.clear()
+    SCRIPT["select"] = lambda data: [_far(0.0), _far(600.0)]
+
+    def endless_order(choices: Sequence[Choice], data: SelectionInput) -> Any:
+        for k in itertools.count():
+            pulled.append(k)
+            yield k
+
+    SCRIPT["order"] = endless_order
+
+    text = _refused(
+        offline,
+        tmp_path,
+        selector="scripted",
+        orderer="scripted-order",
+        fields_per_well=2,
+    )
+
+    assert text == (
+        "orderer scripted-order: the order is not a permutation of 0..1: it has "
+        "more than 2 items"
+    )
+    assert len(pulled) == 3
+
+
+class _UnprintableError(Exception):
+    def __str__(self) -> str:
+        raise RuntimeError("str fails")
+
+
+def test_an_error_that_cannot_be_printed_or_is_huge_is_still_a_refusal_of_a_bounded_size(
+    tmp_path: Path, offline: Microscope
+) -> None:
+    _seed(tmp_path, [cell_at("A1", 0.0, 0.0)], wells=("A1",))
+
+    def unprintable(data: SelectionInput) -> list[Choice]:
+        raise _UnprintableError
+
+    SCRIPT["select"] = unprintable
+    text = _refused(offline, tmp_path, selector="scripted")
+    assert re.fullmatch(
+        r"selector scripted: _UnprintableError: \(the message cannot be printed\)"
+        r" \(at test_route_selection\.py:\d+\)",
+        text,
+    ), text
+
+    def wordy(data: SelectionInput) -> list[Choice]:
+        raise SelectionError("x" * 2_000_000)
+
+    SCRIPT["select"] = wordy
+    text = _refused(offline, tmp_path, selector="scripted")
+    assert text.startswith("selector scripted: xxx")
+    assert len(text) <= 1100
 
 
 def test_a_keyboard_interrupt_in_a_selector_is_not_a_refusal(
