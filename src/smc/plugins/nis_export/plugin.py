@@ -31,7 +31,7 @@ program says that the two agree:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 from pydantic import Field, field_validator
 
@@ -98,6 +98,8 @@ class NisExportPlugin:
     provides = "nis-export"
     reads: tuple[str, ...] = ("route",)
     reads_optional: tuple[str, ...] = ()
+    #: Never drives the stand, so ``smc run nis-export --offline`` runs it (algorithms §4).
+    offline: ClassVar[bool] = True
 
     def run(
         self,

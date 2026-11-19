@@ -25,7 +25,7 @@ that a biologist reads rest on it:
 from __future__ import annotations
 
 from collections import Counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import Field
 
@@ -78,6 +78,8 @@ class DensityPlugin:
     provides = "density"
     reads: tuple[str, ...] = ("scan-plan", "scan", "cells")
     reads_optional: tuple[str, ...] = ()
+    #: Never drives the stand, so ``smc run density --offline`` runs it (algorithms §4).
+    offline: ClassVar[bool] = True
 
     def run(
         self,

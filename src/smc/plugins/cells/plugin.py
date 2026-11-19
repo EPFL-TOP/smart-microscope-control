@@ -31,7 +31,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import numpy as np
 import numpy.typing as npt
@@ -250,6 +250,8 @@ class CellsPlugin:
     provides = "cells"
     reads: tuple[str, ...] = ("scan",)
     reads_optional: tuple[str, ...] = ()
+    #: Never drives the stand, so ``smc run cells --offline`` runs it (algorithms §4).
+    offline: ClassVar[bool] = True
 
     def run(
         self,

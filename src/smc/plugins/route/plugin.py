@@ -15,10 +15,12 @@ decides, because the positions that NIS-Elements will visit rest on it:
   and not taken from a stored number.
 * **Another objective is a scaling, not a measurement.** The field of an objective
   that is not the scan's is the scan's matrix times the ratio of the profile's
-  pixel sizes (binning 1 for both, so the ratio is free of it, FM-103). Nothing
-  here knows the offset between two objectives, and the Z and the autofocus offset
-  of the scan are for the scan's objective, so they are dropped for another one
-  (FM-118) and the result says so in ``assumed``.
+  pixel sizes (binning 1 for both, so the ratio is free of it, FM-103). Offline,
+  with no turret, the objectives are the keys of that profile map and the sizes
+  its entries: the same ratio, since the core's factor divides both (algorithms
+  §4.4). Nothing here knows the offset between two objectives, and the Z and the
+  autofocus offset of the scan are for the scan's objective, so they are dropped
+  for another one (FM-118) and the result says so in ``assumed``.
 * **A stop's Z is a frame's the autofocus had not lost.** ``z_um`` and
   ``pfs_offset`` come together from the nearest frame of the well that is not
   ``unlocked``: on an unlocked frame the Z is wherever the search had got to and
@@ -49,8 +51,9 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import Field, field_validator
 
@@ -172,6 +175,8 @@ class RoutePlugin:
     provides = "route"
     reads: tuple[str, ...] = ("scan-plan", "scan", "cells")
     reads_optional: tuple[str, ...] = ("timings",)
+    #: Never drives the stand, so ``smc run route --offline`` runs it (algorithms §4).
+    offline: ClassVar[bool] = True
 
     def run(
         self,
@@ -411,6 +416,43 @@ class RoutePlugin:
         return chosen
 
 
+def _turret_sizes(
+    microscope: Microscope, wanted: str
+) -> tuple[list[str], Callable[[str], float]]:
+    """The objectives that can be imaged with, and the pixel size of each: the turret's, or the profile's when no stand is open.
+
+    On a stand it is the turret's non-empty labels and its ``pixel_size_um``,
+    which divides the profile's size by the core's magnification factor. Offline
+    there is no turret and no core: the labels are the keys of the profile's
+    ``[camera] pixel_size_um`` and the size of each is its entry, ``0.0`` (unknown)
+    for the others. The factor divides the size of every objective alike, so the
+    ratio of two sizes, the only thing ``_imaging_with`` uses, is the same on both
+    (algorithms §4.4).
+
+    Raises:
+        PluginRunError: The stand has no turret to ask (never offline).
+    """
+    if microscope.is_offline:
+        sizes = microscope.profile.camera.pixel_size_um
+
+        def profile_size_of(label: str) -> float:
+            return sizes.get(label, 0.0)
+
+        return [label for label in sizes if label], profile_size_of
+    turret = microscope.get(ObjectiveTurret)
+    if turret is None:
+        raise PluginRunError(
+            _NAME,
+            f"the stand has no turret, so the size of {wanted!r} is unknown; "
+            f"leave objective unset to image with the scan's objective",
+        )
+
+    def turret_size_of(label: str) -> float:
+        return turret.pixel_size_um(label)
+
+    return [label for label in turret.labels() if label], turret_size_of
+
+
 def _imaging_with(
     params: RouteParams, scan: ScanResult, microscope: Microscope
 ) -> _Imaging:
@@ -418,7 +460,8 @@ def _imaging_with(
 
     The scan's own objective, given by name, is the scan's: no turret is asked
     and nothing is scaled or assumed. Any other needs the scan's objective (to
-    scale from), a turret, a label that is on it and a profile size for both.
+    scale from), the sizes of ``_turret_sizes`` (a turret, or offline the
+    profile's map), a label among them and a profile size for both.
     """
     wanted = params.objective
     if wanted is None or wanted == scan.objective:
@@ -429,28 +472,27 @@ def _imaging_with(
             "the scan did not record its objective, so the size of another one "
             "cannot be scaled from it; leave objective unset",
         )
-    turret = microscope.get(ObjectiveTurret)
-    if turret is None:
-        raise PluginRunError(
-            _NAME,
-            f"the stand has no turret, so the size of {wanted!r} is unknown; "
-            f"leave objective unset to image with the scan's objective",
-        )
-    known = [label for label in turret.labels() if label]
+    known, size_of = _turret_sizes(microscope, wanted)
     if wanted not in known:
+        place = (
+            "in the profile's [camera] pixel_size_um"
+            if microscope.is_offline
+            else "on the turret"
+        )
+        names = ", ".join(known) or ("none" if microscope.is_offline else "")
         raise PluginRunError(
             _NAME,
-            f"objective {wanted!r} is not on the turret: {', '.join(known)}; give "
-            f"one of them, or leave objective unset",
+            f"objective {wanted!r} is not {place}: {names}; give one of them, or "
+            f"leave objective unset",
         )
-    size = turret.pixel_size_um(wanted)
+    size = size_of(wanted)
     if not (math.isfinite(size) and size > 0.0):
         raise PluginRunError(
             _NAME,
             f"the profile has no pixel size for {wanted!r}: add it to the "
             f"profile's [camera] pixel_size_um, or leave objective unset",
         )
-    scan_size = turret.pixel_size_um(scan.objective)
+    scan_size = size_of(scan.objective)
     if not (math.isfinite(scan_size) and scan_size > 0.0):
         raise PluginRunError(
             _NAME,
