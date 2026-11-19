@@ -14,7 +14,10 @@ decisions are the ``NEXT:`` line.
 Exit codes: 0 done (or the next action printed); 1 an unknown lane, no Point,
 or the problems that ``--check`` found; 2 a ``gh`` failure; 3 ``--wait`` timed
 out; 4 a usage error or an unexpected crash (a crash must not read as the
-verdict of 1, FM-82).
+verdict of 1, FM-82). A ``gh`` call that fails for a short GitHub reason (a 5xx,
+a timeout, a body that is not JSON) is tried again, three tries with a pause
+between, in a single run and at every poll of ``--wait``; exit 2 is the third
+failure in a row (#591).
 
 The grammar of a lane is fixed in ``/point`` (step 7); ``parse_point`` is its
 only reader. Stdlib only, Python 3.10, ASCII output (#42): the Point's text is
@@ -30,6 +33,7 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NoReturn
@@ -688,7 +692,48 @@ class NoLaneError(Exception):
     """No tracking issue or no Point, or a lane the Point does not have: exit 1."""
 
 
-def gh(*args: str) -> str:
+class TransientGhError(GhError):
+    """A ``gh`` failure that GitHub's own hiccups cause: worth another try."""
+
+
+# A short GitHub failure is tried again before it ends a run: three lanes stopped on one
+# on 2026-11-18 and each stop cost the owner a relaunch. The pauses sit between two tries,
+# so these are three tries in all, 20 s of waiting at most.
+GH_PAUSES_S = (5, 15)
+
+# What `gh` printed on 2026-11-18 (`HTTP 504: 504 Gateway Timeout (.../graphql)`, `gh:
+# Server Error (HTTP 502)`, `unexpected end of JSON input`) and the same families (a
+# client timeout, a connection reset). A 4xx (a missing issue, a refused token, a rate
+# limit) is no hiccup: asking again gives the same answer, so it is not listed.
+_TRANSIENT = re.compile(
+    r"HTTP 5\d\d|bad gateway|service unavailable|gateway time-?out|server error|"
+    r"unexpected end of JSON input|unexpected EOF|timed out|timeout|"
+    r"deadline exceeded|connection reset",
+    re.IGNORECASE,
+)
+
+
+def is_transient(stderr: str) -> bool:
+    """Whether a failed ``gh`` call's stderr is a short GitHub failure."""
+    return _TRANSIENT.search(stderr) is not None
+
+
+def _retrying(attempt: Callable[[], Any]) -> Any:
+    """Call ``attempt`` again, after a pause, while it raises ``TransientGhError``.
+
+    The last failure ends as a plain ``GhError`` that says how many times it was
+    tried, so the exit code stays 2 and the lane's note can say it was not one hiccup.
+    """
+    for pause in (*GH_PAUSES_S, None):
+        try:
+            return attempt()
+        except TransientGhError as exc:
+            if pause is None:
+                raise GhError(f"{exc} (after {len(GH_PAUSES_S) + 1} tries)") from exc
+            time.sleep(pause)
+
+
+def _gh_once(args: tuple[str, ...]) -> str:
     try:
         proc = subprocess.run(
             ["gh", *args],
@@ -703,18 +748,41 @@ def gh(*args: str) -> str:
     except FileNotFoundError:
         raise GhError("gh is not installed or not on PATH") from None
     except subprocess.TimeoutExpired:
-        raise GhError(
+        raise TransientGhError(
             f"gh {' '.join(args[:2])} timed out after {GH_TIMEOUT_S} s"
         ) from None
     if proc.returncode != 0:
-        raise GhError(
+        message = (
             f"gh {' '.join(args[:2])} failed ({proc.returncode}): {proc.stderr.strip()}"
         )
+        if is_transient(proc.stderr):
+            raise TransientGhError(message)
+        raise GhError(message)
     return proc.stdout
 
 
+def gh(*args: str) -> str:
+    """``gh``'s stdout; a short GitHub failure is tried again (``GH_PAUSES_S``)."""
+    return str(_retrying(lambda: _gh_once(args)))
+
+
 def gh_json(*args: str) -> Any:
-    return json.loads(gh(*args) or "null")
+    """``gh``'s stdout as JSON; a body that is not JSON is tried again like a 502.
+
+    ``gh`` exits 0 with an empty or cut-short body when GitHub's answer breaks off
+    in transit, and the reader would crash on it with exit 4, the code of a bug.
+    """
+
+    def attempt() -> Any:
+        text = _gh_once(args)
+        try:
+            return json.loads(text)
+        except ValueError as exc:
+            raise TransientGhError(
+                f"gh {' '.join(args[:2])} returned a body that is not JSON ({exc})"
+            ) from None
+
+    return _retrying(attempt)
 
 
 def ref_state(repo: str, number: int) -> tuple[str, bool]:
@@ -761,6 +829,10 @@ def fetch_facts(repo: str, lanes: dict[str, list[Step]]) -> Facts:
         for n in numbers
     }
     prs = gh_json("pr", "list", "--state", "all", "--limit", "100", "--json", PR_FIELDS)
+    # The listing cuts a PR's comments and reviews at 100 (point.LISTING_CAP): a verdict
+    # past it would read as "no design review yet". The issues above are read by
+    # `issue view`, which pages by itself.
+    point.complete(repo, prs, "pr", gh_json)
     refs: dict[int, str] = {}
     pr_numbers = {int(p["number"]) for p in prs}
     for issue in issues.values():

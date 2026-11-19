@@ -6,6 +6,7 @@ afternoon Point on #51, copied as a string (FM-101).
 
 import importlib.util
 import inspect
+import json
 import subprocess
 import sys
 import textwrap
@@ -1103,6 +1104,8 @@ def test_every_gh_child_has_no_console_a_timeout_and_utf8(monkeypatch) -> None:
 
 
 def test_a_gh_failure_carries_its_stderr(monkeypatch) -> None:
+    _clock(monkeypatch)  # a 502 and a timeout are tried again: no real pause
+
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="HTTP 502\n")
 
@@ -1123,6 +1126,202 @@ def test_a_gh_failure_carries_its_stderr(monkeypatch) -> None:
     monkeypatch.setattr(lane.subprocess, "run", missing)
     with pytest.raises(lane.GhError, match="not installed"):
         lane.gh("pr", "list")
+
+
+# --- a short GitHub failure is tried again (#591) -------------------------------------------
+
+# The three that stopped three lanes on 2026-11-18, as the notes on #51 quote them.
+FAILURES_OF_2026_11_18 = [
+    "HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)",
+    "gh: Server Error (HTTP 502)",
+    "unexpected end of JSON input",
+]
+
+
+class _Gh:
+    """A stand-in for the `gh` child: answers in order, then repeats the last."""
+
+    def __init__(self, *answers: tuple[int, str, str]) -> None:
+        self.answers = list(answers)
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, cmd, **kwargs):
+        self.calls.append(tuple(cmd[1:]))
+        code, out, err = (
+            self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        )
+        return subprocess.CompletedProcess(cmd, code, stdout=out, stderr=err)
+
+
+@pytest.mark.parametrize("stderr", FAILURES_OF_2026_11_18)
+def test_the_three_failures_of_2026_11_18_are_transient(stderr) -> None:
+    assert lane.is_transient(stderr)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "HTTP 404: Not Found (https://api.github.com/repos/o/r/issues/5)",
+        "HTTP 403: API rate limit exceeded",
+        "HTTP 401: Bad credentials",
+        "GraphQL: Could not resolve to an Issue with the number of 502.",
+        "",
+    ],
+)
+def test_a_4xx_is_not_a_hiccup(stderr) -> None:
+    assert not lane.is_transient(stderr)
+
+
+def test_a_gh_call_that_fails_twice_with_a_502_and_then_answers_does_not_end_the_run(
+    monkeypatch, capsys
+) -> None:
+    real = lane.gh_json
+    _canned_gh(monkeypatch)
+    canned = lane.gh_json  # the answers of the canned run, behind the real function
+    monkeypatch.setattr(lane, "gh_json", real)
+    slept = _clock(monkeypatch)
+    failing = 0
+
+    def child(cmd, **kwargs):
+        nonlocal failing
+        args = tuple(cmd[1:])
+        if args[:2] == ("pr", "list") and failing < 2:
+            failing += 1
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="", stderr="gh: Server Error (HTTP 502)\n"
+            )
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps(canned(*args)), stderr=""
+        )
+
+    monkeypatch.setattr(lane.subprocess, "run", child)
+    assert lane.main(["S1"]) == 0
+    assert failing == 2
+    assert slept == [5, 15]
+    assert "NEXT: session plan 5 sonnet" in capsys.readouterr().out
+
+
+def test_a_gh_call_that_keeps_failing_ends_the_run_with_exit_2_after_three_tries(
+    monkeypatch, capsys
+) -> None:
+    slept = _clock(monkeypatch)
+    child = _Gh(
+        (1, "", "HTTP 504: 504 Gateway Timeout (https://api.github.com/graphql)")
+    )
+    monkeypatch.setattr(lane.subprocess, "run", child)
+    assert lane.main(["S1"]) == 2
+    err = capsys.readouterr().err
+    assert "504 Gateway Timeout" in err
+    assert "after 3 tries" in err
+    assert len(child.calls) == 3  # not two, not four
+    assert slept == [5, 15]  # a pause between two tries, none after the last
+
+
+def test_a_body_that_is_not_json_is_tried_again(monkeypatch) -> None:
+    slept = _clock(monkeypatch)
+    child = _Gh((0, "", ""), (0, '{"number": 5, "comm', ""), (0, '{"number": 5}', ""))
+    monkeypatch.setattr(lane.subprocess, "run", child)
+    assert lane.gh_json("issue", "view", "5") == {"number": 5}
+    assert len(child.calls) == 3
+    assert slept == [5, 15]
+    # and a body that stays broken ends with exit 2's error, not with the crash of exit 4
+    child = _Gh((0, "<html>", ""))
+    monkeypatch.setattr(lane.subprocess, "run", child)
+    with pytest.raises(lane.GhError, match=r"not JSON.*after 3 tries"):
+        lane.gh_json("issue", "view", "5")
+    assert len(child.calls) == 3
+
+
+def test_a_gh_call_that_returns_text_is_tried_again_too(monkeypatch) -> None:
+    slept = _clock(monkeypatch)
+    child = _Gh((1, "", "gh: Server Error (HTTP 502)"), (0, "plain text", ""))
+    monkeypatch.setattr(lane.subprocess, "run", child)
+    assert lane.gh("run", "view") == "plain text"
+    assert len(child.calls) == 2
+    assert slept == [5]
+
+
+def test_a_gh_call_that_times_out_is_tried_again(monkeypatch) -> None:
+    slept = _clock(monkeypatch)
+    calls = 0
+
+    def slow(cmd, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise subprocess.TimeoutExpired(cmd, lane.GH_TIMEOUT_S)
+        return subprocess.CompletedProcess(cmd, 0, stdout="[1]", stderr="")
+
+    monkeypatch.setattr(lane.subprocess, "run", slow)
+    assert lane.gh_json("pr", "list") == [1]
+    assert calls == 3
+    assert slept == [5, 15]
+
+
+def test_a_4xx_or_a_missing_gh_is_not_tried_again(monkeypatch) -> None:
+    slept = _clock(monkeypatch)
+    child = _Gh((1, "", "HTTP 404: Not Found (https://api.github.com/repos/o/r)"))
+    monkeypatch.setattr(lane.subprocess, "run", child)
+    with pytest.raises(lane.GhError, match="HTTP 404") as caught:
+        lane.gh_json("api", "repos/o/r")
+    assert "tries" not in str(caught.value)
+    assert len(child.calls) == 1
+
+    def missing(cmd, **kwargs):
+        child.calls.append(tuple(cmd))
+        raise FileNotFoundError("gh")
+
+    monkeypatch.setattr(lane.subprocess, "run", missing)
+    with pytest.raises(lane.GhError, match="not installed"):
+        lane.gh_json("api", "repos/o/r")
+    assert len(child.calls) == 2  # one more, not three
+    assert slept == []
+
+
+def test_a_wait_poll_that_hits_a_502_goes_on(monkeypatch, capsys) -> None:
+    slept = _clock(monkeypatch)
+    child = _Gh((1, "", "gh: Server Error (HTTP 502)"), (0, "[]", ""))
+    monkeypatch.setattr(lane.subprocess, "run", child)
+    views = iter([_view("wait"), _view("session")])
+
+    def collect(lane_id, start):
+        lane.gh_json("pr", "list")  # the first poll's call meets the 502
+        return next(views)
+
+    monkeypatch.setattr(lane, "collect", collect)
+    assert lane.run_lane("S1", None, True, 120, 28800) == 0
+    assert slept == [5, 120]  # the retry's pause, then the poll's
+    assert capsys.readouterr().out == "NEXT: session x\n"
+
+
+def test_the_facts_read_a_prs_reviews_past_the_listing_cap(monkeypatch) -> None:
+    ready = "## Review (design session, 2026-11-11)\n\n**Verdict: ready to merge**"
+    listed = _pr(433, ())
+    listed["reviews"] = [
+        {"body": f"r{i}", "submittedAt": "2026-11-11T08:00:00Z"} for i in range(100)
+    ]
+    calls: list[tuple[str, ...]] = []
+
+    def fake(*args: str) -> Any:
+        calls.append(args)
+        if args[:2] == ("pr", "list"):
+            return [listed]
+        if args[:2] == ("api", "--paginate"):
+            assert args[2] == "repos/o/r/pulls/433/reviews?per_page=100"
+            return [{"body": ready, "submitted_at": "2026-11-11T09:00:00Z"}]
+        if args[:2] == ("issue", "view"):
+            return _issue(int(args[2]), ())
+        raise AssertionError(args)
+
+    monkeypatch.setattr(lane, "gh_json", fake)
+    lanes = lane.parse_point("**S1 \N{EM DASH} x**\nS1.1 `/feature 6`\n")
+    facts = lane.fetch_facts("o/r", lanes)
+    assert point_verdict(facts.prs[0]) == "ready to merge"
+    assert sum(1 for c in calls if c[:2] == ("api", "--paginate")) == 1
+
+
+def point_verdict(pr: dict[str, Any]) -> str:
+    return str(lane.point.verdict(lane.point.review_texts(pr)))
 
 
 def test_a_ref_is_open_closed_merged_or_closed_unmerged(monkeypatch) -> None:
