@@ -18,6 +18,12 @@ with no commits yet *is* an ancestor of main without being done - removing
 its worktree would destroy a session that has just started. Without ``gh``
 nothing is removed.
 
+A review checks a PR out detached, so its worktree has no branch: it is asked of
+GitHub by commit (``commits/<sha>/pulls``) and removed when its ``HEAD`` is the head
+of a merged or closed PR, its tree is clean and no live process holds its lock.
+A ``worktree-agent-*`` branch that no worktree has checked out and that holds no
+commit ``origin/main`` lacks is deleted without asking GitHub (#591).
+
 Stdlib only, Windows included, ASCII output (a redirected stream on Windows
 cannot encode check marks, #42).
 """
@@ -26,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import re
 import shutil
@@ -357,16 +364,68 @@ def review_checkout_state(root: Path, branch: str) -> str | None:
     return "merged" if ok and status.strip() in {"behind", "identical"} else "no PR"
 
 
+def commit_pr_state(root: Path, sha: str) -> str:
+    """The state of the pull requests whose head is commit ``sha``, asked of GitHub.
+
+    One of ``merged``, ``closed``, ``open``, ``no PR`` or ``unknown``. A review
+    session checks a PR out detached, so its worktree has no branch to ask about
+    (#591: 18 of them, each at the head of a merged PR, were removed by hand). Only
+    a PR whose *head* is the commit counts: a commit that is merely inside a PR, or
+    a PR's merge commit, says nothing about a commit made in the worktree, and one
+    that GitHub does not know (``HTTP 422``) is a local commit, kept. When several
+    PRs share the head, open wins over merged wins over closed.
+    """
+    if shutil.which("gh") is None:
+        return "unknown"
+    ok, out = run_note(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/commits/{sha}/pulls"], root
+    )
+    if not ok:
+        return "no PR" if "No commit found" in out else "unknown"
+    try:
+        pulls = json.loads(out)
+    except ValueError:
+        return "unknown"
+    if not isinstance(pulls, list):
+        return "unknown"
+    states = {
+        "merged" if pr.get("merged_at") else str(pr.get("state", "")).lower()
+        for pr in pulls
+        if isinstance(pr, dict)
+        and str((pr.get("head") or {}).get("sha", "")).lower() == sha.lower()
+    }
+    for state in ("open", "merged", "closed"):
+        if state in states:
+            return state
+    return "no PR"
+
+
+def worktree_state(root: Path, path: Path, branch: str) -> str:
+    """``pr_state`` of the branch, or of the commit when the worktree is detached."""
+    if branch:
+        return pr_state(root, branch)
+    ok, sha = run_note(["git", "rev-parse", "HEAD"], path)
+    if not ok:
+        return "unknown"
+    return commit_pr_state(root, sha.strip())
+
+
 def cmd_list(root: Path) -> int:
     main = main_checkout(root)
     for path, branch, _ in worktrees(root):
-        state = "main" if path.resolve() == main else pr_state(root, branch)
+        state = "main" if path.resolve() == main else worktree_state(root, path, branch)
         print(f"{state:8s} {branch or '(detached)':40s} {path}")
     return 0
 
 
 def clean_worktrees(root: Path, main: Path, dry_run: bool) -> int:
-    """Remove managed worktrees that are merged, clean and not locked by a live pid."""
+    """Remove managed worktrees at the end of their PR, clean, not locked by a live pid.
+
+    A worktree on a branch ends with a *merged* PR. A detached one (a review's
+    checkout of a PR) ends with a merged or *closed* PR whose head is its ``HEAD``
+    (``commit_pr_state``). Any other is kept, with its reason, and a worktree
+    locked by a live process is kept and named.
+    """
     managed = (main / ".claude" / "worktrees").resolve()
     main_resolved = main.resolve()
     here = Path.cwd().resolve()
@@ -375,29 +434,30 @@ def clean_worktrees(root: Path, main: Path, dry_run: bool) -> int:
         resolved = path.resolve()
         if resolved == main_resolved or not resolved.is_relative_to(managed):
             continue
+        label = branch or "(detached)"
         if here == resolved or here.is_relative_to(resolved):
-            print(f"skip     {branch:40s} {path}  (you are in it)")
+            print(f"skip     {label:40s} {path}  (you are in it)")
             continue
-        state = pr_state(root, branch)
-        if state != "merged":
-            print(f"keep     {branch or '(detached)':40s} {path}  ({state})")
+        state = worktree_state(root, resolved, branch)
+        if state not in (("merged",) if branch else ("merged", "closed")):
+            print(f"keep     {label:40s} {path}  ({state})")
             continue
         ok, out = run_note(["git", "status", "--porcelain"], resolved)
         if not ok:
-            print(f"keep     {branch:40s} {path}  (could not check status: {out})")
+            print(f"keep     {label:40s} {path}  (could not check status: {out})")
             continue
         if out.strip():
-            print(f"keep     {branch:40s} {path}  (dirty)")
+            print(f"keep     {label:40s} {path}  (dirty)")
             continue
         if locked is not None:
             owner = lock_owner(locked)
             if owner is None:
-                print(f"keep     {branch:40s} {path}  (locked, no pid in: {locked!r})")
+                print(f"keep     {label:40s} {path}  (locked, no pid in: {locked!r})")
                 continue
             if pid_alive(owner):
-                print(f"keep     {branch:40s} {path}  (locked by live pid {owner})")
+                print(f"keep     {label:40s} {path}  (locked by live pid {owner})")
                 continue
-        print(f"{'would remove' if dry_run else 'remove':8s} {branch:40s} {path}")
+        print(f"{'would remove' if dry_run else 'remove':8s} {label:40s} {path}")
         if dry_run:
             continue
         if locked is not None:
@@ -417,8 +477,37 @@ def clean_worktrees(root: Path, main: Path, dry_run: bool) -> int:
     return removed
 
 
+AGENT_BRANCH_PREFIX = "worktree-agent-"
+
+
+def is_agent_branch_without_work(main: Path, branch: str) -> tuple[bool, str]:
+    """``(True, "")`` for a ``worktree-agent-*`` branch with no commit ``origin/main`` lacks.
+
+    A subagent's worktree starts on such a branch at the main checkout's ``HEAD``;
+    one that is renamed (a develop) leaves the name, and one that checks a PR out
+    detached (a review) leaves the branch behind with no commit of its own: 24 of
+    them were deleted by hand on 2026-11-18 (#591). No PR is asked about: a branch
+    all of whose commits are in ``origin/main`` holds nothing to lose. The second
+    item is the reason it is kept, "" when it is not an agent branch.
+    """
+    if not branch.startswith(AGENT_BRANCH_PREFIX):
+        return False, ""
+    ok, out = run_note(
+        ["git", "rev-list", "--count", f"origin/main..refs/heads/{branch}"], main
+    )
+    if not ok:
+        return False, f"could not compare with origin/main: {out}"
+    if out.strip() != "0":
+        return False, f"{out.strip()} commit(s) that origin/main lacks"
+    return True, ""
+
+
 def clean_branches(root: Path, main: Path, dry_run: bool) -> int:
-    """Delete local branches, other than ``main``, whose PR is merged and unused."""
+    """Delete local branches, other than ``main``, that are done and unused.
+
+    Done is a merged PR, or, for a ``worktree-agent-*`` branch, no commit of its
+    own (``is_agent_branch_without_work``); never a branch a worktree has checked out.
+    """
     checked_out = {branch for _, branch, _ in worktrees(root) if branch}
     ok, out = run_note(["git", "branch", "--format=%(refname:short)"], main)
     if not ok:
@@ -429,11 +518,18 @@ def clean_branches(root: Path, main: Path, dry_run: bool) -> int:
         branch = branch.strip()
         if not branch or branch == "main" or branch in checked_out:
             continue
-        state = pr_state(root, branch)
-        if state != "merged":
-            print(f"keep     {branch:40s} (branch, {state})")
-            continue
-        print(f"{'would delete' if dry_run else 'deleted':8s} {branch:40s} (branch)")
+        # Local and cheap, so asked before GitHub: 24 of them were left on one day.
+        empty, why = is_agent_branch_without_work(main, branch)
+        if not empty:
+            state = pr_state(root, branch)
+            if state != "merged":
+                reason = f"{state}; {why}" if why else state
+                print(f"keep     {branch:40s} (branch, {reason})")
+                continue
+        note = "no commit of its own" if empty else "merged"
+        print(
+            f"{'would delete' if dry_run else 'deleted':8s} {branch:40s} (branch, {note})"
+        )
         if dry_run:
             continue
         ok, detail = run_note(["git", "branch", "-D", branch], main)

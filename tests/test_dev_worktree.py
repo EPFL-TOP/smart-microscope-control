@@ -1,6 +1,7 @@
 """scripts/dev/worktree.py decides which worktrees to delete; pin its rules."""
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -337,3 +338,283 @@ def test_a_review_checkout_of_an_open_pr_is_open(wt, monkeypatch) -> None:
     )
     assert wt.pr_state(Path("."), "pr5") == "open"
     assert wt.review_checkout_state(Path("."), "print-fix") is None
+
+
+# -- a review's detached worktree and the branches a subagent leaves (#591) ----
+
+
+def _git_out(*args: str, cwd: Path) -> str:
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True
+    )
+    return proc.stdout.strip()
+
+
+def _add_detached(repo: Path, name: str) -> tuple[Path, str]:
+    """A worktree with no branch (a review's checkout), at the repository's HEAD."""
+    path = repo / ".claude" / "worktrees" / name
+    _git("worktree", "add", "-q", "--detach", str(path), "HEAD", cwd=repo)
+    return path, _git_out("rev-parse", "HEAD", cwd=path)
+
+
+def _commit_in(path: Path, name: str) -> str:
+    """A commit made in the worktree itself: GitHub has never seen it."""
+    (path / name).write_text(name, encoding="utf-8")
+    _git("add", name, cwd=path)
+    _git("commit", "-q", "-m", name, cwd=path)
+    return _git_out("rev-parse", "HEAD", cwd=path)
+
+
+def _pull(sha: str, state: str = "closed", merged: bool = True, head: str = "") -> dict:
+    """One entry of `commits/<sha>/pulls`: the PR's own head is what counts."""
+    return {
+        "state": state,
+        "merged_at": "2026-11-18T10:00:00Z" if merged else None,
+        "head": {"sha": head or sha},
+    }
+
+
+def _github(wt, monkeypatch, table: dict[str, list[dict]] | None = None, fail=""):
+    """A stubbed `gh api commits/<sha>/pulls`: the table's answer, else GitHub's 422."""
+    monkeypatch.setattr(wt.shutil, "which", lambda name: "/usr/bin/gh")
+    real = wt.run_note
+    asked: list[str] = []
+
+    def fake(args, cwd):
+        if args[0] != "gh":
+            return real(args, cwd)
+        line = " ".join(args)
+        asked.append(line)
+        if fail:
+            return False, fail
+        sha = line.split("/commits/")[1].split("/")[0]
+        if sha in (table or {}):
+            return True, json.dumps((table or {})[sha])
+        return False, f"gh: No commit found for SHA: {sha} (HTTP 422)"
+
+    monkeypatch.setattr(wt, "run_note", fake)
+    return asked
+
+
+@pytest.mark.parametrize(
+    ("pull", "expected"),
+    [
+        (_pull("x"), "merged"),
+        (_pull("x", merged=False), "closed"),
+        (_pull("x", state="open", merged=False), "open"),
+    ],
+)
+def test_the_state_of_a_commit_is_that_of_the_pr_it_heads(
+    wt, monkeypatch, pull, expected
+) -> None:
+    _github(wt, monkeypatch, {"x": [pull]})
+    assert wt.commit_pr_state(Path("."), "x") == expected
+
+
+def test_a_commit_that_is_only_inside_a_pr_is_not_its_head(wt, monkeypatch) -> None:
+    # `commits/<sha>/pulls` also lists a PR that merely contains the commit, and the PR a
+    # merge commit introduced: neither says the commit made in a worktree is done.
+    _github(wt, monkeypatch, {"x": [_pull("x", head="someone-elses-head")]})
+    assert wt.commit_pr_state(Path("."), "x") == "no PR"
+    _github(wt, monkeypatch, {"x": []})
+    assert wt.commit_pr_state(Path("."), "x") == "no PR"
+
+
+def test_a_pr_that_shares_its_head_with_another_is_decided_open_then_merged(
+    wt, monkeypatch
+) -> None:
+    both = [_pull("x"), _pull("x", merged=False), _pull("x", "open", merged=False)]
+    _github(wt, monkeypatch, {"x": both})
+    assert wt.commit_pr_state(Path("."), "x") == "open"
+    _github(wt, monkeypatch, {"x": both[:2]})
+    assert wt.commit_pr_state(Path("."), "x") == "merged"
+
+
+def test_a_commit_github_does_not_know_is_no_pr_and_any_other_failure_is_unknown(
+    wt, monkeypatch
+) -> None:
+    _github(wt, monkeypatch, {})
+    assert wt.commit_pr_state(Path("."), "x") == "no PR"
+    _github(wt, monkeypatch, fail="gh: Server Error (HTTP 502)")
+    assert wt.commit_pr_state(Path("."), "x") == "unknown"
+    monkeypatch.setattr(wt, "run_note", lambda args, cwd: (True, "not json"))
+    assert wt.commit_pr_state(Path("."), "x") == "unknown"
+    monkeypatch.setattr(wt, "run_note", lambda args, cwd: (True, '{"a": 1}'))
+    assert wt.commit_pr_state(Path("."), "x") == "unknown"
+    monkeypatch.setattr(wt.shutil, "which", lambda name: None)
+    assert wt.commit_pr_state(Path("."), "x") == "unknown"
+
+
+@pytest.mark.parametrize("merged", [True, False], ids=["merged", "closed"])
+def test_clean_removes_a_detached_clean_worktree_at_the_head_of_a_merged_pr(
+    wt, repo, monkeypatch, merged
+) -> None:
+    # (a PR closed without a merge counts as well: its review is over)
+    path, sha = _add_detached(repo, "review-1")
+    asked = _github(wt, monkeypatch, {sha: [_pull(sha, merged=merged)]})
+    assert wt.clean_worktrees(repo, repo, dry_run=False) == 1
+    assert not path.exists()
+    assert f"commits/{sha}/pulls" in asked[0]
+
+
+def test_a_branch_worktree_of_a_closed_pr_is_still_kept(wt, repo, monkeypatch) -> None:
+    # only a detached worktree ends with a closed PR: a branch is done when merged
+    path = _add_worktree(repo, "issue-7", "feat/7")
+    monkeypatch.setattr(wt, "pr_state", lambda root, branch: "closed")
+    assert wt.clean_worktrees(repo, repo, dry_run=False) == 0
+    assert path.is_dir()
+
+
+def test_clean_keeps_a_detached_worktree_that_is_dirty_locked_by_a_live_process_or_at_a_commit_github_does_not_know(
+    wt, repo, monkeypatch, capsys
+) -> None:
+    dirty, dirty_sha = _add_detached(repo, "review-dirty")
+    (dirty / "scratch.txt").write_text("wip", encoding="utf-8")
+    locked, locked_sha = _add_detached(repo, "review-locked")
+    _lock(repo, locked, f"claude session review (pid {os.getpid()} start now)")
+    unknown, _ = _add_detached(repo, "review-local")
+    local_sha = _commit_in(unknown, "mine.txt")
+    # a merged PR has the first two commits as its head, so only dirt and the lock keep
+    # them; the third commit is absent from the table: GitHub answers 422 for it
+    table = {
+        dirty_sha: [_pull(dirty_sha)],
+        locked_sha: [_pull(locked_sha)],
+    }
+    assert local_sha not in table
+    _github(wt, monkeypatch, table)
+    assert wt.clean_worktrees(repo, repo, dry_run=False) == 0
+    assert dirty.is_dir()
+    assert locked.is_dir()
+    assert unknown.is_dir()
+    assert (unknown / "mine.txt").read_text(encoding="utf-8") == "mine.txt"
+    out = capsys.readouterr().out
+    assert "(dirty)" in out
+    assert f"locked by live pid {os.getpid()}" in out  # a live lock is named
+    assert "(no PR)" in out
+    assert out.count("(detached)") == 3
+
+
+def test_clean_keeps_a_detached_worktree_whose_pr_is_open_or_when_github_does_not_answer(
+    wt, repo, monkeypatch, capsys
+) -> None:
+    path, sha = _add_detached(repo, "review-open")
+    _github(wt, monkeypatch, {sha: [_pull(sha, "open", merged=False)]})
+    assert wt.clean_worktrees(repo, repo, dry_run=False) == 0
+    assert "(open)" in capsys.readouterr().out
+    _github(wt, monkeypatch, fail="gh: Server Error (HTTP 502)")
+    assert wt.clean_worktrees(repo, repo, dry_run=False) == 0
+    assert "(unknown)" in capsys.readouterr().out
+    assert path.is_dir()
+
+
+def test_clean_notes_a_detached_worktree_whose_directory_is_gone(
+    wt, repo, monkeypatch
+) -> None:
+    # as for a branch worktree (FM-31): git still lists it, the HEAD cannot be read,
+    # and the healthy one after it is still reached
+    gone, _ = _add_detached(repo, "review-gone")
+    healthy, sha = _add_detached(repo, "review-healthy")
+    shutil.rmtree(gone)
+    _github(wt, monkeypatch, {sha: [_pull(sha)]})
+    assert wt.clean_worktrees(repo, repo, dry_run=False) == 1
+    assert not healthy.exists()
+
+
+def test_a_dry_run_names_the_detached_worktree_it_would_remove(
+    wt, repo, monkeypatch, capsys
+) -> None:
+    path, sha = _add_detached(repo, "review-2")
+    _github(wt, monkeypatch, {sha: [_pull(sha)]})
+    assert wt.clean_worktrees(repo, repo, dry_run=True) == 0
+    assert path.is_dir()
+    out = capsys.readouterr().out
+    assert "would remove" in out
+    assert "(detached)" in out
+
+
+def test_list_says_what_a_detached_worktree_is_waiting_for(
+    wt, repo, monkeypatch, capsys
+) -> None:
+    _, sha = _add_detached(repo, "review-3")
+    _github(wt, monkeypatch, {sha: [_pull(sha)]})
+    monkeypatch.chdir(repo)
+    assert wt.cmd_list(repo) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("main ")
+    assert lines[1].startswith("merged ")
+    assert "(detached)" in lines[1]
+
+
+def _agent_repo(repo: Path) -> str:
+    """``origin/main`` one commit ahead of the init commit, whose sha is returned."""
+    init = _git_out("rev-parse", "HEAD", cwd=repo)
+    (repo / "later.txt").write_text("later", encoding="utf-8")
+    _git("add", "later.txt", cwd=repo)
+    _git("commit", "-q", "-m", "later", cwd=repo)
+    _git("update-ref", "refs/remotes/origin/main", "main", cwd=repo)
+    return init
+
+
+def _branches(wt, repo: Path) -> set[str]:
+    return set(wt.run("git", "branch", "--format=%(refname:short)", cwd=repo).split())
+
+
+def test_clean_deletes_a_worktree_agent_branch_with_no_worktree_and_no_commit_of_its_own(
+    wt, repo, monkeypatch, capsys
+) -> None:
+    init = _agent_repo(repo)
+    _git("branch", "worktree-agent-aaa", init, cwd=repo)
+    _git("branch", "worktree-agent-at-main", "main", cwd=repo)
+
+    def never(root, branch):
+        raise AssertionError(f"GitHub was asked about {branch}")
+
+    monkeypatch.setattr(wt, "pr_state", never)
+    assert wt.clean_branches(repo, repo, dry_run=True) == 0
+    assert "worktree-agent-aaa" in _branches(wt, repo)  # a dry run changes nothing
+    assert "would delete" in capsys.readouterr().out
+    assert wt.clean_branches(repo, repo, dry_run=False) == 2
+    assert _branches(wt, repo) == {"main"}
+
+
+def test_clean_keeps_a_worktree_agent_branch_that_has_a_commit_or_a_worktree_or_no_origin_main(
+    wt, repo, monkeypatch, capsys
+) -> None:
+    init = _agent_repo(repo)
+    tree = _git_out("rev-parse", "HEAD^{tree}", cwd=repo)
+    own = _git_out("commit-tree", tree, "-p", init, "-m", "mine", cwd=repo)
+    _git("branch", "worktree-agent-own", own, cwd=repo)
+    _git("branch", "worktree-agent-used", init, cwd=repo)
+    _add_worktree(repo, "agent-used", "worktree-agent-used", new=False)
+    # an old commit of main is not a reason to delete a branch the process does not name
+    _git("branch", "feat/old", init, cwd=repo)
+    monkeypatch.setattr(wt, "pr_state", lambda root, branch: "no PR")
+    assert wt.clean_branches(repo, repo, dry_run=False) == 0
+    out = capsys.readouterr().out
+    assert "worktree-agent-own" in out
+    assert "1 commit(s) that origin/main lacks" in out
+    assert "worktree-agent-used" not in out  # never even attempted (FM-43)
+    assert "feat/old" in out
+    # without origin/main nothing can be compared: kept, with the reason
+    _git("branch", "worktree-agent-aaa", init, cwd=repo)
+    _git("update-ref", "-d", "refs/remotes/origin/main", cwd=repo)
+    assert wt.clean_branches(repo, repo, dry_run=False) == 0
+    assert "could not compare with origin/main" in capsys.readouterr().out
+    assert _branches(wt, repo) >= {
+        "worktree-agent-aaa",
+        "worktree-agent-own",
+        "worktree-agent-used",
+        "feat/old",
+    }
+
+
+def test_a_worktree_agent_branch_with_a_merged_pr_goes_the_way_of_any_merged_branch(
+    wt, repo, monkeypatch
+) -> None:
+    init = _agent_repo(repo)
+    tree = _git_out("rev-parse", "HEAD^{tree}", cwd=repo)
+    own = _git_out("commit-tree", tree, "-p", init, "-m", "mine", cwd=repo)
+    _git("branch", "worktree-agent-own", own, cwd=repo)
+    monkeypatch.setattr(wt, "pr_state", lambda root, branch: "merged")
+    assert wt.clean_branches(repo, repo, dry_run=False) == 1
+    assert _branches(wt, repo) == {"main"}
