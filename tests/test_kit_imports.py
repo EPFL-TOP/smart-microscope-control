@@ -18,10 +18,11 @@ from pathlib import Path
 #: What the subprocess imports. The selection package is there by every module,
 #: and ``route``'s plugin, which imports it, is there too: a selector is loaded
 #: inside the plugin, and the plugin must not pull the Micro-Manager bindings in
-#: by it.
+#: by it. ``smc.data.draw`` is the drawing (algorithms §6): Pillow and numpy, no stand.
 KIT_MODULES = [
     "smc.data",
     "smc.data.cli",
+    "smc.data.draw",
     "smc.cli",
     "smc.selection",
     "smc.selection.api",
