@@ -25,6 +25,14 @@ from smc.selection.api import (
     SelectorParams,
 )
 from smc.selection.checks import check_choices, check_order
+from smc.selection.registry import (
+    orderer,
+    orderer_names,
+    orderers,
+    selector,
+    selector_names,
+    selectors,
+)
 
 __all__ = [
     "Choice",
@@ -36,4 +44,10 @@ __all__ = [
     "SelectorParams",
     "check_choices",
     "check_order",
+    "orderer",
+    "orderer_names",
+    "orderers",
+    "selector",
+    "selector_names",
+    "selectors",
 ]

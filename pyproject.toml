@@ -101,6 +101,13 @@ scan-plan = "smc.plugins.scan_plan.plugin:ScanPlanPlugin"
 stage-report = "smc.plugins.stage_report:StageReport"
 timing = "smc.plugins.timing.plugin:TimingPlugin"
 
+[project.entry-points."smc.selectors"]
+most-cells = "smc.selection.builtin:MostCells"
+
+[project.entry-points."smc.orderers"]
+nearest = "smc.selection.builtin:Nearest"
+as-chosen = "smc.selection.builtin:AsChosen"
+
 [project.urls]
 Homepage = "https://github.com/EPFL-TOP/smart-microscope-control"
 Issues = "https://github.com/EPFL-TOP/smart-microscope-control/issues"
