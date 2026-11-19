@@ -27,6 +27,10 @@ ROOT = Path(__file__).resolve().parents[2]
 TRACKING_TITLE = "Point: next steps"
 STATUS = "status: "
 MAX_LINE = 220
+# Every `gh` child has a timeout (FM-31), and none shares the console, which can change
+# its code page (FM-22): `gh api --paginate` walks several pages in one child.
+GH_TIMEOUT_S = 120
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _DEPENDS = re.compile(r"\*\*Depends on\*\*:?\s*(.*)", re.IGNORECASE)
 _REF = re.compile(r"#(\d+)")
 # The lane a note belongs to: the `S<k>` right after the header's opening parenthesis.
@@ -130,6 +134,31 @@ def lane_notes(comments: list[dict[str, Any]], stamp: str) -> list[str]:
     ]
 
 
+def for_point_lines(comments: list[dict[str, Any]], stamp: str) -> list[str]:
+    """The ``**For /point**`` lines of every lane note since ``stamp``, oldest first.
+
+    A lane's newest note says where the lane stands; a ``For /point`` line is
+    something the owner does not act on and the next point must turn into an
+    issue, a housekeeping step or a line of its list. A lane that wrote one in an
+    early note and a plain note after it would lose it in ``lane_notes``, which
+    keeps the newest note of each lane only (#591). The line ends with the note's
+    URL so that the point can read the whole note.
+    """
+    notes: list[tuple[str, str, dict[str, Any]]] = []
+    for c in comments:
+        match = _LANE.match(str(c.get("body", "")).lstrip())
+        created = str(c.get("createdAt", ""))
+        if match and created >= stamp:
+            notes.append((created, match.group(1), c))
+    out: list[str] = []
+    for created, lane, c in sorted(notes, key=lambda n: n[0]):
+        for item in field(str(c["body"]), "For /point"):
+            line = f"- {lane} ({created}): {clip(item)}"
+            url = str(c.get("url") or "")
+            out.append(ascii_only(f"{line} {url}" if url else line))
+    return out
+
+
 def dependencies(issue: dict[str, Any]) -> list[int]:
     """What a blocked issue waits on: its plan's ``**Depends on**`` line, else its body's.
 
@@ -162,11 +191,20 @@ def verdict(texts: list[dict[str, Any]]) -> str:
 
 
 def field(body: str, name: str) -> list[str]:
-    """The text of a ``**Name**:`` field of a report: its line and its bullets."""
+    """The text of a ``**Name**:`` field of a report: its line and its bullets.
+
+    ``**Name:**`` (the colon inside the bold) is read too: the notes are written
+    by subagents, which drift between the two, and a field that is skipped
+    leaves the owner no trace of what the note said.
+    """
     lines = body.splitlines()
     for i, line in enumerate(lines):
-        if line.strip().startswith(f"**{name}**"):
-            head = line.split(":", 1)[1].strip() if ":" in line else ""
+        text = line.strip()
+        if text.startswith((f"**{name}**", f"**{name}:**")):
+            if text.startswith(f"**{name}:**"):
+                head = text[len(f"**{name}:**") :].strip()
+            else:
+                head = text.split(":", 1)[1].strip() if ":" in text else ""
             out = [head] if head else []
             for nxt in lines[i + 1 :]:
                 if nxt.strip().startswith("- "):
@@ -399,13 +437,21 @@ def status_of(issue: dict[str, Any]) -> str:
 
 
 def gh(*args: str) -> str:
-    proc = subprocess.run(
-        ["gh", *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        proc = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            timeout=GH_TIMEOUT_S,
+            creationflags=_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(
+            f"gh {' '.join(args[:2])} timed out after {GH_TIMEOUT_S} s"
+        ) from None
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise SystemExit(f"gh {' '.join(args[:2])} failed ({proc.returncode})")
@@ -414,6 +460,65 @@ def gh(*args: str) -> str:
 
 def gh_json(*args: str) -> Any:
     return json.loads(gh(*args) or "null")
+
+
+# `gh issue list` and `gh pr list` return at most this many comments (and reviews) of
+# each item, and say nothing when there are more. Measured 2026-11-19, gh 2.103.3: 100 of
+# the 182 comments of the tracking issue; `gh issue view` and `gh api --paginate` return
+# all of them. On 2026-11-18 the point read #51 as of its 100th comment: its `since` was
+# five days old and every Point and lane note after it was invisible (#591).
+LISTING_CAP = 100
+
+
+def paginated(path: str, get_json: Any) -> list[dict[str, Any]]:
+    """Every item of a REST list, by ``gh api --paginate`` (gh joins the pages)."""
+    data = get_json("api", "--paginate", f"{path}?per_page=100")
+    if not isinstance(data, list):
+        raise SystemExit(f"gh api {path}: expected a list, got {type(data).__name__}")
+    return data
+
+
+def normalise_comment(raw: dict[str, Any]) -> dict[str, Any]:
+    """A REST issue comment in the shape ``gh ... --json comments`` has."""
+    return {
+        "id": raw.get("node_id", ""),
+        "body": raw.get("body") or "",
+        "createdAt": raw.get("created_at", ""),
+        "url": raw.get("html_url", ""),
+    }
+
+
+def normalise_review(raw: dict[str, Any]) -> dict[str, Any]:
+    """A REST pull request review in the shape ``gh pr list --json reviews`` has."""
+    return {
+        "id": raw.get("node_id", ""),
+        "body": raw.get("body") or "",
+        "submittedAt": raw.get("submitted_at") or "",
+        "state": raw.get("state", ""),
+    }
+
+
+def complete(
+    repo: str, items: list[dict[str, Any]], kind: str, get_json: Any = None
+) -> None:
+    """Read again, in full, the comments (and a PR's reviews) a listing may have cut.
+
+    ``kind`` is ``issue`` or ``pr``; an item with fewer than ``LISTING_CAP`` of
+    them is complete and costs no call. ``items`` is changed in place.
+    """
+    get = get_json or gh_json
+    for item in items:
+        number = item["number"]
+        if len(item.get("comments") or []) >= LISTING_CAP:
+            item["comments"] = [
+                normalise_comment(c)
+                for c in paginated(f"repos/{repo}/issues/{number}/comments", get)
+            ]
+        if kind == "pr" and len(item.get("reviews") or []) >= LISTING_CAP:
+            item["reviews"] = [
+                normalise_review(r)
+                for r in paginated(f"repos/{repo}/pulls/{number}/reviews", get)
+            ]
 
 
 def ref_state(repo: str, number: int) -> str:
@@ -452,6 +557,7 @@ def main() -> int:
         "--json",
         "number,title,labels,milestone,comments,updatedAt,body",
     )
+    complete(repo, issues, "issue")
     tracking = next((i for i in issues if i["title"] == TRACKING_TITLE), None)
     since = (
         datetime.fromisoformat(ns.since).replace(tzinfo=timezone.utc)
@@ -471,6 +577,7 @@ def main() -> int:
         "--json",
         "number,title,comments",
     )
+    complete(repo, closed, "issue")
     prs = gh_json(
         "pr",
         "list",
@@ -480,6 +587,7 @@ def main() -> int:
         "number,title,mergeStateStatus,statusCheckRollup,reviews,comments,isDraft,"
         "closingIssuesReferences",
     )
+    complete(repo, prs, "pr")
     merged = gh_json(
         "pr",
         "list",
@@ -492,6 +600,7 @@ def main() -> int:
         "--json",
         "number,title,mergedAt,reviews,comments",
     )
+    complete(repo, merged, "pr")
     runs = gh_json(
         "run",
         "list",
@@ -529,6 +638,12 @@ def main() -> int:
     out.append("## Lanes since the last point")
     notes = lane_notes((tracking or {}).get("comments", []), stamp)
     out.extend(notes or ["- none"])
+    out.append("")
+
+    out.append("## For /point (every lane note since the last point)")
+    out.extend(
+        for_point_lines((tracking or {}).get("comments", []), stamp) or ["- none"]
+    )
     out.append("")
 
     out.append("## CI on main")
@@ -640,7 +755,10 @@ def main() -> int:
         out.append(
             f"- {ms['title']}: {ms['closed_issues']} closed, {ms['open_issues']} open"
         )
-    print("\n".join(out))
+    # One pass over the whole report: a Report, a review or an owner note is written by a
+    # subagent, which uses arrows freely, and a redirected stdout on Windows is cp1252 with
+    # strict errors, so one arrow in any of them would lose the whole report (FM-20, #591).
+    print(ascii_only("\n".join(out)))
     return 0
 
 
