@@ -606,6 +606,35 @@ def test_a_run_without_a_preset_records_none(
     assert plugin.seen["checkpoint"].preset is None
 
 
+def test_a_run_on_an_offline_microscope_is_recorded_offline_at_every_step(
+    tmp_path: Path,
+) -> None:
+    # The record of a run on Microscope.offline says so from the first write on:
+    # the running record, the checkpoint and the last, which copy the first.
+    microscope = Microscope.offline(Profile.demo())
+    plugin = SeesItsRecords()
+    done = _run(plugin, microscope, tmp_path)
+
+    assert plugin.seen["running"].offline is True
+    assert plugin.seen["checkpoint"].offline is True
+    assert done.offline is True
+    assert done.dry_run is False
+    assert _stored(tmp_path, "sees-its-records").offline is True
+    stopped = _run(Stops(), microscope, tmp_path)
+    assert stopped.status is StageStatus.stopped
+    assert stopped.offline is True
+
+
+def test_a_run_on_a_stand_is_not_recorded_offline(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    plugin = SeesItsRecords()
+    assert _run(plugin, fake_microscope, tmp_path).offline is False
+    assert plugin.seen["running"].offline is False
+    text = (tmp_path / "run.json").read_text(encoding="utf-8")
+    assert '"offline"' not in text
+
+
 def test_a_wrong_result_type_records_failed(
     fake_microscope: Microscope, tmp_path: Path
 ) -> None:

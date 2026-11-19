@@ -29,6 +29,7 @@ from pydantic import BaseModel
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveTurret
+from smc.hardware.profile import CameraSection
 from smc.plugins import PluginRunError, Progress, load, run_plugin
 from smc.plugins.geometry import Matrix2, footprint
 from smc.plugins.route import algorithm
@@ -940,6 +941,135 @@ def test_an_objective_that_cannot_be_scaled_is_refused(
     assert _refused(demo_microscope, tmp_path, objective=IN_PLACE).reason == (
         "the scan did not record its objective, so the size of another one cannot "
         "be scaled from it; leave objective unset"
+    )
+
+
+def test_a_turret_with_no_label_keeps_the_stands_refusal_text_with_no_name(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stand's text is as it was before `route` could run offline: an empty
+    # list of names stays empty there ("none" is the offline map's word only).
+    _seed(tmp_path, scan_objective=FORTY)
+    turret = demo_microscope.require(ObjectiveTurret)
+    monkeypatch.setattr(turret, "labels", lambda: ["", ""])
+
+    assert _refused(demo_microscope, tmp_path, objective=IN_PLACE).reason == (
+        f"objective {IN_PLACE!r} is not on the turret: ; give one of them, or leave "
+        f"objective unset"
+    )
+
+
+def test_another_objective_offline_gives_the_stands_result(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Offline, the sizes come from the profile's map: the same field as the turret's, which divides both by one factor (algorithms §4.4)."""
+    shape = (240, 320)
+    scan_matrix = _matrix(0.2, 12.0, True)
+    seed = _seed(
+        tmp_path, matrix=scan_matrix, shape=shape, scan_objective=FORTY, file_token="t1"
+    )
+    on_the_stand = _result(_run(demo_microscope, tmp_path, objective=IN_PLACE))
+    offline = Microscope.offline(demo_microscope.profile)
+
+    at_home = _result(_run(offline, tmp_path, objective=IN_PLACE))
+
+    assert at_home == on_the_stand
+    scan_fov = _extent(scan_matrix, shape)
+    assert at_home.fov_um == pytest.approx((4 * scan_fov[0], 4 * scan_fov[1]))
+    assert at_home.positions
+    assert [v for row in at_home.matrix_um_per_px for v in row] == pytest.approx(
+        [4.0 * v for row in scan_matrix for v in row]
+    )
+    assert all(p.z_um is None and p.pfs_offset is None for p in at_home.positions)
+    # The record of the run on the copy says so; the scan's own is not changed.
+    assert _stored(tmp_path).offline is True
+    assert all(f.z_um is not None for f in seed.scan.frames)
+
+
+def test_an_objective_that_cannot_be_scaled_is_refused_offline(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    _seed(tmp_path, scan_objective=FORTY)
+    profile = demo_microscope.profile
+    offline = Microscope.offline(profile)
+    # Written here, from the demo's map, in the order the profile lists it.
+    in_the_map = "Nikon 10X S Fluor, Nikon 40X Plan Fluor ELWD"
+
+    # The map's keys are the labels, so an objective of the turret that the map
+    # does not name is "not in the profile", where the stand says "no pixel size".
+    assert _refused(offline, tmp_path, objective="Nikon 60X").reason == (
+        f"objective 'Nikon 60X' is not in the profile's [camera] pixel_size_um: "
+        f"{', '.join(profile.camera.pixel_size_um)}; give one of them, or leave "
+        f"objective unset"
+    )
+    # "" is no objective that can be asked for, even when the map has a key for it.
+    with_blank = profile.model_copy(
+        update={
+            "camera": CameraSection(
+                pixel_size_um={**profile.camera.pixel_size_um, "": 0.5}
+            )
+        }
+    )
+    for blank_profile in (profile, with_blank):
+        assert _refused(
+            Microscope.offline(blank_profile), tmp_path, objective=""
+        ).reason.startswith(
+            "objective '' is not in the profile's [camera] pixel_size_um: "
+        )
+    assert _refused(offline, tmp_path, objective=TWENTY).reason == (
+        f"objective {TWENTY!r} is not in the profile's [camera] pixel_size_um: "
+        f"{in_the_map}; give one of them, or leave objective unset"
+    )
+
+    # A map with no entry for the scan's own objective: the scale has no origin.
+    without_scans = profile.model_copy(
+        update={
+            "camera": CameraSection(
+                pixel_size_um={
+                    label: size
+                    for label, size in profile.camera.pixel_size_um.items()
+                    if label != FORTY
+                }
+            )
+        }
+    )
+    assert _refused(
+        Microscope.offline(without_scans), tmp_path, objective=IN_PLACE
+    ).reason == (
+        f"the profile has no pixel size for the scan's objective {FORTY!r}: add "
+        f"it to the profile's [camera] pixel_size_um, or leave objective unset"
+    )
+
+    # An empty map names nothing.
+    empty = profile.model_copy(update={"camera": CameraSection(pixel_size_um={})})
+    assert _refused(Microscope.offline(empty), tmp_path, objective=IN_PLACE).reason == (
+        f"objective {IN_PLACE!r} is not in the profile's [camera] pixel_size_um: "
+        f"none; give one of them, or leave objective unset"
+    )
+
+    _seed(tmp_path, scan_objective=None)
+    assert _refused(offline, tmp_path, objective=IN_PLACE).reason == (
+        "the scan did not record its objective, so the size of another one cannot "
+        "be scaled from it; leave objective unset"
+    )
+
+
+def test_the_scans_own_objective_given_by_name_needs_no_sizes_offline(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    seed = _seed(tmp_path, scan_objective=FORTY)
+    empty = demo_microscope.profile.model_copy(
+        update={"camera": CameraSection(pixel_size_um={})}
+    )
+
+    result = _result(_run(Microscope.offline(empty), tmp_path, objective=FORTY))
+
+    assert result.objective == FORTY
+    assert result.matrix_um_per_px == seed.matrix
+    assert result.fov_um == pytest.approx(FOV)
+    assert result.assumed == (
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
     )
 
 

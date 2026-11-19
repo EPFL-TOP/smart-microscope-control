@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import Field
 
@@ -87,6 +87,8 @@ class ReportPlugin:
     provides = "report"
     reads: tuple[str, ...] = ("scan-plan", "scan", "cells", "density")
     reads_optional: tuple[str, ...] = ("route",)
+    #: Never drives the stand, so ``smc run report --offline`` runs it (algorithms §4).
+    offline: ClassVar[bool] = True
 
     def run(
         self,

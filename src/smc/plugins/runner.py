@@ -243,6 +243,7 @@ def run_plugin(
         checkpoint=checkpoint,
         reads=_reads_of(plugin, doc, profile=profile, dry_run=dry_run),
         preset=preset,
+        offline=microscope.is_offline,
     )
     # Before any hardware is touched: a failure here ends the run.
     write_stage(run_doc, running)

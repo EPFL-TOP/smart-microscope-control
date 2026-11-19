@@ -43,6 +43,7 @@ def _record(
     reads: dict[str, ReadRecord | None] | None = None,
     result: dict[str, Any] | None = None,
     preset: str | None = None,
+    offline: bool = False,
 ) -> StageRecord:
     started = T0 + timedelta(minutes=minute)
     return StageRecord(
@@ -59,6 +60,7 @@ def _record(
         result=result if result is not None else ({} if status is DONE else None),
         reads=reads or {},
         preset=preset,
+        offline=offline,
     )
 
 
@@ -127,6 +129,61 @@ def test_a_record_with_preset_round_trips(tmp_path: Path) -> None:
     loaded = RunDocument.load(path)
     assert loaded.stages["a"].preset == "weekly"
     assert loaded.stages["b"].preset is None
+
+
+def test_a_record_that_is_not_offline_is_written_without_the_key(
+    tmp_path: Path,
+) -> None:
+    # A stage made on a stand is written byte for byte as before the field
+    # existed, so an older smc still reads the document: its model refuses a key
+    # it does not know (FM-107).
+    path = tmp_path / "run.json"
+    record = _record("a")
+    assert "offline" not in record.model_dump(mode="json")
+    write_stage(path, record)
+
+    assert '"offline"' not in path.read_text(encoding="utf-8")
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert "offline" not in stored["stages"]["a"]
+    assert RunDocument.load(path).stages["a"].offline is False
+
+
+def test_an_offline_record_keeps_offline_through_a_write_and_a_load(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "run.json"
+    write_stage(path, _record("a", offline=True))
+    write_stage(path, _record("b"))
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["stages"]["a"]["offline"] is True
+    assert "offline" not in stored["stages"]["b"]
+    loaded = RunDocument.load(path)
+    assert loaded.stages["a"].offline is True
+    assert loaded.stages["b"].offline is False
+
+
+def test_a_run_document_written_before_the_field_loads_as_not_offline(
+    tmp_path: Path,
+) -> None:
+    # The text of a document made before `offline` existed: no key at all.
+    path = tmp_path / "run.json"
+    record = _record("a").model_dump(mode="json")
+    assert "offline" not in record
+    _write_json(path, _valid_json(stages={"a": record}))
+
+    assert RunDocument.load(path).stages["a"].offline is False
+
+
+def test_a_record_with_a_preset_and_offline_keeps_both_keys(tmp_path: Path) -> None:
+    # The serializer drops each key on its own: one left out must not take the
+    # other with it.
+    path = tmp_path / "run.json"
+    write_stage(path, _record("a", preset="weekly", offline=True))
+
+    stored = json.loads(path.read_text(encoding="utf-8"))["stages"]["a"]
+    assert stored["preset"] == "weekly"
+    assert stored["offline"] is True
 
 
 def test_a_lone_surrogate_in_a_result_is_written_as_ascii_and_reads_back(

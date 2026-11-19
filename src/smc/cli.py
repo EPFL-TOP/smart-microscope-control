@@ -26,7 +26,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TextIO
 
@@ -102,11 +102,12 @@ from smc.plugins import (
 )
 from smc.plugins import discover as discover_plugins
 from smc.plugins import load as load_plugin
-from smc.plugins.api import P
+from smc.plugins.api import P, Plugin
 from smc.plugins.presets import (
     Preset,
     PresetError,
     PresetExistsError,
+    PresetFile,
     check_name,
     check_preset,
     command_pairs,
@@ -2251,6 +2252,128 @@ def _check_run_doc(value: str | None) -> Path:
     return path
 
 
+def _check_offline(plugin: Plugin[Any, Any], *, dry_run: bool) -> None:
+    """Refuse ``--offline`` for a plugin that drives the stand and for ``--dry-run`` (usage errors, exit 2).
+
+    A plugin opts in with the class attribute ``offline = True``; it is read
+    with ``is True``, so a plugin that sets something truthy still drives the
+    stand. A dry run rehearses moves on a stand that is open; offline there is
+    none, so the two do not combine.
+    """
+    if getattr(plugin, "offline", False) is not True:
+        offline = sorted(
+            name
+            for name, entry in discover_plugins().plugins.items()
+            if getattr(entry.plugin, "offline", False) is True
+        )
+        raise typer.BadParameter(
+            f"{plugin.name} drives the stand; --offline runs: "
+            f"{', '.join(offline) or 'none'}",
+            param_hint="--offline",
+        )
+    if dry_run:
+        raise typer.BadParameter(
+            "--offline and --dry-run cannot be combined: an offline run opens no "
+            "stand, so there is nothing to rehearse",
+            param_hint="--offline",
+        )
+
+
+def _offline_profile(
+    plugin: Plugin[Any, Any], doc: RunDocument, profile: str, *, given: bool
+) -> Profile:
+    """The profile an offline run uses: the one ``doc`` recorded, loaded by name (usage errors, exit 2).
+
+    The profiles recorded are those of the stages that fill the slots the
+    plugin reads (``unusable`` has already made them agree when the run goes
+    on). No stage upstream means nothing was made at a stand. The recorded name
+    is a value from a file: it is looked up as a name, and one that
+    ``Profile.load`` would read as a path is refused (FM-125). ``given`` says
+    that ``--profile`` or ``SMC_PROFILE`` was set: that profile is loaded as on
+    a stand, and must be the recorded one, so that a run is never made on a
+    stand's profile by accident. A ``ProfileError`` of the recorded name is
+    told as a usage error, raised outside the ``except`` (FM-98).
+    """
+    recorded = {
+        provider.profile
+        for slot in plugin.reads
+        if (provider := doc.provider(slot, excluding=plugin.name)) is not None
+    }
+    if not recorded:
+        raise typer.BadParameter(
+            "nothing upstream: an offline run reads a run document made at a stand",
+            param_hint="--run-doc",
+        )
+    if len(recorded) > 1:
+        raise typer.BadParameter(
+            f"the run document's stages were made on different profiles "
+            f"({', '.join(sorted(recorded))}); an offline run needs one",
+            param_hint="--run-doc",
+        )
+    (name,) = recorded
+    # The rule of Profile.load: a ".toml" or a separator is a path, not a name.
+    # A drive-relative name ("D:evil") is no path to Profile.load either, but
+    # Windows joins it to the search folder as "D:evil.toml", outside it.
+    if (
+        name.endswith(".toml")
+        or "/" in name
+        or os.sep in name
+        or PureWindowsPath(name).drive
+    ):
+        raise typer.BadParameter(
+            f"the run document names the profile {name!r}, which is not a profile name",
+            param_hint="--run-doc",
+        )
+    if given:
+        loaded = Profile.load(profile)
+    else:
+        by_name: Profile | None = None
+        problem = ""
+        try:
+            by_name = Profile.load(name)
+        except ProfileError as exc:
+            problem = str(exc)
+        if by_name is None:
+            raise typer.BadParameter(
+                f"the run document was made on profile {name!r}: {problem}",
+                param_hint="--profile",
+            )
+        loaded = by_name
+    if loaded.microscope.name != name:
+        raise typer.BadParameter(
+            f"the run document was made on profile {name!r}, this is "
+            f"{loaded.microscope.name!r}; an offline run uses the profile the "
+            f"document recorded",
+            param_hint="--profile",
+        )
+    return loaded
+
+
+def _params_of_preset(
+    name: str,
+    model: type[P],
+    found: PresetFile,
+    loaded: Profile,
+    before: RunDocument,
+    pairs: Sequence[str],
+) -> P:
+    """The parameters a preset gives ``name``, with the ``--param`` pairs over them.
+
+    What of the preset does not apply on this stand or run document is printed
+    and left out (m5 §10.3).
+    """
+    check = check_preset(
+        found,
+        {name: model},
+        stand=loaded.microscope.name,
+        registered=registered_plate(before),
+        only=name,
+    )
+    for mismatch in check.mismatches:
+        _say(mismatch)
+    return _parse_params_of(name, model, command_pairs(check, name, pairs))
+
+
 def _list_plugins() -> None:
     """One aligned line per plugin, then a ``✗`` line per entry that did not load.
 
@@ -2425,6 +2548,15 @@ def run_command(
             "parameters and the profile must be the same.",
         ),
     ] = False,
+    offline: Annotated[
+        bool,
+        typer.Option(
+            "--offline",
+            help="Run a plugin that never drives the stand on a copied run "
+            "folder, with no Micro-Manager, under the profile the run document "
+            "recorded.",
+        ),
+    ] = False,
 ) -> None:
     """Run a plugin on the stand and record the outcome in a run document.
 
@@ -2441,6 +2573,12 @@ def run_command(
     A preset (smc presets list) gives the parameters an assay repeats: each of
     its values that does not apply on this stand or run document is printed and
     left out, and --param wins over the preset. The stage's record names it.
+
+    A plugin that never drives the stand (cells, density, route, report and
+    nis-export) runs on a run folder copied to a machine with no Micro-Manager
+    when --offline is given: no stand is opened, the profile is the one the run
+    document recorded, and the stage's record says it was made offline. The run
+    document must exist, with a stage made at a stand upstream of the plugin.
     """
     with _Reported(ctx, after_report=_print_unsaved_result):
         if list_plugins:
@@ -2462,7 +2600,38 @@ def run_command(
                 _say(line)
             return
         preset_name: str | None = None
-        if preset is None:
+        if offline:
+            # The profile comes from the document, so the document is read
+            # first; the preset then reads that profile and that document, as
+            # on a stand (algorithms §4.1).
+            _check_offline(entry.plugin, dry_run=dry_run)
+            path = _check_run_doc(run_doc)
+            if not path.exists():
+                raise typer.BadParameter(
+                    f"{path} does not exist: an offline run reads a run document "
+                    f"made at a stand",
+                    param_hint="--run-doc",
+                )
+            before = RunDocument.load(path)
+            source = ctx.get_parameter_source("profile")
+            loaded = _offline_profile(
+                entry.plugin,
+                before,
+                profile,
+                given=source is not None and source.name != "DEFAULT",
+            )
+            if preset is None:
+                params = _parse_params_of(name, entry.plugin.Params, param or [])
+            else:
+                try:
+                    found = load_preset(preset, loaded)
+                except PresetError as exc:
+                    raise typer.BadParameter(str(exc), param_hint="--preset") from None
+                params = _params_of_preset(
+                    name, entry.plugin.Params, found, loaded, before, param or []
+                )
+                preset_name = found.name
+        elif preset is None:
             params = _parse_params_of(name, entry.plugin.Params, param or [])
             path = _check_run_doc(run_doc)
             loaded = Profile.load(profile)
@@ -2478,17 +2647,8 @@ def run_command(
                 raise typer.BadParameter(str(exc), param_hint="--preset") from None
             path = _check_run_doc(run_doc)
             before = RunDocument.load_or_new(path)
-            check = check_preset(
-                found,
-                {name: entry.plugin.Params},
-                stand=loaded.microscope.name,
-                registered=registered_plate(before),
-                only=name,
-            )
-            for mismatch in check.mismatches:
-                _say(mismatch)
-            params = _parse_params_of(
-                name, entry.plugin.Params, command_pairs(check, name, param or [])
+            params = _params_of_preset(
+                name, entry.plugin.Params, found, loaded, before, param or []
             )
             preset_name = found.name
         check_ready(
@@ -2499,8 +2659,17 @@ def run_command(
             dry_run=dry_run,
             resume=resume,
         )
-        with Microscope.open(loaded, dry_run=dry_run) as microscope:
-            if not dry_run:
+        if offline:
+            _say(
+                f"offline: no stand is opened; the profile, "
+                f"{loaded.microscope.name}, is the run document's"
+            )
+        with (
+            Microscope.offline(loaded)
+            if offline
+            else Microscope.open(loaded, dry_run=dry_run)
+        ) as microscope:
+            if not (dry_run or offline):
                 _say_stop_refused(microscope.profile.safety)
             record = run_plugin(
                 entry.plugin,

@@ -102,6 +102,11 @@ class Plugin(Protocol[P, R]):
     thing; ``reads`` are slots the runner insists on and ``reads_optional``
     slots the plugin uses when they are usable. ``run`` returns its ``Result``
     and never writes the run document itself.
+
+    ``offline`` is an optional class attribute, not a member: the registry's
+    ``_MEMBERS`` and ``isinstance`` do not ask for it, and ``smc run --offline``
+    reads it with ``getattr(plugin, "offline", False)``. A plugin that sets it
+    to ``True`` never drives the stand, so it must need no capability.
     """
 
     name: str

@@ -223,6 +223,13 @@ class Microscope:
     fakes). Capabilities are built once, on first request, and cached, so
     every caller of ``require(XYStage)`` shares one stage and one lock.
 
+    :meth:`offline` builds the other kind: a facade with **no core and no
+    device**, for a plugin that never drives the stand, run on a copied run
+    folder (algorithms §4.2). It has no capability (``has`` is false, ``get``
+    gives ``None``, ``require`` says no stand is open), reads nothing, and
+    closes with nothing to unload; a stand's facade is unchanged.
+    ``is_offline`` tells the two apart.
+
     ``core`` stays public for the CLI and the tests; a plugin that touches it
     bypasses every guard and fails review (design §12).
     """
@@ -230,27 +237,34 @@ class Microscope:
     profile: Profile
     roles: RoleMap
     devices: list[DeviceInfo]
-    core: CMMCorePlus
 
     def __init__(
-        self, core: CMMCorePlus, profile: Profile, *, dry_run: bool = False
+        self, core: CMMCorePlus | None, profile: Profile, *, dry_run: bool = False
     ) -> None:
-        """Wire a core that is already loaded; prefer :meth:`open` or :meth:`from_core`."""
-        self.core = core
+        """Wire a core that is already loaded; prefer :meth:`open` or :meth:`from_core`.
+
+        ``core=None`` is the offline facade (:meth:`offline`): no timeout is
+        set, no device is read and no role is resolved, since there is no stand.
+        """
+        self._core: CMMCorePlus | None = core
         self.profile = profile
         timeout_ms = profile.micromanager.device_timeout_ms
-        # FM-10: a move's deadline is the core timeout, resolved per action.
-        core.setTimeoutMs(timeout_ms)
-        self.devices = devices_from_core(core)
-        self.roles = resolve_roles(
-            self.devices,
-            core_roles=core_roles(core),
-            overrides=profile.roles.assign,
-            exclusions=profile.roles.exclude,
-        )
-        for warning in self.roles.warnings:
-            log.warning("%s", warning)
-        self._point_autofocus_slot()
+        if core is None:
+            self.devices = []
+            self.roles = resolve_roles([])
+        else:
+            # FM-10: a move's deadline is the core timeout, resolved per action.
+            core.setTimeoutMs(timeout_ms)
+            self.devices = devices_from_core(core)
+            self.roles = resolve_roles(
+                self.devices,
+                core_roles=core_roles(core),
+                overrides=profile.roles.assign,
+                exclusions=profile.roles.exclude,
+            )
+            for warning in self.roles.warnings:
+                log.warning("%s", warning)
+            self._point_autofocus_slot()
         safety = profile.safety
         # Only a stand that has a focus drive has a Z jog to guard; the
         # profile cannot know that at load time, so the warning waits for the
@@ -299,6 +313,26 @@ class Microscope:
         self._unload_error: str | None = None
 
     @property
+    def core(self) -> CMMCorePlus:
+        """The Micro-Manager core this facade owns (the CLI and the tests read it).
+
+        A property, so that the offline facade, which has none, says so
+        instead of handing out ``None`` for a caller to call a method on. It
+        holds the core and nothing refers back, so it adds no cycle (FM-92).
+
+        Raises:
+            HardwareError: This is an offline facade (:meth:`offline`).
+        """
+        if self._core is None:
+            raise HardwareError("no stand is open (offline run): there is no core")
+        return self._core
+
+    @property
+    def is_offline(self) -> bool:
+        """Whether this facade has no stand: it was built by :meth:`offline`."""
+        return self._core is None
+
+    @property
     def unload_error(self) -> str | None:
         """Why the last unload failed, or ``None``: the stand may still be held.
 
@@ -342,6 +376,19 @@ class Microscope:
             " (dry-run)" if dry_run else "",
         )
         return microscope
+
+    @classmethod
+    def offline(cls, profile: Profile) -> Microscope:
+        """A facade with no core and no device, under ``profile``: no stand is open.
+
+        For a plugin that never drives the stand, run on a run folder copied
+        to a machine with no Micro-Manager (algorithms §4). It has no
+        capability, so a move fails before it starts, by construction; it
+        never calls ``open_core`` and never imports ``pymmcore_plus``. ``profile``
+        is the one the run document recorded: the plugins read from it what
+        no stand is needed to give (the pixel size of each objective).
+        """
+        return cls(None, profile)
 
     @classmethod
     def from_core(
@@ -403,8 +450,14 @@ class Microscope:
 
         Raises:
             CapabilityMissingError: No loaded device fills the role; the
-                message points at ``[roles.assign]`` in the profile.
+                message points at ``[roles.assign]`` in the profile. On an
+                offline facade, every capability, ``Channels`` included.
         """
+        if self._core is None:
+            # Before the Channels branch, which asks the core for its groups.
+            raise CapabilityMissingError(
+                capability.__name__, None, hint="no stand is open (offline run)"
+            )
         found = self._lookup(capability)
         if found is None and capability is Channels:
             raise CapabilityMissingError(
@@ -451,7 +504,13 @@ class Microscope:
         Raises:
             TypeError: ``implementation`` lacks a method of the capability's
                 Protocol, which would otherwise surface at the first call.
+            HardwareError: This is an offline facade: nothing runs on it that
+                an override could stand in for.
         """
+        if self._core is None:
+            raise HardwareError(
+                "no stand is open (offline run): there is nothing to override"
+            )
         if capability in CAPABILITY_ROLES and not isinstance(
             implementation, capability
         ):
@@ -483,7 +542,11 @@ class Microscope:
         the stop path looks the stages up here (FM-70). Such a handler may
         also build the capability this call is building; the first one cached
         is kept, so a facade never hands out two stages.
+
+        An offline facade has none: ``None`` before the cache is looked at.
         """
+        if self._core is None:
+            return None
         with self._capabilities_lock:
             found = self._capabilities.get(capability)
             if found is None:
@@ -804,8 +867,11 @@ class Microscope:
         """One status line: ``XY (x, y) µm | Z z µm | exposure ms | shutter open | autofocus off``.
 
         A capability the stand lacks is left out; one whose read failed shows
-        ``?``. ``| moving: …`` and ``| HALTED`` are added when they apply.
+        ``?``. ``| moving: …`` and ``| HALTED`` are added when they apply. An
+        offline facade says so, whatever the halt.
         """
+        if self._core is None:
+            return "offline (no stand is open)"
         state = self.state()
         parts: list[str] = []
         if self._lookup(XYStage) is not None:
@@ -950,8 +1016,14 @@ class Microscope:
                 anything moved (the WARNING line says what each stop did),
                 but nothing was unloaded: the action still uses the devices.
                 Call ``close()`` again once it has returned.
+
+        An offline facade has no device to unload, so it is only marked
+        closed: no unload, no ``detach_callbacks``, nothing logged.
         """
         if self._closed:
+            return
+        if self._core is None:
+            self._closed = True
             return
         if _owns(self._lock):
             self._stop_if_moving()
