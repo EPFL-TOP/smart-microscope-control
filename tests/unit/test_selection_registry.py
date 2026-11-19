@@ -406,6 +406,20 @@ def test_no_selector_at_all_says_to_reinstall(
     assert "known: good" in str(found.value)
 
 
+def test_the_built_ins_are_registered_in_the_installed_metadata() -> None:
+    # The real `entry_points`, no replacement: it fails until smc is installed
+    # again after the entry points were added (FM-112), as the plugin registry's
+    # own test of the installed plugins does. Membership only, never the whole
+    # set: a lab's own package adds to it (FM-191).
+    assert "most-cells" in selector_names()
+    assert {"nearest", "as-chosen"} <= set(orderer_names())
+    assert selector("most-cells").name == "most-cells"
+    assert orderer("nearest").name == "nearest"
+    assert orderer("as-chosen").name == "as-chosen"
+    assert {"most-cells"} <= set(selectors())
+    assert {"nearest", "as-chosen"} <= set(orderers())
+
+
 def test_a_keyboard_interrupt_while_an_algorithm_is_created_is_not_a_finding(
     installed: dict[str, list[EntryPoint]],
 ) -> None:
