@@ -725,3 +725,294 @@ def test_a_lane_note_is_not_an_owner_note(point, monkeypatch, capsys) -> None:
     )
     assert "#5 owner note: is the stand free on Friday?" in notes
     assert "Lane" not in notes
+
+
+# --- a listing cuts comments at 100; the point reads them all (#591) -----------------
+
+
+def _rest(body: str, at: str, n: int = 0) -> dict:
+    """A comment as `gh api` returns it: REST names, not the listing's."""
+    return {
+        "node_id": f"IC_{n}",
+        "body": body,
+        "created_at": at,
+        "html_url": f"https://github.com/o/r/issues/51#issuecomment-{n}",
+    }
+
+
+def _old_comments(count: int) -> list[dict]:
+    """``count`` comments of 2026-11-13, the last of them the Point of that day."""
+    notes = [
+        _c(f"note {i}", f"2026-11-13T10:{i % 60:02d}:00Z") for i in range(count - 1)
+    ]
+    point_of_the_day = _c(
+        "## Point (design session, 2026-11-13)\n\nold", "2026-11-13T19:23:40Z"
+    )
+    return [*notes, point_of_the_day]
+
+
+def _paged(listed: list[dict], newer: list[dict], seen: list[tuple[str, ...]]):
+    """A stand-in for `gh_json` where `gh api --paginate` holds more than the listing."""
+    full = [_rest(c["body"], c["createdAt"], n) for n, c in enumerate(listed)] + newer
+    tracking = {**_issue(51, "Point: next steps", []), "comments": listed}
+    base = _canned([], [tracking], [])
+
+    def fake(*args: str):
+        if args[:2] == ("api", "--paginate"):
+            seen.append(args)
+            assert args[2].startswith("repos/EPFL-TOP/smart-microscope-control/")
+            return full
+        return base(*args)
+
+    return fake
+
+
+def test_a_tracking_issue_with_more_than_100_comments_gives_its_since_from_the_newest_point(
+    point, monkeypatch, capsys
+) -> None:
+    # The listing holds the first 100 comments of #51 (the newest Point among them is the
+    # one of 11-13); the paginated read holds the Points of 11-17 and 11-18 and a lane note.
+    listed = _old_comments(100)
+    newer = [
+        _rest(
+            "## Point (design session, 2026-11-17)\n\nmid", "2026-11-17T20:00:00Z", 101
+        ),
+        _rest(
+            "## Point (design session, 2026-11-18)\n\nnew", "2026-11-18T20:17:58Z", 102
+        ),
+        _rest(
+            "## Lane (S1, 2026-11-18)\n\n**Done**: x\n**Next**: y\n**For /point**: z\n",
+            "2026-11-18T21:00:00Z",
+            103,
+        ),
+    ]
+    seen: list[tuple[str, ...]] = []
+    monkeypatch.setattr(point, "gh_json", _paged(listed, newer, seen))
+    monkeypatch.setattr(sys, "argv", ["point.py"])
+    assert point.main() == 0
+    out = capsys.readouterr().out
+    assert "since 2026-11-18T20:17:58Z" in out.splitlines()[0]
+    # the lane note after the newest Point is listed, in the lanes' and the For /point section
+    assert "- S1 (2026-11-18T21:00:00Z): x / y" in out
+    assert (
+        "- S1 (2026-11-18T21:00:00Z): z"
+        " https://github.com/o/r/issues/51#issuecomment-103"
+    ) in out
+    # one read of the tracking issue's comments, paginated, 100 to a page
+    assert len(seen) == 1
+    assert seen[0][2].endswith("/issues/51/comments?per_page=100")
+
+
+def test_an_issue_under_the_listing_cap_is_not_read_again(
+    point, monkeypatch, capsys
+) -> None:
+    seen: list[tuple[str, ...]] = []
+    monkeypatch.setattr(point, "gh_json", _paged(_old_comments(99), [], seen))
+    monkeypatch.setattr(sys, "argv", ["point.py"])
+    assert point.main() == 0
+    assert seen == []
+    assert "since 2026-11-13T19:23:40Z" in capsys.readouterr().out.splitlines()[0]
+
+
+def test_every_listing_the_report_reads_is_read_again_where_it_is_cut(
+    point, monkeypatch, capsys
+) -> None:
+    # open issues, closed issues, open PRs and merged PRs: each listing cuts at 100
+    cut = [_c(f"x{i}", "2026-11-10T00:00:00Z") for i in range(100)]
+    asked: list[str] = []
+
+    def fake(*args: str):
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": "o/r"}
+        if args[:2] == ("issue", "list"):
+            number = 3 if "open" in args else 4
+            return [{**_issue(number, "feat: x", []), "comments": cut}]
+        if args[:2] == ("pr", "list"):
+            if "open" in args:
+                pr = {"number": 5, "title": "p", "mergeStateStatus": "CLEAN"}
+                return [{**pr, "comments": cut, "reviews": []}]
+            return [
+                {
+                    "number": 6,
+                    "title": "q",
+                    "mergedAt": "2026-11-10T00:00:00Z",
+                    "comments": [],
+                    "reviews": [{"body": "r", "submittedAt": "t"}] * 100,
+                }
+            ]
+        if args[:2] == ("api", "--paginate"):
+            asked.append(args[2])
+            return []
+        if args[0] == "run" or args[0] == "api":
+            return []
+        raise AssertionError(args)
+
+    monkeypatch.setattr(point, "gh_json", fake)
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+    assert point.main() == 0
+    assert sorted(asked) == [
+        "repos/o/r/issues/3/comments?per_page=100",
+        "repos/o/r/issues/4/comments?per_page=100",
+        "repos/o/r/issues/5/comments?per_page=100",
+        "repos/o/r/pulls/6/reviews?per_page=100",
+    ]
+
+
+def test_the_listing_cap_is_100_comments(point) -> None:
+    # measured 2026-11-19 on gh 2.103.3: the listing of #51 returned 100 of 182
+    assert point.LISTING_CAP == 100
+
+
+def test_a_prs_reviews_and_comments_past_the_cap_are_read_again(point) -> None:
+    pr = {
+        "number": 7,
+        "comments": [
+            _c(f"c{i}", f"2026-11-01T00:{i % 60:02d}:00Z") for i in range(100)
+        ],
+        "reviews": [
+            {"body": f"r{i}", "submittedAt": "2026-11-01T01:00:00Z"} for i in range(100)
+        ],
+    }
+    calls: list[str] = []
+    ready = "## Review (design session, 2026-11-02)\n\n**Verdict: ready to merge**"
+
+    def get(*args: str):
+        assert args[:2] == ("api", "--paginate")
+        calls.append(args[2])
+        if "/pulls/7/reviews" in args[2]:
+            return [
+                *[
+                    {"body": f"r{i}", "submitted_at": "2026-11-01T01:00:00Z"}
+                    for i in range(100)
+                ],
+                {"body": ready, "submitted_at": "2026-11-02T08:00:00Z", "state": "X"},
+                {"body": "", "submitted_at": None, "state": "PENDING"},
+            ]
+        return [_rest("last comment", "2026-11-03T00:00:00Z", 1)]
+
+    point.complete("o/r", [pr], "pr", get)
+    assert calls == [
+        "repos/o/r/issues/7/comments?per_page=100",
+        "repos/o/r/pulls/7/reviews?per_page=100",
+    ]
+    # the verdict was the 101st review: the listing could not show it
+    assert point.verdict(point.review_texts(pr)) == "ready to merge"
+    assert pr["comments"][0]["createdAt"] == "2026-11-03T00:00:00Z"
+    assert pr["reviews"][-1]["submittedAt"] == ""  # a pending review has no date
+
+
+def test_an_item_at_99_is_complete_and_one_at_100_is_not(point) -> None:
+    calls: list[str] = []
+
+    def get(*args: str):
+        calls.append(args[2])
+        return []
+
+    at_99 = {"number": 1, "comments": [_c("x", "t")] * 99}
+    at_100 = {"number": 2, "comments": [_c("x", "t")] * 100}
+    point.complete("o/r", [at_99, at_100], "issue", get)
+    assert calls == ["repos/o/r/issues/2/comments?per_page=100"]
+    assert at_99["comments"] == [_c("x", "t")] * 99
+    assert at_100["comments"] == []
+
+
+def test_a_paginated_read_that_is_not_a_list_stops_the_report(point) -> None:
+    item = {"number": 3, "comments": [_c("x", "t")] * 100}
+    with pytest.raises(SystemExit, match="expected a list"):
+        point.complete("o/r", [item], "issue", lambda *a: None)
+
+
+# --- the For /point lines of every lane note (#591) ------------------------------------
+
+
+def _note(lane: str, at: str, body: str, url: str = "") -> dict:
+    return {
+        "body": f"## Lane ({lane}, 2026-11-18)\n\n{body}\n",
+        "createdAt": at,
+        "url": url,
+    }
+
+
+def test_the_for_point_lines_of_every_lane_note_since_the_point_are_listed(
+    point,
+) -> None:
+    comments = [
+        _note(
+            "S1", "2026-11-18T09:00:00Z", "**Done**: a\n**For /point**: first, S1", "u1"
+        ),
+        _note("S2", "2026-11-18T10:00:00Z", "**Done**: b\n**Next**: you merge"),
+        # a later note of S1 has none: the first note's line must still be listed
+        _note("S1", "2026-11-18T11:00:00Z", "**Done**: c\n**Next**: wait"),
+        _note("S3", "2026-11-18T12:00:00Z", "**For /point**:\n- one\n- two", "u3"),
+        _note("S2", "2026-11-17T23:59:59Z", "**For /point**: before the window", "u0"),
+        _note("S4", "2026-11-18T00:00:00Z", "**For /point**: at the start", "u4"),
+        _c("## Point (design session, 2026-11-18)\n\n**For /point**: not a lane", "t"),
+        _c("**For /point**: a plain owner note", "2026-11-18T13:00:00Z"),
+    ]
+    assert point.for_point_lines(comments, "2026-11-18T00:00:00Z") == [
+        "- S4 (2026-11-18T00:00:00Z): at the start u4",
+        "- S1 (2026-11-18T09:00:00Z): first, S1 u1",
+        "- S3 (2026-11-18T12:00:00Z): one u3",
+        "- S3 (2026-11-18T12:00:00Z): two u3",
+    ]
+    assert point.for_point_lines(comments, "2026-11-19T00:00:00Z") == []
+
+
+def test_a_for_point_line_with_the_colon_inside_the_bold_is_read(point) -> None:
+    note = _note("S1", "2026-11-18T09:00:00Z", "**For /point:** a decision for #27")
+    assert point.for_point_lines([note], "") == [
+        "- S1 (2026-11-18T09:00:00Z): a decision for #27"
+    ]
+    assert point.field("**Done:** x\n**Next**: y", "Done") == ["x"]
+    assert point.field("**Done:** x\n**Next**: y", "Next") == ["y"]
+
+
+def test_a_for_point_line_is_one_short_ascii_line(point) -> None:
+    long = "word " * 80
+    note = _note(
+        "S1", "2026-11-18T09:00:00Z", f"**For /point**: {long} \N{RIGHTWARDS ARROW} end"
+    )
+    (line,) = point.for_point_lines([note], "")
+    assert "\n" not in line
+    assert line.isascii()
+    assert len(line) < 300
+    assert line.endswith("...")
+
+
+def test_the_report_lists_the_for_point_lines_under_their_own_heading(
+    point, monkeypatch, capsys
+) -> None:
+    tracking = _tracking(
+        [
+            _c("## Point (design session, 2026-11-11)\n\nnew", "2026-11-11T08:00:00Z"),
+            _note(
+                "S1", "2026-11-11T09:00:00Z", "**Done**: a\n**For /point**: early one"
+            ),
+            _note("S1", "2026-11-11T10:00:00Z", "**Done**: b\n**Next**: c"),
+        ]
+    )
+    monkeypatch.setattr(point, "gh_json", _canned([], [tracking], []))
+    monkeypatch.setattr(sys, "argv", ["point.py"])
+    assert point.main() == 0
+    out = capsys.readouterr().out
+    headings = [line for line in out.splitlines() if line.startswith("## ")]
+    assert headings[2:4] == [
+        "## Lanes since the last point",
+        "## For /point (every lane note since the last point)",
+    ]
+    section = out.split("## For /point")[1].split("\n## ")[0]
+    assert "- S1 (2026-11-11T09:00:00Z): early one" in section
+    # the lanes' section keeps showing the newest note only
+    lanes = out.split("## Lanes since the last point")[1].split("\n## ")[0]
+    assert "early one" not in lanes
+    assert out.split("## Merged since")[0].isascii()
+
+
+def test_the_for_point_section_says_none_without_a_line(
+    point, monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(point, "gh_json", _canned([], [_tracking([])], []))
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+    assert point.main() == 0
+    section = capsys.readouterr().out.split("## For /point")[1]
+    assert section.split("\n## ")[0].strip().splitlines()[1:] == ["- none"]
