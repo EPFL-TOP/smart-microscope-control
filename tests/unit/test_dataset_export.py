@@ -9,13 +9,21 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import smc.data.dataset as dataset_module
-from smc.data.dataset import DatasetFile, DatasetManifest, _copy_and_hash, _sha256_of
+from smc.data.dataset import (
+    DatasetFile,
+    DatasetManifest,
+    _copy_and_hash,
+    _sha256_of,
+    readme_text,
+)
 
 # --- the copy and the manifest ---------------------------------------------------
 
@@ -102,3 +110,99 @@ def test_the_manifest_dumps_to_json_and_loads_back_equal() -> None:
 def test_the_windows_limits_are_module_attributes_a_test_can_set() -> None:
     assert dataset_module.MAX_PATH == 260
     assert dataset_module.ON_WINDOWS is (os.name == "nt")
+
+
+# --- the README ------------------------------------------------------------------
+
+
+def _manifest(**changes: Any) -> DatasetManifest:
+    """A manifest built by hand, for the README: what a scan of two wells with cells says."""
+    fields: dict[str, Any] = {
+        "smc_version": "1.2.3",
+        "exported_utc": datetime(2026, 11, 18, 12, 12, 47, tzinfo=timezone.utc),
+        "source": "run.json",
+        "profile": "demo-sample",
+        "objective": "Nikon 10X S Fluor",
+        "pixel_size_um": 0.6,
+        "image_shape_px": (60, 80),
+        "wells": ("A1", "B2"),
+        "frames": 8,
+        "cells": True,
+        "cells_absent": None,
+        "files": {},
+        "scrubbed": (),
+    }
+    fields.update(changes)
+    return DatasetManifest(**fields)
+
+
+def _readme(manifest: DatasetManifest, **changes: Any) -> str:
+    arguments: dict[str, Any] = {
+        "scanned_utc": datetime(2026, 11, 17, 14, 32, 5, tzinfo=timezone.utc),
+        "cells_file": "cells/t1.json",
+        "classes": ("single", "doublet"),
+    }
+    arguments.update(changes)
+    return readme_text(manifest, **arguments)
+
+
+def test_the_readme_says_what_the_design_lists() -> None:
+    text = _readme(_manifest())
+    lines = [line.split() for line in text.splitlines()]
+
+    assert ["scanned", "2026-11-17", "14:32", "UTC"] in lines
+    assert ["exported", "2026-11-18", "12:12", "UTC", "by", "smc", "1.2.3"] in lines
+    assert ["profile", "demo-sample"] in lines
+    assert ["objective", "Nikon", "10X", "S", "Fluor"] in lines
+    assert ["pixel", "size", "0.6000", "um", "per", "pixel"] in lines
+    assert "image shape  60 x 80 pixels (height x width)" in text
+    assert "A1, B2 (the order of the scan plan)" in text
+    assert ["frames", "8"] in lines
+    assert "detected, listed in cells/t1.json (classes: single, doublet)" in text
+    # The layout, the conventions, the two ways to use it, and what was left out.
+    for name in ("run.json", "README.md", "manifest.json", "cells/<token>.json"):
+        assert name in text
+    assert "scan/<token>/<well>/<name>.tif" in text
+    assert "well_dx_um" in text
+    assert "(dx_um, dy_um) = M @ (d_col, d_row)" in text
+    assert "a pixel size of 0 is unknown" in text.lower()
+    assert "from smc.data import load_scan" in text
+    assert "smc dataset check" in text
+    assert "work on a copy" in text.lower()
+    assert "only the scan's frames and the cells file were copied" in text.lower()
+    # Neither a hash nor a path: the manifest has the first, and FM-50 the second.
+    assert "sha256" not in text.lower()
+    assert not re.search(r"[0-9a-f]{32}", text)
+    assert not re.search(r"(/Users/|/home/|[A-Za-z]:\\\\)", text)
+    assert text.isascii()
+    assert text.endswith("\n")
+
+
+def test_the_readme_says_unknown_for_what_the_scan_does_not_say() -> None:
+    text = _readme(_manifest(objective=None), scanned_utc=None)
+    lines = [line.split() for line in text.splitlines()]
+    assert ["objective", "unknown"] in lines
+    assert ["scanned", "unknown"] in lines
+
+
+def test_the_readme_of_a_scan_with_no_cells_says_why_and_lists_no_cells_file() -> None:
+    manifest = _manifest(cells=False, cells_absent="no cells record")
+    text = _readme(manifest, cells_file=None, classes=())
+    assert "none: no cells record" in text
+    assert "cells/<token>.json" not in text
+    assert "classes" not in text
+
+
+def test_an_objective_with_a_greek_letter_passes_through_and_reads_back_as_utf8(
+    tmp_path: Path,
+) -> None:
+    text = _readme(_manifest(objective="Plan Apo \N{GREEK SMALL LETTER LAMDA} 20x"))
+    assert not text.isascii()
+    path = tmp_path / "README.md"
+    path.write_bytes(text.encode("utf-8"))
+    assert "Plan Apo \N{GREEK SMALL LETTER LAMDA} 20x" in path.read_text(
+        encoding="utf-8"
+    )
+    # Only the objective's own word is outside ASCII: the fixed text is not.
+    other = [line for line in text.splitlines() if "Plan Apo" not in line]
+    assert all(line.isascii() for line in other)
