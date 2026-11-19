@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import itertools
 import math
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -20,13 +22,24 @@ from select_fields_seed import (
     PIXEL_UM,
     SHAPE,
     UPRIGHT,
+    cell_at,
     load_script,
     matrix_of,
+    record,
     seed_run,
 )
-from smc.data import draw
+from smc.data import Scan, draw, load_scan
 from smc.plugins.geometry import Matrix2, footprint
-from smc.plugins.slots import Cell, ScanFrame, WellGeometry, load_frame, well_geometry
+from smc.plugins.slots import (
+    Cell,
+    RoutePosition,
+    RouteResult,
+    ScanFrame,
+    WellGeometry,
+    load_frame,
+    well_geometry,
+)
+from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
 
 HEIGHT, WIDTH = SHAPE
 GREEN = (0, 255, 0)
@@ -405,3 +418,445 @@ def test_a_camera_matrix_that_cannot_be_inverted_is_refused_when_a_frame_is_adde
     )
     with pytest.raises(ValueError, match="cannot be inverted"):
         mosaic.add(np.zeros(SHAPE, dtype=np.uint16), 1000.0, -500.0)
+
+
+# ------------------------------------------------------------------- the route
+
+
+def _stop(
+    order: int,
+    well: str,
+    index: int,
+    x_um: float = 0.0,
+    y_um: float = 0.0,
+    *,
+    score: float | None = None,
+) -> RoutePosition:
+    return RoutePosition(
+        order=order,
+        well=well,
+        name=f"{well}_r{index:03d}",
+        x_um=x_um,
+        y_um=y_um,
+        z_um=None,
+        pfs_offset=None,
+        counts={"single": 1},
+        score=score,
+    )
+
+
+def _route(
+    positions: tuple[RoutePosition, ...],
+    *,
+    labels: tuple[str, ...] = ("single", "doublet"),
+    uncovered: dict[str, int] | None = None,
+    objective: str | None = "2-Plan Fluor 10x",
+    matrix: Matrix2 = UPRIGHT,
+    shape: tuple[int, int] = SHAPE,
+    fov_um: tuple[float, float] = (400.0, 300.0),
+) -> RouteResult:
+    return RouteResult(
+        objective=objective,
+        matrix_um_per_px=matrix,
+        image_shape_px=shape,
+        fov_um=fov_um,
+        labels=labels,
+        positions=positions,
+        uncovered=uncovered if uncovered is not None else {},
+        distance_um=0.0,
+        travel_s=None,
+    )
+
+
+def _write_route(
+    path: Path,
+    result: RouteResult | dict[str, Any],
+    *,
+    plugin: str = "route",
+    params: dict[str, Any] | None = None,
+    day: int = 29,
+    profile: str = "demo",
+    dry_run: bool = False,
+    reads: dict[str, ReadRecord | None] | None = None,
+) -> None:
+    """A ``route`` record as a run of ``plugin`` left it, ``done``, after the seed's stages (day 28)."""
+    then = datetime(2026, 10, day, 9, 30, tzinfo=timezone.utc)
+    write_stage(
+        path,
+        StageRecord(
+            plugin=plugin,
+            provides="route",
+            attempt="a1",
+            status=StageStatus.done,
+            started_utc=then,
+            finished_utc=then,
+            profile=profile,
+            dry_run=dry_run,
+            smc_version="0",
+            params=params if params is not None else {},
+            result=(
+                result if isinstance(result, dict) else result.model_dump(mode="json")
+            ),
+            reads=reads or {},
+        ),
+    )
+
+
+def _scan_of_run(
+    tmp_path: Path,
+    *,
+    route: RouteResult | dict[str, Any] | None = None,
+    cells: list[Cell] | None = None,
+    wells: tuple[str, ...] = ("A1", "B2"),
+    **route_options: Any,
+) -> Scan:
+    """A scan seeded in ``tmp_path`` and loaded back by ``load_scan``, with a ``route`` record when ``route`` is given."""
+    seed = seed_run(
+        tmp_path,
+        cells=cells if cells is not None else [cell_at("A1", 0.0, 0.0)],
+        wells=wells,
+        rows=1,
+        columns=1,
+    )
+    if route is not None:
+        _write_route(seed.path, route, **route_options)
+    return load_scan(seed.path)
+
+
+CHOSE = {"selector": "most-cells", "orderer": "nearest"}
+
+
+def test_a_stop_is_numbered_by_its_rank_in_its_well_not_by_its_plate_wide_order(
+    tmp_path: Path,
+) -> None:
+    # The demo-sample's shape: the order is plate-wide, so B2 starts at 3, not at 0.
+    positions = (
+        _stop(0, "A1", 0),
+        _stop(1, "A1", 1),
+        _stop(2, "A1", 2),
+        _stop(3, "B2", 0),
+        _stop(4, "B2", 1),
+    )
+    scan = _scan_of_run(tmp_path, route=_route(positions), params=CHOSE)
+    view, why = draw.route_of(scan)
+    assert why is None
+    assert view is not None
+    second = draw.stops_of_well(view, "B2")
+    assert [(s.rank, s.order, s.name) for s in second] == [
+        (1, 3, "B2_r000"),
+        (2, 4, "B2_r001"),
+    ]
+    assert [s.rank for s in draw.stops_of_well(view, "A1")] == [1, 2, 3]
+    # A well typed as a person types it is the same well.
+    assert draw.stops_of_well(view, "b02") == second
+    assert draw.stops_of_well(view, "A2") == ()
+
+
+def test_the_rank_follows_the_visiting_order_and_equal_orders_keep_the_records() -> (
+    None
+):
+    result = _route((_stop(7, "A1", 0), _stop(5, "A1", 1), _stop(6, "A1", 2)))
+    view = draw.RouteView("route", None, None, result)
+    by_order = draw.stops_of_well(view, "A1")
+    assert [(s.name, s.rank) for s in by_order] == [
+        ("A1_r001", 1),
+        ("A1_r002", 2),
+        ("A1_r000", 3),
+    ]
+    tied = _route((_stop(4, "A1", 0), _stop(4, "A1", 1), _stop(3, "A1", 2)))
+    ranks = draw.stops_of_well(draw.RouteView("route", None, None, tied), "A1")
+    assert [s.name for s in ranks] == ["A1_r002", "A1_r000", "A1_r001"]
+
+
+def test_a_stop_keeps_the_score_the_selector_gave_it() -> None:
+    result = _route((_stop(0, "A1", 0, score=0.5), _stop(1, "A1", 1)))
+    stops = draw.stops_of_well(draw.RouteView("route", None, None, result), "A1")
+    assert [s.score for s in stops] == [0.5, None]
+
+
+def test_a_score_follows_the_number_in_three_significant_digits_and_no_score_adds_nothing() -> (
+    None
+):
+    assert draw.label_of(2, 0.82345) == "2 (0.823)"
+    assert draw.label_of(2, None) == "2"
+    assert draw.label_of(2, 12345.6) == "2 (1.23e+04)"
+    assert draw.label_of(2, 0.0) == "2 (0)"
+    assert draw.label_of(2, -0.5) == "2 (-0.5)"
+
+
+def _captions_scan(tmp_path: Path, route: RouteResult, **options: Any) -> Scan:
+    cells = [
+        cell_at("B2", 0.0, 0.0, "single"),
+        cell_at("B2", 50.0, 0.0, "single"),
+        cell_at("B2", 100.0, 0.0, "doublet"),
+        cell_at("B2", 150.0, 0.0, "debris"),
+        cell_at("B2", 200.0, 0.0, "debris"),
+        cell_at("B2", 250.0, 0.0, "debris"),
+        cell_at("A1", 0.0, 0.0, "single"),
+    ]
+    return _scan_of_run(tmp_path, route=route, cells=cells, **options)
+
+
+def test_the_caption_names_the_well_the_route_the_selector_the_orderer_the_field_the_stops_and_the_uncovered(
+    tmp_path: Path,
+) -> None:
+    route = _route((_stop(0, "B2", 0),), uncovered={"B2": 3})
+    scan = _captions_scan(tmp_path, route, params=CHOSE)
+    view, _ = draw.route_of(scan)
+    assert draw.caption_lines(scan, "B2", view, None, stops=5, frames=1) == [
+        "B2: 5 stops; uncovered single, doublet cells: 3",
+        "route: selector most-cells, orderer nearest",
+        "fields 400 x 300 um at 2-Plan Fluor 10x",
+        "cells: single (gold) 2, doublet (cyan) 1, debris (red) 3",
+    ]
+
+
+def test_the_caption_counts_stops_in_words_and_leaves_out_what_it_does_not_know(
+    tmp_path: Path,
+) -> None:
+    route = _route((_stop(0, "B2", 0),), objective=None, uncovered={"A1": 1})
+    scan = _captions_scan(tmp_path, route, params=CHOSE)
+    view, _ = draw.route_of(scan)
+    one = draw.caption_lines(scan, "B2", view, None, stops=1, frames=1)
+    none = draw.caption_lines(scan, "B2", view, None, stops=0, frames=1)
+    # B2 is not in `uncovered`: not counted, which is not 0. No objective: no "at".
+    assert one[0] == "B2: 1 stop; uncovered cells: not counted"
+    assert none[0] == "B2: no stop; uncovered cells: not counted"
+    assert one[2] == "fields 400 x 300 um"
+
+
+def test_the_caption_says_the_frames_that_could_not_be_read_and_the_stops_left_out(
+    tmp_path: Path,
+) -> None:
+    route = _route((_stop(0, "B2", 0),), uncovered={"B2": 0})
+    scan = _captions_scan(tmp_path, route, params=CHOSE)
+    view, _ = draw.route_of(scan)
+    lines = draw.caption_lines(
+        scan,
+        "B2",
+        view,
+        None,
+        stops=3,
+        frames=109,
+        unreadable=3,
+        first_problem="scan/t1/B2/B2_0003.tif: the file is missing",
+        off_picture=2,
+    )
+    assert lines[-2:] == [
+        "3 of 109 frames could not be read; first: "
+        "scan/t1/B2/B2_0003.tif: the file is missing",
+        "2 stops outside the picture are not drawn",
+    ]
+    one = draw.caption_lines(scan, "B2", view, None, stops=3, frames=9, off_picture=1)
+    assert one[-1] == "1 stop outside the picture is not drawn"
+    clean = draw.caption_lines(scan, "B2", view, None, stops=3, frames=9)
+    assert not any("outside" in line or "could not" in line for line in clean)
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {},
+        {"selector": 5, "orderer": ["nearest"]},
+        {"selector": "", "orderer": None},
+    ],
+)
+def test_a_route_that_names_no_selector_says_it_is_not_recorded(
+    tmp_path: Path, params: dict[str, Any]
+) -> None:
+    # A route made before the selection contract (or by the prototype) says neither;
+    # a value that is not a string counts as not recorded (FM-125).
+    scan = _captions_scan(tmp_path, _route((_stop(0, "B2", 0),)), params=params)
+    view, _ = draw.route_of(scan)
+    assert view is not None
+    assert (view.selector, view.orderer) == (None, None)
+    lines = draw.caption_lines(scan, "B2", view, None, stops=1, frames=1)
+    assert lines[1] == "route: selector and orderer not recorded"
+
+
+def test_the_prototypes_record_is_drawn_as_the_route_and_named_as_such(
+    tmp_path: Path,
+) -> None:
+    # `route-prototype` started later than `route`, so it fills the slot (provider).
+    scan = _captions_scan(tmp_path, _route((_stop(0, "B2", 0),)), params=CHOSE)
+    _write_route(
+        scan.run_dir / "run.json",
+        _route((_stop(0, "B2", 0), _stop(1, "B2", 1))),
+        plugin="route-prototype",
+        day=30,
+    )
+    scan = load_scan(scan.run_dir / "run.json")
+    view, why = draw.route_of(scan)
+    assert why is None
+    assert view is not None
+    assert view.plugin == "route-prototype"
+    assert len(draw.stops_of_well(view, "B2")) == 2
+    lines = draw.caption_lines(scan, "B2", view, None, stops=2, frames=1)
+    assert lines[1] == "route-prototype: selector and orderer not recorded"
+
+
+def test_only_one_name_recorded_says_which_is_missing(tmp_path: Path) -> None:
+    scan = _captions_scan(
+        tmp_path, _route((_stop(0, "B2", 0),)), params={"selector": "most-cells"}
+    )
+    view, _ = draw.route_of(scan)
+    lines = draw.caption_lines(scan, "B2", view, None, stops=1, frames=1)
+    assert lines[1] == "route: selector most-cells, orderer not recorded"
+
+
+def _stale_route(tmp_path: Path) -> Scan:
+    """A route that read ``scan`` attempt ``a1``, and a scan run again since (attempt ``a2``, later)."""
+    seed = seed_run(tmp_path, cells=[cell_at("A1", 0.0, 0.0)], wells=("A1",))
+    _write_route(
+        seed.path,
+        _route((_stop(0, "A1", 0),)),
+        reads={"scan": ReadRecord(plugin="scan", attempt="a1")},
+    )
+    record(seed.path, "scan", "scan", seed.scan, attempt="a2", day=30)
+    return load_scan(seed.path)
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("none", "the run document has no route; smc run --list shows"),
+        ("stale", "route read its inputs from an earlier run; run it again"),
+        ("other profile", "route was run on stand-b, this is demo; run route again"),
+        ("dry run", "route was a dry run; run it without --dry-run"),
+    ],
+)
+def test_a_route_that_is_not_usable_on_the_scan_is_a_reason_and_not_a_route(
+    tmp_path: Path, case: str, reason: str
+) -> None:
+    if case == "none":
+        scan = _scan_of_run(tmp_path)
+    elif case == "stale":
+        scan = _stale_route(tmp_path)
+    elif case == "other profile":
+        scan = _scan_of_run(
+            tmp_path, route=_route((_stop(0, "A1", 0),)), profile="stand-b"
+        )
+    else:
+        scan = _scan_of_run(tmp_path, route=_route((_stop(0, "A1", 0),)), dry_run=True)
+    view, why = draw.route_of(scan)
+    assert view is None
+    assert why is not None
+    assert why.startswith(reason), why
+
+
+def test_a_route_record_that_is_not_a_route_result_is_a_reason_naming_the_first_problem(
+    tmp_path: Path,
+) -> None:
+    good = _route((_stop(0, "A1", 0),)).model_dump(mode="json")
+    good["positions"] = "not a list of stops"
+    scan = _scan_of_run(tmp_path, route=good)
+    view, why = draw.route_of(scan)
+    assert view is None
+    assert why is not None
+    assert why.startswith(
+        "the route record is not a route result this smc reads (positions: "
+    )
+    assert why.endswith("); run route again")
+
+
+def test_a_route_record_with_no_result_is_a_reason(tmp_path: Path) -> None:
+    seed = seed_run(tmp_path, cells=[cell_at("A1", 0.0, 0.0)], wells=("A1",))
+    then = datetime(2026, 10, 29, 9, 30, tzinfo=timezone.utc)
+    write_stage(
+        seed.path,
+        StageRecord(
+            plugin="route",
+            provides="route",
+            attempt="a1",
+            status=StageStatus.done,
+            started_utc=then,
+            finished_utc=then,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=None,
+        ),
+    )
+    view, why = draw.route_of(load_scan(seed.path))
+    assert view is None
+    assert why == "the route record has no result; run route again"
+
+
+def test_without_a_route_the_caption_says_why_in_its_second_line(
+    tmp_path: Path,
+) -> None:
+    scan = _scan_of_run(tmp_path)
+    view, why = draw.route_of(scan)
+    lines = draw.caption_lines(scan, "A1", view, why, stops=0, frames=1)
+    assert lines[0] == "A1: no route drawn"
+    assert lines[1] == why
+    assert lines[2].startswith("cells: ")
+    assert len(lines) == 3
+
+
+def test_a_record_string_of_a_million_characters_is_clipped_in_the_caption(
+    tmp_path: Path,
+) -> None:
+    huge = "s" * 1_000_000
+    route = _route((_stop(0, "B2", 0),), objective="o" * 1_000_000)
+    scan = _captions_scan(tmp_path, route, params={"selector": huge, "orderer": "n"})
+    view, _ = draw.route_of(scan)
+    lines = draw.caption_lines(scan, "B2", view, None, stops=1, frames=1)
+    assert len(lines) <= 8
+    assert all(len(line) <= 200 for line in lines)
+    assert "s" * 117 + "..." in lines[1]
+    assert "s" * 118 not in lines[1]
+
+
+def test_a_record_string_with_a_newline_a_control_character_or_a_path_stays_on_one_line(
+    tmp_path: Path,
+) -> None:
+    route = _route(
+        (_stop(0, "B2", 0),), objective="a\nb\x00c\N{GREEK SMALL LETTER LAMDA}"
+    )
+    scan = _captions_scan(tmp_path, route, params=CHOSE)
+    view, _ = draw.route_of(scan)
+    lines = draw.caption_lines(scan, "B2", view, None, stops=1, frames=1)
+    assert lines[2] == "fields 400 x 300 um at a b?c\\u03bb"
+    assert all(line.isascii() and "\n" not in line for line in lines)
+
+
+def test_the_cells_line_lists_a_label_the_classes_do_not_know_as_white(
+    tmp_path: Path,
+) -> None:
+    # `load_scan` refuses cells the result did not count, so the scan is built in memory.
+    seed = seed_run(tmp_path, cells=[], wells=("A1", "B2"), rows=1, columns=1)
+    scan = Scan.from_results(
+        tmp_path,
+        RunDocument.load(seed.path),
+        plan=seed.plan,
+        result=seed.scan,
+        cells_result=seed.result,
+        cells=[cell_at("B2", 0.0, 0.0, "single"), cell_at("B2", 50.0, 0.0, "mystery")],
+    )
+    line = draw.caption_lines(scan, "B2", None, "none", stops=0, frames=1)[-1]
+    assert line == (
+        "cells: single (gold) 1, doublet (cyan) 0, debris (red) 0, mystery (white) 1"
+    )
+
+
+def test_a_scan_with_no_cells_says_why_in_the_cells_line_without_a_path(
+    tmp_path: Path,
+) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",))
+    cells_file = tmp_path / seed.result.file
+    cells_file.unlink()
+    scan = load_scan(seed.path)
+    assert scan.cells is None
+    line = draw.caption_lines(scan, "A1", None, "none", stops=0, frames=1)[-1]
+    assert line.startswith("cells: none (cells file ")
+    assert str(tmp_path) not in line
+    assert "<run folder>" in line
+
+
+def test_a_scan_that_found_no_cell_shows_zeros_and_not_none(tmp_path: Path) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",))
+    scan = load_scan(seed.path)
+    line = draw.caption_lines(scan, "A1", None, "none", stops=0, frames=1)[-1]
+    assert line == "cells: single (gold) 0, doublet (cyan) 0, debris (red) 0"

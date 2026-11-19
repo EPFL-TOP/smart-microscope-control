@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import contextlib
 import math
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,17 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 from PIL import Image, ImageDraw, ImageFont
+from pydantic import ValidationError
 
+from smc.data.scan import Scan
 from smc.plugins.geometry import Matrix2, footprint
-from smc.plugins.slots import Cell, ScanFrame, WellGeometry
+from smc.plugins.slots import (
+    Cell,
+    RouteResult,
+    ScanFrame,
+    WellGeometry,
+    normalise_well,
+)
 
 # The mosaic is for *looking*, not for measuring: a frame is reduced by block means,
 # placed on the canvas by the nearest pixel, and a later frame overwrites an earlier
@@ -485,9 +494,270 @@ def frame_problem(frame: ScanFrame, exc: Exception, run_dir: Path) -> str:
         reason = exc.strerror or type(exc).__name__
     else:
         reason = str(exc)
+    return f"{frame.file}: {scrub_run_folder(reason, run_dir)}"
+
+
+def scrub_run_folder(text: str, run_dir: Path) -> str:
+    """``text`` with the run folder's path (as written, as POSIX and resolved) replaced by ``<run folder>``.
+
+    A picture is shared and pasted into public reports, and a message that came from
+    a file or from the file system may quote the absolute path of this PC (FM-50). A
+    run folder written as ``.`` or ``..`` (the document is in the current folder) is
+    not replaced as written, or every dot of the text would go: the resolved path is.
+    """
     folders = {str(run_dir), run_dir.as_posix()}
     with contextlib.suppress(OSError):
         folders.add(str(run_dir.resolve()))
     for folder in sorted(folders, key=len, reverse=True):
-        reason = reason.replace(folder, "<run folder>")
-    return f"{frame.file}: {reason}"
+        if folder.strip("./\\"):
+            text = text.replace(folder, "<run folder>")
+    return text
+
+
+# ====================================================================== The route
+#
+# What is drawn of a selection is what the ``route`` slot holds, whichever plugin made
+# it (``route``, or ``route-prototype`` of ``scripts/dev/select_fields.py``): the
+# stops of a well, numbered from 1 in the order they are visited. The route's own
+# camera is the one that draws them (FM-124), and its record is read as a result the
+# collaborator may have edited: a record that is not a route result is a reason in the
+# caption and never an exception.
+
+#: Every string of a record is clipped to this many characters in a caption (FM-74).
+_CLIP = 120
+#: The classes' names and counts are listed without limit by the cells stage; the
+#: caption lists at most this many labels that the cells stage does not know.
+_LABELS_LISTED = 8
+
+
+@dataclass(frozen=True, slots=True)
+class Stop:
+    """One stop of the route in one well: its rank there, from 1, and where it is.
+
+    ``rank`` is the stop's place among the well's stops by the record's ``order``,
+    never parsed from ``name``: it is the ``k + 1`` of ``<well>_r<k:03d>``, so "stop 3"
+    on a picture is the ``E8_r002`` that the NIS list names. ``order`` is the route's
+    own, plate-wide (the second well's first stop is not 0).
+    """
+
+    rank: int
+    order: int
+    name: str
+    x_um: float
+    y_um: float
+    score: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class RouteView:
+    """The route that is drawn: the record's plugin, what it says it chose with, and its result.
+
+    ``selector`` and ``orderer`` are the names the record's ``params`` hold, ``None``
+    for a record made before the selection contract (or by the prototype script),
+    which does not say: unknown is not guessed.
+    """
+
+    plugin: str
+    selector: str | None
+    orderer: str | None
+    result: RouteResult
+
+
+def _first_problem(error: ValidationError) -> str:
+    """``<where>: <what>`` of the first validation error, on one line."""
+    first = error.errors()[0]
+    where = ".".join(str(part) for part in first["loc"]) or "result"
+    return f"{where}: {first['msg']}"
+
+
+def _name_in(params: Mapping[str, Any], key: str) -> str | None:
+    """The record's name for ``key`` when it is a non-empty string; anything else is "not recorded" (FM-125)."""
+    value = params.get(key)
+    return value if isinstance(value, str) and value else None
+
+
+def route_of(scan: Scan) -> tuple[RouteView | None, str | None]:
+    """The route to draw, or ``(None, why not)``: the slot's latest record when it is usable on the scan.
+
+    Usable is what ``RunDocument.unusable`` says for every reader of the slot (it
+    exists, ended ``done``, is not stale, was run on the scan's profile and was not a
+    dry run) **and** a record whose result this smc reads as a ``RouteResult``. Every
+    way it is not is a sentence for the caption, with what to run again.
+    """
+    document = scan.document
+    reason = document.unusable("route", profile=scan.profile, dry_run=False)
+    if reason is not None:
+        return None, reason
+    record = document.provider("route")
+    if record is None or record.result is None:
+        return None, "the route record has no result; run route again"
+    try:
+        result = RouteResult.model_validate(record.result)
+    except ValidationError as exc:
+        return None, (
+            f"the route record is not a route result this smc reads "
+            f"({_first_problem(exc)}); run route again"
+        )
+    return (
+        RouteView(
+            plugin=record.plugin,
+            selector=_name_in(record.params, "selector"),
+            orderer=_name_in(record.params, "orderer"),
+            result=result,
+        ),
+        None,
+    )
+
+
+def stops_of_well(view: RouteView, well: str) -> tuple[Stop, ...]:
+    """The stops of ``well`` in visiting order, ranked from 1 there.
+
+    The sort is stable: two stops with the same ``order`` keep the record's order.
+    ``well`` is compared as a person types it (``b02`` is ``B2``).
+    """
+    name = normalise_well(well)
+    mine = [p for p in view.result.positions if normalise_well(p.well) == name]
+    mine.sort(key=lambda p: p.order)
+    return tuple(
+        Stop(
+            rank=rank,
+            order=p.order,
+            name=p.name,
+            x_um=p.x_um,
+            y_um=p.y_um,
+            score=p.score,
+        )
+        for rank, p in enumerate(mine, start=1)
+    )
+
+
+def label_of(rank: int, score: float | None) -> str:
+    """The text of a stop's number: ``3``, or ``3 (0.823)`` with the selector's score in three significant digits.
+
+    A score of ``0.0`` is a score (``is None`` and not falsy). The ``measures`` the
+    selector gave are not drawn: they are in the record, and a picture holds one
+    number per stop.
+    """
+    return str(rank) if score is None else f"{rank} ({score:.3g})"
+
+
+def _record_text(value: str, run_dir: Path | None = None) -> str:
+    """A string that came from a file, as one short ASCII line: scrubbed of the run folder, collapsed, escaped, clipped.
+
+    A record can hold anything: a name of a million characters (FM-74), a newline
+    that would add lines to the caption, a control character, a path of the PC it
+    was made on (FM-50). The head is cut first so that the work is bounded.
+    """
+    head = value[: 4 * _CLIP]
+    if run_dir is not None:
+        head = scrub_run_folder(head, run_dir)
+    text = ascii_text(" ".join(head.split()))
+    text = "".join(c if " " <= c <= "~" else "?" for c in text)
+    return text if len(text) <= _CLIP else text[: _CLIP - 3] + "..."
+
+
+def _stops_text(count: int) -> str:
+    if count == 0:
+        return "no stop"
+    return "1 stop" if count == 1 else f"{count} stops"
+
+
+def _route_lines(
+    well: str, view: RouteView | None, absent: str | None, stops: int
+) -> list[str]:
+    """The caption's lines about the route: the well and its stops, who chose them and with what, and the field."""
+    if view is None:
+        return [f"{well}: no route drawn", _record_text(absent or "no route record")]
+    result = view.result
+    labels = ", ".join(_record_text(label) for label in result.labels)
+    key = normalise_well(well)
+    count = next(
+        (n for name, n in result.uncovered.items() if normalise_well(name) == key),
+        None,
+    )
+    if count is None:
+        uncovered = "uncovered cells: not counted"
+    else:
+        uncovered = (
+            f"uncovered {labels} cells: {count}"
+            if labels
+            else (f"uncovered cells: {count}")
+        )
+    plugin = _record_text(view.plugin)
+    if view.selector is None and view.orderer is None:
+        chose = f"{plugin}: selector and orderer not recorded"
+    else:
+        selector = _record_text(view.selector) if view.selector else "not recorded"
+        orderer = _record_text(view.orderer) if view.orderer else "not recorded"
+        chose = f"{plugin}: selector {selector}, orderer {orderer}"
+    width, height = result.fov_um
+    fields = f"fields {width:.0f} x {height:.0f} um"
+    if result.objective is not None:
+        fields += f" at {_record_text(result.objective)}"
+    return [f"{well}: {_stops_text(stops)}; {uncovered}", chose, fields]
+
+
+def _cells_line(scan: Scan, well: str) -> str:
+    """``cells: single (gold) 5, doublet (cyan) 3``: this well's cells per class with the colour each is drawn in, or why there are none."""
+    if scan.cells is None:
+        return f"cells: none ({_record_text(scan.cells_absent or 'no reason given', scan.run_dir)})"
+    classes = _classes_of(scan, well)
+    counts = Counter(cell.label for cell in scan.cells_of(well=well))
+    parts = [
+        f"{_record_text(label)} ({CLASS_COLOURS[k % len(CLASS_COLOURS)][0]}) "
+        f"{counts.get(label, 0)}"
+        for k, label in enumerate(classes)
+    ]
+    # A label the cells stage does not know is drawn white, and is listed so.
+    strangers = sorted(set(counts) - set(classes))
+    parts += [
+        f"{_record_text(label)} (white) {counts[label]}"
+        for label in strangers[:_LABELS_LISTED]
+    ]
+    if len(strangers) > _LABELS_LISTED:
+        parts.append(f"{len(strangers) - _LABELS_LISTED} more labels (white)")
+    return "cells: " + ", ".join(parts)
+
+
+def _classes_of(scan: Scan, well: str) -> tuple[str, ...]:
+    """The classes in the cells stage's order; a scan built with no cells result has the labels its cells hold, sorted."""
+    if scan.cells_result is not None:
+        return tuple(scan.cells_result.classes)
+    return tuple(sorted({cell.label for cell in scan.cells_of(well=well)}))
+
+
+def caption_lines(
+    scan: Scan,
+    well: str,
+    view: RouteView | None,
+    absent: str | None,
+    *,
+    stops: int,
+    frames: int,
+    unreadable: int = 0,
+    first_problem: str | None = None,
+    off_picture: int = 0,
+) -> list[str]:
+    """The caption of a well's picture, one string per line, ASCII, each string of a record clipped to 120 characters.
+
+    With a route: the well, its stops and its uncovered cells; the plugin, the
+    selector and the orderer it names (or that it does not); the field. Without one:
+    the well and why. Then, always, the cells per class with the colour each is drawn
+    in, and only when it applies the frames that could not be read and the stops
+    outside the picture. The lines are wrapped to the picture's width by
+    ``render_png``.
+    """
+    lines = _route_lines(well, view, absent, stops)
+    lines.append(_cells_line(scan, well))
+    if unreadable:
+        lines.append(
+            f"{unreadable} of {frames} frames could not be read; first: "
+            f"{_record_text(first_problem or 'no reason given')}"
+        )
+    if off_picture:
+        lines.append(
+            "1 stop outside the picture is not drawn"
+            if off_picture == 1
+            else f"{off_picture} stops outside the picture are not drawn"
+        )
+    return lines
