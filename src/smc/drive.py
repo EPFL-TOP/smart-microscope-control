@@ -14,7 +14,9 @@ does not lock and a light whose readback disagrees say so, with ``reached`` fals
 
 from __future__ import annotations
 
+import logging
 import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -44,6 +46,7 @@ __all__ = [
     "move_z",
     "read_autofocus",
     "read_autofocus_offset",
+    "read_in_range",
     "set_autofocus_offset",
     "set_objective",
     "switch_light",
@@ -51,6 +54,8 @@ __all__ = [
     "xy_text",
     "z_text",
 ]
+
+logger = logging.getLogger("smc.drive")
 
 #: What a switch-off says in dry run: the facade sends it all the same (design §13),
 #: and the operator must not believe the stand was left as it was.
@@ -329,21 +334,68 @@ def read_autofocus(microscope: Microscope) -> AutofocusReading:
     return AutofocusReading(text, state.autofocus_engaged, known)
 
 
-def engage_autofocus(microscope: Microscope) -> DriveResult:
-    """Engage the autofocus with the profile's lock timeout; ``reached`` only when it locked.
+def read_in_range(microscope: Microscope) -> str:
+    """One read of whether the autofocus's reference is in range: ``in range: yes|no``, ``""``, or ``in range: ? (cause)``.
+
+    Session 5's F13 read ``in range: no`` only after a failed engage. With the
+    autofocus off, this read is what tells a reference out of reach from a wait
+    that was too short (m2 §12.13). ``""`` is for a stand whose profile names no
+    in-range property: ``is_in_range()`` is ``None`` there and nothing is said, so
+    today's output stays as it is. A failed read is a ``?`` with its cause on one
+    line, never an exception: the state of the autofocus is read by the caller and
+    is the answer, this clause is a finding about it (FM-170). Only
+    ``HardwareError`` counts as a failed read; anything else is a bug and
+    propagates.
 
     Raises:
         CapabilityMissingError: The stand has no autofocus.
+    """
+    autofocus = microscope.require(Autofocus)
+    try:
+        in_range = autofocus.is_in_range()
+    except HardwareError as exc:
+        # An empty message falls back to the class name alone, so the clause
+        # never ends in ``: )``.
+        cause = " ".join(str(exc).split())
+        named = f"{type(exc).__name__}: {cause}" if cause else type(exc).__name__
+        return f"in range: ? ({named})"
+    if in_range is None:
+        return ""
+    return "in range: yes" if in_range else "in range: no"
+
+
+def engage_autofocus(
+    microscope: Microscope, timeout_s: float | None = None
+) -> DriveResult:
+    """Engage the autofocus and wait for the lock; ``reached`` only when it locked.
+
+    ``timeout_s`` is how long to wait for this engage; ``None``: the profile's
+    lock timeout. The capability checks it before anything is sent. A lock logs,
+    at INFO, how long the whole call took (settling included), so a probe can tell
+    "the wait was too short" from "no lock"; the outcome text does not carry it,
+    and a dry run, where ``True`` is the commanded outcome and not a lock, logs
+    nothing.
+
+    Raises:
+        CapabilityMissingError: The stand has no autofocus.
+        ValueError: ``timeout_s`` is out of the capability's bounds (finite, in
+            (0, 600] s, above ``settle_s``); nothing was sent.
         SafetyRefusedError: The stand engages only at an offset seen locked with
             this objective, and none was.
         MicroscopeHaltedError: The stand is halted.
     """
-    locked = microscope.require(Autofocus).engage()
+    autofocus = microscope.require(Autofocus)
+    started = time.monotonic()
+    locked = autofocus.engage(timeout_s=timeout_s)
     if microscope.dry_run:
         return DriveResult(
             f"[dry-run] would engage the autofocus; {read_autofocus(microscope).text}"
         )
     if locked:
+        logger.info(
+            "autofocus engage: locked and settled in %.1f s",
+            time.monotonic() - started,
+        )
         return DriveResult("autofocus locked")
     # ``False`` means off by the capability's contract, but a search left running
     # drives Z: what the stand reads is said, never what the contract promises
