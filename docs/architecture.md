@@ -73,9 +73,13 @@ from.
 ```
 src/smc/
   cli.py                  the reference interface (devices, stage, z, objective,
-                          autofocus, light, snap, run, ui, presets, config, doctor)
+                          autofocus, light, snap, run, ui, presets, dataset, config,
+                          doctor)
   drive.py                the drive actions, written once for the CLI and the page
   plates.py, plates.toml  the lab's own plate definitions, registered with useq
+  data/                   a scan's run folder read with no microscope: load_scan,
+                          Scan, cells_table, and `smc dataset show`; imports no
+                          hardware (the collaborator's kit, algorithms design §3)
   discovery/              the read-only inventory of a PC, in throwaway cores
   hardware/
     core.py               open/close a core; demo config; install status
@@ -114,7 +118,9 @@ docs/plugins/, docs/ui/   how to use each tool, and the plate page
 scripts/github/           labels, milestones, backlog bootstrap
 ```
 
-Not on `main` when this was written: `src/smc/data/` and `src/smc/selection/`,
-the collaborator's kit (a loader with no hardware, selectors chosen by name;
-designed in [`docs/design/algorithms.md`](design/algorithms.md), built by the
-issues #564 to #568), and a Viventis backend (M6, not started).
+Not on `main` when this was written: `src/smc/selection/`, the rest of the
+collaborator's kit (selectors chosen by name, the contract of a selector, the
+offline runs, the dataset's export; designed in
+[`docs/design/algorithms.md`](design/algorithms.md), built by the issues #565
+to #568; its loader, `src/smc/data/`, is built), and a Viventis backend (M6,
+not started).

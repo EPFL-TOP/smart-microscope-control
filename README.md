@@ -42,8 +42,9 @@ the milestones and what is open are in [`docs/roadmap.md`](docs/roadmap.md).
   ([`docs/roadmap.md`](docs/roadmap.md#from-nis-elements-to-smc-for-the-experiment)).
   The collaborator's kit (a dataset exported from a scan, a loader that needs
   no microscope, the contract of a selection algorithm) is designed in
-  [`docs/design/algorithms.md`](docs/design/algorithms.md); its guide comes
-  with issue #554 and does not exist yet.
+  [`docs/design/algorithms.md`](docs/design/algorithms.md); its loader exists
+  (`smc.data`, `smc dataset show`), the rest is being built, and its guide
+  comes with issue #554 and does not exist yet.
 
 ## How it fits together
 

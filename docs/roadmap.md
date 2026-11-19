@@ -24,9 +24,9 @@ not, and the issues that are still open on it.
 
 The collaborator's kit for selection algorithms (a dataset, a loader with no
 hardware, the contract of a selector) is designed in
-[`docs/design/algorithms.md`](design/algorithms.md) and built by issues #564
-to #568. The way from these pieces to smc running the experiment itself is the
-section
+[`docs/design/algorithms.md`](design/algorithms.md). Its loader is built
+(`smc.data`, #564); the rest is built by issues #565 to #568. The way from
+these pieces to smc running the experiment itself is the section
 [*From NIS-Elements to smc for the experiment*](#from-nis-elements-to-smc-for-the-experiment).
 
 ## M0 — Bootstrap *(this repository as it stands)*
@@ -164,10 +164,13 @@ move, and only one program holds the stand at a time, so the page's
   carry `well_dx_um` and `well_dy_um`
   ([session 5](hardware/nikon-ti2.md#scans-and-the-page)). The kit the
   collaborator works with is designed in
-  [`docs/design/algorithms.md`](design/algorithms.md).
-- **Open.** The kit: the loader (#564), the offline runs (#566), the dataset's
-  export (#565), the contract of a selector (#567), the drawing of what it
-  chose (#568), then the guide (#554). The data: the 40× scan of the stand
+  [`docs/design/algorithms.md`](design/algorithms.md); its loader is on `main`
+  (#564): `smc.data` reads a scan's run folder with no Micro-Manager
+  (`load_scan`, `Scan`, `cells_table`) and `smc dataset show` prints what it
+  holds.
+- **Open.** The rest of the kit: the offline runs (#566), the dataset's export
+  (#565), the contract of a selector (#567), the drawing of what it chose
+  (#568), then the guide (#554). The data: the 40× scan of the stand
   session of 2026-11-19 as a dataset (#595; the session itself is on #198).
   The first task, the algorithm itself (#570). One question is the owner's:
   whether the selection reads the 10× scan and the 40× scan only judges it
