@@ -17,10 +17,12 @@ import json
 import os
 import shutil
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict
+from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError
 
 from smc import __version__
 from smc.data.scan import DatasetError, Scan, load_scan
@@ -33,9 +35,11 @@ from smc.run.files import (
 )
 
 __all__ = [
+    "DatasetCheck",
     "DatasetFile",
     "DatasetManifest",
     "DatasetWriteError",
+    "check_dataset",
     "export_dataset",
     "readme_text",
 ]
@@ -554,3 +558,159 @@ def export_dataset(
             f"manifest.json: remove it, then export again"
         ) from exc
     return final
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetCheck:
+    """What ``check_dataset`` found: the manifest, each file that does not match, and the scan.
+
+    ``problems`` is one sentence per file, in the manifest's order, each
+    beginning with the file's relative path; empty when every file matches.
+    ``scan`` is the loaded scan when there is no problem, and ``None`` when
+    there is one: the loader is not run on a folder that is known to be damaged.
+    """
+
+    manifest: DatasetManifest
+    problems: tuple[str, ...]
+    scan: Scan | None
+
+
+def _read_manifest(directory: Path) -> tuple[Path, DatasetManifest]:
+    """``directory/manifest.json``, read and validated, or a refusal that starts with its path.
+
+    The manifest is read as ``utf-8-sig`` (a byte-order mark from Notepad,
+    FM-80); its ``schema_version`` is judged on the raw JSON, before the model
+    sees it, so that a newer smc's manifest is reported as newer and not as a
+    list of fields this smc does not know; a manifest with no ``run.json`` in
+    it is not one this smc wrote (FM-229).
+    """
+    path = directory / _MANIFEST
+    try:
+        data = retry_on_permission_error(path.read_bytes)
+    except FileNotFoundError:
+        raise DatasetError(
+            f"{path}: no manifest.json: this is not a dataset, or an export that "
+            f"did not finish (it writes manifest.json last)"
+        ) from None
+    except OSError as exc:
+        raise DatasetError(f"{path}: cannot be read ({exc.strerror or exc})") from exc
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise DatasetError(
+            f"{path}: is not UTF-8 text ({exc.reason} at byte {exc.start})"
+        ) from None
+    try:
+        raw: Any = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise DatasetError(
+            f"{path}: is not valid JSON: {exc.msg} (line {exc.lineno}, column "
+            f"{exc.colno})"
+        ) from None
+    if not isinstance(raw, dict):
+        raise DatasetError(
+            f"{path}: holds a JSON {type(raw).__name__}, not an object: this is "
+            f"not a manifest"
+        )
+    version = raw.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise DatasetError(
+            f"{path}: schema_version must be an integer of 1 or more, got "
+            f"{version!r}: smc always writes one, so this is not a manifest it wrote"
+        )
+    if version > MANIFEST_SCHEMA:
+        raise DatasetError(
+            f"{path}: written by a newer smc (schema {version}); this smc reads "
+            f"schema {MANIFEST_SCHEMA}: upgrade smc"
+        )
+    try:
+        manifest = DatasetManifest.model_validate(raw)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        where = ".".join(str(part) for part in first["loc"]) or "manifest"
+        more = f" (and {exc.error_count() - 1} more)" if exc.error_count() > 1 else ""
+        raise DatasetError(f"{path}: {where}: {first['msg']}{more}") from None
+    if _RUN_DOCUMENT not in manifest.files:
+        raise DatasetError(
+            f"{path}: lists no {_RUN_DOCUMENT}: this is not a dataset this smc wrote"
+        )
+    return path, manifest
+
+
+def check_dataset(
+    directory: Path | str,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> DatasetCheck:
+    """Check a dataset folder against its manifest: every listed file's size and hash, then the scan.
+
+    A copy that lost a byte on the way (a share, a zip, a USB stick) is found
+    here and not by a wrong result a week later. Each listed file is read once
+    (FM-39): its size is compared first and a file of another size is not read
+    at all. The listed paths are judged before any file is opened: a manifest
+    that names a file outside the folder (``../x``, an absolute path) is
+    refused, so that ``check`` is never made to read a file of the PC by a
+    manifest someone sent. Files of the folder that the manifest does not list
+    are ignored: the collaborator's own outputs live beside the dataset.
+
+    ``load_scan`` runs only when every file matched: it would read the damaged
+    ones.
+
+    Args:
+        directory: The dataset folder.
+        progress: Called as ``progress(done, total)`` after each file checked.
+
+    Raises:
+        DatasetError: ``directory`` is not a folder, has no readable manifest
+            (an export that did not finish has none), the manifest lists a
+            path outside the folder, or ``load_scan`` refuses the scan. A file
+            that is missing or differs is a *problem* in the result, not an
+            exception.
+    """
+    directory = Path(directory)
+    try:
+        is_folder = directory.is_dir()
+    except OSError:
+        is_folder = False
+    if not is_folder:
+        raise DatasetError(f"{directory}: is not a folder")
+    path, manifest = _read_manifest(directory)
+    listed: dict[str, Path] = {}
+    for key in manifest.files:
+        try:
+            listed[key] = resolve_in_run(directory, key)
+        except ValueError as exc:
+            raise DatasetError(
+                f"{path}: lists {key!r}, which is not a path in the dataset "
+                f"folder: {exc}"
+            ) from exc
+
+    problems: list[str] = []
+    total = len(listed)
+    for done, (key, file) in enumerate(manifest.files.items(), start=1):
+        problem = _problem_with(key, listed[key], file)
+        if problem is not None:
+            problems.append(problem)
+        if progress is not None:
+            progress(done, total)
+    scan = None if problems else load_scan(directory / _RUN_DOCUMENT)
+    return DatasetCheck(manifest=manifest, problems=tuple(problems), scan=scan)
+
+
+def _problem_with(key: str, path: Path, listed: DatasetFile) -> str | None:
+    """What is wrong with one listed file, or ``None``: missing, another size, other content, unreadable."""
+    try:
+        have = path.stat().st_size
+    except FileNotFoundError:
+        return f"{key}: missing"
+    except OSError as exc:
+        return f"{key}: cannot be read ({exc.strerror or exc})"
+    if have != listed.bytes:
+        return f"{key}: changed (size {have} instead of {listed.bytes})"
+    try:
+        digest = _sha256_of(path)
+    except OSError as exc:
+        return f"{key}: cannot be read ({exc.strerror or exc})"
+    if digest != listed.sha256.lower():
+        return f"{key}: changed (same size, other content)"
+    return None
