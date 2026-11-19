@@ -10,6 +10,7 @@ nothing is wrapped (FM-37), a one-line refusal must stay one line in a log.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -388,3 +389,173 @@ def check(
     _ok(f"{files} files match manifest.json ({_megabytes(result.manifest)})")
     for line in check_lines(result):
         _say(line)
+
+
+#: The longest side of a picture when ``--max-px`` is not given; ``smc.data.draw`` holds
+#: the same number (a test pins them equal), and is not imported here so that
+#: ``smc.cli`` starts without Pillow.
+_DRAW_DEFAULT_MAX_PX = 1600
+#: The range of ``--max-px`` as the refusal says it, and as ``smc.data.draw`` bounds it.
+_DRAW_MAX_PX_RANGE = (256, 4000)
+
+
+def _wells_asked(text: str | None) -> list[str] | None:
+    """The wells of ``--wells`` (``A1,B2``), blanks dropped; ``None`` when the option was not given.
+
+    Raises:
+        ValueError: The option was given and names no well (``""`` or ``","``): a
+            command that asked for nothing does not draw everything.
+    """
+    if text is None:
+        return None
+    wells = [name.strip() for name in text.split(",") if name.strip()]
+    if not wells:
+        raise ValueError(
+            "no well is named; give wells like A1,B2 or leave the option out"
+        )
+    return wells
+
+
+def _quietly(tell: Callable[[str], None], text: str) -> None:
+    """``tell(text)``, or nothing when the console is gone: the pictures do not depend on it (FM-30).
+
+    A reader that goes away (``| more``, then q, or a PowerShell pipeline that ends
+    early) makes the next write raise ``OSError``, or ``ValueError`` on a closed
+    stream; a command that has drawn for minutes must still write every picture and
+    end with the exit code of what it did, not of what it could say.
+    """
+    with contextlib.suppress(OSError, ValueError):
+        tell(text)
+
+
+def _count_text(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+@dataset_app.command("draw")
+def draw(
+    run_doc: Annotated[
+        Path,
+        typer.Argument(
+            metavar="RUN_DOC",
+            help="The run document of the scan: its run.json, with the frames "
+            "and the cells file where the document says they are.",
+        ),
+    ],
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            metavar="DIR",
+            help="The folder for the pictures, one PNG per well; its parents are "
+            "made. Without it, a folder named draw next to the run document.",
+        ),
+    ] = None,
+    wells: Annotated[
+        str | None,
+        typer.Option(
+            "--wells",
+            metavar="WELLS",
+            help='The wells to draw, separated by commas, as "A1,B2" (quote the '
+            "list in PowerShell). Without it, every well of the scan.",
+        ),
+    ] = None,
+    max_px: Annotated[
+        int,
+        typer.Option(
+            "--max-px",
+            metavar="PIXELS",
+            help="The longest side of a picture in pixels, from 256 to 4000.",
+        ),
+    ] = _DRAW_DEFAULT_MAX_PX,
+) -> None:
+    """Draw each well of a scan: its frames, the wall, the cells by class and the fields the route chose.
+
+    One PNG per well. The chosen fields are drawn as the route's own footprints,
+    numbered from 1 in the order they are visited in that well, with the score the
+    selector gave when it gave one, and the path between them; a caption says what
+    the route is and what was left out. Without a usable route the frames and the
+    cells are drawn and the caption says why. A picture that exists is replaced, and
+    nothing else in the folder is touched. Reads files only and opens no stand. Exit
+    1 when a picture could not be written (the others are), exit 2 when nothing was
+    drawn because the scan or an option cannot be used.
+    """
+    low, high = _DRAW_MAX_PX_RANGE
+    if not low <= max_px <= high:
+        _quietly(_fail, f"--max-px must be an integer from {low} to {high}")
+        raise typer.Exit(code=_EXIT_REFUSED)
+    try:
+        named = _wells_asked(wells)
+    except ValueError as exc:
+        _quietly(_fail, f"--wells: {exc}")
+        raise typer.Exit(code=_EXIT_REFUSED) from None
+    folder = out if out is not None else run_doc.parent / "draw"
+    printer = _progress_printer("drawing")
+
+    def progress(done: int, total: int, _well: str) -> None:
+        # Every picture is written whatever becomes of the console (FM-30): a reader
+        # that goes away (a pipe closed, then q) must not end the wells after it.
+        with contextlib.suppress(OSError, ValueError):
+            printer(done, total)
+
+    try:
+        # Pillow is imported here and not at the top: every other command starts
+        # without it.
+        from smc.data import draw as drawing_module
+
+        scan = load_scan(run_doc)
+        view, absent = drawing_module.route_of(scan)
+        if view is None:
+            route_text = f"not drawn: {absent or 'no route record'}"
+        else:
+            route_text = (
+                f"{view.plugin} ({drawing_module.chose_text(view)}), "
+                f"{_count_text(len(view.result.positions), 'stop')}"
+            )
+        cells_text = (
+            f"none: {scan.cells_absent or 'no reason given'}"
+            if scan.cells is None
+            else f"{len(scan.cells)} detected"
+        )
+        for line in _aligned([["route", route_text], ["cells", cells_text]]):
+            _quietly(_say, line)
+        drawing = drawing_module.draw_scan(
+            scan, folder, wells=named, max_px=max_px, progress=progress
+        )
+    except DatasetError as exc:
+        _quietly(_fail, str(exc))
+        raise typer.Exit(code=_EXIT_REFUSED) from None
+    except Exception as exc:
+        # Not a verdict: an uncaught exception would exit 1, which is "a picture was
+        # not written" (FM-82), so whatever the drawing did not expect is a refusal.
+        _quietly(_fail, f"unexpected {type(exc).__name__}: {exc}")
+        raise typer.Exit(code=_EXIT_REFUSED) from None
+    for line in _aligned(
+        [
+            [
+                picture.well,
+                f"{picture.placed} of {picture.frames} frames",
+                _count_text(picture.stops, "stop"),
+                _count_text(picture.cells, "cell"),
+                str(picture.path)
+                if picture.written
+                else f"not written: {picture.error}",
+            ]
+            for picture in drawing.pictures
+        ]
+    ):
+        _quietly(_say, line)
+    for note in drawing.notes:
+        _quietly(_say, note)
+    unwritten = [picture for picture in drawing.pictures if not picture.written]
+    for picture in unwritten:
+        _quietly(_fail, f"{picture.path} was not written: {picture.error}")
+    written = len(drawing.pictures) - len(unwritten)
+    if unwritten:
+        _quietly(
+            _fail,
+            f"{written} of {len(drawing.pictures)} pictures written to {folder}; "
+            f"run again once the files can be written",
+        )
+        raise typer.Exit(code=_EXIT_PARTIAL)
+    _quietly(_ok, f"{_count_text(written, 'picture')} written to {folder}")
