@@ -8,7 +8,10 @@ whole (FM-45).
 
 from __future__ import annotations
 
+import logging
+import re
 from collections.abc import Callable, Iterator
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
@@ -34,6 +37,9 @@ from smc.hardware.capabilities import (
 )
 from smc.hardware.errors import (
     AutofocusUnsupportedError,
+    CapabilityMissingError,
+    CoreError,
+    DeviceTimeoutError,
     HardwareError,
     SafetyRefusedError,
 )
@@ -935,6 +941,211 @@ def test_an_engage_that_locks_says_so(fake_microscope: Microscope) -> None:
     assert fake_microscope.require(Autofocus).is_locked()
 
 
+class RecordsItsTimeout(NeverLocks):
+    """An autofocus that keeps the ``timeout_s`` each ``engage`` was given."""
+
+    def __init__(self) -> None:
+        self.timeouts: list[float | None] = []
+
+    def engage(self, timeout_s: float | None = None) -> bool:
+        self.timeouts.append(timeout_s)
+        return False
+
+
+@pytest.mark.parametrize(
+    ("asked", "passed"), [(60.0, [60.0]), (None, [None])], ids=["given", "default"]
+)
+def test_an_engage_passes_its_timeout_to_the_autofocus(
+    fake_microscope: Microscope, asked: float | None, passed: list[float | None]
+) -> None:
+    autofocus = RecordsItsTimeout()
+    fake_microscope.override(Autofocus, autofocus)
+
+    if asked is None:
+        drive.engage_autofocus(fake_microscope)
+    else:
+        drive.engage_autofocus(fake_microscope, timeout_s=asked)
+
+    assert autofocus.timeouts == passed
+
+
+def test_a_lock_logs_how_long_it_took(
+    fake_microscope: Microscope, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="smc.drive"):
+        result = drive.engage_autofocus(fake_microscope)
+
+    assert result == DriveResult("autofocus locked")
+    records = [r for r in caplog.records if r.name == "smc.drive"]
+    assert len(records) == 1
+    # INFO: a command without -v prints nothing of it, and the page has no -v.
+    assert records[0].levelno == logging.INFO
+    assert re.fullmatch(
+        r"autofocus engage: locked and settled in \d+\.\d s", records[0].getMessage()
+    )
+
+
+class LocksAfterTwelveSeconds(NeverLocks):
+    """An autofocus whose ``engage`` takes 12.34 s of the clock it is given, then locks."""
+
+    def __init__(self, clock: list[float]) -> None:
+        self._clock = clock
+
+    def engage(self, timeout_s: float | None = None) -> bool:
+        self._clock[0] += 12.34
+        return True
+
+
+def test_the_lock_time_is_what_the_engage_call_took(
+    fake_microscope: Microscope,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The wait advances the clock, so the line measures the whole engage() call
+    # only if the start is read before it and the end after it: a start read
+    # after the call would log 0.0 s. Nothing else decides on it (FM-197).
+    clock = [100.0]
+    monkeypatch.setattr(drive, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    fake_microscope.override(Autofocus, LocksAfterTwelveSeconds(clock))
+
+    with caplog.at_level(logging.INFO, logger="smc.drive"):
+        result = drive.engage_autofocus(fake_microscope)
+
+    assert result == DriveResult("autofocus locked")
+    lines = [r.getMessage() for r in caplog.records if r.name == "smc.drive"]
+    assert lines == ["autofocus engage: locked and settled in 12.3 s"]
+
+
+def test_a_dry_run_engage_logs_no_lock_time(
+    dry: Microscope, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="smc.drive"):
+        drive.engage_autofocus(dry)
+
+    assert [r for r in caplog.records if r.name == "smc.drive"] == []
+
+
+def test_an_engage_that_did_not_lock_logs_no_lock_time(
+    fake_microscope: Microscope, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_microscope.override(Autofocus, NeverLocks())
+
+    with caplog.at_level(logging.INFO, logger="smc.drive"):
+        drive.engage_autofocus(fake_microscope)
+
+    assert [r for r in caplog.records if r.name == "smc.drive"] == []
+
+
+class InRange(NeverLocks):
+    """An autofocus whose reference reads in range, or not, as it is told."""
+
+    def __init__(self, answer: bool) -> None:
+        self._answer = answer
+
+    def is_in_range(self) -> bool | None:
+        return self._answer
+
+
+@pytest.mark.parametrize(
+    ("answer", "text"), [(True, "in range: yes"), (False, "in range: no")]
+)
+def test_read_in_range_says_yes_or_no_when_the_stand_answers(
+    fake_microscope: Microscope, answer: bool, text: str
+) -> None:
+    fake_microscope.override(Autofocus, InRange(answer))
+
+    assert drive.read_in_range(fake_microscope) == text
+
+
+def test_read_in_range_is_empty_when_the_stand_does_not_say(
+    fake_microscope: Microscope,
+) -> None:
+    fake_microscope.override(Autofocus, NeverLocks())
+
+    assert drive.read_in_range(fake_microscope) == ""
+
+
+class InRangeFails(NeverLocks):
+    """An autofocus whose in-range read fails with the error it is given."""
+
+    def __init__(self, error: HardwareError) -> None:
+        self._error = error
+
+    def is_in_range(self) -> bool | None:
+        raise self._error
+
+
+@pytest.mark.parametrize(
+    ("error", "text"),
+    [
+        (
+            HardwareError("autofocus 'PFS':\ncannot read"),
+            "in range: ? (HardwareError: autofocus 'PFS': cannot read)",
+        ),
+        # The class is the real one's, not the base's, and a message of any
+        # whitespace (a driver's CRLF, tabs, runs of spaces) ends on one line.
+        (
+            DeviceTimeoutError("Error in device 'PFS':\r\n\tProperty  not found"),
+            "in range: ? (DeviceTimeoutError: Error in device 'PFS': Property not found)",
+        ),
+        (
+            CoreError("getProperty failed"),
+            "in range: ? (CoreError: getProperty failed)",
+        ),
+    ],
+    ids=["two-lines", "timeout-crlf-tab", "core"],
+)
+def test_read_in_range_that_fails_names_its_cause_on_one_line(
+    fake_microscope: Microscope, error: HardwareError, text: str
+) -> None:
+    fake_microscope.override(Autofocus, InRangeFails(error))
+
+    assert drive.read_in_range(fake_microscope) == text
+
+
+def test_read_in_range_on_a_stand_without_an_autofocus_raises_and_does_not_ask() -> (
+    None
+):
+    # A missing capability is no failed read: it must not become a `?`.
+    core = FakeCore.demo_like()
+    core.unloadDevice("Autofocus")
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), Profile.demo())
+    try:
+        with pytest.raises(CapabilityMissingError):
+            drive.read_in_range(microscope)
+    finally:
+        microscope.close()
+
+
+class InRangeFailsWithoutAMessage(NeverLocks):
+    """An autofocus whose in-range read fails with an error that has no message."""
+
+    def is_in_range(self) -> bool | None:
+        raise HardwareError("")
+
+
+def test_read_in_range_that_fails_without_a_message_names_the_error_class_only(
+    fake_microscope: Microscope,
+) -> None:
+    fake_microscope.override(Autofocus, InRangeFailsWithoutAMessage())
+
+    assert drive.read_in_range(fake_microscope) == "in range: ? (HardwareError)"
+
+
+class InRangeBug(NeverLocks):
+    """An autofocus whose in-range read breaks with something that is no hardware error."""
+
+    def is_in_range(self) -> bool | None:
+        raise KeyError("a bug")
+
+
+def test_read_in_range_does_not_hide_a_bug(fake_microscope: Microscope) -> None:
+    fake_microscope.override(Autofocus, InRangeBug())
+
+    with pytest.raises(KeyError):
+        drive.read_in_range(fake_microscope)
+
+
 def test_a_disengage_reads_the_autofocus_after_it(fake_microscope: Microscope) -> None:
     fake_microscope.require(Autofocus).engage()
 
@@ -1002,7 +1213,9 @@ def test_drive_reaches_the_stand_only_through_the_facade() -> None:
         "__future__",
         "collections.abc",
         "dataclasses",
+        "logging",
         "math",
+        "time",
         "typing",
         "smc.hardware.capabilities",
         "smc.hardware.errors",
