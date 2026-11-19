@@ -613,7 +613,9 @@ def test_autofocus_engage_help_names_the_timeout_option() -> None:
 
     plain = " ".join(_ANSI.sub("", result.output).split())
     assert "--timeout-s" in plain
-    assert "(0, 600]" in plain
+    # The bounds and the default are the layer's constants, not a copy of them.
+    assert f"(0, {mm.MAX_LOCK_TIMEOUT_S:g}]" in plain
+    assert f"else {mm.DEFAULT_LOCK_TIMEOUT_S:g} s (assumed)" in plain
     # Rich reads a bare `[autofocus]` as markup and drops it from the help.
     assert "above [autofocus] settle_s" in plain
 
