@@ -13,21 +13,48 @@ This project puts one Python layer over all of them — built on
 wells, run a tracked time-lapse) runs on any stand that provides the
 capabilities it needs.
 
-> **Status: bootstrap.** The package installs, the CLI answers, the test
-> suite runs against Micro-Manager's simulated microscope on Linux, macOS
-> and Windows. No real stand is driven yet. The plan is in
-> [`docs/roadmap.md`](docs/roadmap.md); the decisions are in
-> [`docs/adr/`](docs/adr/README.md).
+## Where the project stands
+
+As of 2026-11-19. What was measured at a stand is in
+[`docs/hardware/`](docs/hardware/nikon-ti2.md), each fact with its session;
+the milestones and what is open are in [`docs/roadmap.md`](docs/roadmap.md).
+
+- **Nikon Ti2-E: driven at the stand.** Five sessions (0, 1, 2, 3 and 5)
+  brought the stand up through the layer, moved the stage, read and locked
+  the PFS, turned the turret, imaged with the Prime 95B and ran the
+  contracts. The **plate chain** (camera calibration, registration of the
+  plate from its walls, the scan plan and the scan, cells, density, the route,
+  the report) is built, and it ran end to end on the plate page in session 5,
+  on a plate with beads and no cells: a 10× scan with PFS took 218 of 218
+  fields in 116.3 s, and the export's **position list loads in NIS-Elements**.
+  What is not done: a 40× lock from the floor in a well with water (#539), and
+  the chain on a plate with cells.
+- **Zeiss Axio Observer 7: built, not run at the stand.** The Zeiss MTB
+  components and Definite Focus 2 are Python devices in the layer, tested on a
+  fake MTB; they have never been loaded on the stand.
+- **Nikon Ti-E: not started.** Its profile is written from the adapter's
+  device list and says it is assumed; no session has been held.
+- **Viventis LS1: not started.** The components of the two stands are not
+  inventoried.
+- **Where it goes.** smc is to take over the lab's experiment from
+  NIS-Elements in four stages, from "a collaborator's algorithm chooses the
+  fields" to "smc runs the experiment"
+  ([`docs/roadmap.md`](docs/roadmap.md#from-nis-elements-to-smc-for-the-experiment)).
+  The collaborator's kit (a dataset exported from a scan, a loader that needs
+  no microscope, the contract of a selection algorithm) is designed in
+  [`docs/design/algorithms.md`](docs/design/algorithms.md); its loader exists
+  (`smc.data`, `smc dataset show`), the rest is being built, and its guide
+  comes with issue #554 and does not exist yet.
 
 ## How it fits together
 
 ```
-interfaces      CLI `smc`  ·  web UI (proposed)
-plugins         plate registration · find plate · wells · field grid · detection · …
+interfaces      CLI `smc`  ·  the plate page `smc ui` (web, ADR-0006)
+plugins         plate registration · find plate · wells · scan · cells · density · route · NIS export · …
 capabilities    XYStage · ZStage · Camera · Autofocus · Turret · Shutter · LightSource
                 Microscope facade: roles + safety guards + dry-run
 hardware bus    Micro-Manager core via pymmcore-plus
-                C++ adapters (Nikon, cameras) · Python devices (Zeiss MTB, Viventis) · demo
+                C++ adapters (Nikon, cameras) · Python devices (Zeiss MTB; Viventis planned) · demo
 profiles        one TOML per instrument: config, role overrides, limits, quirks
 ```
 
@@ -50,6 +77,8 @@ smc autofocus engage                # engage, disengage or get the autofocus
 smc autofocus offset --floor        # the offset to its floor, before a first lock (m2 §12.10)
 smc light get                       # the light source: get, on, off
 smc snap --out frame.tif            # one frame from the simulated camera
+smc run plate-finding -p demo-sample --run-doc run.json   # the plate-scan tools, on a synthetic plate (docs/plugins/README.md)
+smc ui -p demo-sample --run-doc run.json                  # the plate page in a browser (needs the ui extra: pip install -e ".[ui]")
 smc discover                        # read-only survey of this PC (docs/hardware/microscope-pc-setup.md)
 pytest                              # the suite runs against the simulator
 pre-commit install                  # lint + format on every commit
@@ -64,10 +93,10 @@ that is what a microscope PC needs.
 | Microscope | Route | Status |
 |---|---|---|
 | Micro-Manager demo devices | `DemoCamera` adapter | **the regression bed** — every tool must run here |
-| Nikon Ti2-E | Micro-Manager `NikonTi2` + camera adapter | next (knowledge carried over from `nikon-control`) |
-| Nikon Ti-E | Micro-Manager `NikonTI` | after Ti2; same roles, different adapter |
-| Zeiss Axio Observer 7 | Micro-Manager `PVCAM` camera + Zeiss MTB 2011 as Python devices ([ADR-0007](docs/adr/0007-non-micromanager-hardware.md)) | proposed |
-| Viventis LS1 (×2) | Direct control of its components (Micro-Manager adapters or Python devices), never through the vendor's PyMCS; on-site inventory first ([ADR-0007](docs/adr/0007-non-micromanager-hardware.md)) | later |
+| Nikon Ti2-E | Micro-Manager `NikonTi2` + the Prime 95B on `PVCAM` | **driven at the stand** in five sessions; the plate chain ran end to end in session 5 ([Ti2-E notes](docs/hardware/nikon-ti2.md)) |
+| Nikon Ti-E | Micro-Manager `NikonTI` | not started: an assumed profile, never loaded on a stand |
+| Zeiss Axio Observer 7 | Micro-Manager `PVCAM` camera + Zeiss MTB 2011 as Python devices ([ADR-0007](docs/adr/0007-non-micromanager-hardware.md)) | **built on a fake MTB, not yet run at the stand** ([Zeiss notes](docs/hardware/zeiss-observer7.md)) |
+| Viventis LS1 (×2) | Direct control of its components (Micro-Manager adapters or Python devices), never through the vendor's PyMCS; on-site inventory first ([ADR-0007](docs/adr/0007-non-micromanager-hardware.md)) | not started: the components are not inventoried |
 
 What is known about each stand (adapters, DLLs, power-on order, quirks that
 cost days) is collected in [`docs/hardware/inventory.md`](docs/hardware/inventory.md).
@@ -78,10 +107,12 @@ cost days) is collected in [`docs/hardware/inventory.md`](docs/hardware/inventor
   green CI — see [`CONTRIBUTING.md`](CONTRIBUTING.md) and
   [ADR-0008](docs/adr/0008-repository-workflow.md).
 - Architecture decisions are records in [`docs/adr/`](docs/adr/README.md).
-  Two are **proposed** and waiting for a decision: the user interface
-  ([0006](docs/adr/0006-user-interface.md)) and the route to hardware
-  without a Micro-Manager adapter
-  ([0007](docs/adr/0007-non-micromanager-hardware.md)).
+  All nine are **accepted**, among them the user interface
+  ([0006](docs/adr/0006-user-interface.md), accepted 2026-10-26) and the route
+  to hardware without a Micro-Manager adapter
+  ([0007](docs/adr/0007-non-micromanager-hardware.md), accepted 2026-11-16);
+  0005 and 0008 are amended in part by
+  [0009](docs/adr/0009-light-ci-full-nightly.md), the light CI.
 - The AI coding agent follows [`CLAUDE.md`](CLAUDE.md); the same rules
   apply to humans.
 
@@ -94,8 +125,9 @@ automatic plate finding, well selection, field scanning, camera↔stage
 calibration, throughput measurement) and
 [`lightsheet-live-tracking-tool`](https://github.com/EPFL-TOP/lightsheet-live-tracking-tool)
 (closed-loop tracking with Viventis, Zeiss MTB and Micro-Manager
-backends). Their algorithms are being ported here as plugins; their
-hardware knowledge as profiles and tests.
+backends). Their algorithms are ported here as plugins, with their tests, and
+their hardware knowledge as profiles and tests. The plate chain is ported; the
+tracking runner (#32) and the laser patterns (#36) still wait.
 
 ## License
 
