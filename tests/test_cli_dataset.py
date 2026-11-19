@@ -16,6 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from select_fields_seed import SHAPE, Seed, cell_at, record, seed_run
@@ -279,6 +280,103 @@ def test_summary_lines_shows_a_label_or_a_well_the_detector_does_not_list(
     ]
     assert _words(lines, "A1", "0") == ["A1", "0", "0", "0", "1"]
     assert _words(lines, "A2", "1") == ["A2", "1", "0", "0", "0"]
+
+
+def test_summary_lines_says_the_detector_is_unknown_when_the_scan_has_cells_and_no_result(
+    tmp_path: Path,
+) -> None:
+    seed = seed_run(tmp_path, cells=[], wells=("A1",))
+    scan = Scan.from_results(
+        tmp_path,
+        RunDocument.load(seed.path),
+        plan=seed.plan,
+        result=seed.scan,
+        cells_result=None,
+        cells=[cell_at("A1", 1.0, 1.0, "mitosis")],
+    )
+    lines = summary_lines(scan, seed.path)
+    assert _words(lines, "cells") == ["cells", "1,", "detector", "unknown"]
+    assert _words(lines, "well", "mitosis") == ["well", "mitosis"]
+    assert _words(lines, "A1", "1") == ["A1", "1"]
+
+
+def test_show_lists_every_focus_state_a_well_has_in_the_order_locked_unlocked_off_none(
+    tmp_path: Path,
+) -> None:
+    # A scan of an objective with no autofocus is "none" in every frame, and one
+    # that did not use it is "off": a state that is not told reads as no frame.
+    seed = seed_run(
+        tmp_path,
+        cells=[],
+        wells=("A1", "B2"),
+        focus_of={
+            ("A1", 0): "unlocked",
+            ("A1", 1): "off",
+            ("A1", 2): "off",
+            ("A1", 3): "none",
+            ("B2", 1): "none",
+            ("B2", 2): "none",
+            ("B2", 3): "none",
+        },
+    )
+    code, lines = _show(seed.path)
+    assert code == 0
+    assert _words(lines, "A1", "4") == [
+        "A1",
+        "4",
+        "unlocked",
+        "1,",
+        "off",
+        "2,",
+        "none",
+        "1",
+    ]
+    assert _words(lines, "B2", "4") == ["B2", "4", "locked", "1,", "none", "3"]
+
+
+def test_show_prints_a_records_text_as_it_is_and_not_as_markup_or_an_emoji(
+    tmp_path: Path,
+) -> None:
+    # FM-36: the objective is a record's text, and a label with brackets or a
+    # colon pair is printed whole.
+    seed = seed_run(tmp_path, cells=[])
+    data = json.loads(seed.path.read_text(encoding="utf-8"))
+    data["stages"]["scan"]["result"]["objective"] = "[bold]10x[/bold] :smile:"
+    seed.path.write_text(json.dumps(data), encoding="utf-8")
+    code, lines = _show(seed.path)
+    assert code == 0
+    assert "objective      [bold]10x[/bold] :smile:" in lines
+
+
+def test_show_prints_the_scans_pixel_size_and_not_the_plans(tmp_path: Path) -> None:
+    # FM-124: the plan was laid for another pixel size than the scan took.
+    seed = seed_run(tmp_path, cells=[])
+    data = json.loads(seed.path.read_text(encoding="utf-8"))
+    data["stages"]["scan-plan"]["result"]["pixel_size_um"] = 2.0
+    seed.path.write_text(json.dumps(data), encoding="utf-8")
+    code, lines = _show(seed.path)
+    assert code == 0
+    assert "pixel size     5.0000 µm/px" in lines
+
+
+def test_show_names_the_file_when_the_file_system_will_not_say_what_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-24: "Access is denied" is a refusal with a line and an exit code 2, not a traceback.
+    seed = seed_run(tmp_path, cells=[])
+    original = Path.is_dir
+
+    def is_dir(self: Path) -> bool:
+        if self == seed.path:
+            raise PermissionError(13, "Access is denied")
+        return original(self)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    code, lines = _show(seed.path)
+    assert code == 2
+    (refusal,) = [line for line in lines if "✗" in line]
+    assert refusal.startswith(f"✗ {seed.path}: ")
+    assert "Access is denied" in refusal
 
 
 def test_summary_lines_of_a_loaded_scan_is_what_the_command_prints(

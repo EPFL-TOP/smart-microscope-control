@@ -9,7 +9,8 @@ over as models, arrays and columns. It imports no hardware layer, and
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import struct
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -149,16 +150,28 @@ class Scan:
         """The pixels of ``frame``, read from the run folder with the dtype and shape they were written with.
 
         Raises:
-            DatasetError: The file is missing, empty or corrupt, or its path
-                leads out of the run folder. The message names the frame and
-                its file, and the cause is chained. ``tifffile.TiffFileError``
-                is named: it is a ``ValueError`` only from tifffile 2026, and
-                the floor is 2024.1.
+            DatasetError: The file is missing, empty, truncated or corrupt, or
+                its path leads out of the run folder, or what it holds is not
+                the scan's ``image_shape_px`` (a file that a power cut cut short
+                reads as an empty array, and one written transposed is the right
+                size and the wrong shape, FM-73). The message names the frame
+                and its file, and the cause is chained when there is one.
+                ``tifffile.TiffFileError`` is named: it is a ``ValueError`` only
+                from tifffile 2026, and the floor is 2024.1; a file cut inside
+                its header raises ``struct.error`` from the same read.
         """
         try:
-            return load_frame(self.run_dir, frame)
-        except (OSError, ValueError, tifffile.TiffFileError) as exc:
+            pixels = load_frame(self.run_dir, frame)
+        except (OSError, ValueError, tifffile.TiffFileError, struct.error) as exc:
             raise DatasetError(f"frame {frame.name} ({frame.file}): {exc}") from exc
+        if tuple(pixels.shape) != tuple(self.image_shape_px):
+            raise DatasetError(
+                f"frame {frame.name} ({frame.file}): the file holds "
+                f"{tuple(pixels.shape)} pixels and the scan's frames are "
+                f"{tuple(self.image_shape_px)}; it is cut short or is not this "
+                f"scan's frame"
+            )
+        return pixels
 
     def cells_of(
         self, *, well: str | None = None, frame: int | None = None
@@ -265,10 +278,10 @@ def load_scan(run_doc: Path | str) -> Scan:
             scan and plan.
     """
     path = Path(run_doc)
-    if path.is_dir():
+    if _probe(path.is_dir):
         hint = "is a folder, not a run document; name a file"
         inside = path / "run.json"
-        if inside.is_file():
+        if _probe(inside.is_file):
             hint += f" (did you mean {inside}?)"
         raise DatasetError(f"{path}: {hint}")
     try:
@@ -299,6 +312,21 @@ def load_scan(run_doc: Path | str) -> Scan:
         cells=cells,
         cells_absent=absent,
     )
+
+
+def _probe(look: Callable[[], bool]) -> bool:
+    """``look()``, or ``False`` when the file system refuses to answer (FM-24).
+
+    ``Path.is_dir`` ignores only a missing path before Python 3.14, and "Access
+    is denied" (a share, another user's folder) is an ``OSError`` that would
+    end the load with a traceback. A probe that cannot tell says no, and
+    ``RunDocument.load`` reads the path next and gives the reason in its own
+    words, with the path.
+    """
+    try:
+        return look()
+    except OSError:
+        return False
 
 
 def _slot_result(path: Path, record: StageRecord, model: type[M], slot: str) -> M:

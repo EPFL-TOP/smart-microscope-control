@@ -80,8 +80,12 @@ def test_a_scan_answers_with_the_scans_camera_and_not_the_plans(tmp_path: Path) 
         plan_matrix=matrix_of(2.0, 0.0, False),
         plan_shape=(100, 100),
     )
-    scan = _scan_of(seed)
+    # The seed writes the same pixel size in the plan and the scan whatever the
+    # matrix says, so the plan's is made another by hand.
+    plan = seed.plan.model_copy(update={"pixel_size_um": 2.0})
+    scan = _scan_of(seed, plan=plan)
     assert seed.plan.image_shape_px == (100, 100)  # the oracle: the plan differs
+    assert scan.plan.pixel_size_um == 2.0
     assert scan.image_shape_px == (HEIGHT, WIDTH)
     assert scan.matrix_um_per_px == taken
     assert scan.pixel_size_um == PIXEL_UM
@@ -151,12 +155,31 @@ def _break_first_frame(seed: Seed, how: str) -> ScanFrame:
         target.write_bytes(b"this is not a tiff file " * 20)
     elif how == "empty":
         target.write_bytes(b"")
+    elif how == "header_only":
+        # What a power cut leaves: the TIFF header and nothing after it.
+        target.write_bytes(target.read_bytes()[:8])
+    elif how == "header_and_zeros":
+        # NTFS keeps the file's length and zero-fills what was never flushed.
+        target.write_bytes(target.read_bytes()[:8] + bytes(1000))
+    elif how == "three_bytes":
+        target.write_bytes(target.read_bytes()[:3])
     elif how == "escaping":
         return frame.model_copy(update={"file": "../x.tif"})
     return frame
 
 
-@pytest.mark.parametrize("how", ["missing", "garbage", "empty", "escaping"])
+@pytest.mark.parametrize(
+    "how",
+    [
+        "missing",
+        "garbage",
+        "empty",
+        "escaping",
+        "header_only",
+        "header_and_zeros",
+        "three_bytes",
+    ],
+)
 def test_image_of_a_missing_corrupt_empty_or_escaping_frame_is_a_dataset_error_naming_the_frame(
     tmp_path: Path, how: str
 ) -> None:
@@ -167,7 +190,29 @@ def test_image_of_a_missing_corrupt_empty_or_escaping_frame_is_a_dataset_error_n
         scan.image(frame)
     assert frame.name in str(caught.value)
     assert frame.file in str(caught.value)
-    assert caught.value.__cause__ is not None
+    # A file cut after its header: tifffile 2026 reads an empty array and says
+    # nothing, so the shape finds it and there is no cause; an older release may
+    # raise instead. Either way the error says what was wrong.
+    if how in ("header_only", "header_and_zeros") and caught.value.__cause__ is None:
+        assert "(60, 80)" in str(caught.value)
+    else:
+        assert caught.value.__cause__ is not None
+
+
+@pytest.mark.parametrize("shape", [(WIDTH, HEIGHT), (10, 10), (HEIGHT, WIDTH, 3)])
+def test_image_of_a_frame_that_is_not_the_scans_shape_is_a_dataset_error_naming_both(
+    tmp_path: Path, shape: tuple[int, ...]
+) -> None:
+    # FM-73: a frame written transposed is the right size and the wrong shape.
+    seed = seed_run(tmp_path, cells=[])
+    frame = seed.scan.frames[0]
+    tifffile.imwrite(tmp_path / frame.file, np.zeros(shape, dtype=np.uint16))
+    with pytest.raises(DatasetError) as caught:
+        _scan_of(seed).image(frame)
+    text = str(caught.value)
+    assert frame.name in text
+    assert str(shape) in text
+    assert str((HEIGHT, WIDTH)) in text
 
 
 def test_image_catches_tiffiles_error_by_name_and_not_through_value_error(
@@ -347,7 +392,13 @@ def test_load_scan_takes_the_scans_camera_and_not_the_plans(tmp_path: Path) -> N
         plan_matrix=matrix_of(2.0, 0.0, False),
         plan_shape=(100, 100),
     )
+    _edit(
+        seed.path,
+        lambda data: data["stages"]["scan-plan"]["result"].update(pixel_size_um=2.0),
+    )
     scan = load_scan(seed.path)
+    assert scan.plan.pixel_size_um == 2.0  # the oracle: the plan differs
+    assert scan.pixel_size_um == PIXEL_UM
     assert scan.plan.image_shape_px == (100, 100)
     assert scan.image_shape_px == (HEIGHT, WIDTH)
     assert scan.matrix_um_per_px == seed.matrix
@@ -491,6 +542,23 @@ def _scan_has_no_result(data: dict[str, Any]) -> None:
     data["stages"]["scan"]["result"] = None
 
 
+def _plan_result_is_not_one(data: dict[str, Any]) -> None:
+    data["stages"]["scan-plan"]["result"] = {"wells": ["A1"]}
+
+
+def _plan_has_no_result(data: dict[str, Any]) -> None:
+    data["stages"]["scan-plan"]["result"] = None
+
+
+def _scan_of_another_plugin_with_no_usable_result(data: dict[str, Any]) -> None:
+    # A slot is filled by whichever plugin provides it: the refusal says to run
+    # that plugin again, which is not always the slot's name.
+    record = data["stages"].pop("scan")
+    record["plugin"] = "scan-by-hand"
+    record["result"] = {"folder": "scan/t"}
+    data["stages"]["scan-by-hand"] = record
+
+
 @pytest.mark.parametrize(
     ("how", "reasons"),
     [
@@ -506,6 +574,22 @@ def _scan_has_no_result(data: dict[str, Any]) -> None:
             ["not a scan result this smc reads", "run scan again"],
         ),
         (_scan_has_no_result, ["not a scan result this smc reads", "no result"]),
+        (
+            _plan_result_is_not_one,
+            [
+                "the scan-plan record is not a scan-plan result this smc reads",
+                "(plate_plan: Field required)",
+                "run scan-plan again",
+            ],
+        ),
+        (
+            _plan_has_no_result,
+            ["not a scan-plan result this smc reads", "(it holds no result)"],
+        ),
+        (
+            _scan_of_another_plugin_with_no_usable_result,
+            ["the scan record is not a scan result", "run scan-by-hand again"],
+        ),
     ],
 )
 def test_load_scan_refuses_what_it_cannot_use_naming_the_file_and_the_reason(
@@ -568,6 +652,28 @@ def test_an_unreadable_document_is_not_an_empty_scan(tmp_path: Path) -> None:
     text = _refusal(path)
     assert "not UTF-8" in text
     assert "no scan" not in text
+
+
+def test_a_folder_that_cannot_be_looked_at_is_a_dataset_error_naming_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-24: "Access is denied" on a share or another user's folder. Path.is_dir
+    # ignores only a missing path before Python 3.14 and lets the rest through, so
+    # the probe that looks for a folder must not end the load with a traceback.
+    # Patched, not chmod: a read-only folder proves nothing on Windows.
+    seed = seed_run(tmp_path, cells=[])
+    original = Path.is_dir
+
+    def is_dir(self: Path) -> bool:
+        if self == seed.path:
+            raise PermissionError(13, "Access is denied")
+        return original(self)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    text = _refusal(seed.path)
+    assert text.startswith(f"{seed.path}: ")
+    assert "could not be read" in text
+    assert "Access is denied" in text
 
 
 # --- cells_table ----------------------------------------------------------------
@@ -665,9 +771,25 @@ def test_cells_table_columns_do_not_share_memory() -> None:
     # A caller that edits one column of the table must not edit another: the box
     # columns are cut from one array and each is a copy of its own.
     table = cells_table(_three_cells())
+    columns = [name for name in COLUMNS if table[name].dtype == np.float64]
+    assert len(columns) == 9
+    for first in columns:
+        assert table[first].flags.c_contiguous, first
+        for second in columns:
+            if first != second:
+                assert not np.shares_memory(table[first], table[second]), (
+                    first,
+                    second,
+                )
     table["row0_px"][0] = -1.0
     assert table["row_px"][0] == 20.0
     assert table["row1_px"][0] == 30.0
+
+
+def test_a_dataset_error_is_a_value_error() -> None:
+    # A caller that already handles a bad value handles an unreadable dataset
+    # too, and #565, #567 and #568 raise it for their own refusals.
+    assert issubclass(DatasetError, ValueError)
 
 
 def test_cells_table_is_a_pandas_data_frame_input() -> None:

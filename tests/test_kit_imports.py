@@ -92,6 +92,7 @@ def _violations(path: Path) -> list[str]:
 def test_kit_never_imports_pymmcore_plus(tmp_path: Path) -> None:
     # A collaborator's laptop has no Micro-Manager: importing the kit must not
     # reach for it, through smc.cli either (the sub-app is added to it).
+    assert {"smc.data", "smc.data.cli", "smc.cli"} <= set(KIT_MODULES)
     assert _loaded_hardware_modules(KIT_MODULES, tmp_path) == []
 
 
@@ -118,6 +119,11 @@ def test_the_import_walk_sees_a_from_import_a_submodule_and_a_relative_import(
         "submodule.py": "import smc.hardware.core\n",
         "relative.py": "from . import x\n",
         "nested.py": "def f():\n    from smc.testing.fakes import FakeCore\n",
+        # One source for each name of FORBIDDEN that no source above has: with
+        # the name taken out of the list, only its own source goes unseen.
+        "ui.py": "from smc.ui import page\n",
+        "bindings_plus.py": "def f():\n    import pymmcore_plus\n",
+        "bindings.py": "from pymmcore import CMMCore\n",
         "clean.py": (
             "import numpy\n"
             "from smc.plugins.slots import Cell\n"
@@ -129,8 +135,20 @@ def test_the_import_walk_sees_a_from_import_a_submodule_and_a_relative_import(
         path = tmp_path / name
         path.write_text(text, encoding="utf-8")
         seen[name] = _violations(path)
-    assert [len(seen[name]) for name in sources] == [1, 1, 1, 1, 0], seen
+    assert {name: len(found) for name, found in seen.items()} == {
+        "from_import.py": 1,
+        "submodule.py": 1,
+        "relative.py": 1,
+        "nested.py": 1,
+        "ui.py": 1,
+        "bindings_plus.py": 1,
+        "bindings.py": 1,
+        "clean.py": 0,
+    }, seen
     assert "from smc import hardware" in seen["from_import.py"][0]
     assert "import smc.hardware.core" in seen["submodule.py"][0]
     assert "relative import" in seen["relative.py"][0]
     assert "smc.testing" in seen["nested.py"][0]
+    assert "smc.ui" in seen["ui.py"][0]
+    assert "pymmcore_plus" in seen["bindings_plus.py"][0]
+    assert "from pymmcore import" in seen["bindings.py"][0]
