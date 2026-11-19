@@ -37,6 +37,7 @@ from rich.text import Text
 from typing_extensions import assert_never
 
 from smc import __version__
+from smc.data.cli import dataset_app
 from smc.drive import (
     DriveResult,
     disengage_autofocus,
@@ -2498,6 +2499,7 @@ presets_app = typer.Typer(
     rich_markup_mode="rich",
 )
 app.add_typer(presets_app, name="presets")
+app.add_typer(dataset_app, name="dataset")
 
 
 @presets_app.command("list")

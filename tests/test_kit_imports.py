@@ -17,7 +17,7 @@ from pathlib import Path
 
 #: What the subprocess imports; #567 and #568 add theirs (``smc.selection``,
 #: ``smc.data.draw``), #564 its own.
-KIT_MODULES = ["smc.data", "smc.cli"]
+KIT_MODULES = ["smc.data", "smc.data.cli", "smc.cli"]
 
 #: The packages of ``src/smc/`` the walk covers; #567 adds ``selection``.
 KIT_PACKAGES = ["data"]
