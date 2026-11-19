@@ -659,6 +659,20 @@ def _record_text(value: str, run_dir: Path | None = None) -> str:
     return text if len(text) <= _CLIP else text[: _CLIP - 3] + "..."
 
 
+def chose_text(view: RouteView) -> str:
+    """What the route record says it chose with: ``selector most-cells, orderer nearest``, or that it does not say.
+
+    A record that names neither says so in one phrase, and one that names one of the
+    two says which is missing: unknown is not guessed, and a name that is not a string
+    is "not recorded" (FM-125).
+    """
+    if view.selector is None and view.orderer is None:
+        return "selector and orderer not recorded"
+    selector = _record_text(view.selector) if view.selector else "not recorded"
+    orderer = _record_text(view.orderer) if view.orderer else "not recorded"
+    return f"selector {selector}, orderer {orderer}"
+
+
 def _stops_text(count: int) -> str:
     if count == 0:
         return "no stop"
@@ -680,19 +694,11 @@ def _route_lines(
     )
     if count is None:
         uncovered = "uncovered cells: not counted"
+    elif labels:
+        uncovered = f"uncovered {labels} cells: {count}"
     else:
-        uncovered = (
-            f"uncovered {labels} cells: {count}"
-            if labels
-            else (f"uncovered cells: {count}")
-        )
-    plugin = _record_text(view.plugin)
-    if view.selector is None and view.orderer is None:
-        chose = f"{plugin}: selector and orderer not recorded"
-    else:
-        selector = _record_text(view.selector) if view.selector else "not recorded"
-        orderer = _record_text(view.orderer) if view.orderer else "not recorded"
-        chose = f"{plugin}: selector {selector}, orderer {orderer}"
+        uncovered = f"uncovered cells: {count}"
+    chose = f"{_record_text(view.plugin)}: {chose_text(view)}"
     width, height = result.fov_um
     fields = f"fields {width:.0f} x {height:.0f} um"
     if result.objective is not None:
