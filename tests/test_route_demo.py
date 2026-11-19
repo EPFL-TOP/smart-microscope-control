@@ -22,7 +22,9 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib.metadata import EntryPoint
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from pydantic import BaseModel
@@ -54,6 +56,8 @@ from smc.plugins.slots import (
     TimingsResult,
 )
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
+from smc.selection import registry
+from smc.selection.api import Choice, SelectionInput, SelectorParams
 
 pytestmark = pytest.mark.demo
 
@@ -879,6 +883,66 @@ def test_another_objective_scales_the_field(
     )
     # The scan's frames did measure a Z: the scan itself is not changed by this.
     assert all(f.z_um is not None for f in seed.scan.frames)
+
+
+class _Recorder:
+    """A selector that keeps what it is given and chooses nothing: the route then refuses, and the test reads the input."""
+
+    name = "recorder"
+    summary = "Keeps what it is given."
+    Params = SelectorParams
+    given: ClassVar[list[SelectionInput]] = []
+
+    def select(self, data: SelectionInput, params: SelectorParams) -> list[Choice]:
+        self.given.append(data)
+        return []
+
+
+def test_a_selector_is_given_the_imaging_objectives_field_not_the_scans(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-124: a field chosen at the 40X from a 10X scan has the 40X footprint, so a selector reads the scaled camera.
+
+    The scan was taken at the 10X (0.65 µm a pixel in the profile) and the route
+    images at the 40X (0.1625): a quarter, by the profile's own numbers.
+    """
+    scan_matrix = _matrix(0.2, 12.0, True)
+    shape = (240, 320)
+    seed = _seed(tmp_path, matrix=scan_matrix, shape=shape, scan_objective=IN_PLACE)
+    sizes = demo_microscope.profile.camera.pixel_size_um
+    ratio = sizes[FORTY] / sizes[IN_PLACE]
+    monkeypatch.setattr(
+        registry,
+        "entry_points",
+        lambda *, group: [
+            EntryPoint(name, f"{target}", group)
+            for name, target in {
+                registry.SELECTOR_GROUP: [
+                    ("most-cells", "smc.selection.builtin:MostCells"),
+                    ("recorder", f"{__name__}:_Recorder"),
+                ],
+                registry.ORDERER_GROUP: [
+                    ("nearest", "smc.selection.builtin:Nearest"),
+                ],
+            }[group]
+        ],
+    )
+    _Recorder.given.clear()
+
+    _refused(demo_microscope, tmp_path, selector="recorder", objective=FORTY)
+
+    (data,) = _Recorder.given
+    assert [v for row in data.matrix_um_per_px for v in row] == pytest.approx(
+        [ratio * v for row in scan_matrix for v in row]
+    )
+    assert data.image_shape_px == shape
+    scan_fov = _extent(scan_matrix, shape)
+    assert data.fov_um == pytest.approx((ratio * scan_fov[0], ratio * scan_fov[1]))
+    assert data.objective == FORTY
+    # The scan's own camera is still the scan's, for the selector that wants it.
+    assert data.scan.matrix_um_per_px == scan_matrix
+    assert data.scan.result.objective == IN_PLACE
+    assert data.scan.cells == seed.cells
 
 
 def test_the_scans_own_objective_given_by_name_changes_nothing_and_needs_no_turret(
@@ -1911,7 +1975,8 @@ def test_a_lattice_too_fine_for_the_well_names_the_field_size(
     refused = _refused(demo_microscope, tmp_path)
 
     assert refused.reason == (
-        "the candidate lattice of A1 would hold more than 250000 fields at a step "
+        "selector most-cells: the candidate lattice of A1 would hold more than "
+        "250000 fields at a step "
         "of 0.075 µm; the field is 0.4 by 0.3 µm: check the scan's pixel size, or "
         "raise candidate_step_fraction"
     )
@@ -1928,7 +1993,8 @@ def test_too_many_tests_are_refused_with_a_way_out(
     refused = _refused(demo_microscope, tmp_path)
 
     assert refused.reason == (
-        f"{_singles('A1')} cells × {per_cell:.0f} lattice points per cell would be "  # noqa: RUF001
+        f"selector most-cells: {_singles('A1')} cells × {per_cell:.0f} lattice "  # noqa: RUF001
+        f"points per cell would be "
         f"tested, over 10; raise candidate_step_fraction, or choose fewer labels"
     )
 

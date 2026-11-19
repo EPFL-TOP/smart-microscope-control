@@ -1234,3 +1234,287 @@ def test_the_greedy_equals_an_exact_greedy_with_cells_on_the_fields_edges(
 
     assert chosen == _exact_greedy(points, n=n, min_cells=min_cells)
     assert all(count >= min_cells for _, _, count in chosen)
+
+
+# ------------------------------------------- counting for a selector's choices (#567)
+
+
+def _at_pixel_offset(
+    matrix: Matrix2,
+    shape: tuple[int, int],
+    origin: Point,
+    d_col: float,
+    d_row: float,
+) -> Point:
+    """The stage point ``d_col`` columns and ``d_row`` rows from a field's centre, by ``stage_of_pixel``."""
+    height, width = shape
+    return stage_of_pixel(
+        origin[0],
+        origin[1],
+        (width - 1) / 2.0 + d_col,
+        (height - 1) / 2.0 + d_row,
+        matrix=matrix,
+        image_shape_px=shape,
+    )
+
+
+#: Turned, mirrored and not square: a width and a height, or an axis, cannot be swapped unseen (FM-73).
+CAMERAS = [
+    pytest.param(_matrix(1.0, 0.0, False), (60, 80), id="upright"),
+    pytest.param(_matrix(1.25, 17.0, True), (60, 80), id="turned-mirrored"),
+    pytest.param(_matrix(0.8, 90.0, False), (60, 80), id="quarter-turn"),
+]
+
+
+def _shared_edge_cells(
+    matrix: Matrix2, shape: tuple[int, int], origin: Point, n: int
+) -> tuple[list[Cell], Point]:
+    """``n`` cells on the right edge of the field at ``origin`` and the centre of the field that touches it there.
+
+    The cells sit at ``d_col = W / 2`` of the first field, which is
+    ``d_col = -W / 2`` of the second, a width away along the camera's own axis,
+    at rows spread over the frame's height: the cells that two touching fields
+    both hold when the arithmetic is inclusive.
+    """
+    height, width = shape
+    cells = []
+    for k in range(n):
+        d_row = -height / 2.0 + height * k / (n - 1)
+        x, y = _at_pixel_offset(matrix, shape, origin, width / 2.0, d_row)
+        cells.append(_cell(x, y))
+    return cells, _at_pixel_offset(matrix, shape, origin, float(width), 0.0)
+
+
+def _holds(
+    matrix: Matrix2, shape: tuple[int, int], centre: Point, cells: Sequence[Cell]
+) -> list[bool]:
+    """The oracle: whether each cell is inside the field, by ``choose_fields``' definition (``_inverse_of`` and the half-extents)."""
+    height, width = shape
+    inverse = _inverse_of(matrix)
+    xy = np.array([(c.x_um, c.y_um) for c in cells])
+    d_col, d_row = _pixel_offsets(xy[:, 0] - centre[0], xy[:, 1] - centre[1], inverse)
+    return [
+        bool(held)
+        for held in (np.abs(d_col) <= width / 2.0) & (np.abs(d_row) <= height / 2.0)
+    ]
+
+
+@settings(max_examples=100)
+@given(_worlds())
+def test_held_counts_equal_the_greedys_counts_for_the_fields_it_chose(
+    world: World,
+) -> None:
+    chosen = world.choose()
+    cells = [cell for cell in world.cells if cell.well == world.well.well]
+
+    counted = algorithm.held_counts(
+        cells,
+        [(f.x_um, f.y_um) for f in chosen],
+        labels=world.labels,
+        matrix=world.matrix,
+        image_shape_px=world.shape,
+    )
+
+    assert [list(c.items()) for c in counted] == [
+        list(f.counts.items()) for f in chosen
+    ]
+
+
+@pytest.mark.parametrize(("matrix", "shape"), CAMERAS)
+def test_held_counts_gives_a_cell_on_the_shared_edge_of_two_touching_fields_to_the_first(
+    matrix: Matrix2, shape: tuple[int, int]
+) -> None:
+    first: Point = (0.0, 0.0)
+    cells, second = _shared_edge_cells(matrix, shape, first, 800)
+    in_first = _holds(matrix, shape, first, cells)
+    in_second = _holds(matrix, shape, second, cells)
+    # The cells are there to be held twice; with none that two fields share, the test says nothing.
+    assert any(a and b for a, b in zip(in_first, in_second, strict=True))
+    first_only = sum(a and not b for a, b in zip(in_first, in_second, strict=True))
+    second_only = sum(b and not a for a, b in zip(in_first, in_second, strict=True))
+    both = sum(a and b for a, b in zip(in_first, in_second, strict=True))
+
+    forwards = algorithm.held_counts(
+        cells, [first, second], labels=["single"], matrix=matrix, image_shape_px=shape
+    )
+    backwards = algorithm.held_counts(
+        cells, [second, first], labels=["single"], matrix=matrix, image_shape_px=shape
+    )
+
+    # What both hold goes to the field that comes first in the list, and is counted once.
+    assert forwards == ({"single": first_only + both}, {"single": second_only})
+    assert backwards == ({"single": second_only + both}, {"single": first_only})
+
+
+def test_held_counts_keeps_every_label_as_a_key_zeros_included_in_the_labels_order() -> (
+    None
+):
+    cells = [
+        _cell(0.0, 0.0, "a"),
+        _cell(1.0, 1.0, "a"),
+        _cell(2.0, 0.0, "b"),
+        _cell(500.0, 500.0, "c"),
+    ]
+
+    counted = algorithm.held_counts(
+        cells,
+        [(0.0, 0.0), (1000.0, 1000.0)],
+        labels=["c", "a", "c"],
+        matrix=UPRIGHT,
+        image_shape_px=FRAME,
+    )
+
+    # `b` is not asked for; `c` is a key of the first field though it holds none; a
+    # label given twice is one key; the keys follow the labels, not the cells.
+    assert [list(c.items()) for c in counted] == [
+        [("c", 0), ("a", 2)],
+        [("c", 0), ("a", 0)],
+    ]
+
+
+def test_held_counts_of_no_centre_and_of_no_cell() -> None:
+    kwargs: dict[str, object] = {
+        "labels": ["single"],
+        "matrix": UPRIGHT,
+        "image_shape_px": FRAME,
+    }
+
+    assert algorithm.held_counts([_cell(0.0, 0.0)], [], **kwargs) == ()  # type: ignore[arg-type]
+    assert algorithm.held_counts([], [(0.0, 0.0)], **kwargs) == ({"single": 0},)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("matrix", "shape"), CAMERAS)
+def test_cells_in_field_agrees_with_held_counts_on_a_fields_edge(
+    matrix: Matrix2, shape: tuple[int, int]
+) -> None:
+    centre: Point = (120.0, -80.0)
+    cells, _ = _shared_edge_cells(matrix, shape, centre, 800)
+    # A cell just outside and one just inside, so that both answers occur.
+    cells += [
+        _cell(*_at_pixel_offset(matrix, shape, centre, shape[1] / 2.0 + 0.01, 0.0)),
+        _cell(*_at_pixel_offset(matrix, shape, centre, shape[1] / 2.0 - 0.01, 0.0)),
+    ]
+
+    held = algorithm.cells_in_field(cells, *centre, matrix=matrix, image_shape_px=shape)
+    counted = algorithm.held_counts(
+        cells, [centre], labels=["single"], matrix=matrix, image_shape_px=shape
+    )
+
+    assert counted == ({"single": len(held)},)
+    assert 0 < len(held) < len(cells)
+    expected = _holds(matrix, shape, centre, cells)
+    assert list(held) == [c for c, h in zip(cells, expected, strict=True) if h]
+
+
+def test_cells_in_field_keeps_the_input_order_and_ignores_nothing_but_position() -> (
+    None
+):
+    inside_late = _cell(10.0, 5.0, "doublet", well="B2", frame=3)
+    inside_early = _cell(-20.0, -5.0, "single", well="A1", frame=1)
+    outside = _cell(300.0, 0.0, "single")
+    just_beyond = _cell(50.5, 0.0, "single")  # the field is 100 wide: its edge is at 50
+    on_the_edge = _cell(50.0, 30.0, "debris", well="C3")
+    cells = [inside_late, outside, on_the_edge, just_beyond, inside_early]
+
+    held = algorithm.cells_in_field(
+        cells, 0.0, 0.0, matrix=UPRIGHT, image_shape_px=FRAME
+    )
+
+    # Any well and any label, and the input's order, not the position's.
+    assert held == (inside_late, on_the_edge, inside_early)
+    assert (
+        algorithm.cells_in_field([], 0.0, 0.0, matrix=UPRIGHT, image_shape_px=FRAME)
+        == ()
+    )
+
+
+def test_the_three_counting_functions_refuse_a_matrix_that_cannot_be_inverted() -> None:
+    singular: Matrix2 = ((1.0, 2.0), (2.0, 4.0))
+
+    with pytest.raises(ValueError, match="cannot be inverted"):
+        algorithm.cells_in_field(
+            [_cell(0.0, 0.0)], 0.0, 0.0, matrix=singular, image_shape_px=FRAME
+        )
+    with pytest.raises(ValueError, match="cannot be inverted"):
+        algorithm.held_counts(
+            [], [(0.0, 0.0)], labels=["single"], matrix=singular, image_shape_px=FRAME
+        )
+    with pytest.raises(ValueError, match="cannot be inverted"):
+        algorithm.first_overlap(
+            [(0.0, 0.0), (1.0, 1.0)], matrix=singular, image_shape_px=FRAME
+        )
+
+
+@pytest.mark.parametrize(("matrix", "shape"), CAMERAS)
+def test_first_overlap_is_none_for_touching_fields_and_names_the_first_pair_otherwise(
+    matrix: Matrix2, shape: tuple[int, int]
+) -> None:
+    width = float(shape[1])
+    origin: Point = (10.0, 20.0)
+    touching = _at_pixel_offset(matrix, shape, origin, width, 0.0)
+    overlapping = _at_pixel_offset(matrix, shape, origin, width - 0.01, 0.0)
+    apart = _at_pixel_offset(matrix, shape, origin, 10 * width, 0.0)
+    kwargs: dict[str, object] = {"matrix": matrix, "image_shape_px": shape}
+
+    # A width apart along the camera's own axis: the fields touch, and touching is allowed.
+    assert algorithm.first_overlap([origin, touching], **kwargs) is None  # type: ignore[arg-type]
+    # A float round-off short of a width is still touching: the rule's 1e-6 px.
+    hair = _at_pixel_offset(matrix, shape, origin, width - 1e-9, 0.0)
+    assert algorithm.first_overlap([origin, hair], **kwargs) is None  # type: ignore[arg-type]
+    assert algorithm.first_overlap([origin, overlapping], **kwargs) == (0, 1)  # type: ignore[arg-type]
+    assert algorithm.first_overlap([apart, origin, overlapping], **kwargs) == (1, 2)  # type: ignore[arg-type]
+    assert algorithm.first_overlap([], **kwargs) is None  # type: ignore[arg-type]
+    assert algorithm.first_overlap([origin], **kwargs) is None  # type: ignore[arg-type]
+
+
+def test_first_overlap_orders_the_pairs_by_i_then_j() -> None:
+    # 0 overlaps 3 and 1 overlaps 2: by `i` first, the pair is (0, 3); by `j`
+    # first it would be (1, 2).
+    centres = [(0.0, 0.0), (0.0, 1000.0), (0.0, 1050.0), (50.0, 0.0)]
+
+    assert algorithm.first_overlap(centres, matrix=UPRIGHT, image_shape_px=FRAME) == (
+        0,
+        3,
+    )
+    # Three that overlap one another: the first of them with the second.
+    mutual = [(1000.0, 0.0), (0.0, 0.0), (20.0, 0.0), (40.0, 0.0)]
+    assert algorithm.first_overlap(mutual, matrix=UPRIGHT, image_shape_px=FRAME) == (
+        1,
+        2,
+    )
+
+
+@pytest.mark.parametrize(("matrix", "shape"), CAMERAS)
+def test_first_overlap_does_not_swap_the_width_and_the_height(
+    matrix: Matrix2, shape: tuple[int, int]
+) -> None:
+    height, width = float(shape[0]), float(shape[1])
+    origin: Point = (0.0, 0.0)
+    kwargs: dict[str, object] = {"matrix": matrix, "image_shape_px": shape}
+    # Between the two sizes, along rows then along columns: that is too much for
+    # a height and too little for a width, so a swap shows on one of the two.
+    between = (height + width) / 2.0
+    along_rows = _at_pixel_offset(matrix, shape, origin, 0.0, between)
+    along_columns = _at_pixel_offset(matrix, shape, origin, between, 0.0)
+
+    assert algorithm.first_overlap([origin, along_rows], **kwargs) is None  # type: ignore[arg-type]
+    assert algorithm.first_overlap([origin, along_columns], **kwargs) == (0, 1)  # type: ignore[arg-type]
+
+
+def test_first_overlap_in_blocks_of_one_row_equals_one_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = random.Random(11)
+    centres = [
+        (generator.uniform(-2000.0, 2000.0), generator.uniform(-2000.0, 2000.0))
+        for _ in range(60)
+    ]
+    kwargs: dict[str, object] = {
+        "matrix": _matrix(1.1, 23.0, True),
+        "image_shape_px": (60, 80),
+    }
+    whole = algorithm.first_overlap(centres, **kwargs)  # type: ignore[arg-type]
+    monkeypatch.setattr(algorithm, "_OVERLAP_BLOCK", 1)
+
+    assert whole is not None
+    assert algorithm.first_overlap(centres, **kwargs) == whole  # type: ignore[arg-type]

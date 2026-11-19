@@ -44,7 +44,10 @@ __all__ = [
     "LatticeTooLarge",
     "TooMuchWork",
     "allowed",
+    "cells_in_field",
     "choose_fields",
+    "first_overlap",
+    "held_counts",
     "order_route",
     "path_length_um",
 ]
@@ -66,6 +69,9 @@ _WORK_CHUNK = 2**18
 #: Two fields whose centres differ by this many pixels less than a frame are
 #: overlapping; at exactly a frame they touch, and touching is allowed.
 _TOUCH_PX = 1e-6
+#: Pairs of fields ``first_overlap`` compares at once: 2**20 elements are a few
+#: arrays of 8 MB, and 500 fields (a well's most) are 250 000 of them.
+_OVERLAP_BLOCK = 2**20
 #: A reversal that shortens the path by less than this is not made: it ends 2-opt,
 #: and a float round-off is not an improvement.
 _IMPROVEMENT_UM = 1e-9
@@ -255,6 +261,125 @@ def choose_fields(
             (np.abs(o_col) < width - _TOUCH_PX) & (np.abs(o_row) < height - _TOUCH_PX)
         )
     return tuple(chosen)
+
+
+def cells_in_field(
+    cells: Sequence[Cell],
+    x_um: float,
+    y_um: float,
+    *,
+    matrix: Matrix2,
+    image_shape_px: tuple[int, int],
+) -> tuple[Cell, ...]:
+    """The cells a field centred at ``(x_um, y_um)`` holds, in the order given: any well, any label.
+
+    "Holds" is ``choose_fields``' own test, ``|d_col| <= W/2`` and ``|d_row| <=
+    H/2`` on the pixel offset that ``_inverse_of`` reads, and not
+    ``pixel_of_stage`` asked of each cell against the same half-extents: the two
+    disagreed on 51 of 800 cells placed on a field's edge by ``stage_of_pixel``
+    (rotated, mirrored, non-square cameras), and a selector that counts a cell
+    ``route`` does not would choose a field for it (FM-132). The cells are
+    turned into arrays once per call: a loop over many fields goes through
+    ``held_counts``.
+
+    Raises:
+        ValueError: The matrix cannot be inverted (``pixel_of_stage``' refusal).
+    """
+    inverse = _inverse_of(matrix)
+    height, width = image_shape_px
+    xy = np.array([(cell.x_um, cell.y_um) for cell in cells], dtype=np.float64)
+    xy = xy.reshape(-1, 2)
+    d_col, d_row = _pixel_offsets(xy[:, 0] - x_um, xy[:, 1] - y_um, inverse)
+    inside = (np.abs(d_col) <= width / 2.0) & (np.abs(d_row) <= height / 2.0)
+    return tuple(
+        cell for cell, held in zip(cells, inside.tolist(), strict=True) if held
+    )
+
+
+def held_counts(
+    cells: Sequence[Cell],
+    centres: Sequence[Point],
+    *,
+    labels: Sequence[str],
+    matrix: Matrix2,
+    image_shape_px: tuple[int, int],
+) -> tuple[dict[str, int], ...]:
+    """What each field of one well holds that no earlier field holds: one ``counts`` per centre, in order.
+
+    ``choose_fields``' ``ChosenField.counts`` for any list of centres, so that
+    ``route`` attributes the cells of a selector's choices as it attributes its
+    own: each wanted cell to the **first** field that holds it, a cell on the
+    edge two touching fields share included. ``cells`` are those of **one
+    well** (a cell of another is counted wherever it is, by position alone) and
+    only those of ``labels`` count. Each dict has the keys of ``labels`` in
+    their order (duplicates once), zeros included.
+
+    The arrays are built once and a ``held`` mask is updated per centre, so the
+    work is ``len(centres) * len(cells)`` elementwise operations: do not call
+    ``cells_in_field`` in a loop for this, it converts the cells on each call.
+
+    Raises:
+        ValueError: The matrix cannot be inverted (``pixel_of_stage``' refusal).
+    """
+    inverse = _inverse_of(matrix)
+    height, width = image_shape_px
+    position_of = {label: k for k, label in enumerate(dict.fromkeys(labels))}
+    wanted = [cell for cell in cells if cell.label in position_of]
+    xy = np.array([(cell.x_um, cell.y_um) for cell in wanted], dtype=np.float64)
+    xy = xy.reshape(-1, 2)
+    which = np.array([position_of[cell.label] for cell in wanted], dtype=np.int64)
+    held = np.zeros(len(wanted), dtype=bool)
+    counted: list[dict[str, int]] = []
+    for x, y in centres:
+        d_col, d_row = _pixel_offsets(xy[:, 0] - x, xy[:, 1] - y, inverse)
+        inside = (np.abs(d_col) <= width / 2.0) & (np.abs(d_row) <= height / 2.0)
+        fresh = inside & ~held
+        tallies = np.bincount(which[fresh], minlength=len(position_of))
+        counted.append({label: int(tallies[k]) for label, k in position_of.items()})
+        held |= fresh
+    return tuple(counted)
+
+
+def first_overlap(
+    centres: Sequence[Point],
+    *,
+    matrix: Matrix2,
+    image_shape_px: tuple[int, int],
+) -> tuple[int, int] | None:
+    """The first pair ``(i, j)``, ``i < j``, of fields that overlap, or ``None``; touching is no overlap.
+
+    ``choose_fields``' rule, which removes a candidate when ``|d_col| < W`` and
+    ``|d_row| < H`` of a chosen one in the frame's pixels, less ``_TOUCH_PX`` so
+    that two fields exactly a frame apart touch. Pairs are ordered by ``i``, then
+    ``j``. The comparison is made in numpy over blocks of rows, so that 500
+    fields (125 000 pairs, too slow in a Python loop) are one block, and a list
+    far longer than a well may hold never makes an ``n * n`` array.
+
+    Raises:
+        ValueError: The matrix cannot be inverted (``pixel_of_stage``' refusal).
+    """
+    inverse = _inverse_of(matrix)
+    height, width = image_shape_px
+    xy = np.array(centres, dtype=np.float64).reshape(-1, 2)
+    n = len(xy)
+    block = max(1, _OVERLAP_BLOCK // max(n, 1))
+    columns = np.arange(n)
+    for first in range(0, n, block):
+        rows = np.arange(first, min(first + block, n))
+        d_col, d_row = _pixel_offsets(
+            xy[None, :, 0] - xy[rows, None, 0],
+            xy[None, :, 1] - xy[rows, None, 1],
+            inverse,
+        )
+        close = (
+            (np.abs(d_col) < width - _TOUCH_PX)
+            & (np.abs(d_row) < height - _TOUCH_PX)
+            & (columns[None, :] > rows[:, None])
+        )
+        if close.any():
+            i, j = np.unravel_index(int(close.argmax()), close.shape)
+            return (int(rows[i]), int(j))
+    return None
 
 
 def order_route(points: Sequence[Point], *, start: int) -> list[int]:

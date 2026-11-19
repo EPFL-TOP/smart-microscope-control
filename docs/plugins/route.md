@@ -32,12 +32,94 @@ smc run route -p <profile> --run-doc run.json --param objective="Nikon 40X Plan 
 | `wall_margin_um` | 0 | The distance from the wall that every corner of a field keeps. |
 | `objective` | the scan's | Image with this objective, by its label on the turret; see below. |
 | `candidate_step_fraction` | 0.25 | The spacing of the candidate fields as a fraction of the field's shorter side, above 0 and up to 1. Smaller is finer and slower. |
+| `selector` | `most-cells` | The algorithm that chooses the fields, by its registered name; an unknown name lists the known ones. See *Choosing and ordering by name*. |
+| `selector_params` | `{}` | The selector's own parameters, as JSON, validated against its model. `most-cells` takes none here: `min_cells` and `candidate_step_fraction` above are its parameters. |
+| `orderer` | `nearest` | The algorithm that orders the fields, by its registered name. |
+| `orderer_params` | `{}` | The orderer's own parameters, as JSON. `nearest` and `as-chosen` take none. |
 
-A stop (Ctrl-C) ends the stage between two wells. Nothing is written and no
-checkpoint is kept: the work is arithmetic on records that are already on disk, so a
-re-run starts over and gives the same route (nothing in it is random).
+A stop (Ctrl-C) ends the stage between two wells, after the selector has run: the
+selector is one step for every well, and nothing in its contract lets it see the stop
+(on a 96-well plate where every well is dense that is 30 to 45 s with the default
+selector; Ctrl-C ends it at once). Nothing is written and no checkpoint is kept: the
+work is arithmetic on records that are already on disk, so a re-run starts over and
+gives the same route (nothing in the default selector or orderer is random).
+
+## Choosing and ordering by name
+
+What `route` chooses with, and in what order it visits what it chose, are two
+algorithms looked up by name, not code in the plugin: a **selector** turns the scan's
+cells into fields, and an **orderer** turns those fields into a visiting order. The
+defaults, `most-cells` and `nearest`, are the rule of the rest of this page, so a route
+with no `selector` or `orderer` parameter is the route this page has always described.
+A third, `as-chosen`, keeps the selector's own order (the identity), for a selector
+whose list *is* the route it wants.
+
+```text
+smc run route -p <profile> --run-doc run.json --param selector=my-selector
+smc run route -p <profile> --run-doc run.json --param selector=my-selector --param 'selector_params={"min_density_per_mm2": 20}'
+smc run route -p <profile> --run-doc run.json --param orderer=as-chosen
+```
+
+`selector_params` and `orderer_params` are JSON objects, like `labels` is a JSON
+list: in `cmd.exe` and PowerShell 5.1 the quotes need the escaping of the
+[`smc run`](README.md#running-a-plugin-smc-run) page, or the run is refused with
+`'selector_params' takes JSON`.
+
+- **Where they come from.** Two entry-point groups, `smc.selectors` and
+  `smc.orderers`, as plugins have `smc.plugins`: an algorithm is a class registered
+  under its name in a package that is installed next to smc. The entry points are
+  **read when smc is installed**: a package that was added, or a venv that was not
+  installed again after smc was updated, does not know the new names, and `route` then
+  says `no selector is registered: run pip install -e . in the smc folder`.
+- **A name is checked without importing anything**, so a wrong name is refused with
+  the known ones listed, beside any other bad parameter (`selector 'nope' is not
+  registered; known: most-cells`).
+- **Parameters.** `selector_params` and `orderer_params` are JSON and are validated
+  against the algorithm's own model: a problem starts `selector_params:` (or
+  `orderer_params:`) and names the key. `min_cells` and `candidate_step_fraction` are
+  `most-cells`' parameters and stay route parameters, for the presets and the page: with
+  `most-cells` giving either in `selector_params` too is refused, and with another
+  selector a value other than their default is refused too, naming `most-cells`, since
+  it would be silently ignored.
+- **What a selector is given.** The scan as it is on disk (`smc.data.Scan`: its plan,
+  its wells, their geometry, its frames and its cells), `labels`, `fields_per_well`,
+  `wall_margin_um` and `exclude_centre_um` as given here, and the **imaging objective's
+  field**: for `objective` another than the scan's, the scaled matrix of *Another
+  objective*, and not the scan's. It answers with fields (a well and a centre in stage
+  µm, and optionally a `score` and `measures`, `snake_case` names with their unit), best
+  first. The order of the list is the order in which the cells two touching fields
+  share are given: to the first.
+- **What the layer checks, always.** A selector and an orderer are code that nobody
+  here wrote, so what they give is **refused**, never trimmed: a choice in a well the
+  scan does not have, in a well the cells stage did not scan, with a position, a score
+  or a measure that is not a finite number, with a measure key that is not
+  `snake_case`, whose field leaves the well shrunk by `wall_margin_um` or touches the
+  disc of `exclude_centre_um`, a well with more choices than `fields_per_well`, two
+  fields of one well that overlap (touching is allowed), an item that is not a choice,
+  an order that is not a permutation of the choices. The stage ends `failed` and the
+  reason starts `selector <name>:` or `orderer <name>:` and names the choice by its
+  index, well and position.
+- **An exception in one of them** ends the stage `failed` the same way, with the
+  exception's type, its message and where it was raised (the file's base name and the
+  line, never a path): `selector my-selector: KeyError: 'x' (at my_selector.py:42)`.
+- **What a stop's `counts` mean.** For any selector, each wanted cell is counted once,
+  in the first of the selector's choices that holds it, with `choose_fields`' own
+  arithmetic, so `counts` and `uncovered` add up to the wanted cells whoever chose.
+- **`assumed` says whose it is.** With a selector other than `most-cells`, one line
+  after the others says the fields were chosen by it and that its choice, its score and
+  its measures are its own; with an orderer other than `nearest`, the line about the
+  Euclidean distance is replaced by one that says the order is the orderer's and that
+  `distance_um` is the length of that order's path.
+- **`score` and `measures`** of a choice are written on its stop when the selector gave
+  them, and left out of the JSON when it did not (the default route's is written as it
+  always was). `nis-export` ignores them.
+
+How to write one, with a run folder on a laptop and no stand, is the collaborator's
+guide; the contract is [`algorithms.md`](../design/algorithms.md) §5.
 
 ## What it does, well by well
+
+This is what the defaults, `most-cells` and `nearest`, do.
 
 1. **Candidates.** A square lattice of `candidate_step_fraction` times the field's
    shorter side, centred on the well, over its bounding box. A candidate is kept when
@@ -119,7 +201,7 @@ The slot `route` holds a `RouteResult` (`smc.plugins.slots`):
 
 | Field | Meaning |
 |---|---|
-| `positions` | The stops in route order: `order` (in the whole route), `well`, `name` (`<well>_r<k>`, `k` from 0 along the well's route, three digits), `x_um`, `y_um`, `z_um` and `pfs_offset` (both from the nearest frame that was not `unlocked`, step 4; `null` when there is none; the offset of the cells' plane, derived, when the scan focused on the cells), `counts` (**every** label asked for, zeros included), and `offset_from_focus` (`lock_offset`, `dz_um` and `offset_per_um`, only on a stop whose `pfs_offset` was derived; the key is absent otherwise, so a route from a scan without the focus step is written as it always was). |
+| `positions` | The stops in route order: `order` (in the whole route), `well`, `name` (`<well>_r<k>`, `k` from 0 along the well's route, three digits), `x_um`, `y_um`, `z_um` and `pfs_offset` (both from the nearest frame that was not `unlocked`, step 4; `null` when there is none; the offset of the cells' plane, derived, when the scan focused on the cells), `counts` (**every** label asked for, zeros included), and `offset_from_focus` (`lock_offset`, `dz_um` and `offset_per_um`, only on a stop whose `pfs_offset` was derived; the key is absent otherwise, so a route from a scan without the focus step is written as it always was), and `score` and `measures` (the selector's own, only on a stop whose selector gave them; absent otherwise, so the default route is written as it always was). |
 | `uncovered` | Well to the number of wanted cells that no stop holds. **Every well the cells stage scanned** is a key, zeros included, in the plan's order; a well it did not scan is absent. |
 | `distance_um` | The length of the whole route, between wells included. |
 | `travel_s` | The sum of `timings.move_ms` over the same legs; `null` when no `timing` stage ran. Unknown is not zero. |
@@ -154,8 +236,11 @@ For another objective the result says, in `assumed`:
 
 ## What it assumes
 
-`assumed` always starts with `the route minimises the Euclidean distance between
-fields; whether the stage's move time follows it is not measured`. The timing model
+`assumed` starts with `the route minimises the Euclidean distance between
+fields; whether the stage's move time follows it is not measured` (with another orderer
+than `nearest` it starts with the orderer's line instead, see *Choosing and ordering by
+name*, and with another selector than `most-cells` one line about it follows the
+objective's). The timing model
 is an overhead per move plus a rate per µm, so the shortest path is the fastest
 under it, **if** the stage's time grows with the Euclidean distance. A stage whose X
 and Y move at once (a time nearer the larger of the two) would prefer another
@@ -242,7 +327,13 @@ do, and never gives a route that is empty or that rests on a number that is not 
   value most likely to be wrong: a profile entry 1000 times too small would be a
   million candidates per well, and the reason names the **size of the field** it was
   derived from (`the field is 0.4 by 0.3 µm: check the scan's pixel size, or raise
-  candidate_step_fraction`).
+  candidate_step_fraction`). With `most-cells` the reason starts `selector most-cells:`,
+  like any other refusal that comes from a selector.
+- **A selector or an orderer that is not registered, raises, or gives what the layer
+  refuses** (*Choosing and ordering by name*): `selector <name>: ...` or `orderer
+  <name>: ...`. A selector other than `most-cells` that chooses no field at all gives
+  `selector <name> chose no field in any well (<n> <labels> cells found); check its
+  parameters, or choose another selector`.
 
 ## Limits
 
@@ -255,7 +346,8 @@ do, and never gives a route that is empty or that rests on a number that is not 
   lattice would hold more than 250 000 candidates. The bounds refuse what would be
   worse; they do not make it fast. Raise the fraction rather than waiting. The
   microscope PC's CPU is not measured.
-- **Stop.** A stop is looked at between two wells, not inside one. A well that the
+- **Stop.** A stop is looked at before the selector and between two wells after it,
+  not inside the selector, which is one step for every well. A well that the
   bound still lets through (760 000 cells with a window of 2 809 lattice points each,
   which is a 1331 µm field at a step of 0.02 of it) took 17 s and about 1 GB on the
   same laptop, so a stop can wait that long for the well under way; Ctrl-C ends it at

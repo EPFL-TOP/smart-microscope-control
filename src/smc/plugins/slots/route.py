@@ -54,6 +54,11 @@ class RoutePosition(SlotValue):
     and ``pfs_offset`` ``None`` also when that frame did not use the autofocus.
     ``counts`` are the wanted labels' cells in the field.
 
+    ``score`` and ``measures`` are the selector's own (algorithms §5.2): its
+    ranking of this field (larger is better, on its own scale) and the numbers it
+    decided on, keys in ``snake_case`` with their unit. ``route``'s default
+    selector gives neither, and a stop with neither is written without the keys.
+
     ``pfs_offset`` is the scan's **reading** except for a stop that has
     ``offset_from_focus``: that stop's frame was taken at the cells' plane with
     the autofocus off, and its ``pfs_offset`` is the offset of that plane,
@@ -71,6 +76,8 @@ class RoutePosition(SlotValue):
     pfs_offset: float | None
     counts: dict[str, int]
     offset_from_focus: OffsetFromFocus | None = None
+    score: float | None = None
+    measures: dict[str, float] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _a_derived_offset_is_an_offset(self) -> RoutePosition:
@@ -94,6 +101,13 @@ class RoutePosition(SlotValue):
         data: dict[str, Any] = handler(self)
         if self.offset_from_focus is None:
             data.pop("offset_from_focus", None)
+        # The same for the selector's own score and measures (algorithms §5.6): the
+        # default selector gives neither, so its route is byte for byte what it was.
+        # `is None` and not falsy: a score of 0.0 is a score.
+        if self.score is None:
+            data.pop("score", None)
+        if not self.measures:
+            data.pop("measures", None)
         return data
 
 

@@ -15,12 +15,25 @@ import subprocess
 import sys
 from pathlib import Path
 
-#: What the subprocess imports; #567 and #568 add theirs (``smc.selection``,
-#: ``smc.data.draw``), #564 its own.
-KIT_MODULES = ["smc.data", "smc.data.cli", "smc.cli"]
+#: What the subprocess imports; #568 adds its own (``smc.data.draw``). The
+#: selection package is there by every module, and ``route``'s plugin, which
+#: imports it, is there too: a selector is loaded inside the plugin, and the
+#: plugin must not pull the Micro-Manager bindings in by it.
+KIT_MODULES = [
+    "smc.data",
+    "smc.data.cli",
+    "smc.cli",
+    "smc.selection",
+    "smc.selection.api",
+    "smc.selection.registry",
+    "smc.selection.checks",
+    "smc.selection.builtin",
+    "smc.selection.testing",
+    "smc.plugins.route.plugin",
+]
 
-#: The packages of ``src/smc/`` the walk covers; #567 adds ``selection``.
-KIT_PACKAGES = ["data"]
+#: The packages of ``src/smc/`` the walk covers.
+KIT_PACKAGES = ["data", "selection"]
 
 #: What no module of the kit imports, itself or a submodule of it.
 FORBIDDEN = ["smc.hardware", "smc.testing", "smc.ui", "pymmcore_plus", "pymmcore"]
@@ -93,6 +106,15 @@ def test_kit_never_imports_pymmcore_plus(tmp_path: Path) -> None:
     # A collaborator's laptop has no Micro-Manager: importing the kit must not
     # reach for it, through smc.cli either (the sub-app is added to it).
     assert {"smc.data", "smc.data.cli", "smc.cli"} <= set(KIT_MODULES)
+    assert {
+        "smc.selection",
+        "smc.selection.api",
+        "smc.selection.registry",
+        "smc.selection.checks",
+        "smc.selection.builtin",
+        "smc.selection.testing",
+        "smc.plugins.route.plugin",
+    } <= set(KIT_MODULES)
     assert _loaded_hardware_modules(KIT_MODULES, tmp_path) == []
 
 

@@ -422,6 +422,39 @@ def test_a_reader_records_which_attempt_of_its_upstream_it_read(
     assert _stored(tmp_path, "reader").reads == record.reads
 
 
+class ReadsTheDocument(Base):
+    """Reads ``ctx.document``, lets another stage reach the file, then reads it again."""
+
+    name = provides = "reads-the-document"
+    reads = ("up",)
+
+    def body(self, microscope: Any, params: Params, ctx: RunContext) -> Result:
+        self.seen["first"] = ctx.document
+        write_stage(ctx.run_doc, _done_record("late", minute=30))
+        self.seen["on_disk"] = RunDocument.load(ctx.run_doc)
+        self.seen["second"] = ctx.document
+        return Result(value=1)
+
+
+def test_the_contexts_document_is_the_snapshot_the_runner_took_and_is_never_read_again(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    # `route` hands `ctx.document` to `Scan.from_results`: it is what `upstream`
+    # reads, so a selector sees the records the runner checked and no others.
+    up = _run(Up(), fake_microscope, tmp_path, n=4)
+    plugin = ReadsTheDocument()
+    _run(plugin, fake_microscope, tmp_path)
+
+    first, second = plugin.seen["first"], plugin.seen["second"]
+    assert isinstance(first, RunDocument)
+    assert second is first
+    assert first.stages["up"].attempt == up.attempt
+    assert first.stages["up"].result == {"assumed": [], "value": 4}
+    # The file did change in between, and the context did not follow it.
+    assert "late" in plugin.seen["on_disk"].stages
+    assert "late" not in first.stages
+
+
 def test_params_of_the_wrong_type_are_a_type_error_and_write_nothing(
     fake_microscope: Microscope, tmp_path: Path
 ) -> None:

@@ -237,6 +237,20 @@ class RunContext:
         self._on_progress = on_progress
         self._on_frame = on_frame
 
+    @property
+    def document(self) -> RunDocument:
+        """The run document as the runner read it before ``run``: the records ``upstream`` reads, and no others.
+
+        It is the snapshot itself (a frozen model, not a copy) and is never read
+        from the file again, so a record another process writes meanwhile does
+        not change what a plugin sees. ``route`` hands it to ``Scan.from_results``
+        so that a selection algorithm sees the same ``scan.document`` online and
+        on a dataset. It adds no read the runner has not checked: a plugin that
+        takes another slot's record from it makes a read that staleness does not
+        see, so ``upstream`` stays the way to read a slot.
+        """
+        return self._snapshot
+
     def progress(self, done: int, total: int | None = None, message: str = "") -> None:
         """Report progress to the runner's callback; never validated, never fatal.
 
