@@ -13,16 +13,32 @@ Nothing here imports the hardware layer; ``tests/test_kit_imports.py`` keeps it 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
-from collections.abc import Sequence
+import shutil
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict
 
-from smc.run.files import retry_on_permission_error
+from smc import __version__
+from smc.data.scan import DatasetError, Scan, load_scan
+from smc.data.scrub import scrub_document
+from smc.run.files import (
+    resolve_in_run,
+    retry_on_permission_error,
+    temporary_path,
+    write_atomically,
+)
 
-__all__ = ["DatasetFile", "DatasetManifest", "DatasetWriteError", "readme_text"]
+__all__ = [
+    "DatasetFile",
+    "DatasetManifest",
+    "DatasetWriteError",
+    "export_dataset",
+    "readme_text",
+]
 
 #: Read and written a megabyte at a time: a frame is 4 MB or so, and a scan is
 #: hundreds of them. A module attribute read at the call, so that a test can
@@ -38,6 +54,20 @@ ON_WINDOWS: bool = os.name == "nt"
 
 #: The schema of ``manifest.json`` this smc writes and reads.
 MANIFEST_SCHEMA = 1
+
+#: The three files the export writes itself, after the copies, in this order:
+#: the manifest last, so that a folder without one is an export that did not
+#: finish (FM-106).
+_RUN_DOCUMENT = "run.json"
+_README = "README.md"
+_MANIFEST = "manifest.json"
+
+#: What the free space must exceed the files by: the three generated files and
+#: the file system's own overhead.
+_HEADROOM_BYTES = 1_000_000
+
+#: How many missing frames a refusal names; the rest are counted.
+_MISSING_NAMED = 5
 
 
 class DatasetFile(BaseModel):
@@ -261,3 +291,266 @@ def readme_text(
         "",
     ]
     return "\n".join(lines)
+
+
+def _json_bytes(model: BaseModel) -> bytes:
+    """A model as the run document is written: ASCII, indent 2, a final newline.
+
+    The arguments of ``write_stage``: ASCII so that no console or code page can
+    mangle the file (a lone surrogate and a micro sign are escaped), and
+    ``allow_nan=False`` as a seatbelt, since ``mode="json"`` already turns a
+    non-finite number into ``null``.
+    """
+    text = json.dumps(
+        model.model_dump(mode="json"), indent=2, ensure_ascii=True, allow_nan=False
+    )
+    return (text + "\n").encode("ascii")
+
+
+def _check_out(out: Path) -> Path:
+    """``out`` resolved, or a refusal: the export never overwrites and never deletes.
+
+    A folder that does not exist is made, and an empty one is used; anything
+    else (a file, a folder with something in it) is the operator's, and is
+    named back to them with what to do.
+    """
+    try:
+        root = out.resolve()
+        if out.is_dir():
+            entries = sum(1 for _ in out.iterdir())
+            if entries:
+                raise DatasetError(
+                    f"{out}: exists and is not empty ({entries} entries); export "
+                    f"never overwrites or deletes: name a folder that does not "
+                    f"exist yet, or is empty"
+                )
+        elif out.exists():
+            raise DatasetError(
+                f"{out}: exists and is a file; name a folder that does not exist "
+                f"yet, or is empty"
+            )
+    except OSError as exc:
+        # `resolve` and `stat` on a share that does not answer (FM-116).
+        raise DatasetError(
+            f"{out}: cannot be examined ({exc.strerror or exc}); name a folder "
+            f"on a disk that answers"
+        ) from exc
+    return root
+
+
+def _frame_sources(run_doc: Path, scan: Scan) -> list[tuple[str, Path, int]]:
+    """Each frame's relative path, its source file and its size; a refusal naming the ones that are missing.
+
+    A frame whose path cannot be resolved inside the run folder (a ``..``, an
+    absolute path from another PC) counts as missing, and is never read.
+    """
+    found: list[tuple[str, Path, int]] = []
+    missing: list[str] = []
+    for frame in scan.result.frames:
+        try:
+            source = resolve_in_run(scan.run_dir, frame.file)
+            size = source.stat().st_size if source.is_file() else None
+        except (ValueError, OSError):
+            size = None
+        if size is None:
+            missing.append(frame.file)
+            continue
+        found.append((frame.file, source, size))
+    if missing:
+        named = ", ".join(missing[:_MISSING_NAMED])
+        more = (
+            f" (and {len(missing) - _MISSING_NAMED} more)"
+            if len(missing) > _MISSING_NAMED
+            else ""
+        )
+        raise DatasetError(
+            f"{run_doc}: {len(missing)} of {len(scan.result.frames)} frame files "
+            f"are missing from the run folder: {named}{more}; the scan's folder "
+            f"was moved or partly deleted"
+        )
+    return found
+
+
+def _check_names(run_doc: Path, relatives: Sequence[str]) -> None:
+    """Refuse a run document that gives two files of the dataset one path.
+
+    The copy opens its destination exclusively and would stop part-way at the
+    second; and a frame named ``run.json`` would be replaced by the generated
+    one. Compared as a case-insensitive file system sees them (Windows, macOS):
+    ``A1.tif`` and ``a1.TIF`` are one file there.
+    """
+    seen: dict[str, str] = {}
+    for relative in [*relatives, _RUN_DOCUMENT, _README, _MANIFEST]:
+        key = relative.casefold()
+        if key in seen:
+            raise DatasetError(
+                f"{run_doc}: two files of the dataset would have the same path "
+                f"({seen[key]} and {relative}); this is not a run document smc wrote"
+            )
+        seen[key] = relative
+
+
+def _check_free_space(out: Path, need: int) -> None:
+    """Refuse when the disk that will hold ``out`` has less free than ``need`` bytes.
+
+    The disk is the one of the nearest folder that exists. A share that does
+    not say how much is free is not a reason to refuse: unknown beats guessed,
+    and a write that fills the disk is reported by the copy itself.
+    """
+    try:
+        probe = out
+        while not probe.exists() and probe.parent != probe:
+            probe = probe.parent
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        return
+    if free < need:
+        raise DatasetError(
+            f"{out}: the disk has {free / 1e6:,.1f} MB free and the dataset needs "
+            f"{need / 1e6:,.1f} MB: free some space, or name a folder on another disk"
+        )
+
+
+def _check_path_lengths(out: Path, root: Path, relatives: Sequence[str]) -> None:
+    """On Windows, refuse a destination whose path is ``MAX_PATH`` characters or more.
+
+    Long paths are a setting of the lab PC, not something to assume. The
+    generated files are written through a temporary file that is the longest
+    path a write makes, so it is the one measured for them.
+    """
+    if not ON_WINDOWS:
+        return
+    longest = max(
+        [len(str(root / relative)) for relative in relatives]
+        + [
+            len(str(temporary_path(root / name)))
+            for name in (_RUN_DOCUMENT, _README, _MANIFEST)
+        ]
+    )
+    if longest >= MAX_PATH:
+        raise DatasetError(
+            f"{out}: a file of the dataset would have a path of {longest} "
+            f"characters, and Windows takes {MAX_PATH - 1} at most unless long "
+            f"paths are enabled (not assumed): name a shorter folder"
+        )
+
+
+def export_dataset(
+    run_doc: Path | str,
+    out: Path | str,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> DatasetManifest:
+    """Write the scan of ``run_doc`` as a dataset in the new or empty folder ``out``.
+
+    Everything that can be refused is refused before the first byte is written:
+    ``out`` (a file, or a folder with something in it), the scan (``load_scan``
+    refuses what is not a finished, real scan), missing frame files, a path
+    that Windows would refuse, a disk with too little room. The scrubbed run
+    document, the README and the manifest's fixed fields are built, and
+    validated, before the first write too. Then the frames are copied in the
+    scan's order, the cells file when the scan has cells, and ``run.json``,
+    ``README.md`` and ``manifest.json`` last: a folder with no manifest is an
+    export that did not finish (FM-106).
+
+    Each copy hashes the **source's** bytes as it reads them, so the manifest
+    is the truth of the source and a bad write is found by ``check`` (see
+    ``_copy_and_hash``). Only the frames and the cells file are copied: the
+    other stages' records stay in ``run.json`` (staleness reads them) and
+    their files do not travel.
+
+    Args:
+        run_doc: The source run document's file.
+        out: A folder that does not exist yet (its parents are made) or is empty.
+        progress: Called as ``progress(done, total)`` after each file copied
+            (the frames and the cells file; the three generated ones are not
+            counted).
+
+    Returns:
+        The manifest, as written to ``out``.
+
+    Raises:
+        DatasetError: Refused; nothing was written (the missing parents of
+            ``out`` are not made either).
+        DatasetWriteError: An I/O error part-way; ``out`` holds part of the
+            dataset and no ``manifest.json``, and nothing was deleted.
+    """
+    run_doc = Path(run_doc)
+    out = Path(out)
+    root = _check_out(out)
+    scan = load_scan(run_doc)
+    frames = _frame_sources(run_doc, scan)
+    copies = [(relative, source) for relative, source, _ in frames]
+    need = sum(size for _, _, size in frames) + _HEADROOM_BYTES
+    cells_result = scan.cells_result
+    if scan.cells is not None and cells_result is not None:
+        try:
+            cells_source = resolve_in_run(scan.run_dir, cells_result.file)
+            need += cells_source.stat().st_size
+        except (ValueError, OSError) as exc:
+            raise DatasetError(
+                f"{run_doc}: cells file {cells_result.file} cannot be read "
+                f"({getattr(exc, 'strerror', None) or exc})"
+            ) from exc
+        copies.append((cells_result.file, cells_source))
+    relatives = [relative for relative, _ in copies]
+    _check_names(run_doc, relatives)
+    _check_free_space(out, need)
+    _check_path_lengths(out, root, relatives)
+
+    scrubbed, pointers = scrub_document(scan.document)
+    scan_record = scan.document.provider("scan")
+    manifest = DatasetManifest(
+        smc_version=__version__,
+        exported_utc=datetime.now(timezone.utc),
+        source=run_doc.name,
+        profile=scan.profile,
+        objective=scan.result.objective,
+        pixel_size_um=scan.pixel_size_um,
+        image_shape_px=scan.image_shape_px,
+        wells=scan.wells,
+        frames=len(scan.result.frames),
+        cells=scan.cells is not None,
+        cells_absent=scan.cells_absent,
+        files={},
+        scrubbed=pointers,
+    )
+    readme = readme_text(
+        manifest,
+        scanned_utc=None if scan_record is None else scan_record.started_utc,
+        cells_file=None if cells_result is None else cells_result.file,
+        classes=() if cells_result is None else cells_result.classes,
+    )
+    generated = [
+        (_RUN_DOCUMENT, _json_bytes(scrubbed)),
+        # A lone surrogate in an objective's name (FM-05) must not end the export.
+        (_README, readme.encode("utf-8", errors="replace")),
+    ]
+
+    total = len(copies) + len(generated) + 1
+    files: dict[str, DatasetFile] = {}
+    where = "the folder itself"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        for relative, source in copies:
+            where = relative
+            size, digest = _copy_and_hash(source, root / relative)
+            files[relative] = DatasetFile(bytes=size, sha256=digest)
+            if progress is not None:
+                progress(len(files), len(copies))
+        for relative, data in generated:
+            where = relative
+            write_atomically(root / relative, data)
+            files[relative] = DatasetFile(
+                bytes=len(data), sha256=hashlib.sha256(data).hexdigest()
+            )
+        final = manifest.model_copy(update={"files": files})
+        where = _MANIFEST
+        write_atomically(root / _MANIFEST, _json_bytes(final))
+    except OSError as exc:
+        raise DatasetWriteError(
+            f"{out}: stopped after {len(files)} of {total} files at {where}: "
+            f"{exc.strerror or exc}; {out} holds part of the dataset and has no "
+            f"manifest.json: remove it, then export again"
+        ) from exc
+    return final
