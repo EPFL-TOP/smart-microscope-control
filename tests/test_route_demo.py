@@ -1911,7 +1911,8 @@ def test_a_lattice_too_fine_for_the_well_names_the_field_size(
     refused = _refused(demo_microscope, tmp_path)
 
     assert refused.reason == (
-        "the candidate lattice of A1 would hold more than 250000 fields at a step "
+        "selector most-cells: the candidate lattice of A1 would hold more than "
+        "250000 fields at a step "
         "of 0.075 µm; the field is 0.4 by 0.3 µm: check the scan's pixel size, or "
         "raise candidate_step_fraction"
     )
@@ -1928,7 +1929,8 @@ def test_too_many_tests_are_refused_with_a_way_out(
     refused = _refused(demo_microscope, tmp_path)
 
     assert refused.reason == (
-        f"{_singles('A1')} cells × {per_cell:.0f} lattice points per cell would be "  # noqa: RUF001
+        f"selector most-cells: {_singles('A1')} cells × {per_cell:.0f} lattice "  # noqa: RUF001
+        f"points per cell would be "
         f"tested, over 10; raise candidate_step_fraction, or choose fewer labels"
     )
 

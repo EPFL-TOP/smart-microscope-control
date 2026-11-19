@@ -1,13 +1,19 @@
-"""``route`` chooses the fields that hold the most cells of the wanted classes, then the shortest path through them (m3 §11).
+"""``route`` chooses the fields to image and the order to visit them in: by default the fields that hold the most cells of the wanted classes, then the shortest path through them (m3 §11).
 
-The pure part (the candidate lattice, the greedy that counts each cell once, the
+The choosing and the ordering are a **selector** and an **orderer**, registered
+by name in ``smc.selection`` (algorithms design §5): ``most-cells`` and ``nearest``
+are m3 §11's own rule, so a route with the defaults is the route this plugin always
+made, and another algorithm is a parameter and no change here. What stays in the
+plugin is what the positions that NIS-Elements will visit rest on, and the layer
+that checks an algorithm's answer before any position is written. The pure part of
+the default rule (the candidate lattice, the greedy that counts each cell once, the
 nearest-neighbour-then-2-opt ordering) is ``algorithm.py``, and the stop's Z and
 autofocus offset are ``focus.py``'s. This reads the three records upstream and
 moves nothing, so a dry run is no different from any other, and it reads the
 stand only to ask the turret which objectives it has and what the profile says
 their pixel sizes are, and, for the scan's own objective, the profile's autofocus
 offset factors and offset limits (a profile read, not a device's). What it
-decides, because the positions that NIS-Elements will visit rest on it:
+decides:
 
 * **The scan's camera is the camera.** The matrix and the frame's shape are the
   scan's, so a cell is in a field exactly as the scan saw it (FM-124); the plan's
@@ -20,7 +26,18 @@ decides, because the positions that NIS-Elements will visit rest on it:
   its entries: the same ratio, since the core's factor divides both (algorithms
   §4.4). Nothing here knows the offset between two objectives, and the Z and the
   autofocus offset of the scan are for the scan's objective, so they are dropped
-  for another one (FM-118) and the result says so in ``assumed``.
+  for another one (FM-118) and the result says so in ``assumed``. A selector is
+  given that objective's field, not the scan's.
+* **An algorithm's answer is checked, never trusted.** A selector and an orderer
+  are code nobody here wrote: what they return is refused with a sentence that
+  names them and the choice when it is not a list of fields that keep to the wells
+  and do not overlap, or not a permutation (``smc.selection.checks``), and an
+  exception in them ends the stage ``failed`` naming them, its type and where it
+  was raised (a file's base name and a line, never a path, FM-50).
+* **The cells of a field are counted once, as ``choose_fields`` counts them.** Each
+  wanted cell goes to the first of the selector's choices that holds it
+  (``held_counts``), whoever chose them, so ``counts`` and ``uncovered`` add up to
+  the wanted cells for any selector.
 * **A stop's Z is a frame's the autofocus had not lost.** ``z_um`` and
   ``pfs_offset`` come together from the nearest frame of the well that is not
   ``unlocked``: on an unlocked frame the Z is wherever the search had got to and
@@ -43,6 +60,9 @@ decides, because the positions that NIS-Elements will visit rest on it:
   refuses, and this names the size of the field it was derived from.
 * **No route is a refusal.** A route with no stop would be a ``done`` result that
   every reader must remember to check; the stage ends ``failed`` with the reason.
+* **A stop ends it between two wells.** The selector is one step for every well and
+  nothing in its contract lets it see the stop, so it is looked at before the
+  selector and at each well after it.
 * **Nothing is written and nothing is kept.** A stop ends it and a re-run starts
   over: the work is arithmetic on records already on disk.
 """
@@ -51,24 +71,29 @@ from __future__ import annotations
 
 import itertools
 import math
-from collections.abc import Callable
+import operator
+import os
+import sys
+import traceback
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
-from pydantic import Field, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    JsonValue,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
+from smc.data import DatasetError, Scan
 from smc.hardware.capabilities import ObjectiveTurret
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.errors import PluginRunError
 from smc.plugins.geometry import Matrix2, fov_of, pixel_of_stage
-from smc.plugins.route.algorithm import (
-    ChosenField,
-    LatticeTooLarge,
-    TooMuchWork,
-    choose_fields,
-    order_route,
-    path_length_um,
-)
+from smc.plugins.route.algorithm import held_counts, path_length_um
 from smc.plugins.route.focus import StopFocus, focus_assumed, stop_focus
 from smc.plugins.slots import (
     Cell,
@@ -82,17 +107,46 @@ from smc.plugins.slots import (
     load_cells,
     well_geometry,
 )
+from smc.selection import (
+    Choice,
+    Orderer,
+    OrdererParams,
+    SelectionError,
+    SelectionInput,
+    Selector,
+    SelectorParams,
+    check_choices,
+    check_order,
+    orderer_names,
+    selector_names,
+)
+from smc.selection import orderer as load_orderer
+from smc.selection import selector as load_selector
+from smc.selection.builtin import MostCellsParams
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
 
-__all__ = ["RouteParams", "RoutePlugin"]
+__all__ = [
+    "RouteParams",
+    "RoutePlugin",
+    "orderer_params_of",
+    "selector_params_of",
+]
 
 _NAME = "route"
+#: The names of the built-ins that ``route``'s own parameters and lines of ``assumed`` speak of.
+_MOST_CELLS = "most-cells"
+_NEAREST = "nearest"
+#: A message of an algorithm's exception is cut here: a third party's error may carry a whole table.
+_MAX_MESSAGE = 400
+
+T = TypeVar("T")
+M = TypeVar("M", bound=BaseModel)
 
 
 class RouteParams(PluginParams):
-    """Which cells count, how many fields per well, and what keeps a field away from the wall and the centre."""
+    """Which cells count, how many fields per well, what keeps a field away from the wall and the centre, and which algorithms choose and order the fields."""
 
     labels: tuple[str, ...] = Field(
         ("single",),
@@ -108,7 +162,11 @@ class RouteParams(PluginParams):
     min_cells: int = Field(
         1,
         ge=1,
-        description="A field must hold at least this many cells that no earlier field holds.",
+        description=(
+            "A field must hold at least this many cells that no earlier field "
+            "holds. A parameter of most-cells, kept here for the presets and the "
+            "page; another selector has its own, in selector_params."
+        ),
     )
     exclude_centre_um: float = Field(
         0.0,
@@ -133,7 +191,36 @@ class RouteParams(PluginParams):
         le=1.0,
         description=(
             "The spacing of the candidate fields, as a fraction of the field's "
-            "shorter side; smaller is finer and slower."
+            "shorter side; smaller is finer and slower. A parameter of most-cells, "
+            "kept here for the presets and the page."
+        ),
+    )
+    selector: str = Field(
+        _MOST_CELLS,
+        description=(
+            "The algorithm that chooses the fields, by its registered name; an "
+            "unknown name lists the known ones."
+        ),
+    )
+    selector_params: dict[str, JsonValue] = Field(
+        default_factory=dict,
+        description=(
+            "The selector's own parameters, as JSON "
+            '(selector_params={"min_density_per_mm2": 20}), validated against its '
+            "model; most-cells takes none here."
+        ),
+    )
+    orderer: str = Field(
+        _NEAREST,
+        description=(
+            "The algorithm that orders the fields, by its registered name; an "
+            "unknown name lists the known ones."
+        ),
+    )
+    orderer_params: dict[str, JsonValue] = Field(
+        default_factory=dict,
+        description=(
+            "The orderer's own parameters, as JSON, validated against its model."
         ),
     )
 
@@ -145,6 +232,141 @@ class RouteParams(PluginParams):
             if value.count(label) > 1:
                 raise ValueError(f"labels repeat {label!r}")
         return value
+
+    @field_validator("selector")
+    @classmethod
+    def _the_selector_is_registered(cls, value: str) -> str:
+        """The name is one of the registered ones, read without importing any of them, so that a bad name is listed with a bad bound."""
+        return _registered(value, "selector", selector_names(), load_selector)
+
+    @field_validator("orderer")
+    @classmethod
+    def _the_orderer_is_registered(cls, value: str) -> str:
+        """The same for the orderer's name."""
+        return _registered(value, "orderer", orderer_names(), load_orderer)
+
+    @model_validator(mode="after")
+    def _the_algorithms_parameters_are_theirs(self) -> RouteParams:
+        """Load the two algorithms and validate ``selector_params`` and ``orderer_params`` against their own models.
+
+        An ``after`` validator, so that ``--param`` reports it as a
+        ``ParamsError``; it does not run when a field already failed, which is
+        why the names are checked by field validators and only the parameters
+        are checked here. Whatever a selector's ``Params`` raises is a problem
+        that starts ``selector_params:`` (FM-128).
+        """
+        problem = ""
+        try:
+            selector = load_selector(self.selector)
+            orderer = load_orderer(self.orderer)
+        except SelectionError as exc:
+            problem = str(exc)
+        else:
+            try:
+                selector_params_of(self, selector)
+                orderer_params_of(self, orderer)
+            except ValueError as exc:
+                problem = str(exc)
+        if problem:
+            # Raised outside the handlers: nothing here keeps the algorithm's error (FM-98).
+            raise ValueError(problem)
+        return self
+
+
+def _registered(
+    name: str,
+    kind: str,
+    names: tuple[str, ...],
+    load: Callable[[str], object],
+) -> str:
+    """``name`` when it is registered; otherwise a refusal that lists the known names, or says to reinstall when there are none."""
+    if name in names:
+        return name
+    problem = ""
+    if names:
+        problem = f"{kind} {name!r} is not registered; known: {', '.join(names)}"
+    else:
+        try:
+            load(name)
+        except SelectionError as exc:
+            problem = str(exc)
+    raise ValueError(problem or f"{kind} {name!r} is not registered")
+
+
+def selector_params_of(params: RouteParams, selector: Selector[Any]) -> SelectorParams:
+    """The parameters ``selector`` is called with: its own model validated, with the two ``most-cells`` bounds ``route`` keeps.
+
+    ``min_cells`` and ``candidate_step_fraction`` are ``most-cells``' parameters,
+    kept on ``RouteParams`` for the presets and the page: with ``most-cells`` they
+    are its parameters, and giving either in ``selector_params`` too is refused;
+    with another selector a value other than their default is refused, naming
+    ``most-cells``, since it would be silently ignored. The defaults are always
+    accepted, so a page that sends all the fields reads right.
+
+    Raises:
+        ValueError: A problem that starts ``selector_params:`` (or names the
+            bound); the first, and the same text whatever the selector.
+    """
+    if selector.name == _MOST_CELLS:
+        taken = [
+            key
+            for key in ("min_cells", "candidate_step_fraction")
+            if key in params.selector_params
+        ]
+        if taken:
+            raise ValueError(
+                "selector_params: give min_cells and candidate_step_fraction as "
+                "route parameters: they are most-cells' parameters"
+            )
+        _validated(selector.Params, params.selector_params, "selector_params")
+        return MostCellsParams(
+            min_cells=params.min_cells,
+            candidate_step_fraction=params.candidate_step_fraction,
+        )
+    for key in ("min_cells", "candidate_step_fraction"):
+        if getattr(params, key) != RouteParams.model_fields[key].default:
+            raise ValueError(
+                f"{key} is a parameter of most-cells; selector "
+                f"{selector.name!r} has its own: give them in selector_params"
+            )
+    own: type[SelectorParams] = selector.Params
+    return _validated(own, params.selector_params, "selector_params")
+
+
+def orderer_params_of(params: RouteParams, orderer: Orderer[Any]) -> OrdererParams:
+    """The parameters ``orderer`` is called with: its own model, validated.
+
+    Raises:
+        ValueError: A problem that starts ``orderer_params:``.
+    """
+    own: type[OrdererParams] = orderer.Params
+    return _validated(own, params.orderer_params, "orderer_params")
+
+
+def _validated(model: type[M], raw: dict[str, JsonValue], field: str) -> M:
+    """``model`` built from ``raw``, or a ``ValueError`` that starts ``field:`` and names the first problem.
+
+    Whatever an algorithm's ``Params`` raises is the same refusal (FM-128): a
+    ``mode="before"`` validator that raises ``TypeError`` is not wrapped by
+    pydantic, and would otherwise end ``RouteParams()`` with a traceback. The
+    problem is built as text and raised outside the handlers (FM-98).
+    """
+    problem = ""
+    try:
+        return model.model_validate(raw)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        where = ".".join(str(part) for part in first["loc"])
+        problem = f"{field}: {where + ': ' if where else ''}{first['msg']}"
+    except Exception as exc:
+        problem = f"{field}: {type(exc).__name__}: {_one_line(exc)}"
+    raise ValueError(problem)
+
+
+def _one_line(error: BaseException) -> str:
+    """An error's message on one line, cut short: a third party's may be a table."""
+    text = " ".join(str(error).split())
+    return text if len(text) <= _MAX_MESSAGE else text[: _MAX_MESSAGE - 1] + "…"
 
 
 @dataclass(frozen=True)
@@ -162,12 +384,13 @@ class _Imaging:
 
 
 class RoutePlugin:
-    """Chooses fields that hold the most wanted cells in each well, and the shortest path through them."""
+    """Chooses fields with a selector (by default, the ones that hold the most wanted cells in each well) and orders them with an orderer (by default, the shortest path)."""
 
     name = _NAME
     summary = (
         "Choose the fields that hold the most cells of the wanted classes in each "
-        "well, then the shortest route through them."
+        "well, then the shortest route through them; the algorithms are "
+        "parameters (selector, orderer)."
     )
     Params = RouteParams
     Result = RouteResult
@@ -184,15 +407,18 @@ class RoutePlugin:
         params: RouteParams,
         ctx: RunContext,
     ) -> RouteResult:
-        """Choose the fields well by well, then order them; raise when there is no route to give.
+        """Choose the fields, then order them, then give each stop its Z and counts; raise when there is no route to give.
 
         Raises:
             PluginRunError: A label is not one of the cells' classes; the
                 objective asked for cannot be scaled; the camera matrix cannot
                 be inverted; the cells file no longer matches; the cells hold a
-                well the plan has no field for; the candidate lattice or the
-                counting is too large; or no field holds a wanted cell.
-            StopRequested: The operator stopped it, between two wells.
+                well the plan has no field for; the selector or the orderer
+                is not registered, raises, or gives an answer the layer
+                refuses (the text names it and the choice); or no field holds a
+                wanted cell.
+            StopRequested: The operator stopped it, before the selector or
+                between two wells after it.
         """
         plan = ctx.upstream("scan-plan", ScanPlanResult)
         scan = ctx.upstream("scan", ScanResult)
@@ -212,7 +438,6 @@ class RoutePlugin:
         shape = scan.image_shape_px
         _require_invertible(imaging.matrix, shape)
         fov_um = fov_of(imaging.matrix, shape)
-        step_um = params.candidate_step_fraction * min(fov_um)
 
         problem = ""
         cells: tuple[Cell, ...] = ()
@@ -243,10 +468,57 @@ class RoutePlugin:
                 )
 
         scanned = [well for well in plan.wells if well in cells_result.counts]
+        _require_geometry(plan)
+        dataset = _dataset_of(ctx, plan, scan, cells_result, cells)
+        data = SelectionInput(
+            scan=dataset,
+            labels=params.labels,
+            fields_per_well=params.fields_per_well,
+            wall_margin_um=params.wall_margin_um,
+            exclude_centre_um=params.exclude_centre_um,
+            objective=imaging.objective,
+            matrix_um_per_px=imaging.matrix,
+            image_shape_px=shape,
+        )
+        selector, orderer, selector_params, orderer_params = _algorithms_of(params)
+
+        ctx.raise_if_stopped()
+        choices = _guarded(
+            "selector",
+            selector.name,
+            selector,
+            lambda: _as_list(selector.select(data, selector_params), "select"),
+        )
+        _guarded(
+            "selector", selector.name, selector, lambda: check_choices(choices, data)
+        )
+        by_well = _by_well(choices, scanned, selector.name)
+        counts_of = _counts_of(choices, by_well, cells, params, imaging, shape)
+
+        order: list[int] = []
+        if choices:
+            order = _guarded(
+                "orderer",
+                orderer.name,
+                orderer,
+                lambda: _as_list(orderer.order(choices, data, orderer_params), "order"),
+            )
+            _guarded(
+                "orderer",
+                orderer.name,
+                orderer,
+                lambda: check_order(order, len(choices)),
+            )
+            # numpy integers are indices (the check accepted them): plain ones from here on.
+            order = [operator.index(i) for i in order]
+        place = {index: rank for rank, index in enumerate(order)}
+        visiting = {
+            well: [i for i in order if choices[i].well == well] for well in scanned
+        }
+
         frames_of = scan.frame_index()
-        positions: list[RoutePosition] = []
+        made: dict[int, RoutePosition] = {}
         uncovered: dict[str, int] = {}
-        previous: tuple[float, float] | None = None
         total_wanted = 0
         nearest_unlocked = 0
         without_candidate = 0
@@ -258,71 +530,51 @@ class RoutePlugin:
                 cells_result.counts[well].get(label, 0) for label in params.labels
             )
             total_wanted += wanted
-            chosen: tuple[ChosenField, ...] = ()
-            if wanted:
-                chosen = self._choose(
-                    plan, well, cells, params, imaging, shape, fov_um, step_um
+            stops = visiting[well]
+            uncovered[well] = wanted - sum(sum(counts_of[i].values()) for i in stops)
+            taken = frames_of.get(well, [])
+            candidates = _candidates(scan, taken)
+            for k, index in enumerate(stops):
+                choice = choices[index]
+                frame = (
+                    None if imaging.other else _nearest_frame(scan, candidates, choice)
                 )
-            uncovered[well] = wanted - sum(sum(f.counts.values()) for f in chosen)
-            if chosen:
-                reference = (
-                    previous if previous is not None else _first_field_of(plan, well)
+                focus = stop_focus(
+                    frame,
+                    objective=scan.objective,
+                    factors=factors,
+                    offset_limits=offset_limits,
                 )
-                stops = _stops(chosen, reference)
-                taken = frames_of.get(well, [])
-                candidates = _candidates(scan, taken)
-                for k, index in enumerate(stops):
-                    field = chosen[index]
-                    frame = (
-                        None
-                        if imaging.other
-                        else _nearest_frame(scan, candidates, field)
-                    )
-                    focus = stop_focus(
-                        frame,
-                        objective=scan.objective,
-                        factors=factors,
-                        offset_limits=offset_limits,
-                    )
-                    focuses.append(focus)
-                    if not imaging.other and len(candidates) < len(taken):
-                        # The rule changed this stop's answer only when the nearest
-                        # of all the well's frames is the unlocked one.
-                        nearest = _nearest_frame(scan, taken, field)
-                        if nearest is not None and nearest.focus == "unlocked":
-                            nearest_unlocked += 1
-                            if frame is None:
-                                without_candidate += 1
-                    positions.append(
-                        RoutePosition(
-                            order=len(positions),
-                            well=well,
-                            name=f"{well}_r{k:03d}",
-                            x_um=field.x_um,
-                            y_um=field.y_um,
-                            z_um=focus.z_um,
-                            pfs_offset=focus.pfs_offset,
-                            counts=dict(field.counts),
-                            offset_from_focus=focus.derived,
-                        )
-                    )
-                previous = (positions[-1].x_um, positions[-1].y_um)
+                focuses.append(focus)
+                if not imaging.other and len(candidates) < len(taken):
+                    # The rule changed this stop's answer only when the nearest
+                    # of all the well's frames is the unlocked one.
+                    nearest = _nearest_frame(scan, taken, choice)
+                    if nearest is not None and nearest.focus == "unlocked":
+                        nearest_unlocked += 1
+                        if frame is None:
+                            without_candidate += 1
+                made[index] = RoutePosition(
+                    order=place[index],
+                    well=well,
+                    name=f"{well}_r{k:03d}",
+                    x_um=float(choice.x_um),
+                    y_um=float(choice.y_um),
+                    z_um=focus.z_um,
+                    pfs_offset=focus.pfs_offset,
+                    counts=dict(counts_of[index]),
+                    offset_from_focus=focus.derived,
+                    score=None if choice.score is None else float(choice.score),
+                    measures={
+                        key: float(value) for key, value in choice.measures.items()
+                    },
+                )
             ctx.progress(done + 1, len(scanned), well)
 
-        labels = " or ".join(params.labels)
+        positions = [made[index] for index in order]
         if not positions:
-            if total_wanted == 0:
-                raise PluginRunError(
-                    _NAME,
-                    f"the cells stage found no {labels} cell: there is nothing to "
-                    f"route; choose other labels, or check the scan and the cells",
-                )
             raise PluginRunError(
-                _NAME,
-                f"no field of {fov_um[0]:.0f} by {fov_um[1]:.0f} µm holds "
-                f"{params.min_cells} or more {labels} cell and keeps to the wells' "
-                f"margins; lower min_cells, wall_margin_um or exclude_centre_um, or "
-                f"check the scan's pixel size",
+                _NAME, _no_route(params, fov_um, total_wanted, selector.name)
             )
 
         points = [(p.x_um, p.y_um) for p in positions]
@@ -346,9 +598,13 @@ class RoutePlugin:
                 else None
             ),
             assumed=(
-                "the route minimises the Euclidean distance between fields; whether "
-                "the stage's move time follows it is not measured",
+                _order_line(orderer.name),
                 *imaging.assumed,
+                *(
+                    ()
+                    if selector.name == _MOST_CELLS
+                    else (_selector_line(selector.name),)
+                ),
                 *(
                     (
                         _unlocked_line(
@@ -367,53 +623,214 @@ class RoutePlugin:
             ),
         )
 
-    def _choose(
-        self,
-        plan: ScanPlanResult,
-        well: str,
-        cells: tuple[Cell, ...],
-        params: RouteParams,
-        imaging: _Imaging,
-        shape: tuple[int, int],
-        fov_um: tuple[float, float],
-        step_um: float,
-    ) -> tuple[ChosenField, ...]:
-        """The fields of one well, with the refusals of the algorithm said in the stage's words."""
-        problem = ""
-        chosen: tuple[ChosenField, ...] = ()
+
+def _order_line(orderer: str) -> str:
+    """The ``assumed`` line about the visiting order: route's shortest path, or the orderer's."""
+    if orderer == _NEAREST:
+        return (
+            "the route minimises the Euclidean distance between fields; whether "
+            "the stage's move time follows it is not measured"
+        )
+    return (
+        f"the visiting order is orderer '{orderer}''s, not route's shortest path: "
+        f"distance_um is the length of that order's path, and whether the stage's "
+        f"move time follows it is not measured"
+    )
+
+
+def _selector_line(selector: str) -> str:
+    return (
+        f"the fields were chosen by selector '{selector}', not by route's own rule "
+        f"of most cells: its choice, its score and its measures are its own"
+    )
+
+
+def _no_route(
+    params: RouteParams,
+    fov_um: tuple[float, float],
+    total_wanted: int,
+    selector: str,
+) -> str:
+    """Why there is no stop at all: no wanted cell, or no field the algorithm chose, in the words that tell what to change."""
+    labels = " or ".join(params.labels)
+    if total_wanted == 0:
+        return (
+            f"the cells stage found no {labels} cell: there is nothing to "
+            f"route; choose other labels, or check the scan and the cells"
+        )
+    if selector == _MOST_CELLS:
+        return (
+            f"no field of {fov_um[0]:.0f} by {fov_um[1]:.0f} µm holds "
+            f"{params.min_cells} or more {labels} cell and keeps to the wells' "
+            f"margins; lower min_cells, wall_margin_um or exclude_centre_um, or "
+            f"check the scan's pixel size"
+        )
+    return (
+        f"selector {selector} chose no field in any well ({total_wanted} {labels} "
+        f"cells found); check its parameters, or choose another selector"
+    )
+
+
+def _require_geometry(plan: ScanPlanResult) -> None:
+    """Refuse a plan with a well its own plate does not have, as a plan to run again.
+
+    ``Scan.from_results`` takes the geometry of every well of the plan and says
+    the same in its own words; this is the sentence this stage has always given
+    (a well that is not on the plate is a plan that does not belong to its
+    plate), asked once here so that it does not change with the loader.
+    """
+    problem = ""
+    for well in plan.wells:
         try:
-            geometry = well_geometry(plan.plate_plan, well)
+            well_geometry(plan.plate_plan, well)
         except ValueError as exc:
             problem = f"{exc}; run scan-plan again"
-        else:
-            try:
-                chosen = choose_fields(
-                    cells,
-                    geometry,
-                    labels=params.labels,
-                    matrix=imaging.matrix,
-                    image_shape_px=shape,
-                    n=params.fields_per_well,
-                    min_cells=params.min_cells,
-                    exclude_centre_um=params.exclude_centre_um,
-                    wall_margin_um=params.wall_margin_um,
-                    step_um=step_um,
-                )
-            except LatticeTooLarge as exc:
-                problem = (
-                    f"{exc}; the field is {fov_um[0]:.3g} by {fov_um[1]:.3g} µm: "
-                    f"check the scan's pixel size, or raise candidate_step_fraction"
-                )
-            except TooMuchWork as exc:
-                problem = (
-                    f"{exc}; raise candidate_step_fraction, or choose fewer labels"
-                )
-            except ValueError as exc:
-                problem = str(exc)
-        if problem:
-            # Raised outside the handlers: nothing here keeps the algorithm's error (FM-98).
-            raise PluginRunError(_NAME, problem)
-        return chosen
+            break
+    if problem:
+        # Raised outside the handler: nothing here keeps the geometry's error (FM-98).
+        raise PluginRunError(_NAME, problem)
+
+
+def _dataset_of(
+    ctx: RunContext,
+    plan: ScanPlanResult,
+    scan: ScanResult,
+    cells_result: CellsResult,
+    cells: tuple[Cell, ...],
+) -> Scan:
+    """The scan as a selection algorithm reads it, built from what ``ctx.upstream`` has already read and checked."""
+    problem = ""
+    try:
+        return Scan.from_results(
+            ctx.run_dir,
+            ctx.document,
+            plan=plan,
+            result=scan,
+            cells_result=cells_result,
+            cells=cells,
+        )
+    except DatasetError as exc:
+        problem = f"{exc}; run scan-plan, scan and cells again"
+    # Raised outside the handler: nothing here keeps the loader's error (FM-98).
+    raise PluginRunError(_NAME, problem)
+
+
+def _algorithms_of(
+    params: RouteParams,
+) -> tuple[Selector[Any], Orderer[Any], SelectorParams, OrdererParams]:
+    """The two algorithms by name, and the parameters each is called with.
+
+    ``RouteParams`` has checked all of it when it was built, so this fails only
+    for parameters made without validation, or an algorithm that changed
+    between the two: said as a refusal of the stage all the same.
+    """
+    problem = ""
+    try:
+        selector = load_selector(params.selector)
+        orderer = load_orderer(params.orderer)
+        return (
+            selector,
+            orderer,
+            selector_params_of(params, selector),
+            orderer_params_of(params, orderer),
+        )
+    except (SelectionError, ValueError) as exc:
+        problem = str(exc)
+    # Raised outside the handler: nothing here keeps the registry's error (FM-98).
+    raise PluginRunError(_NAME, problem)
+
+
+def _guarded(kind: str, name: str, owner: object, call: Callable[[], T]) -> T:
+    """``call()``, with an algorithm's failure said as a refusal of this stage that names it (``selector most-cells: ...``).
+
+    A ``SelectionError`` is the algorithm's own sentence (or a check's) and is
+    kept as it is. Any other ``Exception`` is the algorithm's bug, named by its
+    type and by where it was raised: the base name of the file and the line of the
+    innermost frame in ``owner``'s own module, and never a path, which says who
+    is logged on (FM-50). ``KeyboardInterrupt`` and ``SystemExit`` pass. The
+    sentence is built inside the handler, from the traceback, and raised outside
+    it, so nothing keeps the algorithm's frames (FM-98).
+    """
+    problem = ""
+    try:
+        return call()
+    except SelectionError as exc:
+        problem = f"{kind} {name}: {exc}"
+    except Exception as exc:
+        problem = (
+            f"{kind} {name}: {type(exc).__name__}: {_one_line(exc)}"
+            f"{_raised_at(exc, owner)}"
+        )
+    raise PluginRunError(_NAME, problem)
+
+
+def _raised_at(error: BaseException, owner: object) -> str:
+    """`` (at plugin.py:42)``: where in ``owner``'s own module the error was raised, or nothing when it came from elsewhere."""
+    module = sys.modules.get(type(owner).__module__)
+    source = getattr(module, "__file__", None)
+    if not isinstance(source, str):
+        return ""
+    wanted = os.path.normcase(os.path.abspath(source))
+    found: tuple[str, int] | None = None
+    for frame, line in traceback.walk_tb(error.__traceback__):
+        file = frame.f_code.co_filename
+        if os.path.normcase(os.path.abspath(file)) == wanted:
+            found = (os.path.basename(file), line)
+    return "" if found is None else f" (at {found[0]}:{found[1]})"
+
+
+def _as_list(raw: Iterable[T] | None, method: str) -> list[T]:
+    """What an algorithm returned as a list; ``None`` is refused in words, since ``list(None)`` would say "not iterable"."""
+    if raw is None:
+        raise SelectionError(f"{method} returned None, not a list")
+    return list(raw)
+
+
+def _by_well(
+    choices: list[Choice], scanned: list[str], selector: str
+) -> dict[str, list[int]]:
+    """The indices of the choices in each well, in the selector's order; a choice in a well the cells stage did not scan is refused, not dropped.
+
+    A route covers the wells that have cells, and a choice in another would be a
+    field that nobody asked for and nothing counts: left out without a word.
+    """
+    by_well: dict[str, list[int]] = {well: [] for well in scanned}
+    for index, choice in enumerate(choices):
+        if choice.well not in by_well:
+            raise PluginRunError(
+                _NAME,
+                f"selector {selector}: choice {index} is in well {choice.well}, "
+                f"which the cells stage did not scan ({', '.join(scanned) or 'none'}); "
+                f"a route covers the wells that have cells",
+            )
+        by_well[choice.well].append(index)
+    return by_well
+
+
+def _counts_of(
+    choices: list[Choice],
+    by_well: dict[str, list[int]],
+    cells: tuple[Cell, ...],
+    params: RouteParams,
+    imaging: _Imaging,
+    shape: tuple[int, int],
+) -> dict[int, dict[str, int]]:
+    """Each choice's ``counts``: the wanted cells it holds that no earlier choice of its well holds, in the selector's order."""
+    cells_of: dict[str, list[Cell]] = {well: [] for well in by_well}
+    for cell in cells:
+        if cell.well in cells_of:
+            cells_of[cell.well].append(cell)
+    counts: dict[int, dict[str, int]] = {}
+    for well, indices in by_well.items():
+        held = held_counts(
+            cells_of[well],
+            [(choices[i].x_um, choices[i].y_um) for i in indices],
+            labels=params.labels,
+            matrix=imaging.matrix,
+            image_shape_px=shape,
+        )
+        counts.update(zip(indices, held, strict=True))
+    return counts
 
 
 def _turret_sizes(
@@ -555,31 +972,6 @@ def _require_invertible(matrix: Matrix2, shape: tuple[int, int]) -> None:
         raise PluginRunError(_NAME, problem)
 
 
-def _first_field_of(plan: ScanPlanResult, well: str) -> tuple[float, float]:
-    """The first planned field of a well, in the scan's visiting order: where the scan starts in it."""
-    for field in plan.fields:
-        if field.well == well:
-            return (field.x_um, field.y_um)
-    raise PluginRunError(
-        _NAME,
-        f"the scan plan has no field for well {well!r}; run scan-plan again",
-    )
-
-
-def _stops(
-    chosen: tuple[ChosenField, ...], reference: tuple[float, float]
-) -> list[int]:
-    """The visiting order of a well's fields: from the one nearest ``reference``, then the shortest path.
-
-    Ties for the nearest go to the field chosen first.
-    """
-    start = min(
-        range(len(chosen)),
-        key=lambda i: (math.dist((chosen[i].x_um, chosen[i].y_um), reference), i),
-    )
-    return order_route([(f.x_um, f.y_um) for f in chosen], start=start)
-
-
 def _candidates(scan: ScanResult, positions: list[int]) -> list[int]:
     """The frames of a well that a stop may take its Z and autofocus offset from: every one the autofocus had not lost the sample on.
 
@@ -610,7 +1002,7 @@ def _unlocked_line(n: int, total: int, without_candidate: int) -> str:
 
 
 def _nearest_frame(
-    scan: ScanResult, positions: list[int], field: ChosenField
+    scan: ScanResult, positions: list[int], field: Choice
 ) -> ScanFrame | None:
     """The frame, among ``positions``, that the stage reached nearest to ``field``; ``None`` when there are none.
 
