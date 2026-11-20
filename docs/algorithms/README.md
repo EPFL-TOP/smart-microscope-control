@@ -69,7 +69,11 @@ py -m venv .venv
 ```
 
 (If PowerShell refuses to run the script, `Set-ExecutionPolicy -Scope Process
-RemoteSigned` allows it for this window only.)
+RemoteSigned` allows it for this window only.) The Windows commands of this guide are
+for PowerShell; at a `cmd.exe` prompt the activation is `.venv\Scripts\activate.bat`.
+Clone the repository to a short path (for example `C:\src\smc`): the PyTorch install
+below holds files with long names, and Windows refuses paths over 260 characters unless
+long paths are enabled.
 
 `pytest` skips the tests that need Micro-Manager's simulated microscope, with the reason
 `Micro-Manager demo adapters not installed`. That is expected on your computer: those
@@ -251,17 +255,10 @@ density: 2/2 C3
 `density` counts the cells of each well and class and divides by the area that was
 imaged. Next, `route` chooses the fields and the order to visit them in. With no
 `selector` parameter it uses the rule the project has always used (`most-cells`: the
-fields that hold the most cells, then the shortest path):
+fields that hold the most cells, then the shortest path), counting the `single` class:
 
 ```sh
-smc run route --offline --run-doc local/work/run.json --param 'labels=["single","doublet"]' --param fields_per_well=4
-```
-
-In PowerShell 5.1 and `cmd.exe` escape each inner double quote of a JSON value with a
-backslash (not tried on a Windows shell):
-
-```powershell
-smc run route --offline --run-doc local/work/run.json --param "labels=[\"single\",\"doublet\"]" --param fields_per_well=4
+smc run route --offline --run-doc local/work/run.json --param fields_per_well=4
 ```
 
 ```text
@@ -272,18 +269,36 @@ route: 2/2 C3
 ```
 
 The result is printed after these lines as JSON: the stops, in visiting order, each with
-its well, its position and the cells it holds. Your selector replaces the rule by name,
-and its parameters are JSON (`selector_params`); an orderer is chosen the same way:
+its well, its position and the cells it holds. Your selector replaces the rule by name
+(`selector=<name>`), and an orderer is chosen the same way (`orderer=<name>`).
+[`docs/plugins/route.md`](../plugins/route.md) lists `route`'s parameters and what it
+checks.
+
+A parameter that is a list or an object is **JSON**: the classes to count
+(`labels=["single","doublet"]`) and your selector's own parameters (`selector_params`).
+In a POSIX shell, single quotes keep the double quotes of the JSON:
 
 ```sh
-smc run route --offline --run-doc local/work/run.json --param selector=<name> --param 'selector_params={"min_cells": 3}'
-smc run route --offline --run-doc local/work/run.json --param selector=<name> --param orderer=as-chosen
+smc run route --offline --run-doc local/work/run.json --param selector=<name> --param 'selector_params={"min_cells":3}'
 ```
 
-`as-chosen` keeps your selector's own order. A mistake of yours is a refusal and never a
-silent change: the stage ends `failed` with a sentence that starts `selector <name>:`
-and names the choice. [`docs/plugins/route.md`](../plugins/route.md) lists `route`'s
-parameters and what it checks.
+Windows shells quote it in their own ways (PowerShell 5.1, PowerShell 7 and `cmd.exe`
+differ, and none is tried here), so give JSON through a **preset file**, which no shell
+reads. Save this as `local/my-route.toml`; each item of the list is a `--param`:
+
+```toml
+[params]
+route = ['labels=["single", "doublet"]', 'selector_params={"min_cells": 3}']
+```
+
+```sh
+smc run route --offline --run-doc local/work/run.json --preset local/my-route.toml --param selector=<name>
+smc run route --offline --run-doc local/work/run.json --preset local/my-route.toml --param selector=<name> --param orderer=as-chosen
+```
+
+A `--param` replaces the preset's value of the same key. `as-chosen` keeps your
+selector's own order. A mistake of yours is a refusal and never a silent change: the
+stage ends `failed` with a sentence that starts `selector <name>:` and names the choice.
 
 Draw what was chosen. One picture per well, in `local/work/draw/` (the pictures it
 writes are replaced; nothing else is touched):
@@ -293,12 +308,12 @@ smc dataset draw local/work/run.json
 ```
 
 ```text
-route  route (selector <name>, orderer as-chosen), 8 stops
+route  route (selector <name>, orderer as-chosen), 7 stops
 cells  84 detected
 drawing: 1/2
 drawing: 2/2
 B2  16 of 16 frames  4 stops  34 cells  local/work/draw/B2.png
-C3  16 of 16 frames  4 stops  50 cells  local/work/draw/C3.png
+C3  16 of 16 frames  3 stops  50 cells  local/work/draw/C3.png
 ✓ 2 pictures written to local/work/draw
 ```
 
@@ -413,7 +428,10 @@ page.
 Before every push, the checks the continuous integration runs:
 
 ```sh
-ruff check . && ruff format --check . && mypy && pytest
+ruff check .
+ruff format --check .
+mypy
+pytest
 ```
 
 ## What never to assume
