@@ -175,11 +175,12 @@ _CHECK_REFUSED = (
     " (the plate check before the first field; nothing moved: check_plate=false "
     "scans without it)"
 )
-#: The end of a refusal of the check's own measurement (no wall in view, a frame
-#: that would not come): the stage moved, so it does not say ``nothing moved``,
-#: and the scan can be run without the check. A plate that moved (the verdict) is
-#: never given it: registering it again is the answer, and ``check_plate=false``
-#: would scan it where it is not.
+#: The end of a refusal of the check's own measurement (``measure_well``'s: no
+#: wall in view, a wall lost, walls that fit no circle): the stage moved, so it
+#: does not say ``nothing moved``, and the scan can be run without the check. A
+#: plate that moved (the verdict) is never given it: registering it again is the
+#: answer, and ``check_plate=false`` would scan it where it is not. A device's
+#: fault in the check (a camera that stops answering) keeps its type and has none.
 _CHECK_FAILED = (
     " (the plate check before the first field: check_plate=false scans without it)"
 )

@@ -9604,8 +9604,10 @@ def run_check(
   `objective_text`), and the rest of the sentence is unchanged; with a zero
   shift the text is byte for byte the one above (#576). Every other refusal of
   `run_check` is `measure_well`'s, the check's own measurement failing (a wall
-  not found, a frame that would not come): a plain `PluginRunError` and not a
-  `PlateMovedError`, so that a caller words the advice for each apart. On any
+  not found or lost, walls that fit no circle): a plain `PluginRunError` and not a
+  `PlateMovedError`, so that a caller words the advice for each apart. A
+  device's fault (a camera that stops answering) is no `PluginRunError` and keeps
+  its type (FM-64). On any
   exception during the moves, `warn_left(stage, ctx, xy, start, where)` and the
   exception goes on (FM-88, FM-64), as `plate-walls`. Nothing touches the
   autofocus, the turret or Z: the caller decides (D4).
@@ -9678,7 +9680,7 @@ Its outcomes (#576):
   past: registering the plate again is its answer, and `check_plate=false`
   would scan the plate where it is not.
 - **Any other `PluginRunError`** (the check could not measure: a wall not
-  found, a frame that would not come), raised again after the handler as
+  found or lost, walls that fit no circle), raised again after the handler as
   `reason + _CHECK_FAILED`, with `AUTOFOCUS_LEFT_OFF` after it when the scan
   switched the autofocus off. `_CHECK_FAILED` is a space and the parenthesis
   `(the plate check before the first field: check_plate=false scans without
@@ -9793,6 +9795,9 @@ line, the saving line, then `the plate was checked under <objective>: <w1> and
   `test_a_scan_on_a_stage_that_reports_no_limits_says_so_after_the_checks_line`,
   `test_a_resume_with_every_well_done_says_the_plate_was_not_checked`,
   `test_a_plan_that_records_no_registration_objective_says_so`,
+  `test_a_registration_under_no_turret_is_not_called_an_older_plan`,
+  `test_a_resume_with_nothing_left_never_reads_the_plate`,
+  `test_without_a_check_t_s_counts_from_the_start_of_the_loop`,
   `test_a_plate_record_the_scan_cannot_read_names_check_plate_false`; and for
   the tool `test_a_plate_moved_under_the_40x_is_refused_naming_the_offset_its_distances_are_from`,
   `test_a_plate_that_moved_is_a_plate_moved_error_and_another_refusal_is_not`,

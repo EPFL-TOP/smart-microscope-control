@@ -87,9 +87,10 @@ class PlateMovedError(PluginRunError):
     that the runner and every ``except PluginRunError`` see no change) so that
     the scan can tell the verdict from the check's other refusals: a plate that
     moved is answered by registering it again, and a check that could not
-    measure (no wall in view, a frame that would not come) is answered by
-    scanning without it (m3 §27.4). Advice written for the first is never
-    given to the second.
+    measure (``measure_well``'s refusals: no wall in view, a wall lost, walls
+    that fit no circle) is answered by scanning without it (m3 §27.4). Advice
+    written for the first is never given to the second. A device's fault (a
+    camera that stops answering) is neither: it keeps its own type (FM-64).
     """
 
 

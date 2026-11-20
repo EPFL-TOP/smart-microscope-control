@@ -83,8 +83,9 @@ moved into that objective's frame, so the first well's clause names the offset i
 verdict is a `PlateMovedError` (a `PluginRunError`, so the runner and the exit codes see
 no change), which is how [`scan`](scan.md) tells it from a check that could not measure.
 
-A check that **could not measure** (no wall found within the search, a frame that would not
-come) is another refusal, not a verdict: its reason names the walk's own advice (`check
+A check that **could not measure** (no wall found within the search, a wall lost in the
+frame centred on it, walls that fit no circle) is another refusal, not a verdict: its
+reason names the walk's own advice (`check
 that the light is on, and that the plate lies as it was registered: a plate moved by more
 than <search> µm since plate-walls registered it hides <well>'s wall from this check`)
 and the stage is where the walk left it. Under a fluorescence light path that shows no

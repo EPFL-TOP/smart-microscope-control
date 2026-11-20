@@ -481,6 +481,29 @@ def test_a_stop_during_the_check_ends_stopped_and_says_the_autofocus_was_left_of
     ) in caplog.messages
 
 
+def test_a_stop_during_the_check_without_an_autofocus_says_nothing_of_one(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Nothing was switched off, so there is nothing to lock again: the WARNING
+    # of the left-off autofocus would be false (FM-165).
+    rig = _rig(stands, documents, tmp_path)
+    stop = threading.Event()
+
+    def in_the_check(progress: Progress) -> None:
+        if progress.message == "checking the plate: A1 -Y":
+            stop.set()
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        record = _scan(rig, stop=stop, on_progress=in_the_check)
+
+    assert record.status is StageStatus.stopped
+    assert _frames_written(rig) == []
+    assert not [m for m in caplog.messages if "autofocus" in m]
+
+
 def test_a_plan_made_from_another_registrations_objective_skips_the_check_and_says_so(
     stands: list[Microscope],
     documents: Documents,
@@ -578,6 +601,26 @@ def test_a_plate_moved_within_the_bound_passes_with_its_distance(
     assert result.plate_check.max_shift_um == 60.0
 
 
+def _ticking_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The scan's clock replaced by one that moves one second per reading; its reading is ``now[0]``.
+
+    The scan reads ``monotonic`` at ``t0`` and at each frame's ``t_s``, and
+    ``perf_counter`` for its engage timers: the second one stays the real one.
+    """
+    now = [1000.0]
+
+    def monotonic() -> float:
+        now[0] += 1.0
+        return now[0]
+
+    monkeypatch.setattr(
+        scan_plugin,
+        "time",
+        SimpleNamespace(monotonic=monotonic, perf_counter=time.perf_counter),
+    )
+    return now
+
+
 def test_the_first_frames_t_s_does_not_count_the_check(
     stands: list[Microscope],
     documents: Documents,
@@ -585,22 +628,10 @@ def test_the_first_frames_t_s_does_not_count_the_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A clock that moves one second per reading, and a check that takes 100 s of
-    # it: t_s counts from the attempt's first field, so no frame's is near 100
-    # (it would be 100 or more with t0 taken before the check, #576, item 7).
+    # it: t_s counts from the attempt's first field, so the frames read 1 s and
+    # 2 s (they would read 102 and 103 with t0 taken before the check, #576, item 7).
     rig = _rig(stands, documents, tmp_path)
-    now = [1000.0]
-
-    def monotonic() -> float:
-        now[0] += 1.0
-        return now[0]
-
-    # The scan reads ``monotonic`` at t0 and at each frame's t_s, and
-    # ``perf_counter`` for its engage timers: both stay.
-    monkeypatch.setattr(
-        scan_plugin,
-        "time",
-        SimpleNamespace(monotonic=monotonic, perf_counter=time.perf_counter),
-    )
+    now = _ticking_clock(monkeypatch)
     real = scan_plugin._check_the_plate
 
     def slow(*args: Any, **kwargs: Any) -> Any:
@@ -613,8 +644,23 @@ def test_the_first_frames_t_s_does_not_count_the_check(
     result = _result(_scan(rig))
 
     assert result.plate_check is not None
-    assert len(result.frames) == 2
-    assert all(0.0 < frame.t_s < 50.0 for frame in result.frames)
+    assert [frame.t_s for frame in result.frames] == [1.0, 2.0]
+
+
+def test_without_a_check_t_s_counts_from_the_start_of_the_loop(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No check ran, so nothing re-reads t0: the origin is the loop's start.
+    rig = _rig(stands, documents, tmp_path)
+    _ticking_clock(monkeypatch)
+
+    result = _result(_scan(rig, check_plate=False))
+
+    assert result.plate_check is None
+    assert [frame.t_s for frame in result.frames] == [1.0, 2.0]
 
 
 def test_the_scans_check_waits_no_settle_time(
@@ -839,12 +885,10 @@ def test_a_plan_whose_matrix_was_not_measured_skips_the_check_and_says_so(
     )
 
 
-def test_a_resume_with_every_well_done_says_the_plate_was_not_checked(
-    stands: list[Microscope],
-    documents: Documents,
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def _stopped_with_every_well_done(
+    stands: list[Microscope], documents: Documents, tmp_path: Path, **params: Any
+) -> _Rig:
+    """A 2-well scan (with ``params``) stopped after A1, its checkpoint edited to say both wells were done: nothing is left for a resume."""
     rig = _rig(stands, documents, tmp_path, wells="A1:A2")
     stop = threading.Event()
 
@@ -852,12 +896,21 @@ def test_a_resume_with_every_well_done_says_the_plate_was_not_checked(
         if progress.done == 2:
             stop.set()
 
-    record = _scan(rig, stop=stop, on_progress=after_the_first_well)
+    record = _scan(rig, stop=stop, on_progress=after_the_first_well, **params)
     assert record.status is StageStatus.stopped
-    # The checkpoint says both wells were done: nothing is left for the resume.
     dumped = RunDocument.load(rig.run_doc).stages["scan"].model_dump(mode="json")
     dumped["checkpoint"]["wells_done"] = ["A1", "A2"]
     write_stage(rig.run_doc, StageRecord.model_validate(dumped))
+    return rig
+
+
+def test_a_resume_with_every_well_done_says_the_plate_was_not_checked(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rig = _stopped_with_every_well_done(stands, documents, tmp_path)
     snaps = rig.camera.snaps
     moves = rig.stage.moves
 
@@ -874,6 +927,52 @@ def test_a_resume_with_every_well_done_says_the_plate_was_not_checked(
     assert rig.camera.snaps == snaps
     assert rig.stage.moves == moves
     assert len(result.frames) == 2
+
+
+def test_a_resume_with_nothing_left_never_reads_the_plate(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The skip comes before the plate is read: a record this smc cannot read, which
+    # refuses a scan that has a field to place, does not refuse one that has none.
+    rig = _stopped_with_every_well_done(stands, documents, tmp_path)
+    record = RunDocument.load(rig.run_doc).stages["plate-walls"]
+    dumped = record.model_dump(mode="json")
+    dumped["result"]["plate"] = "nonsense-plate"
+    write_stage(rig.run_doc, StageRecord.model_validate(dumped))
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_scan(rig, resume=True))
+
+    _skipped(
+        result,
+        "the plate was not checked: every well of the plan was done by an earlier "
+        "attempt, so this one takes no frame",
+        caplog,
+    )
+
+
+def test_a_resume_with_nothing_left_and_check_plate_false_says_the_parameter(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The skips are in the table's order: the operator's own choice is said first.
+    rig = _stopped_with_every_well_done(stands, documents, tmp_path, check_plate=False)
+    # The first attempt said it too (every attempt does, once): count the resume's.
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_scan(rig, resume=True, check_plate=False))
+
+    _skipped(
+        result,
+        "the plate was not checked against its registration (check_plate=false)",
+        caplog,
+    )
 
 
 def test_a_plan_that_records_no_registration_objective_says_so(
@@ -902,6 +1001,37 @@ def test_a_plan_that_records_no_registration_objective_says_so(
     )
 
 
+def test_a_registration_under_no_turret_is_not_called_an_older_plan(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Both records say no turret: the plan's objective is known and recorded as
+    # none, so "run scan-plan again" would change nothing. The line is the
+    # offset's, which a scan-plan on that stand also leaves unmeasured.
+    rig = _rig(stands, documents, tmp_path)
+    plan = RunDocument.load(rig.run_doc).stages["scan-plan"].model_dump(mode="json")
+    plan["result"]["plate_objective"] = None
+    plan["result"]["objective_shift_um"] = None
+    write_stage(rig.run_doc, StageRecord.model_validate(plan))
+    walls = RunDocument.load(rig.run_doc).stages["plate-walls"].model_dump(mode="json")
+    walls["result"]["objective"] = None
+    walls["result"]["walls"]["objective"] = None
+    write_stage(rig.run_doc, StageRecord.model_validate(walls))
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_scan(rig))
+
+    _skipped(
+        result,
+        "the plate was not checked: the offset between no turret and "
+        f"{TEN} is not measured (the profile's [objectives]), and a check would "
+        "read it as a move",
+        caplog,
+    )
+
+
 def test_a_plate_record_the_scan_cannot_read_names_check_plate_false(
     stands: list[Microscope], documents: Documents, tmp_path: Path
 ) -> None:
@@ -918,6 +1048,8 @@ def test_a_plate_record_the_scan_cannot_read_names_check_plate_false(
 
     assert raised.value.plugin == "scan"
     assert raised.value.slot == "plate"
+    # What the reader said is kept: the operator is told which part of the record is wrong.
+    assert "Unknown plate name" in raised.value.reason
     assert raised.value.reason.endswith(
         "run plate-walls again; or scan with check_plate=false, which does not "
         "read the plate"

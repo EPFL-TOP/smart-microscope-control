@@ -156,9 +156,9 @@ them with the registered centres moved into the plan's objective's frame. It is
   after that switch-off a WARNING says that nothing engaged PFS again: lock it on the
   sample before the next scan, since no frame of the attempt records that it was used.
 - **A check that could not measure** (no wall in view: a light path that shows none, a
-  fluorescence one say, or a plate moved by more than the search of 1000 µm; a frame
-  that would not come) ends the scan `failed`, with no frame of the scan, and its reason
-  ends with the parenthesis `(the plate check before the first field: check_plate=false
+  fluorescence one say, or a plate moved by more than the search of 1000 µm; a wall lost
+  in the frame centred on it; walls that fit no circle) ends the scan `failed`, with no
+  frame of the scan, and its reason ends with the parenthesis `(the plate check before the first field: check_plate=false
   scans without it)`. It does not say `nothing moved`: the stage moved. After the
   switch-off of the autofocus the reason ends with that parenthesis, then the
   autofocus's sentence. The verdict of a plate that moved never carries it: registering
