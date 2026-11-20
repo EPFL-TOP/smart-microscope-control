@@ -95,6 +95,20 @@ def latest(comments: list[dict[str, Any]], prefix: str) -> dict[str, Any] | None
     return max(hits, key=lambda c: str(c.get("createdAt", "")), default=None)
 
 
+def author_of(comment: dict[str, Any]) -> str:
+    """The login that wrote a comment, or ``unknown``.
+
+    A comment with no header is a person's note, and there are two people in the
+    repository (the owner and a collaborator, ``docs/design/algorithms.md`` §7.5):
+    the point names the author instead of guessing who the owner is. ``gh ... --json
+    comments`` carries ``author.login``; a comment that has none says ``unknown``
+    rather than being read as the owner's.
+    """
+    author = comment.get("author")
+    login = author.get("login") if isinstance(author, dict) else None
+    return str(login) if login else "unknown"
+
+
 def last_point_time(comments: list[dict[str, Any]]) -> str | None:
     """The ``createdAt`` of the newest ``## Point`` comment, or ``None``.
 
@@ -480,12 +494,17 @@ def paginated(path: str, get_json: Any) -> list[dict[str, Any]]:
 
 def normalise_comment(raw: dict[str, Any]) -> dict[str, Any]:
     """A REST issue comment in the shape ``gh ... --json comments`` has."""
-    return {
+    user = raw.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    comment: dict[str, Any] = {
         "id": raw.get("node_id", ""),
         "body": raw.get("body") or "",
         "createdAt": raw.get("created_at", ""),
         "url": raw.get("html_url", ""),
     }
+    if login:  # REST names the author `user`; the listing names it `author`
+        comment["author"] = {"login": login}
+    return comment
 
 
 def normalise_review(raw: dict[str, Any]) -> dict[str, Any]:
@@ -688,7 +707,7 @@ def main() -> int:
         )
     out.append("")
 
-    out.append("## Since the last point: reports, deviations, reviews, owner notes")
+    out.append("## Since the last point: reports, deviations, reviews, notes")
     seen = False
     for issue in [*work, *(i for i in closed if not is_nightly_issue(i))]:
         for c in issue.get("comments", []):
@@ -725,7 +744,7 @@ def main() -> int:
                 continue
             elif not head.startswith("## "):
                 seen = True
-                out.append(f"- {ref} owner note: {clip(body, 160)}")
+                out.append(f"- {ref} note ({author_of(c)}): {clip(body, 160)}")
     if not seen:
         out.append("- nothing new")
     out.append("")
@@ -755,8 +774,8 @@ def main() -> int:
         out.append(
             f"- {ms['title']}: {ms['closed_issues']} closed, {ms['open_issues']} open"
         )
-    # One pass over the whole report: a Report, a review or an owner note is written by a
-    # subagent, which uses arrows freely, and a redirected stdout on Windows is cp1252 with
+    # One pass over the whole report: a Report, a review or a note is written by a
+    # subagent or a person, who use arrows freely, and a redirected stdout on Windows is cp1252 with
     # strict errors, so one arrow in any of them would lose the whole report (FM-20, #591).
     print(ascii_only("\n".join(out)))
     return 0

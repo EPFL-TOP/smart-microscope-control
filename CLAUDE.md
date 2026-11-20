@@ -44,6 +44,15 @@ sessions**, and the GitHub issue is the contract between them:
   add defensive fixes that change no interface ("Beyond the plan"); it
   never changes a fixed interface — that comes back as `## Plan deviation`.
 - The **owner** decides ADRs, merges PRs and runs hardware sessions.
+- A **collaborator** (a second developer, with write access, who never merges)
+  runs `/develop` on `area: algorithms` issues, and `/feature` on a small one;
+  the supervising skills stay the owner's. Such an issue touches nothing of
+  `smc.hardware`, `profiles/` or `smc.ui`: it is done when the algorithm passes
+  its tests on a dataset, and a second issue of the owner's connects the result
+  to the tool that drives the microscope and carries the check at the stand
+  (`docs/design/algorithms.md` §7; the guide is `docs/algorithms/README.md`).
+  Their own notes carry no header, as the owner's do: `point.py` names the
+  author of each.
 
 Review agents live in `.claude/agents/`, each with its model in its file:
 Sonnet reviewers with one lens each, and a Haiku verifier that reproduces
@@ -162,6 +171,8 @@ turned into code, a profile entry, a test or a doc line.
 
 - `src/smc/hardware/` bus, capabilities, roles, facade, backends
 - `src/smc/plugins/` registry + built-in tools · `src/smc/run/` run document
+- `src/smc/data/` a scan loaded with no hardware, dataset export · `src/smc/selection/`
+  selectors and orderers by name · `docs/algorithms/` the collaborator's guide
 - `profiles/` one TOML per instrument · `docs/hardware/` what we know
 - `docs/adr/` decisions · `docs/roadmap.md` milestones
 - `scripts/github/` labels, milestones, backlog bootstrap
@@ -180,7 +191,8 @@ Execution session: `/develop <issue>` implement one planned issue to a PR;
 it runs `/adversarial-review <issue>` before the PR, and `/ui-check` (the plate
 page served on a demo stand and photographed with Playwright) first when the
 issue is `area: ui`; `/review` runs it on an `area: ui` PR.
-Scaffolds: `/new-plugin`, `/new-backend`. Shortcut: `/feature` (plan +
+Scaffolds: `/new-plugin`, `/new-backend`, `/new-selector` (a selection algorithm,
+for an `area: algorithms` issue). Shortcut: `/feature` (plan +
 develop in one session, small issues only).
 
 ## Improving the process
