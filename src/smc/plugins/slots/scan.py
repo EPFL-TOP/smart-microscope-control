@@ -42,8 +42,10 @@ class ScanFrame(SlotValue):
     target (the demo rounds a command, M1 §8): the point imaged at the frame
     centre. ``z_um`` is the focus stage's reading, ``None`` without one;
     ``pfs_offset`` the autofocus offset in its native unit, ``None`` when the
-    autofocus was not used. ``t_s`` counts from the start of the attempt that
-    took the frame, and ``file`` is relative to the run folder, POSIX.
+    autofocus was not used. ``t_s`` counts from the end of the plate check when
+    the attempt that took the frame made one, and from the start of its loop
+    otherwise (the check's own time is ``PlateCheck.elapsed_s``), and ``file``
+    is relative to the run folder, POSIX.
 
     ``well_dx_um``, ``well_dy_um`` say where the frame is in its well: the
     readback minus the well's centre, **in stage axes** and µm (m3 §8, *Refined

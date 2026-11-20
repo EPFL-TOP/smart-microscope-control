@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import math
+import pickle
 import re
 import shutil
 import threading
@@ -50,7 +51,8 @@ from smc.hardware.capabilities import (
     XYStage,
 )
 from smc.hardware.profile import Profile
-from smc.plugins import PluginRunError, Progress, load, run_plugin
+from smc.plugins import PluginRunError, Progress, RunContext, load, run_plugin
+from smc.plugins.plate_check.loop import PlateMovedError
 from smc.plugins.plate_check.plugin import AGAIN, PlateCheckParams, PlateCheckPlugin
 from smc.plugins.plate_registration.plugin import (
     PlateRegistrationParams,
@@ -433,6 +435,81 @@ def test_a_plate_moved_50_um_in_the_record_is_refused_naming_both_wells(
     assert any("plate-check stopped at H12's" in m for m in caplog.messages)
 
 
+def test_a_plate_moved_under_the_40x_is_refused_naming_the_offset_its_distances_are_from(
+    stands: list[Microscope], run_doc: Path, documents: Documents
+) -> None:
+    # Under another objective the distance is to the registered centre plus the
+    # 10x -> 40x offset, (-37.5, +12.25) written out: not to the record's own
+    # centre, which is what the sentence used to say it was (#576, item 9).
+    move_registration(run_doc, slide_um=(50.0, 0.0))
+    rig = _rig(stands, objective=FORTY)
+
+    refused = _refused(rig, run_doc, calibration=documents.forty)
+
+    match = re.search(
+        r"A1 lies (\d+\.\d) µm from its registered centre plus the offset "
+        r"\(-37\.5, \+12\.2\) µm to "
+        + re.escape(FORTY)
+        + r" \(([+-]\d+\.\d), ([+-]\d+\.\d)\) and H12 (\d+\.\d) µm ",
+        refused.reason,
+    )
+    assert match is not None, refused.reason
+    assert float(match[1]) == pytest.approx(50.0, abs=0.2)
+    assert [float(match[2]), float(match[3])] == pytest.approx([-50.0, 0.0], abs=0.2)
+    assert float(match[4]) == pytest.approx(50.0, abs=0.2)
+    # The offset is named once, in the first well's clause.
+    assert refused.reason.count("plus the offset") == 1
+
+
+def test_a_plate_moved_under_its_own_objective_names_no_offset(
+    stands: list[Microscope], run_doc: Path
+) -> None:
+    move_registration(run_doc, slide_um=(50.0, 0.0))
+    rig = _rig(stands)
+
+    refused = _refused(rig, run_doc)
+
+    assert "plus the offset" not in refused.reason
+    assert re.search(
+        r"A1 lies \d+\.\d µm from its registered centre \([+-]\d+\.\d, ", refused.reason
+    )
+
+
+def test_a_plate_that_moved_is_a_plate_moved_error_and_another_refusal_is_not(
+    stands: list[Microscope], run_doc: Path
+) -> None:
+    # The verdict is about the plate; a check that finds no wall is about the
+    # check, and the scan words the advice for each apart (#576, item 2).
+    moved = _rig(stands)
+    move_registration(run_doc, slide_um=(50.0, 0.0))
+
+    with pytest.raises(PluginRunError) as verdict:
+        _run(moved, run_doc)
+
+    assert isinstance(verdict.value, PlateMovedError)
+    assert verdict.value.plugin == NAME
+    assert verdict.value.reason.startswith("the plate moved since plate-walls ")
+    # The slide of 1100 µm puts the wall out of the 1000 µm search.
+    move_registration(run_doc, slide_um=(1050.0, 0.0))
+    blind = _rig(stands)
+
+    with pytest.raises(PluginRunError) as no_wall:
+        _run(blind, run_doc)
+
+    assert not isinstance(no_wall.value, PlateMovedError)
+    assert no_wall.value.reason.startswith("no wall found on A1's ")
+
+
+def test_a_plate_moved_error_survives_a_worker_process() -> None:
+    # PluginRunError's own __reduce__ rebuilds the subclass from (plugin, reason).
+    error = PlateMovedError("scan", "the plate moved since plate-walls registered it")
+
+    again = pickle.loads(pickle.dumps(error))
+
+    assert type(again) is PlateMovedError
+    assert (again.plugin, again.reason) == (error.plugin, error.reason)
+
+
 def test_a_plate_turned_0_06_degrees_in_the_record_is_refused(
     stands: list[Microscope], run_doc: Path
 ) -> None:
@@ -516,6 +593,44 @@ def test_a_larger_bound_lets_the_moved_plate_through(
 
     assert result.check.worst_um == pytest.approx(50.0, abs=0.2)
     assert result.check.max_shift_um == 60.0
+
+
+def test_a_settle_time_is_waited_before_every_frame_of_the_check(
+    stands: list[Microscope], run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = _rig(stands)
+    waited: list[float] = []
+    monkeypatch.setattr(RunContext, "wait_s", lambda _self, s: waited.append(s))
+
+    _result(_run(rig, run_doc, settle_ms=250.0))
+
+    # One wait before each frame, of the parameter in seconds (plate-check waits
+    # nowhere else).
+    assert rig.camera.snaps == 16
+    assert waited == [0.25] * rig.camera.snaps
+
+
+def test_a_narrower_search_is_the_one_used_and_named_in_the_refusal(
+    stands: list[Microscope], run_doc: Path
+) -> None:
+    # The record slid 50 µm: the wall lies 50 µm from where it is looked for. A
+    # search of 20 µm around the well's radius does not reach it; the default
+    # one reads the same slide as a verdict.
+    move_registration(run_doc, slide_um=(50.0, 0.0))
+    narrow = _rig(stands)
+
+    refused = _refused(narrow, run_doc, search_um=20.0)
+
+    assert not isinstance(refused, PlateMovedError)
+    assert refused.reason.startswith(
+        "no wall found on A1's +X side in 1 frames, from 3180 to 3220 µm"
+    )
+    assert "a plate moved by more than 20 µm" in refused.reason
+    default = _rig(stands)
+
+    verdict = _refused(default, run_doc)
+
+    assert isinstance(verdict, PlateMovedError)
 
 
 def test_an_unmeasured_offset_is_refused_before_anything_moves(
