@@ -21,10 +21,12 @@ import math
 import re
 import shutil
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -53,12 +55,20 @@ from smc.hardware.capabilities import (
     XYStage,
 )
 from smc.hardware.profile import Profile
-from smc.plugins import PluginRunError, Progress, load, run_plugin
+from smc.plugins import (
+    PluginRunError,
+    Progress,
+    RunContext,
+    UpstreamError,
+    load,
+    run_plugin,
+)
 from smc.plugins.plate_registration.plugin import (
     PlateRegistrationParams,
     PlateRegistrationPlugin,
 )
 from smc.plugins.plate_walls.loop import AUTOFOCUS_LEFT_OFF
+from smc.plugins.scan import plugin as scan_plugin
 from smc.plugins.scan.plugin import ScanParams, ScanPlugin
 from smc.plugins.scan_plan.plugin import ScanPlanParams, ScanPlanPlugin
 from smc.plugins.slots import ScanResult
@@ -71,6 +81,16 @@ pytestmark = [pytest.mark.demo, pytest.mark.filterwarnings("error::RuntimeWarnin
 AGAIN = (
     "register it again (plate-walls), then run scan-plan and scan again, without "
     "--resume: frames already taken are placed against the old registration"
+)
+#: The way past a check that could not measure: the stage moved, and the scan
+#: runs without the check. A plate that moved is never given it.
+CHECK_FAILED = (
+    " (the plate check before the first field: check_plate=false scans without it)"
+)
+#: The check walk's own line on a stage that reports no soft limits, written out.
+NO_LIMITS_LINE = (
+    "the stage reports no soft limits, so the frames' moves were not checked "
+    "against any travel"
 )
 #: Two fields in A1, the plan's first well; A2 is the second well of a resume.
 SMALL = {"rows": 1, "columns": 2}
@@ -109,6 +129,13 @@ class _Stage:
 
     def limits_um(self) -> tuple[Limits, Limits] | None:
         return self._inner.limits_um()
+
+
+class _NoLimitsStage(_Stage):
+    """The same stage on a stand that does not say what its soft limits are."""
+
+    def limits_um(self) -> tuple[Limits, Limits] | None:
+        return None
 
 
 class _Camera:
@@ -294,10 +321,48 @@ def test_the_scan_refuses_a_plate_moved_50_um_in_the_record_before_its_first_fra
     assert match is not None, refused.reason
     assert float(match[1]) == pytest.approx(50.0, abs=0.2)
     assert float(match[2]) == pytest.approx(50.0, abs=0.2)
+    # A verdict is never told the check can be skipped: the plate where it lies
+    # now is the thing the check refuses (#576, item 2).
+    assert "check_plate" not in refused.reason
     # No frame of the scan: the check's own frames only, two wells of 8.
     assert _frames_written(rig) == []
     assert rig.camera.snaps == 16
     assert RunDocument.load(rig.run_doc).stages["scan"].checkpoint is None
+
+
+def test_a_check_that_finds_no_wall_names_check_plate_false(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    # The record slid 1100 µm: A1's +X wall is past the walk (2200 to 4200 µm
+    # from the expected centre for the search of 1000 µm), as a light path that
+    # shows no wall would leave it. The check could not measure, which is not
+    # the plate's verdict: the stage moved, and check_plate=false scans without it.
+    rig = _rig(stands, documents, tmp_path)
+    move_registration(rig.run_doc, slide_um=(1100.0, 0.0))
+
+    refused = _refused(rig)
+
+    assert refused.reason.startswith(
+        "no wall found on A1's +X side in 5 frames, from 2200 to 4200 µm"
+    )
+    assert refused.reason.endswith(AGAIN + CHECK_FAILED)
+    assert "nothing moved" not in refused.reason
+    assert _frames_written(rig) == []
+    assert RunDocument.load(rig.run_doc).stages["scan"].checkpoint is None
+
+
+def test_the_scans_default_search_is_1000_um(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    # The scan hands the check no search: the check's default, 1000 µm, is the one
+    # named, and a wall 1100 µm off is outside it.
+    rig = _rig(stands, documents, tmp_path)
+    move_registration(rig.run_doc, slide_um=(1100.0, 0.0))
+
+    refused = _refused(rig)
+
+    assert "more than 1000 µm since plate-walls registered it" in refused.reason
+    assert "from 2200 to 4200 µm" in refused.reason
 
 
 def test_the_scan_refuses_a_plate_turned_0_06_degrees_in_the_record_before_its_first_frame(
@@ -443,13 +508,17 @@ def test_check_frames_that_cannot_be_saved_are_said_after_the_checks_line(
     stands: list[Microscope], documents: Documents, tmp_path: Path
 ) -> None:
     rig = _rig(stands, documents, tmp_path)
+    # A stage that reports no limits, so that the walk's own line is in the result
+    # and the order is the whole order: the check's line, the walk's, the unsaved.
+    rig.stand.override(XYStage, _NoLimitsStage(rig.stage, rig.calls))
     (rig.run_doc.parent / "plate-check").write_text("not a folder", encoding="utf-8")
 
     result = _result(_scan(rig))
 
     assert result.plate_check is not None
     assert result.assumed[0].startswith("the plate was checked before the first field")
-    assert result.assumed[1] == (
+    assert result.assumed[1] == NO_LIMITS_LINE
+    assert result.assumed[2] == (
         "8 frames of the plate check could not be saved (the log says why)"
     )
 
@@ -507,6 +576,100 @@ def test_a_plate_moved_within_the_bound_passes_with_its_distance(
     assert result.plate_check is not None
     assert result.plate_check.worst_um == pytest.approx(50.0, abs=0.2)
     assert result.plate_check.max_shift_um == 60.0
+
+
+def test_the_first_frames_t_s_does_not_count_the_check(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A clock that moves one second per reading, and a check that takes 100 s of
+    # it: t_s counts from the attempt's first field, so no frame's is near 100
+    # (it would be 100 or more with t0 taken before the check, #576, item 7).
+    rig = _rig(stands, documents, tmp_path)
+    now = [1000.0]
+
+    def monotonic() -> float:
+        now[0] += 1.0
+        return now[0]
+
+    # The scan reads ``monotonic`` at t0 and at each frame's t_s, and
+    # ``perf_counter`` for its engage timers: both stay.
+    monkeypatch.setattr(
+        scan_plugin,
+        "time",
+        SimpleNamespace(monotonic=monotonic, perf_counter=time.perf_counter),
+    )
+    real = scan_plugin._check_the_plate
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        check = real(*args, **kwargs)
+        now[0] += 100.0
+        return check
+
+    monkeypatch.setattr(scan_plugin, "_check_the_plate", slow)
+
+    result = _result(_scan(rig))
+
+    assert result.plate_check is not None
+    assert len(result.frames) == 2
+    assert all(0.0 < frame.t_s < 50.0 for frame in result.frames)
+
+
+def test_the_scans_check_waits_no_settle_time(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The scan hands the check settle_s=0: a frame of the check is not delayed
+    # (the scan calls wait_s nowhere else), and the 16 frames each wait nothing.
+    rig = _rig(stands, documents, tmp_path)
+    waited: list[float] = []
+    monkeypatch.setattr(RunContext, "wait_s", lambda _self, s: waited.append(s))
+
+    _result(_scan(rig))
+
+    assert waited == [0.0] * 16
+
+
+def test_a_scan_on_a_stage_that_reports_no_limits_says_so_after_the_checks_line(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    # The check's walk was not held to any travel, which plate-check says for its
+    # own walk: the scan's result says it too, after the check's line (#576, item 6).
+    rig = _rig(stands, documents, tmp_path)
+    rig.stand.override(XYStage, _NoLimitsStage(rig.stage, rig.calls))
+
+    result = _result(_scan(rig))
+
+    assert result.plate_check is not None
+    assert result.assumed[0].startswith("the plate was checked before the first field")
+    assert result.assumed[1] == NO_LIMITS_LINE
+    assert result.assumed.count(NO_LIMITS_LINE) == 1
+
+
+def test_a_scan_on_a_stage_with_soft_limits_says_nothing_of_them(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    # The walk was held to the travel, so there is nothing assumed to say.
+    base = profile()
+    limited = base.model_copy(
+        update={
+            "safety": base.safety.model_copy(
+                update={
+                    "xy_soft_limits_um": ((-80_000.0, 80_000.0), (-80_000.0, 80_000.0))
+                }
+            )
+        }
+    )
+    rig = _rig(stands, documents, tmp_path, limited)
+
+    result = _result(_scan(rig))
+
+    assert result.plate_check is not None
+    assert NO_LIMITS_LINE not in result.assumed
 
 
 # ------------------------------------------------------------------ the skips
@@ -676,6 +839,101 @@ def test_a_plan_whose_matrix_was_not_measured_skips_the_check_and_says_so(
     )
 
 
+def test_a_resume_with_every_well_done_says_the_plate_was_not_checked(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rig = _rig(stands, documents, tmp_path, wells="A1:A2")
+    stop = threading.Event()
+
+    def after_the_first_well(progress: Progress) -> None:
+        if progress.done == 2:
+            stop.set()
+
+    record = _scan(rig, stop=stop, on_progress=after_the_first_well)
+    assert record.status is StageStatus.stopped
+    # The checkpoint says both wells were done: nothing is left for the resume.
+    dumped = RunDocument.load(rig.run_doc).stages["scan"].model_dump(mode="json")
+    dumped["checkpoint"]["wells_done"] = ["A1", "A2"]
+    write_stage(rig.run_doc, StageRecord.model_validate(dumped))
+    snaps = rig.camera.snaps
+    moves = rig.stage.moves
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_scan(rig, resume=True))
+
+    _skipped(
+        result,
+        "the plate was not checked: every well of the plan was done by an earlier "
+        "attempt, so this one takes no frame",
+        caplog,
+    )
+    # Nothing was prepared and nothing walked: no frame, no move, no check folder.
+    assert rig.camera.snaps == snaps
+    assert rig.stage.moves == moves
+    assert len(result.frames) == 2
+
+
+def test_a_plan_that_records_no_registration_objective_says_so(
+    stands: list[Microscope],
+    documents: Documents,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An older scan-plan never wrote plate_objective: that is not a registration
+    # made under no turret, and the plate record is under the 10x.
+    rig = _rig(stands, documents, tmp_path)
+    record = RunDocument.load(rig.run_doc).stages["scan-plan"]
+    dumped = record.model_dump(mode="json")
+    del dumped["result"]["plate_objective"]
+    write_stage(rig.run_doc, StageRecord.model_validate(dumped))
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_scan(rig))
+
+    _skipped(
+        result,
+        "the plate was not checked: the plan does not record the objective of the "
+        "registration it was made from (an older scan-plan), and the plate record "
+        f"is under {TEN}: run scan-plan again to check it",
+        caplog,
+    )
+
+
+def test_a_plate_record_the_scan_cannot_read_names_check_plate_false(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    # A plate record edited to a plate this smc does not know: the scan reads it
+    # only for the check, so the refusal ends with the way past (#576, item 8).
+    rig = _rig(stands, documents, tmp_path)
+    record = RunDocument.load(rig.run_doc).stages["plate-walls"]
+    dumped = record.model_dump(mode="json")
+    dumped["result"]["plate"] = "nonsense-plate"
+    write_stage(rig.run_doc, StageRecord.model_validate(dumped))
+
+    with pytest.raises(UpstreamError) as raised:
+        _scan(rig)
+
+    assert raised.value.plugin == "scan"
+    assert raised.value.slot == "plate"
+    assert raised.value.reason.endswith(
+        "run plate-walls again; or scan with check_plate=false, which does not "
+        "read the plate"
+    )
+    # FM-98: raised outside the handler of the error it stands for.
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    stored = RunDocument.load(rig.run_doc).stages["scan"]
+    assert stored.status is StageStatus.failed
+    assert rig.camera.snaps == 0
+    # The way past it is the one named: the same document scans without the check.
+    result = _result(_scan(rig, check_plate=False))
+    assert result.plate_check is None
+    assert len(result.frames) == 2
+
+
 # --------------------------------------------------------------- the autofocus
 
 
@@ -724,6 +982,34 @@ def test_a_refused_check_after_the_switch_off_says_the_autofocus_was_left_off(
     assert refused.reason.endswith(AGAIN + AUTOFOCUS_LEFT_OFF)
     assert "engage" not in af.calls
     assert af.engaged is False
+
+
+def test_a_check_that_finds_no_wall_after_the_switch_off_ends_with_the_way_past_then_the_autofocus_sentence(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    af = RecordingAutofocus(engaged=True, locked=True)
+    rig = _rig(stands, documents, tmp_path, autofocus=af)
+    move_registration(rig.run_doc, slide_um=(1100.0, 0.0))
+
+    refused = _refused(rig)
+
+    assert refused.reason.startswith("no wall found on A1's +X side in 5 frames")
+    # The way past comes first, then what the switch-off left (§5.7 D3).
+    assert refused.reason.endswith(AGAIN + CHECK_FAILED + AUTOFOCUS_LEFT_OFF)
+    assert "engage" not in af.calls
+    assert af.engaged is False
+
+
+def test_a_check_that_finds_no_wall_without_an_autofocus_ends_with_the_way_past_alone(
+    stands: list[Microscope], documents: Documents, tmp_path: Path
+) -> None:
+    rig = _rig(stands, documents, tmp_path)
+    move_registration(rig.run_doc, slide_um=(1100.0, 0.0))
+
+    refused = _refused(rig)
+
+    assert refused.reason.endswith(CHECK_FAILED)
+    assert AUTOFOCUS_LEFT_OFF not in refused.reason
 
 
 def test_a_refused_check_without_an_autofocus_says_nothing_of_it(
