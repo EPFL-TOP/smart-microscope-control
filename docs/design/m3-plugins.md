@@ -1272,7 +1272,9 @@ def load_frame(run_dir: Path, frame: ScanFrame) -> npt.NDArray[Any]: ...
   autofocus was not used. `focus`: `locked` (used and locked when the
   frame was taken), `unlocked` (used, not locked), `off` (the stand has
   an autofocus the scan did not use), `none` (it has none). `t_s` counts
-  from the start of the attempt that took the frame. `well_dx_um`,
+  from the end of the plate check when the attempt that took the frame
+  made one (§27.5), and from the start of its loop otherwise; the check's
+  time is `PlateCheck.elapsed_s` (#576). `well_dx_um`,
   `well_dy_um`: where the frame is in its well, the readback minus the
   well's centre in stage axes (§8, *Refined while planning #430*); `None`,
   both, in a scan written before they existed.
@@ -9529,12 +9531,15 @@ class CheckSetup:
     objective: str | None
     shift_um: tuple[float, float]
     refs: tuple[WellRef, ...]
-    registered: tuple[tuple[float, float], ...]
+    registered_xy_um: tuple[tuple[float, float], ...]
     walk: WallWalk
     offsets: tuple[float, ...]
     max_shift_um: float
     again: str
     assumed: tuple[str, ...]
+
+
+class PlateMovedError(PluginRunError): ...
 
 
 def prepare_check(
@@ -9583,13 +9588,24 @@ def run_check(
 - **`run_check`**: `xy.wait()`, the start read, the clock; each well through
   `measure_well` (its refusals unchanged, `walk.stage` the caller's); then the
   differences, `rigid_motion`, and `checked_utc = datetime.now(timezone.utc)`.
-  Above the bound, after the last well, the refusal (`PluginRunError` of the
-  stage, raised outside any handler, FM-98):
+  Above the bound, after the last well, the refusal, the **verdict**: a
+  `PlateMovedError` (a subclass of `PluginRunError` with its constructor and its
+  `__reduce__`, so that the runner and every `except PluginRunError` see no
+  change) of the stage, raised outside any handler, FM-98:
   `the plate moved since plate-walls registered it: <w1> lies <d1:.1f> µm from
   its registered centre (<dx:+.1f>, <dy:+.1f>) and <w2> <d2:.1f> µm (<dx:+.1f>,
   <dy:+.1f>) under <objective>, more than <bound:g> µm; it turned about
   <turn:+.3f>° and slid about (<sx:+.1f>, <sy:+.1f>) µm: <again>` (`<objective>`
-  is `no turret` when `None`; with more wells, each is named in order). On any
+  is `no turret` when `None`; with more wells, each is named in order). A
+  distance is to the registered centre plus `shift_um` (§18), so **when
+  `shift_um` is not `(0.0, 0.0)`** the first well's clause reads `<w1> lies
+  <d1:.1f> µm from its registered centre plus the offset (<sx:+.1f>,
+  <sy:+.1f>) µm to <objective> (<dx:+.1f>, <dy:+.1f>)` (`<objective>` through
+  `objective_text`), and the rest of the sentence is unchanged; with a zero
+  shift the text is byte for byte the one above (#576). Every other refusal of
+  `run_check` is `measure_well`'s, the check's own measurement failing (a wall
+  not found, a frame that would not come): a plain `PluginRunError` and not a
+  `PlateMovedError`, so that a caller words the advice for each apart. On any
   exception during the moves, `warn_left(stage, ctx, xy, start, where)` and the
   exception goes on (FM-88, FM-64), as `plate-walls`. Nothing touches the
   autofocus, the turret or Z: the caller decides (D4).
@@ -9628,9 +9644,11 @@ order, each a skip, logged once at WARNING, its line in `assumed`:
 |---|---|
 | `check_plate` is false | `the plate was not checked against its registration (check_plate=false)` |
 | a dry run | `dry run: the plate was not checked against its registration` |
+| no well is left (`nothing_left`, a resume whose wells are all done; checked before the plate is read) | `the plate was not checked: every well of the plan was done by an earlier attempt, so this one takes no frame` |
 | `plate` not read | `the plate was not checked: plate not read: <ctx.why_not_read("plate")>` |
 | not `wall-images` | `the plate was not checked: it was registered by <method>, which measures no well's walls (plate-walls does)` |
-| `plan.plate_objective != plate.objective` | `the plate was not checked: the plan was made from a registration under <a>, the plate record is under <b>` |
+| `plan.plate_objective is None` and `plate.objective` is not | `the plate was not checked: the plan does not record the objective of the registration it was made from (an older scan-plan), and the plate record is under <plate objective>: run scan-plan again to check it` |
+| `plan.plate_objective != plate.objective`, every other mismatch | `the plate was not checked: the plan was made from a registration under <a>, the plate record is under <b>` |
 | `plan.objective_shift_um` is `None` | `the plate was not checked: the offset between <plate objective> and <plan objective> is not measured (the profile's [objectives]), and a check would read it as a move` |
 | `plan.matrix_source != "camera-calibration"` | `the plate was not checked: the plan's camera matrix is the <source>'s, and a wall is looked for with a measured one only` |
 
@@ -9640,23 +9658,51 @@ plan.pixel_size_um, shape=plan.image_shape_px, max_shift_um=params.
 max_plate_shift_um, search_um=None, settle_s=0.0, folder=ctx.run_dir /
 "plate-check" / token, folder_text=f"plate-check/{token}", again=<the scan's>)`,
 `token = new_token()`; its refusals refuse the scan before anything moves.
+A plate record that exists but that `ctx.upstream_or_none("plate", PlateResult)`
+cannot read (an unknown or edited plate name: `PlateResult` validates it) is
+not a skip: the `UpstreamError` is raised again, outside the handler (FM-98),
+as `UpstreamError("scan", "plate", f"{exc.reason}; or scan with
+check_plate=false, which does not read the plate")` (the same class, so the
+CLI's exit code for it is unchanged), the stage `failed` and nothing moved
+(#576). `useq.WellPlate.from_str` in `prepare_check` stays as it is: after
+that validation it cannot be reached with a name `useq` does not know.
 
 **In the loop**, for the first well of the attempt only, after `_check_well`
 and `_switch_off_at_wall`: `run_check(setup, xy, camera, ctx, on_side)`, whose
-`on_side` calls `ctx.progress(done, total, f"checking the plate: {text}")`. A
-`PluginRunError` from it, when that switch-off returned `True`, is raised again
-after the handler with `AUTOFOCUS_LEFT_OFF` (§5.7 D3) appended; otherwise it
-passes. The first field then engages the autofocus as after any wall
-(`after_wall`), unchanged.
+`on_side` calls `ctx.progress(done, total, f"checking the plate: {text}")`.
+Its outcomes (#576):
 
-**The result**: `plate_check` is the check, and its line comes first after
-`stand.assumed`: `the plate was checked before the first field: <w1> and <w2>
-lie within <worst:.1f> µm of their registered centres under <objective> (bound
-<b:g> µm), at <checked_utc to the second>`, or the skip's line. A save error
-of a check frame adds the walk's own line (§17.4 step 4).
+- **The verdict** (`PlateMovedError`): when that switch-off returned `True`,
+  raised again after the handler as a `PluginRunError` with `AUTOFOCUS_LEFT_OFF`
+  (§5.7 D3) appended; otherwise it passes unchanged. It never carries a way
+  past: registering the plate again is its answer, and `check_plate=false`
+  would scan the plate where it is not.
+- **Any other `PluginRunError`** (the check could not measure: a wall not
+  found, a frame that would not come), raised again after the handler as
+  `reason + _CHECK_FAILED`, with `AUTOFOCUS_LEFT_OFF` after it when the scan
+  switched the autofocus off. `_CHECK_FAILED` is a space and the parenthesis
+  `(the plate check before the first field: check_plate=false scans without
+  it)`. It does not say "nothing moved": the stage moved (the walk-refusal of
+  `prepare_check` before anything moves, `_CHECK_REFUSED`, does).
+- **A stop, a halt, a fault**: its type and, after the switch-off, its WARNING,
+  unchanged (FM-64, FM-165).
+
+The first field then engages the autofocus as after any wall (`after_wall`),
+unchanged. `t0`, the clock of `ScanFrame.t_s` (§3.4), is read again right after
+the check returns, so that `t_s` counts from the attempt's first field (from the
+loop's start when no check ran); `PlateCheck.elapsed_s` holds the check's time.
+
+**The result**: `plate_check` is the check. After `stand.assumed` come, in this
+order, the check's line: `the plate was checked before the first field: <w1>
+and <w2> lie within <worst:.1f> µm of their registered centres under
+<objective> (bound <b:g> µm), at <checked_utc to the second>`; the check walk's
+own lines (`CheckSetup.assumed`: `the stage reports no soft limits, so the
+frames' moves were not checked against any travel` when the stage reports
+none); the save error of a check frame, the walk's own line (§17.4 step 4); or,
+when no check ran, the skip's line alone.
 
 **For #549** (the scan's time estimate): the check adds about 20 s at the 10×
-to every attempt (§27.1).
+to every attempt (§27.1), not measured (§27.9); #609 measures it.
 
 ### 27.6 The tool — `plate_check/plugin.py` (new)
 
@@ -9737,12 +9783,27 @@ line, the saving line, then `the plate was checked under <objective>: <w1> and
   `test_with_a_locked_autofocus_the_check_walks_with_it_off_and_the_first_field_engages_it_again`
   and `test_a_refused_check_after_the_switch_off_says_the_autofocus_was_left_off`
   (`RecordingAutofocus`: the switch-off before the check's first move).
+- **#576's follow-ups**, in the same two modules:
+  `test_a_check_that_finds_no_wall_names_check_plate_false` (and, after the
+  switch-off, `…_ends_with_the_way_past_then_the_autofocus_sentence`; the
+  verdict is asserted to hold no `check_plate`),
+  `test_the_scans_default_search_is_1000_um`,
+  `test_the_first_frames_t_s_does_not_count_the_check`,
+  `test_the_scans_check_waits_no_settle_time`,
+  `test_a_scan_on_a_stage_that_reports_no_limits_says_so_after_the_checks_line`,
+  `test_a_resume_with_every_well_done_says_the_plate_was_not_checked`,
+  `test_a_plan_that_records_no_registration_objective_says_so`,
+  `test_a_plate_record_the_scan_cannot_read_names_check_plate_false`; and for
+  the tool `test_a_plate_moved_under_the_40x_is_refused_naming_the_offset_its_distances_are_from`,
+  `test_a_plate_that_moved_is_a_plate_moved_error_and_another_refusal_is_not`,
+  `test_a_settle_time_is_waited_before_every_frame_of_the_check`,
+  `test_a_narrower_search_is_the_one_used_and_named_in_the_refusal`.
 
 The moved records differ from the bound by far (50.0 and 61.4 µm against 25);
 the unmoved plate reads 0.02 µm.
 
 **Failure modes**: FM-19, FM-64, FM-73, FM-88, FM-98, FM-125, FM-142, FM-165,
-FM-207, FM-216, FM-223.
+FM-207, FM-216, FM-223, FM-263.
 
 ### 27.9 Not verified (for the owner)
 

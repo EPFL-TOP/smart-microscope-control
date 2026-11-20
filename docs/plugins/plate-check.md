@@ -76,6 +76,20 @@ the plate moved since plate-walls registered it: B2 lies 31.9 µm from its regis
 
 The turn and the slide are said, never judged: the verdict is how far a well moved.
 
+Under another objective than the registration's, a distance is to the registered centre
+moved into that objective's frame, so the first well's clause names the offset it is from:
+`B2 lies 31.9 µm from its registered centre plus the offset (-37.5, +12.2) µm to <objective>
+(-14.5, -28.4)`. Under the registration's own objective the text is the one above. The
+verdict is a `PlateMovedError` (a `PluginRunError`, so the runner and the exit codes see
+no change), which is how [`scan`](scan.md) tells it from a check that could not measure.
+
+A check that **could not measure** (no wall found within the search, a frame that would not
+come) is another refusal, not a verdict: its reason names the walk's own advice (`check
+that the light is on, and that the plate lies as it was registered: a plate moved by more
+than <search> µm since plate-walls registered it hides <well>'s wall from this check`)
+and the stage is where the walk left it. Under a fluorescence light path that shows no
+wall the check cannot work; `scan` then names `check_plate=false`, which scans without it.
+
 ## What is refused before anything moves
 
 A dry run; a turret at an empty position; an offset between the plate's objective and

@@ -145,17 +145,33 @@ them with the registered centres moved into the plan's objective's frame. It is
   and B5 33.5 µm (-16.7, +29.0) under <objective>, more than 25 µm; it turned about
   -0.056° and slid about (-15.6, +0.3) µm: register it again (plate-walls), then run
   scan-plan and scan again, without --resume: frames already taken are placed against
-  the old registration`. When the scan had switched PFS off at that well, the reason
-  ends with `; the autofocus was switched off before anything moved and was not engaged
-  again: engage it again on the sample`. A stop, a halt or a fault during the check
-  ends the scan as it would anywhere (`stopped` stays `stopped`), and after that
-  switch-off a WARNING says that nothing engaged PFS again: lock it on the sample before
-  the next scan, since no frame of the attempt records that it was used.
+  the old registration`. Under another objective than the registration's, the first
+  well's clause names the offset its distance is from: `A1 lies 50.0 µm from its
+  registered centre plus the offset (-37.5, +12.2) µm to <objective> (-50.0, +0.0)`, so
+  that the numbers can be read against `plate-walls`' record; under the registration's
+  own objective the text is the one above. When the scan had switched PFS off at that
+  well, the reason ends with `; the autofocus was switched off before anything moved and
+  was not engaged again: engage it again on the sample`. A stop, a halt or a fault
+  during the check ends the scan as it would anywhere (`stopped` stays `stopped`), and
+  after that switch-off a WARNING says that nothing engaged PFS again: lock it on the
+  sample before the next scan, since no frame of the attempt records that it was used.
+- **A check that could not measure** (no wall in view: a light path that shows none, a
+  fluorescence one say, or a plate moved by more than the search of 1000 µm; a frame
+  that would not come) ends the scan `failed`, with no frame of the scan, and its reason
+  ends with the parenthesis `(the plate check before the first field: check_plate=false
+  scans without it)`. It does not say `nothing moved`: the stage moved. After the
+  switch-off of the autofocus the reason ends with that parenthesis, then the
+  autofocus's sentence. The verdict of a plate that moved never carries it: registering
+  the plate again is its answer, and `check_plate=false` would scan the plate where it
+  is not.
 - **A plate that did not move**: the result's `plate_check` holds the check, with
   `checked_utc`, and the first line of `assumed` after the stand's says `the plate was
   checked before the first field: A1 and H12 lie within 0.4 µm of their registered
   centres under <objective> (bound 25 µm), at 2026-11-18T09:12:33+00:00`. The check's
-  frames are kept as `plate-check/<token>/<well>_<side>.tif`.
+  frames are kept as `plate-check/<token>/<well>_<side>.tif`. Next come the check walk's
+  own lines (on a stage that reports no soft limits: `the stage reports no soft limits,
+  so the frames' moves were not checked against any travel`), then, when frames could not
+  be saved, `n frames of the plate check could not be saved (the log says why)`.
 - **When it is not made**, the scan goes on, logs one WARNING and says why in `assumed`,
   first after the stand's lines, in this order:
 
@@ -163,11 +179,18 @@ them with the registered centres moved into the plan's objective's frame. It is
   |---|---|
   | `check_plate=false` | `the plate was not checked against its registration (check_plate=false)` |
   | a dry run | `dry run: the plate was not checked against its registration` |
+  | no well is left (a `--resume` of a scan whose wells are all done) | `the plate was not checked: every well of the plan was done by an earlier attempt, so this one takes no frame` |
   | the plate record could not be read | `the plate was not checked: plate not read: <why>` |
   | the plate was registered by `plate-registration`, `plate-finding` or the holder's estimate | `the plate was not checked: it was registered by <method>, which measures no well's walls (plate-walls does)` |
+  | the plan does not record the objective of its registration (an older scan-plan) and the plate record is under one | `the plate was not checked: the plan does not record the objective of the registration it was made from (an older scan-plan), and the plate record is under <plate objective>: run scan-plan again to check it` |
   | the plan was made from another registration's objective | `the plate was not checked: the plan was made from a registration under <a>, the plate record is under <b>` |
   | the offset between the plate's objective and the plan's is not measured | `the plate was not checked: the offset between <a> and <b> is not measured (the profile's [objectives]), and a check would read it as a move` |
   | the plan's camera matrix is the profile's or a parameter | `the plate was not checked: the plan's camera matrix is the <source>'s, and a wall is looked for with a measured one only` |
+
+  A plate record that exists but that this smc cannot read (a plate name it does not know,
+  say) is not a skip: the scan ends `failed` before anything moves, with `scan reads plate,
+  but the result of plate-walls is not what scan expects (…); run plate-walls again; or
+  scan with check_plate=false, which does not read the plate`.
 
 **The cost** is about 20 s at the 10× per attempt (two wells of 8 frames and the travel
 between them, estimated from session 5's registration; not measured at the stand). **The
@@ -368,7 +391,9 @@ The slot `scan` holds a `ScanResult` (`smc.plugins.slots`):
   `z_um` (`null` without a focus drive); `focus` (`locked`, `unlocked`: used and not
   locked, `off`: the stand has an autofocus the scan did not use, `none`: it has
   none); `pfs_offset` (in the autofocus's own unit, `null` when not used); `t_s` from
-  the start of the attempt that took it; and, only for a field that had the focus on
+  the first field of the attempt that took it (after the plate check, when the attempt
+  made one: the check's time is the check's `elapsed_s`); and, only for a field that had
+  the focus on
   the cells, `cell_focus`: its `source` (`swept`, or `well` for a field that reused its
   well's offset), its `sweep` (the centre, the Z readbacks, the scores, the outcome and
   the refined plane), `dz_um` (the frame's Z command minus the centre), `frame_score`
