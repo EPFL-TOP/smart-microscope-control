@@ -75,6 +75,11 @@
     "description": "docs/, README, ADRs"
   },
   {
+    "name": "area: algorithms",
+    "color": "5319E7",
+    "description": "Pure algorithm on acquired data — no microscope, no smc.hardware (ADR-0004's algorithm half)"
+  },
+  {
     "name": "scope: demo",
     "color": "FBCA04",
     "description": "Micro-Manager demo devices"
