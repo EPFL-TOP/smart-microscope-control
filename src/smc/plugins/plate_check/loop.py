@@ -68,6 +68,7 @@ from smc.plugins.slots import (
 
 __all__ = [
     "CheckSetup",
+    "PlateMovedError",
     "checked_line",
     "objective_text",
     "prepare_check",
@@ -79,15 +80,28 @@ _MIN_WELLS = 2
 _NO_TURRET = "no turret"
 
 
+class PlateMovedError(PluginRunError):
+    """The verdict of a check that measured: a registered well lies farther from its centre than the bound.
+
+    A subclass of ``PluginRunError`` (its constructor and ``__reduce__``, so
+    that the runner and every ``except PluginRunError`` see no change) so that
+    the scan can tell the verdict from the check's other refusals: a plate that
+    moved is answered by registering it again, and a check that could not
+    measure (no wall in view, a frame that would not come) is answered by
+    scanning without it (m3 §27.4). Advice written for the first is never
+    given to the second.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class CheckSetup:
     """What one check measures and holds it to, fixed before the first move.
 
     ``refs`` are the expected centres (the registered ones plus ``shift_um``) in
-    the order measured, ``registered`` the registered ones in the same order.
-    ``again`` ends the refusal: what the operator does about a plate that moved,
-    which differs between the scan and the tool. ``assumed`` is the soft limits'
-    line, or nothing.
+    the order measured, ``registered_xy_um`` the registered ones in the same
+    order. ``again`` ends the refusal: what the operator does about a plate that
+    moved, which differs between the scan and the tool. ``assumed`` is the soft
+    limits' line, or nothing.
     """
 
     plate: str
@@ -95,7 +109,7 @@ class CheckSetup:
     objective: str | None
     shift_um: tuple[float, float]
     refs: tuple[WellRef, ...]
-    registered: tuple[tuple[float, float], ...]
+    registered_xy_um: tuple[tuple[float, float], ...]
     walk: WallWalk
     offsets: tuple[float, ...]
     max_shift_um: float
@@ -198,7 +212,7 @@ def prepare_check(
         objective=objective,
         shift_um=shift_um,
         refs=refs,
-        registered=registered,
+        registered_xy_um=registered,
         walk=walk,
         offsets=offsets,
         max_shift_um=max_shift_um,
@@ -257,10 +271,12 @@ def run_check(
     names every well's numbers (§27.4).
 
     Raises:
-        PluginRunError: Of ``setup.walk.stage``: a well moved more than
+        PlateMovedError: Of ``setup.walk.stage``: a well moved more than
             ``max_shift_um`` (the refusal carries every well's distance and
-            difference, the bound, the turn and the slide, then ``again``), or
-            any of ``measure_well``'s refusals. The stage is where it was left.
+            difference, the bound, the turn and the slide, then ``again``).
+        PluginRunError: Of ``setup.walk.stage``, not a ``PlateMovedError``: any
+            of ``measure_well``'s refusals (the check could not measure). The
+            stage is where it was left.
         MicroscopeHaltedError, MotionStoppedError, StopRequested: Passed (FM-64).
     """
     stage = setup.walk.stage
@@ -273,7 +289,7 @@ def run_check(
     checked: list[CheckedWell] = []
     frames = 0
     try:
-        for ref, registered in zip(setup.refs, setup.registered, strict=True):
+        for ref, registered in zip(setup.refs, setup.registered_xy_um, strict=True):
             fit, taken = measure_well(
                 xy,
                 camera,
@@ -305,7 +321,7 @@ def run_check(
         )
         worst_um = max(w.distance_um for w in checked)
         if worst_um > setup.max_shift_um:
-            raise PluginRunError(stage, _moved(setup, checked, turn_deg, slide))
+            raise PlateMovedError(stage, _moved(setup, checked, turn_deg, slide))
     except BaseException:
         # A stop, a halt, a fault or a refusal: the stage stays where it is, the
         # exception goes on (FM-88, FM-64), and nothing is caught.
@@ -341,12 +357,24 @@ def _moved(
     turn_deg: float,
     slide: tuple[float, float],
 ) -> str:
-    """The refusal of a plate that moved: every well's distance and difference, the bound, the turn, the slide, then what to do."""
+    """The refusal of a plate that moved: every well's distance and difference, the bound, the turn, the slide, then what to do.
+
+    A distance is to the registered centre moved into the objective's frame
+    (§18), so under another objective than the registration's the first well's
+    clause names that offset: the numbers then do not match the record's, and
+    the reader is told why (the text under the registration's own objective is
+    unchanged).
+    """
     parts = []
     for n, well in enumerate(checked):
         dx, dy = well.difference_xy_um
         lies = " lies" if n == 0 else ""
         whose = " from its registered centre" if n == 0 else ""
+        if n == 0 and setup.shift_um != (0.0, 0.0):
+            whose += (
+                f" plus the offset ({setup.shift_um[0] + 0.0:+.1f}, "
+                f"{setup.shift_um[1] + 0.0:+.1f}) µm to {objective_text(setup.objective)}"
+            )
         parts.append(
             f"{well.well}{lies} {well.distance_um:.1f} µm{whose} "
             f"({dx + 0.0:+.1f}, {dy + 0.0:+.1f})"
