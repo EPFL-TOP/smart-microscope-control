@@ -1,0 +1,47 @@
+name: Algorithm
+description: "A pure algorithm on acquired data that chooses fields or orders them. No microscope is needed."
+title: "feat(algorithms): "
+labels: ["type: feature", "area: algorithms"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        An algorithm issue touches `src/smc/selection/`, its tests, its page under
+        `docs/algorithms/` and `pyproject.toml`, and nothing of `src/smc/hardware/`,
+        `profiles/` or `src/smc/ui/`. It is done when the algorithm passes its tests in
+        CI and has been looked at on a dataset with the owner. Connecting it to the tool
+        that drives the microscope is a second issue, the owner's. Read
+        `docs/algorithms/README.md` first.
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What the algorithm should achieve on a scan, in one paragraph (for example, which fields to image at higher magnification, and why those).
+    validations:
+      required: true
+  - type: textarea
+    id: data_in
+    attributes:
+      label: Data in
+      description: The dataset on the lab's share (its name, and who has the path) and the stages it needs (a scan, its cells, anything else). Say what a selector may read, for example the cells' positions and classes, or the frames' pixels.
+    validations:
+      required: true
+  - type: textarea
+    id: decision_out
+    attributes:
+      label: Decision out
+      description: The selector or the orderer to write, its parameters, and the numbers it decides on (its measures, with their units in the name, for example `density_per_mm2`, `nn_median_um`, `doublet_fraction`).
+    validations:
+      required: true
+  - type: textarea
+    id: judged
+    attributes:
+      label: How it is judged
+      description: Tests on synthetic inputs whose answer is known, the dataset's drawings looked at with the owner (`smc dataset draw`), and the numbers to report on the algorithm's page.
+    validations:
+      required: true
+  - type: textarea
+    id: wiring
+    attributes:
+      label: The wiring issue
+      description: Filled by the owner, once the issue that connects this result to the microscope exists. Leave empty when you open the issue.
