@@ -22,10 +22,40 @@ pip install -e ".[dev,ui]"
 python -m playwright install chromium   # on a bare Linux add --with-deps
 ```
 
+## Working on algorithms (no microscope)
+
+An algorithm that chooses fields from a scan's data (cell density, spacing,
+doublets) needs a laptop and nothing of Micro-Manager: no adapters, no
+`mmcore install`, no `smc doctor`, no vendor software.
+
+```sh
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"          # pymmcore-plus comes as a library; no adapters
+pre-commit install
+pytest                           # the demo tests skip: "Micro-Manager demo adapters not installed"
+pip install -e ".[dev,detect]"   # only to run the cell model (torch)
+```
+
+On Windows, in PowerShell, the activation is `.venv\Scripts\Activate.ps1`.
+
+The tests that need the simulated microscope skip on your laptop, and run in
+the CI of every pull request, where `SMC_REQUIRE_MM=1` turns a skip into a
+failure so that nothing is skipped its way to green. **Never set
+`SMC_REQUIRE_MM` on a laptop.** Building the acquisition loop is the other
+case: it needs the demo adapters (`mmcore install --test-adapters`).
+
+[`docs/algorithms/README.md`](docs/algorithms/README.md) is the guide: get a
+dataset, load it, run the tools offline, write a selector (`/new-selector`),
+test it, and what never to assume or touch.
+
 ## The loop
 
 1. **Issue first.** Use a template. Write acceptance criteria; add a short
-   plan before you start coding.
+   plan before you start coding. A result of an algorithm is two issues: an
+   *Algorithm* issue (`area: algorithms`, which touches nothing of
+   `smc.hardware`, `profiles/` or `smc.ui`) that is done when the algorithm
+   passes its tests on a dataset, and the owner's issue that connects it to
+   the tool that drives the microscope and carries the check at the stand.
 2. **Branch**: `feat/<issue>-<slug>` (or `fix/`, `docs/`, `chore/`, `adr/`).
 3. **Code + tests.** New behaviour is proven on the demo devices; pure
    algorithms get unit tests; hardware-only behaviour gets a `FakeCore`
@@ -34,6 +64,11 @@ python -m playwright install chromium   # on a bare Linux add --with-deps
 4. **Verify**: `ruff check . && ruff format --check . && mypy && pytest`.
 5. **Pull request** with the template. Title in Conventional Commits form
    (`feat(core): …`). One reviewer. Squash merge by the maintainer.
+   `.github/CODEOWNERS` gives `src/smc/hardware/`, `profiles/`, `docs/adr/`,
+   `docs/design/`, `.github/`, `.claude/` and `CLAUDE.md` to the owner: a pull
+   request that touches one of them needs the owner's review, once the
+   branch protection of `main` asks for code owners' reviews (the owner sets
+   it in the repository's settings; until then it only requests the review).
 
 ## Testing
 
