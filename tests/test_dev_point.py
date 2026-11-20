@@ -582,7 +582,7 @@ def test_the_nightly_issue_is_left_out_of_the_owner_notes(
         capsys.readouterr().out.split("## Since the last point")[1].split("\n## ")[0]
     )
     assert "nothing new" in notes
-    assert "#77 owner note" not in notes
+    assert "#77 note (" not in notes
 
 
 # --- the window starts at the last Point; the lanes are listed (#432) ---------
@@ -725,8 +725,57 @@ def test_a_lane_note_is_not_an_owner_note(point, monkeypatch, capsys) -> None:
     notes = (
         capsys.readouterr().out.split("## Since the last point")[1].split("\n## ")[0]
     )
-    assert "#5 owner note: is the stand free on Friday?" in notes
+    assert "#5 note (unknown): is the stand free on Friday?" in notes
     assert "Lane" not in notes
+
+
+def test_an_unheaded_comment_is_a_note_named_by_its_author(
+    point, monkeypatch, capsys
+) -> None:
+    # Two people write plain notes now (the owner and a collaborator): the point
+    # prints who wrote each one instead of reading every note as the owner's.
+    work = {
+        **_issue(5, "feat: y", ["status: in-progress"]),
+        "comments": [
+            {
+                "author": {"login": "someone"},
+                "body": "a note",
+                "createdAt": "2026-11-12T10:00:00Z",
+            },
+            {"body": "no author at all", "createdAt": "2026-11-12T11:00:00Z"},
+            {
+                "author": None,
+                "body": "a null author",
+                "createdAt": "2026-11-12T12:00:00Z",
+            },
+            {
+                "author": {"login": ""},
+                "body": "an empty login",
+                "createdAt": "2026-11-12T13:00:00Z",
+            },
+        ],
+    }
+    monkeypatch.setattr(point, "gh_json", _canned([], [work], []))
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+    assert point.main() == 0
+    notes = (
+        capsys.readouterr().out.split("## Since the last point")[1].split("\n## ")[0]
+    )
+    assert "- #5 note (someone): a note" in notes
+    assert "- #5 note (unknown): no author at all" in notes
+    assert "- #5 note (unknown): a null author" in notes
+    assert "- #5 note (unknown): an empty login" in notes
+    assert "owner note" not in notes
+
+
+def test_a_comment_read_through_the_rest_api_keeps_its_author(point) -> None:
+    # `gh api` names the author `user`; the point reads the listing's `author`. A
+    # tracking issue past 100 comments is read through the REST API, and its notes
+    # must not all become `note (unknown)`.
+    rest = {**_rest("a note", "2026-11-12T10:00:00Z", 7), "user": {"login": "someone"}}
+    assert point.author_of(point.normalise_comment(rest)) == "someone"
+    assert point.author_of(point.normalise_comment(_rest("x", "t"))) == "unknown"
+    assert point.normalise_comment({**rest, "user": None})["body"] == "a note"
 
 
 # --- a listing cuts comments at 100; the point reads them all (#591) -----------------
@@ -1082,7 +1131,7 @@ def test_a_report_with_an_arrow_in_any_text_does_not_end_on_a_cp1252_stdout(
     assert out.isascii()
     assert "- #9 fix round, follow-up: -> track it" in out
     assert "- #5 report, Friction: -> slow" in out
-    assert "- #5 owner note: is the ?m stage free?" in out
+    assert "- #5 note (unknown): is the ?m stage free?" in out
 
 
 def test_every_gh_child_of_the_point_has_no_console_a_timeout_and_utf8(
