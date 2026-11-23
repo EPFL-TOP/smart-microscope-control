@@ -66,6 +66,7 @@ from smc.ui.guide import (
     busy_note,
     calibrate_changed,
     calibrate_is_the_plates,
+    calibrate_measured_other,
     calibrate_position_unknown,
     calibration_failed,
 )
@@ -186,12 +187,19 @@ class StubCalibration:
     assumed: ClassVar[tuple[str, ...]] = ()
     started: ClassVar[threading.Event] = threading.Event()
     release: ClassVar[threading.Event | None] = None
+    #: The operator's turn at the handset **during the run**, between the click's read of the
+    #: turret and the tool's own: the label the tool then reads is this one (m5 §18.6 D21).
+    turns_to: ClassVar[str | None] = None
 
     def run(
         self, microscope: Any, params: StubCalibrationParams, ctx: RunContext
     ) -> CameraCalibration:
         StubCalibration.seen.append(params)
         StubCalibration.started.set()
+        if StubCalibration.turns_to is not None:
+            microscope.require(ObjectiveTurret).select(
+                StubCalibration.turns_to, confirm=True
+            )
         if StubCalibration.release is not None:
             # In the tool's own way: a STOP is seen between two steps, the stage stays put.
             deadline = time.monotonic() + 10.0
@@ -237,6 +245,7 @@ def _fresh_state() -> Iterator[None]:
     StubCalibration.seen = []
     StubCalibration.fails = None
     StubCalibration.assumed = ()
+    StubCalibration.turns_to = None
     StubCalibration.started = threading.Event()
     StubCalibration.release = None
     Slow.started = threading.Event()
@@ -975,6 +984,128 @@ def test_a_stop_during_a_calibration_says_stopped_and_leaves_the_other_documents
     assert view.registered is not None
 
 
+# --- D21: a document is its file's position's -------------------------------------------
+
+
+def test_a_run_that_measured_another_objective_than_the_button_named_says_so_and_not_done(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # Acceptance 3 (FM-216, FM-177): the click read the 40X at position 1, and the operator turned
+    # the turret to the 20X at the handset before the tool read its own label. What is on the
+    # disk is the 20X's calibration in the 40X's file.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    StubCalibration.turns_to = TWENTY
+    page = _page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        outcome = _calibrate(page, FORTY)
+        view = page.view()
+        # The turret stands at the 20X now: the default (the empty field) must not take the 20X's
+        # calibration out of the 40X's file for the 20X's own (D16, D21).
+        step = page.offsets_step("")
+        after = run_doc.read_bytes()
+    finally:
+        page.close()
+
+    document = _folder(run_doc) / "position-1.json"
+    assert outcome == (
+        f"Camera calibration: {calibrate_measured_other(FORTY, TWENTY, 'position-1.json')}"
+    )
+    assert "done" not in outcome
+    # The run did write the record of what it measured, in the file of the label it started at.
+    held = view.calibrations
+    assert [(h.position, h.read.objective, h.read.problem) for h in held] == [
+        (1, TWENTY, None)
+    ]
+    assert (
+        CameraCalibration.model_validate(
+            RunDocument.load(document).stages["camera-calibration"].result
+        ).objective
+        == TWENTY
+    )
+    # Left out of the default: nothing to measure with, and the wait is the page's own.
+    assert step.targets == ()
+    assert step.pairs == ()
+    assert step.wait == OFFSETS_NO_DOCUMENT
+    # The page's own document is the registration's, as ever, and the turret is where the
+    # *operator* left it (the run did not turn it back, and nothing here turns it).
+    assert after == before
+    assert _in_place(fake_microscope) == TWENTY
+
+
+def test_a_run_that_measured_the_named_objective_says_what_the_tool_says(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    StubCalibration.assumed = ("the stage was not turned",)
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY)
+    finally:
+        page.close()
+
+    # The tool's own end: its title, its time and its first assumed line, not the page's check.
+    assert outcome.startswith("Camera calibration done in ")
+    assert outcome.endswith("; assumed: the stage was not turned")
+    assert "measured" not in outcome
+
+
+def test_a_calibration_that_ended_failed_says_the_tools_failure_and_never_the_objective_check(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The check runs after a run that ended `done` only. A document that reads as a usable one of
+    # another objective whatever the end (here: the read is replaced) must not turn a failure
+    # into the page's other words.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    StubCalibration.fails = "the frame is dark or flat"
+    monkeypatch.setattr(
+        controller_module,
+        "_read_calibration",
+        lambda path, *, profile, dry_run: CalibrationRead(
+            path, TWENTY, "2026-11-17T09:00:00+00:00", None
+        ),
+    )
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY)
+    finally:
+        page.close()
+
+    assert (
+        outcome
+        == "Camera calibration failed: camera-calibration: the frame is dark or flat"
+    )
+
+
+def test_a_record_that_cannot_be_read_after_the_run_leaves_the_tools_own_outcome(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing the page can say of a document it cannot read: the tool's `done` stands (FM-98).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    monkeypatch.setattr(
+        controller_module,
+        "_read_calibration",
+        lambda path, *, profile, dry_run: CalibrationRead(
+            path, None, "", "the share does not answer"
+        ),
+    )
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY)
+    finally:
+        page.close()
+
+    assert outcome.startswith("Camera calibration done in ")
+
+
 # --- D15: the held documents ------------------------------------------------------------
 
 
@@ -1215,6 +1346,8 @@ def test_offsets_step_with_an_empty_field_takes_the_held_documents_in_position_o
 def test_the_default_leaves_out_the_plates_objective_a_problem_and_an_objective_not_on_the_turret(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
+    # D21: a document is kept only when its objective is the label of its own position, so the
+    # 40X's calibration in the sixth file is left out although the 40X is on the turret.
     _seed_plate(run_doc)
     _hold(
         run_doc,
@@ -1223,6 +1356,7 @@ def test_the_default_leaves_out_the_plates_objective_a_problem_and_an_objective_
         position_3="Objective-2",  # a problem, below
         position_4=TWENTY,
         position_5="Nikon 60X Plan Apo",  # not on the turret now
+        position_6=FORTY,  # on the turret, but at position 1, not here
     )
     (_folder(run_doc) / "position-3.json").write_text("{not json", encoding="utf-8")
     page = _page(fake_microscope, run_doc)
@@ -1238,8 +1372,8 @@ def test_the_default_leaves_out_the_plates_objective_a_problem_and_an_objective_
         str(_folder(run_doc) / "position-1.json"),
         str(_folder(run_doc) / "position-4.json"),
     ]
-    # Nothing is dropped silently: the three left out are in the list the block draws.
-    assert [h.position for h in held] == [1, 2, 3, 4, 5]
+    # Nothing is dropped silently: the four left out are in the list the block draws.
+    assert [h.position for h in held] == [1, 2, 3, 4, 5, 6]
 
 
 def test_with_nothing_held_and_nothing_typed_the_wait_is_the_no_document_text(

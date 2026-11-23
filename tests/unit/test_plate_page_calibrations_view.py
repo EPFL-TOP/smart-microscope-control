@@ -826,6 +826,56 @@ def test_the_list_names_each_document_its_objective_and_date_each_objective_with
     assert view.calibrations_held_text.visible is True
 
 
+def test_the_list_says_a_document_in_another_objectives_file_and_lists_that_objective_as_missing(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # Acceptance 3 (D21): the 10X's calibration, run into position-1.json (the 40X's file), was
+    # listed as the 10X's with no warning and the 40X as missing. Its line now says whose it is
+    # and where it is wrong; the 40X has none; a document at its own position is as it was; and
+    # the notes of a document that is not offered are not shown under it.
+    _hold(run_doc, 1, TEN, assumed=("a note of the 10X's calibration",))
+    _hold(run_doc, 4, TWENTY, assumed=("a note of the 20X's calibration",))
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+
+    folder = run_doc.parent / "calibrations"
+    lines = view.calibrations_held_text.object.splitlines()
+    assert lines == [
+        f"Camera calibrations the page holds, one document per objective, in {folder}:",
+        f"position 1 ({FORTY}): the document holds a calibration of {TEN}, not of the "
+        "objective at this position now (the turret was turned during a run, or "
+        f"relabelled since): calibrate {FORTY} again, or type the documents to use",
+        f"{TWENTY}: calibrated on 2026-11-17",
+        f"  {TWENTY}: a note of the 20X's calibration",
+        # In turret order: the 40X has none, whatever position 1's file holds.
+        f"{FORTY}: no calibration yet",
+        "Objective-2: no calibration yet",
+        "Objective-4: no calibration yet",
+        "Objective-5: no calibration yet",
+    ]
+    # The button, for the 40X, says what the next calibration replaces: the 10X's document.
+    assert view.offsets_calibrate_wait.object == calibrate_replaces(TEN, SEEDED)
+
+
+def test_with_the_labels_unread_a_document_is_listed_as_it_is_and_nothing_is_said_of_its_position(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # Labels that cannot be read say nothing of a position: the line is the usable one, and no
+    # objective is listed as missing (FM-145: the page's copy of the labels is all it has).
+    _hold(run_doc, 1, TWENTY)
+    _seed_plate(run_doc)
+    fake_microscope.override(ObjectiveTurret, Turret([], FORTY))
+    view = make_view()
+    view.refresh()
+    view.tick()
+
+    lines = view.calibrations_held_text.object.splitlines()
+    assert lines[1:] == [f"{TWENTY}: calibrated on 2026-11-17"]
+
+
 def test_the_notes_of_a_calibration_are_listed_under_its_line(
     make_view: Callable[..., PlatePageView],
     fake_microscope: Microscope,

@@ -169,8 +169,10 @@ from smc.ui.guide import (
     a1_corner,
     busy_note,
     calibrate_changed,
+    calibrate_measured_other,
     calibrate_position_unknown,
     calibrate_wait,
+    calibration_at_its_position,
     calibration_failed,
     calibration_file,
     calibration_paths,
@@ -5960,12 +5962,25 @@ class PlatePage:
             RuntimeError: An activity is going (``<name> is running``), or the page is closed.
         """
         self._refuse_if_busy()
-        title = tool_title("camera-calibration")
         found = self._calibrate_target(expected)
         if isinstance(found, str):
-            self._set_outcome(f"{title}: {found}")
+            self._set_outcome(f"{tool_title('camera-calibration')}: {found}")
             return
-        path = found
+        self._calibrate_into(found, expected, pairs)
+
+    def _calibrate_into(self, path: Path, expected: str, pairs: Sequence[str]) -> None:
+        """Start ``camera-calibration`` into the position's document ``path``: the tail both calibrate buttons share (m5 §18.6 D13, D14, D19, D21).
+
+        The folder is made on the worker, the run is ``_prepare(..., doc_path=path)`` and the
+        activity is named ``camera-calibration`` (the strip, STOP, a second run refused, the
+        clock: as any run). **After a run that ended ``done``** the record it wrote is read
+        again and, when it names another objective than ``expected`` (the label the button
+        showed), the outcome is the page's words and not ``done``: the operator can turn the
+        turret at the handset between the click's read and the tool's own, and what is on the
+        disk is then the other objective's calibration in this position's file (D21, FM-177).
+        The page cannot undo it, and a record it cannot read is the tool's outcome to say.
+        """
+        title = tool_title("camera-calibration")
         loaded = self.preset
         preset = None if loaded is None else loaded.file.name
         prepared = self._prepare("camera-calibration", pairs, doc_path=path)
@@ -5974,6 +5989,8 @@ class PlatePage:
             return
         entry, parsed, planned = prepared
         folder = self.calibrations_folder
+        profile = self._profile.microscope.name
+        dry_run = self._dry_run
 
         def body(event: threading.Event) -> str:
             # Made on the worker: a folder on a share that does not answer must not hold the
@@ -5983,7 +6000,7 @@ class PlatePage:
                 folder.mkdir(exist_ok=True)
             except OSError as exc:
                 return f"{title} failed: could not make {folder}: {_one_line(exc)}"
-            return self._run_plugin(
+            ended = self._run_plugin(
                 "camera-calibration",
                 entry,
                 parsed,
@@ -5991,7 +6008,13 @@ class PlatePage:
                 preset,
                 planned=planned,
                 doc_path=path,
-            ).outcome
+            )
+            if ended.status != "done":
+                return ended.outcome
+            read = _read_calibration(str(path), profile=profile, dry_run=dry_run)
+            if read.problem is None and read.objective != expected:
+                return f"{title}: {calibrate_measured_other(expected, read.objective, path.name)}"
+            return ended.outcome
 
         self._start_activity("camera-calibration", body)
 
@@ -6129,14 +6152,18 @@ class PlatePage:
         return tuple(held)
 
     def _default_calibrations(self) -> tuple[CalibrationRead, ...]:
-        """The held documents that an empty field measures with: usable, not the plate's objective, and on the turret now, in position order (m5 §18.6 D16).
+        """The held documents that an empty field measures with: usable, not the plate's objective, and its position's own now, in position order (m5 §18.6 D16, D21).
 
         As if their paths were typed: ``offsets_step`` reads them, waits for them and
-        refuses them as it does a typed line. Each document left out has its reason in the
-        block's list (D15), so nothing is dropped silently. The turret's labels are read once
-        for the filter; labels that cannot be read filter nothing out, and the step's own wait
-        says so (``OFFSETS_TURRET_UNREAD``) rather than a list that looks empty. Nothing is read
-        for a page with no offer: the step's wait is the reason.
+        refuses them as it does a typed line. A document is kept only when its objective is the
+        label of **its own position** now (``calibration_at_its_position``): one that is on the
+        turret but in another objective's file is left out, as is one naming an objective that is
+        no label (D21: the file names a position and the document an objective, and a turn at the
+        handset during a run or a relabelled turret makes them differ). Each document left out
+        has its reason in the block's list (D15), so nothing is dropped silently. The turret's
+        labels are read once for the filter; labels that cannot be read filter nothing out, and
+        the step's own wait says so (``OFFSETS_TURRET_UNREAD``) rather than a list that looks
+        empty. Nothing is read for a page with no offer: the step's wait is the reason.
         """
         doc, unreadable = self._document()
         if unreadable is not None:
@@ -6151,7 +6178,13 @@ class PlatePage:
             if held.read.problem is None
             and held.read.objective is not None
             and held.read.objective != offer.plate_objective
-            and (not labels or held.read.objective in labels)
+            and (
+                not labels
+                or calibration_at_its_position(
+                    labels, held.position, held.read.objective
+                )
+                is True
+            )
         )
 
     # --- the offsets block (m5 §18) -----------------------------------------------------
