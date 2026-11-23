@@ -187,6 +187,7 @@ from smc.ui.guide import (
     wells_from_line,
     wells_known_lines,
 )
+from smc.ui.selection import stop_tip
 
 __all__ = [
     "PlatePageView",
@@ -810,7 +811,7 @@ class PlatePageView:
             }
         )
         self.route_source = ColumnDataSource(
-            {"x": [], "y": [], "order": [], "well": []}
+            {"x": [], "y": [], "order": [], "well": [], "tip": []}
         )
         # ``x``, ``y`` and ``text`` are always set together and of one length: a LabelSet
         # over columns of different lengths raises in Bokeh, and the map stops redrawing.
@@ -937,7 +938,10 @@ class PlatePageView:
         self.figure.line(
             "x", "y", source=self.route_source, line_width=2, color="#d62728"
         )
-        self.figure.scatter(
+        # The route's circles are in the hover's list (``_ensure_renderer``): a stop says its
+        # name, its visit number and, when the selector gave them, its score and measures
+        # (m5 §21, D10).
+        self.route_points = self.figure.scatter(
             "x", "y", source=self.route_source, marker="circle", size=5, color="#d62728"
         )
         self.figure.scatter(
@@ -3462,6 +3466,15 @@ class PlatePageView:
             "y": [stop.y_um for stop in view.route],
             "order": [stop.order for stop in view.route],
             "well": [stop.well for stop in view.route],
+            "tip": [
+                stop_tip(
+                    name=stop.name,
+                    order=stop.order,
+                    score=stop.score,
+                    measures=dict(stop.measures),
+                )
+                for stop in view.route
+            ],
         }
         plan = view.plan
         fields = () if plan is None else plan.fields
@@ -3679,7 +3692,9 @@ class PlatePageView:
                 x="x", y="y", width="w", height="h", angle="angle", **common
             )
         renderer.level = "underlay"
-        self.hover.renderers = [renderer]
+        # The wells' and the route's circles: the frame renderer (`self.frame_renderer`) is the
+        # map's own and stays in no hover's list (FM-174).
+        self.hover.renderers = [renderer, self.route_points]
         self.wells_renderer = renderer
         self._circular = circular
 

@@ -1761,7 +1761,7 @@ def test_the_imaged_layer_is_a_green_rect_over_the_fields_under_the_route_and_no
         assert green.fill_color != orange.fill_color
         # Visible over the orange: not clear, and more opaque than the plan's fields.
         assert 0.0 < orange.fill_alpha < green.fill_alpha < 1.0
-        assert view.hover.renderers == [view.wells_renderer]
+        assert view.hover.renderers == [view.wells_renderer, view.route_points]
 
 
 def test_a_dry_run_scan_marks_no_field_while_it_runs(

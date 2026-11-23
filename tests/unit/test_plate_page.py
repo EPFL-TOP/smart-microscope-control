@@ -1064,7 +1064,7 @@ def test_round_wells_are_circles_and_square_ones_rectangles(
     assert isinstance(view.wells_renderer.glyph, Rect)
     drawing = [r for r in view.figure.renderers if r.data_source is view.wells_source]
     assert len(drawing) == 1
-    assert view.hover.renderers == [view.wells_renderer]
+    assert view.hover.renderers == [view.wells_renderer, view.route_points]
     view.plate_select.value = "96-well"
     assert isinstance(view.wells_renderer.glyph, Circle)
     assert (
@@ -1795,13 +1795,13 @@ def test_the_fields_are_drawn_under_the_route_and_the_wells_keep_the_hover(
     # The route is drawn over the fields: later in the list is on top at one level.
     fields_at, route_at = order()
     assert fields_at < route_at
-    assert view.hover.renderers == [view.wells_renderer]
+    assert view.hover.renderers == [view.wells_renderer, view.route_points]
     assert view.wells_renderer.level == "underlay"
     # A plate with square wells swaps the wells' renderer, and the fields stay where they were.
     view.plate_select.value = "384-well"
     fields_at, route_at = order()
     assert fields_at < route_at
-    assert view.hover.renderers == [view.wells_renderer]
+    assert view.hover.renderers == [view.wells_renderer, view.route_points]
 
 
 def test_a_second_tab_draws_the_plan_the_first_ran(
