@@ -47,6 +47,7 @@ from smc.hardware.capabilities import (
     Camera,
     LightSource,
     ObjectiveTurret,
+    Shutter,
     XYStage,
     ZStage,
 )
@@ -179,6 +180,7 @@ from smc.ui.guide import (
     calibration_failed,
     calibration_file,
     calibration_goes_to_a_document,
+    calibration_light,
     calibration_paths,
     centres_reach_note,
     checkpoint_note,
@@ -1091,6 +1093,11 @@ class PageStatus:
     locked (PFS searching: the scan refuses it, so no note advises a lock then), ``False`` for
     off only (m5 §20 D1, as amended by the owner's decision on #546). A decision (a note that
     says how to lock again) reads it and never the words of ``autofocus`` (FM-155).
+    ``auto_shutter`` is whether the core opens the shutter around each exposure, read in the same
+    pass as ``light_on`` **only when the light reads off** (``None`` otherwise, and with no shutter
+    or a read that failed): a light that reads off at rest says nothing of the frame while the
+    core's auto-shutter opens it for the snap, so a calibration does not wait for it
+    (``calibration_light``, m5 §18.6 D20 as amended by the review of #557).
     """
 
     stand: str
@@ -1115,6 +1122,7 @@ class PageStatus:
     goto_answer: GotoAnswer | None = None
     stop_segments_um: tuple[tuple[str, float], ...] = ()
     autofocus_locked: bool | None = None
+    auto_shutter: bool | None = None
 
 
 def _stop_segments_um(safety: SafetySection) -> tuple[tuple[str, float], ...]:
@@ -1154,6 +1162,7 @@ class _StandRead:
     halted: bool
     problems: tuple[str, ...]
     autofocus_locked: bool | None = None
+    auto_shutter: bool | None = None
 
 
 def jog_crossing(
@@ -4802,6 +4811,7 @@ class PlatePage:
             stop_refused=stop_refused,
             problems=read.problems,
             connected=read.connected,
+            auto_shutter=read.auto_shutter,
             goto=goto,
             clock=clock,
             chain=chain,
@@ -4828,6 +4838,7 @@ class PlatePage:
                 state = microscope.state()
                 problems = list(state.errors)
                 light_on: bool | None = None
+                auto_shutter: bool | None = None
                 light = microscope.get(LightSource)
                 if light is not None:
                     try:
@@ -4839,6 +4850,11 @@ class PlatePage:
                         self._note_light_read(microscope, light, None, raised=True)
                     else:
                         self._note_light_read(microscope, light, light_on, raised=False)
+                        if light_on is False:
+                            # Only then does it matter (a calibration waits for a light that
+                            # reads off): the one flag of the core's, and no read when the
+                            # light is on or unknown.
+                            auto_shutter = self._auto_shutter_of(microscope)
                 autofocus = (
                     describe_autofocus(state)
                     if microscope.has(Autofocus)
@@ -4871,6 +4887,7 @@ class PlatePage:
                         halted=state.halted,
                         problems=tuple(problems),
                         autofocus_locked=autofocus_locked,
+                        auto_shutter=auto_shutter,
                     )
         return _StandRead(
             began_s=began_s,
@@ -6235,15 +6252,39 @@ class PlatePage:
 
     @staticmethod
     def _light_in_place(microscope: Microscope) -> bool | None:
-        """Whether the light reads on now, or ``None``: no light source, no switch smc knows, or a read that raised (m5 §18.6 D20)."""
+        """Whether the light reads on now as ``calibrate_wait`` takes it, or ``None``: no light source, no switch smc knows, a read that raised, or a light that reads off while the core's auto-shutter opens it for the exposure (m5 §18.6 D20).
+
+        The last is ``calibration_light``'s: on the Ti2-E the lamp is the core's shutter and
+        auto-shutter is on, so it reads closed at rest and open for the camera's own snap, and a
+        refusal would be false (found by the review of #557).
+        """
         light = microscope.get(LightSource)
         if light is None:
             return None
         try:
-            return light.is_on()
+            on = light.is_on()
         except Exception as exc:
             log.warning(
                 "light: its state could not be read before a calibration: %s: %s",
+                type(exc).__name__,
+                _one_line(exc),
+            )
+            return None
+        return calibration_light(
+            on, PlatePage._auto_shutter_of(microscope) if on is False else None
+        )
+
+    @staticmethod
+    def _auto_shutter_of(microscope: Microscope) -> bool | None:
+        """Whether the core opens the shutter around each exposure, or ``None``: no shutter, or a read that raised (nothing is kept)."""
+        shutter = microscope.get(Shutter)
+        if shutter is None:
+            return None
+        try:
+            return shutter.auto_shutter()
+        except Exception as exc:
+            log.warning(
+                "shutter: its auto-shutter could not be read: %s: %s",
                 type(exc).__name__,
                 _one_line(exc),
             )

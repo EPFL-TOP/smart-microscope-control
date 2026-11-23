@@ -167,6 +167,7 @@ from smc.ui.guide import (
     calibration_goes_to_a_document,
     calibration_held_line,
     calibration_how_text,
+    calibration_light,
     calibration_missing_line,
     calibration_note_line,
     calibration_paths,
@@ -4738,6 +4739,33 @@ def test_calibrate_wait_has_no_default_for_the_light() -> None:
             objective=_FORTY_X,
             plate_objective=_TEN_X,
         )
+
+
+@pytest.mark.parametrize(
+    ("light_on", "auto_shutter", "expected"),
+    [
+        # A light that reads off while the core opens the shutter around the exposure is unknown:
+        # the Ti2-E's lamp is the core's shutter, closed at rest (the review of #557).
+        (False, True, None),
+        # Without auto-shutter, or when it could not be read, a light that reads off stands.
+        (False, False, False),
+        (False, None, False),
+        # A light that reads on or is unknown is what it is, whatever the auto-shutter says.
+        (True, True, True),
+        (True, False, True),
+        (True, None, True),
+        (None, True, None),
+        (None, False, None),
+        (None, None, None),
+    ],
+)
+def test_calibration_light_is_unknown_for_a_light_off_under_auto_shutter_and_as_read_otherwise(
+    light_on: bool | None, auto_shutter: bool | None, expected: bool | None
+) -> None:
+    assert calibration_light(light_on, auto_shutter) is expected
+    # What the controller and the view hand to calibrate_wait refuses exactly when it is False.
+    refused = _wait(light_on=calibration_light(light_on, auto_shutter))
+    assert (refused == CALIBRATE_LIGHT_OFF) is (expected is False)
 
 
 @pytest.mark.parametrize(

@@ -451,8 +451,13 @@ dark frame, and its refusal would replace the position's usable document, so the
 `the light reads off, so the camera's frame would be dark and the calibration would fail: switch
 it on (Light on, in the drive bar), then press the button again`. The light is read again at the
 click; a light whose state is not known (the demo's, a lamp with no switch smc knows) refuses
-nothing, and a frame that is dark with the light on (the light path on the eyepiece, the step
-leaving the lit sample) is still the tool's refusal. A new calibration **replaces** the position's
+nothing, **and neither does one that reads off while the core's auto-shutter is on**: on the
+Ti2-E the lamp is the core's shutter and auto-shutter is on, so it reads closed at rest and
+Micro-Manager opens it around the camera's own snap (found by the review of #557 on that
+stand's own layout). A frame that is dark with the light on (the light path on the eyepiece, the
+step leaving the lit sample) is still the tool's refusal. The reason applies to a calibration
+that goes into a document of the objective's own, from either button: the Stand screen's click
+into the run document (a plate registered by eye, the plate's own objective) is not refused for it. A new calibration **replaces** the position's
 document, and a failed or stopped one leaves it with none until one succeeds: when the position
 holds a usable one of that objective, the button says `Calibrate the camera again at <objective>`
 and the line beside it says `A new calibration replaces the one of <date>: if it fails or is
@@ -488,7 +493,9 @@ the empty field leaves it out. Nothing is moved or deleted. **A folder the accou
 folder (PermissionError: <reason>); which objectives have a calibration is not known`, and no
 objective is listed `no calibration yet` while it is there (the page does not know); with no
 document read, *Measure the offsets* waits with that line and not with the one that sends the
-operator to the button. Only the twelve names `position-1.json` to `position-12.json` are looked at.
+operator to the button. The grouping is POSIX's (a file's `stat` asks only to search its folder); on
+Windows an account can be denied a single file, which the line then says of the folder (not verified
+there, #557's review). Only the twelve names `position-1.json` to `position-12.json` are looked at.
 
 **The field is optional.** *Other calibration documents (optional), one path per line, in the
 order the turret turns*: **empty, *Measure the offsets* measures with the documents the page holds**

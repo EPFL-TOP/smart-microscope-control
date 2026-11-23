@@ -304,8 +304,9 @@ holds the objective). A new calibration at the same position replaces its docume
 failed or stopped one leaves it with no usable calibration until one succeeds: the page says
 so before the click. That includes a calibration the tool **refuses for a dark frame**: the page
 waits while the light reads off (`LightSource.is_on()`, read again at the click; an unknown light
-refuses nothing), but a frame that is dark with the light on is still the tool's refusal and still
-replaces the document. A document names an objective and its file a position: the page checks the
+refuses nothing, and neither does a light that reads off while the core's auto-shutter is on, as
+on the Ti2-E, whose lamp opens for the snap), but a frame that is dark with the light on is still
+the tool's refusal and still replaces the document. A document names an objective and its file a position: the page checks the
 record it wrote against the objective of the button (a turn at the handset during the run says
 `it measured <other>, not <objective> as the button said ...`), and lists a document that is not
 its position's with a line of its own and leaves it out of the empty field's default.

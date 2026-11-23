@@ -27,7 +27,7 @@ from pymmcore_plus import CMMCorePlus
 
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
-from smc.hardware.capabilities import LightSource, ObjectiveTurret
+from smc.hardware.capabilities import LightSource, ObjectiveTurret, Shutter
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
@@ -293,6 +293,32 @@ class Turret:
 
     def offset(self, label: str) -> Any:
         raise NotImplementedError
+
+
+class AutoShutter:
+    """The core's shutter and its auto-shutter switch, as the test sets them (m5 §18.6 D20).
+
+    On the Ti2-E the lamp (``DiaLamp``) is the core's shutter and auto-shutter is on: the lamp
+    reads closed at rest and Micro-Manager opens it around the camera's own snap.
+    """
+
+    def __init__(self, auto: bool | Exception) -> None:
+        self.auto = auto
+
+    def is_open(self) -> bool:
+        return False
+
+    def set_open(self, open_: bool) -> bool:
+        return open_
+
+    def auto_shutter(self) -> bool:
+        if isinstance(self.auto, Exception):
+            raise self.auto
+        return self.auto
+
+    def set_auto_shutter(self, on: bool) -> bool:
+        self.auto = on
+        return on
 
 
 class Light:
@@ -1050,6 +1076,7 @@ def test_a_stand_click_into_a_document_refuses_in_the_designs_order(
     twice[4] = FORTY  # the 40X on two positions: its position cannot be named
     light = Light(False)
     fake_microscope.override(LightSource, light)
+    fake_microscope.override(Shutter, AutoShutter(False))
     fake_microscope.override(ObjectiveTurret, Turret(twice, FORTY))
     fake_microscope.stop()
     page = _page(fake_microscope, run_doc)
@@ -1225,6 +1252,9 @@ def test_a_light_that_reads_off_refuses_the_calibration_and_leaves_the_usable_do
     _seed_calibration(document, FORTY)
     light = Light(True)
     fake_microscope.override(LightSource, light)
+    # A stand whose exposure does not open the lamp (auto-shutter off): the light at rest is
+    # what the frame sees.
+    fake_microscope.override(Shutter, AutoShutter(False))
     page = _page(fake_microscope, run_doc)
     try:
         assert page.status().light_on is True
@@ -1269,6 +1299,7 @@ def test_a_light_that_reads_off_leaves_every_document_alone_for_a_click_that_ran
     _seed_plate(run_doc)
     _turn(fake_microscope, FORTY)
     fake_microscope.override(LightSource, Light(False))
+    fake_microscope.override(Shutter, AutoShutter(False))
     page = _page(fake_microscope, run_doc)
     try:
         before = run_doc.read_bytes()
@@ -1310,6 +1341,97 @@ def test_an_unknown_light_or_one_that_raises_refuses_nothing(
     assert outcome.startswith("Camera calibration done in ")
     assert (_folder(run_doc) / "position-1.json").is_file()
     assert len(StubCalibration.seen) == 1
+
+
+@pytest.mark.parametrize("button", BUTTONS)
+def test_a_light_that_reads_off_while_the_core_opens_the_shutter_for_the_snap_refuses_nothing(
+    fake_microscope: Microscope, run_doc: Path, button: str
+) -> None:
+    # The review of #557 (probed on the Ti2-E's own layout, `profiles/nikon-ti2.cfg`): the lamp is
+    # the core's shutter and AutoShutter is 1, so `is_on()` reads False at rest while the camera's
+    # snap opens it. The refusal would be false, on the owner's main stand, for both buttons.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    fake_microscope.override(LightSource, Light(False))
+    fake_microscope.override(Shutter, AutoShutter(True))
+    page = _page(fake_microscope, run_doc)
+    try:
+        status = page.status()
+        outcome = _calibrate(page, FORTY, button=button)
+    finally:
+        page.close()
+
+    assert status.light_on is False
+    assert status.auto_shutter is True
+    assert outcome.startswith("Camera calibration done in ")
+    assert len(StubCalibration.seen) == 1
+
+
+@pytest.mark.parametrize("button", BUTTONS)
+@pytest.mark.parametrize(
+    "auto",
+    [False, RuntimeError("the core does not answer")],
+    ids=["auto-shutter off", "a read that raises"],
+)
+def test_a_light_that_reads_off_still_refuses_unless_the_core_is_known_to_open_the_shutter(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    auto: bool | Exception,
+    button: str,
+) -> None:
+    # Without auto-shutter, or when it cannot be read, the exposure does not open the lamp as far
+    # as the page knows: the refusal D20 designed stands (unknown does not become `fine`).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    fake_microscope.override(LightSource, Light(False))
+    fake_microscope.override(Shutter, AutoShutter(auto))
+    page = _page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        _click(page, button, FORTY)
+        outcome = page.status().outcome
+        running = page.status().running
+        after = run_doc.read_bytes()
+    finally:
+        page.close()
+
+    assert outcome == f"Camera calibration: {CALIBRATE_LIGHT_OFF}"
+    assert running is None
+    assert StubCalibration.seen == []
+    assert after == before
+
+
+def test_the_status_reads_the_auto_shutter_only_when_the_light_reads_off(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The flag matters only for a light that reads off: no extra read of the core otherwise.
+    shutter = AutoShutter(True)
+    reads: list[bool] = []
+    real = shutter.auto_shutter
+
+    def counted() -> bool:
+        reads.append(True)
+        return real()
+
+    shutter.auto_shutter = counted  # type: ignore[method-assign]
+    light = Light(True)
+    fake_microscope.override(LightSource, light)
+    fake_microscope.override(Shutter, shutter)
+    page = _page(fake_microscope, run_doc)
+    try:
+        on = page.status()
+        light.reading = None
+        unknown = page.status()
+        assert reads == []
+        light.reading = False
+        off = page.status()
+    finally:
+        page.close()
+
+    assert (on.light_on, on.auto_shutter) == (True, None)
+    assert (unknown.light_on, unknown.auto_shutter) == (None, None)
+    assert (off.light_on, off.auto_shutter) == (False, True)
+    assert reads == [True]
 
 
 def test_a_stand_with_no_light_source_refuses_nothing(
@@ -2129,6 +2251,32 @@ def test_a_denial_is_said_once_and_the_positions_the_look_reached_are_listed(
     assert view.calibrations_denied == (
         f"{_folder(run_doc)}: the page cannot look into this folder (PermissionError: "
         "Access is denied); which objectives have a calibration is not known"
+    )
+
+
+def test_a_denial_that_gives_no_reason_says_so_and_never_the_file(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A `PermissionError` raised with no errno or message has no `strerror`: the line says the
+    # class and that no reason was given (FM-98: text, and never the error or the file).
+    _seed_plate(run_doc)
+    real = Path.stat
+
+    def stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.parent.name == "calibrations":
+            raise PermissionError()
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        page.close()
+
+    assert view.calibrations_denied == (
+        f"{_folder(run_doc)}: the page cannot look into this folder (PermissionError: "
+        "no reason given); which objectives have a calibration is not known"
     )
 
 

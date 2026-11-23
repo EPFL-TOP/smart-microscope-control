@@ -190,6 +190,7 @@ __all__ = [
     "calibration_goes_to_a_document",
     "calibration_held_line",
     "calibration_how_text",
+    "calibration_light",
     "calibration_missing_line",
     "calibration_note_line",
     "calibration_paths",
@@ -3415,6 +3416,22 @@ def calibrate_wait(
     if light_on is False:
         return CALIBRATE_LIGHT_OFF
     return None
+
+
+def calibration_light(light_on: bool | None, auto_shutter: bool | None) -> bool | None:
+    """The light as ``calibrate_wait`` takes it: ``light_on``, except that a light that reads off while the core's auto-shutter is on is unknown (D20, FM-206).
+
+    On a stand whose lamp is the core's shutter (the Ti2-E's ``DiaLamp``) with auto-shutter on, the
+    shutter reads closed at rest and Micro-Manager opens it around the camera's own snap, which is
+    what the tool does: the switch at rest says nothing of the frame, and ``CALIBRATE_LIGHT_OFF``
+    would be a false refusal (found by the review of #557, probed on the Ti2-E's own layout). An
+    unknown light refuses nothing. ``auto_shutter`` is ``None`` when it could not be read (no
+    shutter, a read that raised) and then the light stands as read: a stand that cannot say
+    whether the exposure opens the lamp keeps the refusal D20 designed.
+    """
+    if light_on is False and auto_shutter is True:
+        return None
+    return light_on
 
 
 def calibration_goes_to_a_document(

@@ -129,6 +129,7 @@ from smc.ui.guide import (
     calibration_goes_to_a_document,
     calibration_held_line,
     calibration_how_text,
+    calibration_light,
     calibration_missing_line,
     calibration_note_line,
     calibration_paths,
@@ -4495,7 +4496,7 @@ class PlatePageView:
             dry_run=status.dry_run,
             objective=objective,
             plate_objective=plate,
-            light_on=status.light_on,
+            light_on=calibration_light(status.light_on, status.auto_shutter),
         )
         lines = [
             blocked,
@@ -4619,7 +4620,7 @@ class PlatePageView:
             dry_run=status.dry_run,
             objective=objective,
             plate_objective=plate,
-            light_on=status.light_on,
+            light_on=calibration_light(status.light_on, status.auto_shutter),
         )
         self.offsets_calibrate_button.label = calibrate_label(
             objective, plate, again=same
