@@ -1329,6 +1329,22 @@ def test_a_well_with_exactly_twelve_scored_stops_says_no_more_and_skips_unscored
     assert "A1_unscored" not in line
 
 
+def test_the_scores_line_is_in_visiting_order_whatever_the_names_and_the_scores_say() -> (
+    None
+):
+    # Visited A1_r005 first, then A1_r001, then A1_r003: neither the names nor the scores are
+    # in order, so a line sorted by either is another line.
+    stops: list[tuple[str, str, float | None, dict[str, float]]] = [
+        ("A1", "A1_r005", 0.5, {}),
+        ("A1", "A1_r001", 0.9, {}),
+        ("A1", "A1_r003", 0.1, {}),
+    ]
+    text, _ = _scored(_records(), stops)
+    assert re.findall(r'<p class="counts scores">(.*?)</p>', text) == [
+        "Selector scores: A1_r005 0.5, A1_r001 0.9, A1_r003 0.1"
+    ]
+
+
 def test_measures_without_a_score_are_in_the_title_and_make_no_scores_line() -> None:
     text, _ = _scored(_records(), [("A1", "A1_r000", None, {"keep_um": 12.5})])
     assert "<title>A1_r000: 1 single (keep_um 12.5)</title>" in text

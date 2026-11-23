@@ -8,9 +8,11 @@ Bokeh and no registry, so none of this opens a widget.
 from __future__ import annotations
 
 import ast
+import html
 from pathlib import Path
 
-from pydantic import Field
+from markdown_it import MarkdownIt
+from pydantic import Field, field_validator
 
 import smc.ui.selection as selection
 from smc.plugins.route.plugin import RouteParams
@@ -24,6 +26,7 @@ from smc.ui.selection import (
     UNKNOWN_KEYS,
     AlgorithmChoice,
     algorithm_params_text,
+    markdown_safe,
     option_label,
     options,
     params_from_text,
@@ -44,6 +47,17 @@ class DensityParams(SelectorParams):
 
 class NoParams(SelectorParams):
     """A selector that takes nothing."""
+
+
+class StrictTags(SelectorParams):
+    """A selector whose validator expects text and raises what pydantic does not wrap when given a list."""
+
+    tags: tuple[str, ...] = ()
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _split(cls, value: object) -> object:
+        return value.split(",")  # type: ignore[attr-defined]
 
 
 def _choice(
@@ -176,6 +190,36 @@ def test_a_value_the_model_refuses_is_kept_as_typed_with_the_problem_named() -> 
     text, problem = algorithm_params_text(DensityParams, {"tags": "a, b"})
     assert text == '{"tags": "a, b"}'
     assert problem == '\'tags\' takes JSON, for example ["A1", "B2"]'
+
+
+def test_a_validator_that_raises_what_pydantic_does_not_wrap_is_the_problem_and_the_text_is_written() -> (
+    None
+):
+    # `route` turns the same error into `selector_params: AttributeError: ...` (FM-128): the page
+    # says it under the fields, writes the text as typed, and does not fail the handler.
+    text, problem = algorithm_params_text(StrictTags, {"tags": '["a", "b"]'})
+    assert text == '{"tags": "[\\"a\\", \\"b\\"]"}'
+    assert problem == "AttributeError: 'list' object has no attribute 'split'"
+
+
+def test_markdown_safe_keeps_the_characters_and_removes_the_markup() -> None:
+    hostile = (
+        '<img src=x onerror="alert(1)"> **bold** [x](javascript:y) &amp; a_b `c` '
+        "~~d~~ x|y 'quoted'"
+    )
+    assert markdown_safe(hostile) == (
+        '&lt;img src=x onerror="alert(1)"&gt; \\*\\*bold\\*\\* \\[x\\](javascript:y) '
+        "&amp;amp; a\\_b \\`c\\` \\~\\~d\\~\\~ x\\|y 'quoted'"
+    )
+    # Panel renders a description as Markdown into HTML (measured on 1.10.0, raw HTML allowed):
+    # rendered, the string has no tag of its own and reads as the characters it was.
+    rendered = MarkdownIt("commonmark").render(markdown_safe(hostile))
+    for tag in ("<img", "<strong>", "<em>", "<a ", "<code>", "<del>"):
+        assert tag not in rendered
+    assert html.unescape(rendered).strip() == f"<p>{hostile}</p>"
+    # The same string unescaped is the markup the finding was about.
+    assert "<img" in MarkdownIt("commonmark").render(hostile)
+    assert markdown_safe("float  gt=0  Cells per mm2.") == "float  gt=0  Cells per mm2."
 
 
 def test_params_from_text_gives_each_key_as_the_text_the_cli_takes() -> None:

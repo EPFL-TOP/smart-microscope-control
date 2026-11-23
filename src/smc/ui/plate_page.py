@@ -36,7 +36,7 @@ import shlex
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -196,6 +196,7 @@ from smc.ui.selection import (
     UNKNOWN_KEYS,
     AlgorithmChoice,
     algorithm_params_text,
+    markdown_safe,
     options,
     params_from_text,
     stop_tip,
@@ -1904,7 +1905,7 @@ class PlatePageView:
                     key: pn.widgets.TextInput(
                         label=key,
                         placeholder=plain_default(default),
-                        description=f"{type_name}  {notes}".strip(),
+                        description=markdown_safe(f"{type_name}  {notes}".strip()),
                         value=texts.get(key, ""),
                     )
                     for key, type_name, default, notes in choice.params
@@ -2626,23 +2627,39 @@ class PlatePageView:
             description=description,
             sizing_mode="stretch_width",
         )
-        self._ensure_option(select, value)
+        self._ensure_option(select, value, installed={c.name for c in choices})
         select.value = value
         return select
 
     @staticmethod
-    def _ensure_option(select: Any, name: str) -> None:
+    def _ensure_option(select: Any, name: str, installed: Collection[str] = ()) -> None:
         """Add the option ``<name> (not installed)`` when ``name`` is not a value of ``select``, once (m5 §21, D6, FM-264).
 
         A preset or the profile's suggestion may name an algorithm that is not installed on this
         PC, and what a widget library does with a value it was not given is its own affair
         (Panel 1.10.0 accepts it silently and draws it blank; older releases were not measured):
         the option is added **before** the assignment, so that the Select says what the preset
-        says and ``route`` refuses it with the installed names.
+        says and ``route`` refuses it with the installed names. The one installed algorithm
+        that is not an option's value is the default, whose entry is ``""``: named explicitly
+        (``selector=most-cells``, a legal pair) it is an option of its own, never "not installed".
         """
         if name in select.options.values():
             return
-        select.options = {**select.options, f"{name} (not installed)": name}
+        label = (
+            f"{name} (default, named)"
+            if name in installed
+            else f"{name} (not installed)"
+        )
+        select.options = {**select.options, label: name}
+
+    def _installed_names(self, select: Any) -> frozenset[str]:
+        """The names of the algorithms installed for ``select``, when it is one of the route row's two."""
+        return frozenset(
+            choice.name
+            for widgets in self._algorithms.values()
+            if widgets.select is select
+            for choice in widgets.choices
+        )
 
     def _runner(self, plugin: str) -> Callable[[Any], None]:
         def clicked(event: Any) -> None:
@@ -3304,7 +3321,9 @@ class PlatePageView:
                 for key, widget in fields.items():
                     if isinstance(widget, pn.widgets.Select):
                         # A name the preset gives that this PC lacks is shown (D6).
-                        self._ensure_option(widget, expected[tool][key])
+                        self._ensure_option(
+                            widget, expected[tool][key], self._installed_names(widget)
+                        )
                     widget.value = expected[tool][key]
         finally:
             # Always: a guard left up would stop the note following the edits.

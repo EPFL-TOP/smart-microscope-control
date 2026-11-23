@@ -13,6 +13,7 @@ the test that did not expect it.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import shlex
@@ -24,7 +25,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from pydantic import Field, create_model
+from markdown_it import MarkdownIt
+from pydantic import Field, create_model, field_validator
 from pymmcore_plus import CMMCorePlus
 
 if os.environ.get("SMC_REQUIRE_UI"):
@@ -111,6 +113,42 @@ class ByScore:
         return list(range(len(choices)))
 
 
+class ModedParams(SelectorParams):
+    """A string and a tuple with defaults: what ``describe_params`` prints with quotes and a repr."""
+
+    mode: str = "fast"
+    tags: tuple[str, ...] = ("a", "b")
+
+
+class ModedSelector:
+    name = "moded"
+    summary = "Has a string default and a tuple default."
+    Params = ModedParams
+
+    def select(self, data: Any, params: ModedParams) -> list[Any]:
+        return []
+
+
+class StrictParams(SelectorParams):
+    """A validator that expects text and raises what pydantic does not wrap when it is given a list."""
+
+    tags: tuple[str, ...] = ()
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _split(cls, value: object) -> object:
+        return value.split(",")  # type: ignore[attr-defined]
+
+
+class StrictSelector:
+    name = "strict"
+    summary = "Its validator raises an AttributeError on a list."
+    Params = StrictParams
+
+    def select(self, data: Any, params: StrictParams) -> list[Any]:
+        return []
+
+
 class NoParams(PluginParams):
     pass
 
@@ -180,6 +218,8 @@ AS_CHOSEN = _algorithm(
 )
 DENSITY = _algorithm("density", f"{THIS}:DensitySelector", registry.SELECTOR_GROUP)
 BY_SCORE = _algorithm("by-score", f"{THIS}:ByScore", registry.ORDERER_GROUP)
+MODED = _algorithm("moded", f"{THIS}:ModedSelector", registry.SELECTOR_GROUP)
+STRICT = _algorithm("strict", f"{THIS}:StrictSelector", registry.SELECTOR_GROUP)
 
 
 @pytest.fixture(autouse=True)
@@ -848,6 +888,97 @@ def test_an_orderers_fields_write_orderer_params(page: PlatePage) -> None:
     )
 
 
+def test_the_most_cells_fields_typed_on_the_default_selector_are_route_parameters_and_never_selector_params(
+    page: PlatePage,
+) -> None:
+    from smc.plugins.params import parse_params
+    from smc.plugins.route.plugin import RouteParams
+
+    view = PlatePageView(page)
+    own = view.tool_fields["route"]
+    own["min_cells"].value = "3"
+    own["candidate_step_fraction"].value = "0.5"
+    # `route` refuses these two inside `selector_params` ("give them as route parameters"): they
+    # are fields of the tool, sent as pairs of their own, and the JSON text stays empty.
+    assert _carrier(view).value == ""
+    assert view._algorithms["selector"].note.visible is False
+    route = view.result_rows["route"]
+    assert _words(route.command.object)[-4:] == [
+        "--param",
+        "min_cells=3",
+        "--param",
+        "candidate_step_fraction=0.5",
+    ]
+    parsed = parse_params(RouteParams, ["min_cells=3", "candidate_step_fraction=0.5"])
+    assert (parsed.min_cells, parsed.candidate_step_fraction) == (3, 0.5)
+
+
+def test_choosing_an_orderer_keeps_what_was_typed_for_the_selector(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    own = view.tool_fields["route"]
+    own["min_cells"].value = "3"
+    own["candidate_step_fraction"].value = "0.5"
+    _orderer(view).value = "by-score"
+    # D5 empties the old algorithm's own text and fields: the selector's, when the selector
+    # changes. An orderer's change is none of the selector's business.
+    assert (own["min_cells"].value, own["candidate_step_fraction"].value) == (
+        "3",
+        "0.5",
+    )
+    _orderer(view).value = ""
+    assert (own["min_cells"].value, own["candidate_step_fraction"].value) == (
+        "3",
+        "0.5",
+    )
+    # And a selector's text is left alone by the orderer's choice.
+    _selector(view).value = "density"
+    _density(view)["keep"].value = "4"
+    _orderer(view).value = "by-score"
+    assert _carrier(view).value == '{"keep": 4}'
+    assert _carrier(view, "orderer").value == ""
+    assert _words(view.result_rows["route"].command.object)[-6:] == [
+        "--param",
+        "selector=density",
+        "--param",
+        'selector_params={"keep": 4}',
+        "--param",
+        "orderer=by-score",
+    ]
+
+
+def test_a_group_fields_placeholder_is_the_default_as_the_operator_reads_it(
+    make_page: Callable[..., PlatePage], registered: Callable[..., None]
+) -> None:
+    registered(selectors=[MOST_CELLS, MODED])
+    view = PlatePageView(make_page())
+    fields = view._algorithms["selector"].fields["moded"]
+    # `describe_params` prints a string with its quotes and a tuple as its repr: neither is
+    # what the operator would type (the same rule as every tool's field).
+    assert fields["mode"].placeholder == "fast"
+    assert fields["tags"].placeholder == "a, b"
+
+
+def test_a_validator_that_raises_what_pydantic_does_not_wrap_is_a_note_and_the_text_is_written(
+    make_page: Callable[..., PlatePage],
+    registered: Callable[..., None],
+    handler_failures: list[Any],
+) -> None:
+    registered(selectors=[MOST_CELLS, STRICT])
+    view = PlatePageView(make_page())
+    _selector(view).value = "strict"
+    fields = view._algorithms["selector"].fields["strict"]
+    fields["tags"].value = '["a", "b"]'
+    # No handler failed: the text is what was typed, and the note says what `route` will say.
+    assert handler_failures == []
+    assert _carrier(view).value == '{"tags": "[\\"a\\", \\"b\\"]"}'
+    note = view._algorithms["selector"].note
+    assert note.object == "AttributeError: 'list' object has no attribute 'split'"
+    assert note.visible is True
+    assert view.message.object == ""
+
+
 # --- a change of algorithm (D5) -------------------------------------------------------------
 
 
@@ -1078,6 +1209,49 @@ def test_a_profile_suggestion_that_names_a_selector_that_is_not_installed_is_sho
     )
 
 
+def test_the_default_named_explicitly_by_a_suggestion_or_a_preset_is_installed_and_says_so(
+    make_page: Callable[..., PlatePage], tmp_path: Path
+) -> None:
+    # `selector=most-cells` and `orderer=nearest` are legal pairs: the algorithms are installed,
+    # and their entries are `""` (the default's), so the value names them as an entry of its own.
+    profile = Profile.model_validate(
+        {
+            "microscope": {"name": "demo"},
+            "suggest": {
+                "route": {
+                    "params": ["selector=most-cells", "orderer=nearest"],
+                    "why": "the stand's own choice",
+                }
+            },
+        }
+    )
+    view = PlatePageView(make_page(profile=profile))
+    for field in (_selector(view), _orderer(view)):
+        assert "not installed" not in " ".join(field.options)
+    assert (_selector(view).value, _orderer(view).value) == ("most-cells", "nearest")
+    assert _selector(view).options["most-cells (default, named)"] == "most-cells"
+    assert _orderer(view).options["nearest (default, named)"] == "nearest"
+    assert view._algorithms["selector"].summary.object == MOST_CELLS_SUMMARY
+    assert view._algorithms["orderer"].summary.object == NEAREST_SUMMARY
+    assert view_group_visible(view) == "most-cells"
+    # The same through a load of a preset that names them.
+    folder = tmp_path / "profiles" / "presets"
+    folder.mkdir(parents=True)
+    (folder / "named.toml").write_text(
+        '[params]\nroute = ["selector=most-cells", "orderer=nearest"]\n',
+        encoding="utf-8",
+    )
+    other = PlatePageView(make_page())
+    _load(other, "named")
+    assert "not installed" not in " ".join(_selector(other).options)
+    assert (_selector(other).value, _orderer(other).value) == ("most-cells", "nearest")
+    assert other.result_rows["route"].from_lines["selector"].object == (
+        "from the preset named"
+    )
+    assert other.preset_note.object.endswith("the page holds the preset's values")
+    assert view_group_visible(other) == "most-cells"
+
+
 def test_a_profile_suggestion_of_a_selector_and_its_text_fills_the_group_at_the_build(
     make_page: Callable[..., PlatePage],
 ) -> None:
@@ -1294,7 +1468,16 @@ def test_a_hostile_summary_key_and_description_stay_plain_text(
     assert label.startswith(f"hostile {DASH} <img src=x onerror=")
     (field,) = widgets.fields["hostile"].values()
     assert field.label == "<b>key</b>"
-    assert field.description == f"int  {HOSTILE}"
+    # Panel renders a description as Markdown into HTML in a tooltip, so the page hands it the
+    # characters, not the markup: entities and backslashes that read back as the original string.
+    assert field.description == (
+        'int  &lt;img src=x onerror="alert(1)"&gt; \\*\\*bold\\*\\* '
+        "\\[x\\](javascript:y) &amp;amp;"
+    )
+    rendered = MarkdownIt("commonmark").render(field.description)
+    assert "<img" not in rendered
+    assert "<strong>" not in rendered
+    assert html.unescape(rendered).strip() == f"<p>int  {HOSTILE}</p>"
     # A note that names a hostile key is plain text too.
     _carrier(view).value = json.dumps({HOSTILE: 1})
     assert type(widgets.note) is pn.pane.Str

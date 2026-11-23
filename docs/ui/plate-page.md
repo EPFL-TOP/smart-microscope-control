@@ -722,7 +722,9 @@ all that are left.` From the top:
     `min_cells` and `candidate_step_fraction` (the tool refuses them beside another selector);
     **loading a preset is not a choice**: every field takes the preset's value. A name that a
     preset or the profile gives and this PC lacks is **shown** (`<name> (not installed)`), its
-    summary says the installed ones, and Run is refused by the tool with the same names. The
+    summary says the installed ones, and Run is refused by the tool with the same names (the
+    default named explicitly, `selector=most-cells`, is installed and reads `most-cells (default,
+    named)`). The
     algorithms are read **once, when the page starts**: one installed afterwards (`pip install
     -e .`) is there after the page is restarted, and one that does not import is no entry and
     a line of the problems under the header; with no selector at all the field stays the

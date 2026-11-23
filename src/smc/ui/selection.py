@@ -35,6 +35,7 @@ __all__ = [
     "UNKNOWN_KEYS",
     "AlgorithmChoice",
     "algorithm_params_text",
+    "markdown_safe",
     "option_label",
     "options",
     "params_from_text",
@@ -76,6 +77,26 @@ class AlgorithmChoice:
     summary: str
     params: tuple[tuple[str, str, str, str], ...]
     model: type[BaseModel]
+
+
+#: What Markdown reads as syntax in a line of plain words, each given a backslash.
+_MARKDOWN_PUNCTUATION = "\\`*_[]~|"
+
+
+def markdown_safe(text: str) -> str:
+    """``text`` as a Panel ``description`` shows it: the characters it holds, never markup (FM-139).
+
+    Panel renders a widget's ``description`` string as Markdown into raw HTML in a tooltip
+    (measured on 1.10.0: ``<img src=x onerror=...>`` came out as a live tag and ``**bold**`` as
+    ``<strong>``). An algorithm's description is its author's words, so ``<`` and ``>`` become
+    entities (the ampersand first) and the punctuation Markdown reads gets a backslash: the
+    tooltip then reads as the original characters. Quotes are left alone, since ``&#x27;`` would
+    meet the backslash rule of ``#`` otherwise.
+    """
+    escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return "".join(
+        f"\\{char}" if char in _MARKDOWN_PUNCTUATION else char for char in escaped
+    )
 
 
 def _collapsed(text: str) -> str:
@@ -157,6 +178,16 @@ def algorithm_params_text(
         )
     except ParamsError as error:
         return json.dumps(filled), "; ".join(error.problems)
+    except Exception as error:
+        # A validator of the algorithm's own can raise what pydantic does not wrap (an
+        # `AttributeError` on a list it expected as text): `route` turns that into
+        # `selector_params: AttributeError: ...` (FM-128), and so does the note, instead of a
+        # handler that fails and leaves the fields saying what Run does not send (FM-113).
+        try:
+            message = " ".join(str(error).split())
+        except Exception:
+            message = "the message cannot be printed"
+        return json.dumps(filled), f"{type(error).__name__}: {message}"
     dumped = parsed.model_dump(mode="json")
     return json.dumps(
         {key: dumped[key] for key in model.model_fields if key in filled}
