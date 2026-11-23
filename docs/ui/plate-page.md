@@ -182,15 +182,35 @@ ZDrive refuse a stop on this stand: a move already sent finishes first; a long o
 end of its current segment (at most 500 µm in XY, 100 µm in Z). Use the stand's own controls
 to stop a move that must not finish.` (the devices are those that refused, the sizes the
 profile's, and the autofocus clause only when the stand has one), or `the stop failed:
-<why>`. The page names no API call in any text it shows: the layer's own advice to a program
-(`call resume()`) is said as *press Resume*, here and in the server's console
-([#544](https://github.com/EPFL-TOP/smart-microscope-control/issues/544)); the command line
-keeps the layer's text. On a stand whose stages refuse a stop (the Ti2-E's, [#204](https://github.com/EPFL-TOP/smart-microscope-control/issues/204)) the strip also says so: a move already under way
-runs to its target, **unless** the profile cuts that role's moves into segments
-(`[safety] max_segment_um`, `max_z_segment_um`): then the strip says `an xy_stage move ends
-at the end of its current segment (sent in segments of at most 500 µm)`, with the size the
-profile gives, and the rest of the move is never sent. After STOP every action is refused
-until **Resume**, which is refused while a run is going.
+<why>`. The page names none of the **stop family's calls** (`stop()`, `resume()`, `wait()`) in
+any text it shows: the layer's own advice to a program is said as the page's buttons, here
+and in the server's console ([#544](https://github.com/EPFL-TOP/smart-microscope-control/issues/544),
+[#592](https://github.com/EPFL-TOP/smart-microscope-control/issues/592); the command line keeps
+the layer's text). `call resume()` is *press Resume*, and a motion the layer still tracks, which
+the layer words "wait for it (`wait()`) or stop it (`stop()`), or, if it never settles, check the
+stand and call `resume()`", reads `` `xy_stage XYStage` is still moving; wait for it or press
+STOP; if it never settles, press STOP, check the stand, then press Resume ``: *STOP* is always on
+the page and, pressed with nothing running, halts the stand, which is what offers *Resume*, so it
+is a sequence the page can always follow (*Resume* alone is not offered while nothing is halted,
+and it drops every tracked motion, so it is never advised first). A device's name in backticks
+is a name, not a call. **The rule's boundary:** a test walks the layer's string literals
+(`src/smc`, without `ui/` and the command line) and fails on one that still names `stop()`,
+`resume()` or `wait()` after the page's words, so a new advice worded with a call is said before
+it reaches the page. The autofocus's calls (`engage()`, `disengage()`, `focus_by_um()`,
+`offset_by_native()`) and the DF2's (`learn_reference()`, `stabilize_now()`) are **not** said by
+the page yet: each has a button or a plain name on it, and each text's words are a choice of
+its own (a follow-up).
+
+On a stand whose stages refuse a stop (the Ti2-E's, [#204](https://github.com/EPFL-TOP/smart-microscope-control/issues/204)) the strip also says so: `STOP is refused by xy_stage,
+focus, autofocus_offset on this stand: a move under way runs to its target`, and, where the
+profile cuts a refused role's moves into segments (`[safety] max_segment_um`,
+`max_z_segment_um`), `…, or to the end of its segment if cut`. The strip says **that** a move is
+cut and never by how much (it is always on screen, and the Ti2-E's three safety keys made the
+longer note three lines and moved the page when *Drive* was armed,
+[#529](https://github.com/EPFL-TOP/smart-microscope-control/issues/529)); the sizes are the
+profile's and are said where they are acted on, by the note a STOP gives and by the Scan
+lead below, from one function, so that **no text of the page types a size**. After STOP every
+action is refused until **Resume**, which is refused while a run is going.
 
 **The regions, from the top** ([m5 §17.3](../design/m5-web-ui.md), at 1280 px wide and
 more):
@@ -561,6 +581,19 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   click that arrives anyway too. It also waits while a stopped scan's checkpoint stands
   (`Continue the scan or Start again first: ...`): laying the fields out again would put that
   checkpoint out of `--resume`'s reach;
+- **a note under the chain's line**, once *Measure the time* has ended with the autofocus **not
+  locked** (`timing` left it off): `The autofocus is not locked: Autofocus on, under the image,
+  locks it again at the offset now set if this page has read that offset locked since
+  Connect. ...`. It follows the **read** of the autofocus, never the tool's words, and it is
+  a note, not a wait: no button is disabled by it. It **leaves with the chain's line**, by
+  decision: every other action (a jog, a light, a Snap) starts with no chain, so after a Snap
+  the note is gone while the autofocus still reads off (the Scan screen says the same thing
+  where it matters, before the scan, whatever was done since). It says **nothing while the
+  stand is halted** either: a STOP switches the autofocus off first, and *Autofocus on* is
+  refused until *Resume* (the strip says `HALTED`, *Resume* is on the page), so the advice
+  would be wrong; after *Resume* the next tick draws it again from the same read
+  ([#592](https://github.com/EPFL-TOP/smart-microscope-control/issues/592), [m5 §17.12.12
+  D39, D40](../design/m5-web-ui.md));
 - when the wells selected are **not** the plan's wells, a note says which wells the plan is for
   and to lay the fields out again to scan the others: the plan is what `scan` does, and a
   selection made since has not changed it.
@@ -585,6 +618,15 @@ engineer's words (see *STOP says what it did*). From the top:
   which took none). On a page served with
   `--dry-run` a note says that **a dry run walks the fields and takes no frame**, so `cells`
   and what follows have nothing to read; the button still starts it;
+- **a note about the autofocus before the click**, while the scan's `autofocus` field means
+  `required` (`Autofocus is required and it is not locked, so the scan will refuse to start:
+  press Autofocus on, under the image, first, ...`) or `if-engaged`, the default (`The
+  autofocus is not locked, so the scan will not use it ...`), and the autofocus reads **off**.
+  Not on a dry run, not for `off`, not for an autofocus that is on and still searching, and
+  **not while the stand is halted**: after a STOP the autofocus reads off and *Autofocus on*
+  is refused until *Resume*, so the advice would be wrong ([#592](https://github.com/EPFL-TOP/smart-microscope-control/issues/592)).
+  It is a note and never a wait: the button stays enabled, the scan's own check is the one
+  guard;
 - **after a STOP or a failure**, what ended the scan: `Stopped by STOP at field 45 of 72.`
   (whatever the run document says: a STOP that lands in a move ends the record `failed`), or
   `Failed at field 45 of 72: <the error's line>`; a page opened after the stop, or that ran
@@ -1191,8 +1233,10 @@ inputs from an earlier run; run it again`; the values are kept, and marked), the
 result's values, two spaces in, a line each (a text cut at 80 characters, a list or an
 object only counted, at most eight, then `… n more`), then **where the result is**, then
 what the result **assumed**
-(at most eight, then `… n more`, each cut at 600 characters) and the error (cut at 600
-characters too). Where the result is: each `file` and `folder` the result names, as an
+(at most **twelve**, then `… n more`, each cut at 600 characters: one above the eleven lines
+`scan-plan` writes at most, so that its two `estimate:` lines, which come last, are never the
+ones behind the count, [#592](https://github.com/EPFL-TOP/smart-microscope-control/issues/592))
+and the error (cut at 600 characters too). Where the result is: each `file` and `folder` the result names, as an
 indented `file: <absolute path>` line (a relative one is under the run document's folder;
 an absolute one is shown as written, in whichever OS's style the run document holds it;
 each is cut at 600 characters), or an indented `in the run document` when it names none:
@@ -1687,6 +1731,14 @@ map's reframing were checked on Panel 1.10.0 and 1.9.4, headless Chromium, macOS
 refused across a turn of the Ti2-E's real turret, and the capture notes against a real registration;
 the local time on a PC whose zone is not the lab's; a STOP in a move on a stand whose profile says
 `stop_refused_by` (the words say `stopped by STOP` only when the stand raised the stop's own error).
+
+**The session-5 leftovers** ([#592](https://github.com/EPFL-TOP/smart-microscope-control/issues/592))
+add, for the owner at the Ti2-E: a STOP and a refused action, read at the stand (the strip's
+shorter note, and `press STOP, check the stand, then press Resume` after a refusal for a motion
+that still moves); the strip's two lines on the Ti2-E's own values (measured in headless Chromium
+on macOS with the Ti2-E's three safety keys on a copy of `demo-sample.toml`: two lines, 241
+characters, nothing moves when *Drive* is armed, the toggle's bottom at 792 of 800); and the two
+lock notes after a STOP.
 
 **Connect and Disconnect** add: Connect, Disconnect, NIS-Elements taking the stand,
 then Connect again, at a real stand; **a stand opened on the page's worker thread**,

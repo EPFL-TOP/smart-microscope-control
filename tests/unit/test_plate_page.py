@@ -929,14 +929,17 @@ def test_the_card_text_of_a_worst_case_record_is_bounded(
     page: PlatePage, run_doc: Path
 ) -> None:
     # 2000 assumptions of 700 characters, 2000 keys, an error of 100,000 and a profile
-    # of 5,000: a card of 620,000 characters before the bounds (m5 §2.4).
+    # of 5,000: a card of 620,000 characters before the bounds (m5 §2.4). The card keeps 12
+    # assumed lines since #592 (m5 §17.12.12 D41), so the worst card is about 8.2 kB here
+    # (§2.4 puts it at about 9.4 kB with a header of its own): still a bound, two orders of
+    # magnitude under the case above, and the bound is moved with the cap, not removed.
     result: dict[str, Any] = {"assumed": ["a" * 700] * 2000}
     result.update({f"key{i}": i for i in range(2000)})
     _seed_raw(run_doc, "scan", result, profile="p" * 5000, error="e" * 100_000)
     text = PlatePageView(page).tool_cards["scan"].object
-    assert len(text) < 7_500
+    assert len(text) < 9_500
     assert text.splitlines()[-1] == f"error: {'e' * 600}…"
-    assert "assumed: … 1992 more" in text.splitlines()
+    assert "assumed: … 1988 more" in text.splitlines()
 
 
 def test_a_result_card_is_plain_text_under_its_tool(
