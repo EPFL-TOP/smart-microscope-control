@@ -933,8 +933,22 @@ def test_a_stand_click_on_an_unreadable_run_document_is_the_runs_refusal_and_wri
 
 @pytest.mark.parametrize(
     ("shown", "now"),
-    [(TEN, TWENTY), (FORTY, TWENTY), (TWENTY, FORTY), (TEN, FORTY)],
-    ids=["plates-own-then-20X", "40X-then-20X", "20X-then-40X", "plates-own-then-40X"],
+    [
+        (TEN, TWENTY),
+        (FORTY, TWENTY),
+        (TWENTY, FORTY),
+        (TEN, FORTY),
+        # The turret now reads the plate's own objective: the destination would be the run
+        # document, for a label that was drawn for a document of its own.
+        (FORTY, TEN),
+    ],
+    ids=[
+        "plates-own-then-20X",
+        "40X-then-20X",
+        "20X-then-40X",
+        "plates-own-then-40X",
+        "40X-then-plates-own",
+    ],
 )
 def test_a_stand_click_that_showed_one_objective_is_refused_when_the_turret_now_reads_another(
     fake_microscope: Microscope, run_doc: Path, shown: str, now: str

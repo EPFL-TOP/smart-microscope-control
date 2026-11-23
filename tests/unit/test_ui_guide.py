@@ -4785,7 +4785,11 @@ def test_calibration_at_its_position_is_none_without_labels_false_past_them_and_
     assert calibration_at_its_position(labels, len(labels), _TWENTY_X) is True
     assert calibration_at_its_position(labels, len(labels) + 1, _TWENTY_X) is False
     assert calibration_at_its_position(labels, 0, _FORTY_X) is False
+    # Position 0 and a negative one are no position, whatever Python's negative indexes say:
+    # the last label is the 20X, and position 0 would read it.
+    assert calibration_at_its_position(labels, 0, _TWENTY_X) is False
     assert calibration_at_its_position(labels, -1, _TWENTY_X) is False
+    assert calibration_at_its_position(labels, -len(labels), _FORTY_X) is False
     # No objective, or a blank one, is at no position, an empty position's included.
     assert calibration_at_its_position(labels, 1, None) is False
     assert calibration_at_its_position(labels, 3, "") is False
