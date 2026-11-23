@@ -68,6 +68,7 @@ from smc.plugins.presets import PresetError, PresetExistsError
 from smc.plugins.slots import IMAGE_SIDES
 from smc.plugins.slots.plate import ORIENTATION_DEG, PlateOrientation
 from smc.ui.controller import (
+    CALIBRATE_FIELDS,
     NOT_CONNECTED,
     HeldCalibration,
     LoadedPreset,
@@ -93,6 +94,7 @@ from smc.ui.guide import (
     MEASURE_AFTER_THE_SCAN,
     MEASURE_THE_TIME,
     NO_FILES_YET,
+    OFFSETS_MEASURE_LABEL,
     OFFSETS_NOT_TURNED_BACK,
     OFFSETS_STALE,
     OFFSETS_TITLE,
@@ -116,12 +118,18 @@ from smc.ui.guide import (
     StepName,
     again_note,
     busy_note,
+    calibrate_command_folder_note,
     calibrate_label,
+    calibrate_position_unknown,
     calibrate_replaces,
-    calibrate_replaces_plate,
+    calibrate_stand_routed,
     calibrate_wait,
+    calibration_at_its_position,
+    calibration_file,
+    calibration_goes_to_a_document,
     calibration_held_line,
     calibration_how_text,
+    calibration_light,
     calibration_missing_line,
     calibration_note_line,
     calibration_paths,
@@ -336,8 +344,10 @@ _OFFSETS_CALIBRATIONS_LABEL = "Other calibration documents (optional), one path 
 _OFFSETS_CALIBRATIONS_PLACEHOLDER = (
     "leave empty to measure with the calibrations listed above"
 )
-#: The fields of the camera-calibration form that the block's button sends (m5 §18.6 D13).
-_CALIBRATE_FIELDS = ("step_um", "settle_ms")
+#: The fields of the camera-calibration form that a click into an objective's own document sends
+#: (m5 §18.6 D13, D19): the block's button, and the Stand screen's when it is routed. The
+#: controller's own constant, since it is the one that drops every other pair.
+_CALIBRATE_FIELDS = CALIBRATE_FIELDS
 #: The title of the how-to card (m5 §18.6.3): the block's button is the way, a terminal the other.
 _OFFSETS_HOW_TITLE = "Or make a document in a terminal"
 _OFFSETS_SESSION_LABEL = "Session (goes into each offset's measured text; optional)"
@@ -674,6 +684,21 @@ class _CentreSlot:
 
 
 @dataclass(frozen=True, slots=True)
+class _AtPosition:
+    """The turret position of an objective and the document the page holds there (m5 §18.6 D12, D19).
+
+    ``position`` is ``None`` when the page's copy of the labels does not name one; ``held`` is the
+    view's document at it, ``usable`` when it has no problem, and ``same`` when it is a usable
+    one of the objective asked about (the one a new calibration replaces).
+    """
+
+    position: int | None
+    held: HeldCalibration | None
+    usable: bool
+    same: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _ResultRow:
     """One of the Results screen's five rows: built once, rewritten by the redraws (m5 §17.4.5, §17.11.2).
 
@@ -819,9 +844,14 @@ class PlatePageView:
         # The objective the *Calibrate the camera* button names, per view (m5 §18.6 D12, FM-151:
         # another tab draws its own, FM-177: the click sends this label, drawn with the button's).
         self._calibrate_for: str | None = None
-        # The documents the page held at the last redraw of the block: the wait beside *Measure
-        # the offsets* was read for them, and says nothing true once they change.
-        self._held_drawn: tuple[HeldCalibration, ...] = ()
+        # The same for the Stand screen's *Calibrate the camera* (m5 §18.6 D19): the tick's
+        # objective, written by ``_draw_stand`` and sent by the click, because the destination of
+        # the calibration is chosen for the label the button showed (FM-151, FM-177).
+        self._stand_calibrate_for: str | None = None
+        # The documents the page held at the last redraw of the block, and the line for a folder
+        # it could not look into: the wait beside *Measure the offsets* was read for them, and
+        # says nothing true once either changes (FM-247, m5 §18.6 D22).
+        self._held_drawn: tuple[tuple[HeldCalibration, ...], str | None] = ((), None)
         self._offsets_step_drawn: OffsetsStep | None = None
         self._offsets_shown: tuple[str, ...] = ()
         self._offsets_wait = ""
@@ -1527,9 +1557,11 @@ class PlatePageView:
         self.stand_connect_button.on_click(
             self._handler(lambda event: self.on_connect())
         )
-        # The same handler as the *Run camera-calibration* of the expert view's section.
+        # Not the handler of the *Run camera-calibration* of the expert view's section (that one
+        # stays ``on_run``: the expert's way into the run document): this button's destination is
+        # chosen by the controller, for the label it showed (m5 §18.6 D19).
         self.calibrate_button.on_click(
-            self._handler(self._runner("camera-calibration"))
+            self._handler(lambda event: self.on_stand_calibrate())
         )
         self.register_button.on_click(self._handler(lambda event: self.on_register()))
 
@@ -1575,7 +1607,7 @@ class PlatePageView:
             sizing_mode="stretch_width",
         )
         self.offsets_measure_button = pn.widgets.Button(
-            label="Measure the offsets", color="primary"
+            label=OFFSETS_MEASURE_LABEL, color="primary"
         )
         self.offsets_wait_text = _wrapped_text()
         self.offsets_confirm_text = _wrapped_text(extra={"color": _WARNING})
@@ -2938,6 +2970,31 @@ class PlatePageView:
         self._try(run)
         self.tick()
 
+    def on_stand_calibrate(self) -> None:
+        """The Stand screen's *Calibrate the camera*: the label the button showed, with what ``on_run`` sends (m5 §18.6 D19, FM-177).
+
+        The click sends **the label the button showed** (``_stand_calibrate_for``, drawn by the
+        tick with the note and the state), and the controller reads the turret again and decides
+        where the calibration goes: into the objective's own document when the plate was
+        registered under another objective, into the run document otherwise. The pairs are the
+        ones ``on_run`` sends, and the controller drops all but the step and the settle for a
+        document. The expert view's *Run camera-calibration* is not this button: it goes through
+        ``on_run`` and writes the run document, as it always did.
+        """
+        expected = self._stand_calibrate_for or ""
+
+        def run() -> None:
+            self.page.calibrate_camera(
+                expected,
+                [
+                    *self.page.page_params("camera-calibration"),
+                    *self._typed("camera-calibration"),
+                ],
+            )
+
+        self._try(run)
+        self.tick()
+
     def on_run_all(self) -> None:
         """*Run all that are left*: the Results tools that loaded, each with the pairs its own *Run* sends (m5 §17.11.2).
 
@@ -4142,6 +4199,12 @@ class PlatePageView:
         view = self._view
         calibration = None if view is None else view.camera_calibration
         objective = status.objective or None
+        # The label the Stand screen's button names, written here with the note and the state it
+        # shares it with and sent by the click: the controller reads the turret again and runs
+        # only for the label it showed (m5 §18.6 D19, FM-177). Blank is none.
+        self._stand_calibrate_for = (
+            objective if objective is not None and objective.strip() else None
+        )
         self.known_block.object = known_text(
             objective=objective,
             calibration=calibration,
@@ -4253,7 +4316,6 @@ class PlatePageView:
         # A page served on Windows says its commands are quoted for a POSIX shell (FM-175).
         note = posix_quoting_note(self._windows)
         self._say(self.register_command_note, note)
-        self._say(self.calibrate_command_note, note)
         self._say(self.layout_command_note, note)
         self._say(self.scan_command_note, note)
         self._draw_calibrate_command()
@@ -4262,7 +4324,16 @@ class PlatePageView:
         self._draw_result_commands()
 
     def _draw_calibrate_command(self) -> None:
-        """The command of ``camera-calibration`` with the page's pairs and the form's typed fields."""
+        """The command of the Stand screen's *Calibrate the camera*: the call the click makes, with the page's pairs and the form's typed fields (ADR-0006, principle 5, m5 §18.6 D19).
+
+        Into the run document, as the expert view's *Run* does, unless the click would go to the
+        objective's own document (``_stand_destination``): then the run into that position's
+        file, with the step and the settle alone, and under it the note that the page makes the
+        folder and a terminal does not. A position the page cannot name has no command: the click
+        is refused. The Windows note (the line is quoted for a POSIX shell, FM-175) follows it.
+        All from the status and the last view, never from the stand (FM-145).
+        """
+        notes: list[str] = []
         try:
             pairs = [
                 *self.page.page_params("camera-calibration"),
@@ -4270,10 +4341,62 @@ class PlatePageView:
             ]
         except ValueError:
             self.calibrate_command.object = ""
+            self._say(self.calibrate_command_note, posix_quoting_note(self._windows))
             return
-        self.calibrate_command.object = self.page.command_for(
-            "camera-calibration", pairs
+        goes, position = self._stand_destination()
+        if not goes:
+            command = self.page.command_for("camera-calibration", pairs)
+        elif position is None:
+            command = ""
+        else:
+            folder = self.page.calibrations_folder
+            command = self.page.command_for(
+                "camera-calibration",
+                [p for p in pairs if p.partition("=")[0] in _CALIBRATE_FIELDS],
+                run_doc=folder / calibration_file(position),
+            )
+            notes.append(calibrate_command_folder_note(str(folder.absolute())))
+        self.calibrate_command.object = command
+        # A page served on Windows says its commands are quoted for a POSIX shell (FM-175).
+        notes.append(posix_quoting_note(self._windows))
+        self._say(self.calibrate_command_note, "\n".join(n for n in notes if n))
+
+    def _stand_destination(self) -> tuple[bool, int | None]:
+        """Whether the Stand screen's click goes into the objective's own document, and the turret position of it, from the status and the last view (m5 §18.6 D19).
+
+        ``calibration_goes_to_a_document`` is the one condition the note, the command, the
+        disabled state and the controller's route read. The position is the page's own copy of
+        the labels (the click reads the turret again): ``None`` when it does not name one.
+        """
+        status = self._status
+        view = self._view
+        offer = None if view is None else view.offsets
+        objective = None if status is None else status.objective
+        if not calibration_goes_to_a_document(
+            None if offer is None else offer.plate_objective, objective
+        ):
+            return False, None
+        return True, turret_position(self._objective_labels, objective)
+
+    def _at_position(self, objective: str | None, named: str | None) -> _AtPosition:
+        """The document the page holds at the turret position of ``objective`` and whether it is ``named``'s own: one decision of ``again`` for the block's button and the Stand screen's note (m5 §18.6 D12, D19, FM-247).
+
+        ``held`` is the view's document at the position the page's copy of the labels gives
+        (``None`` for no position, no document, or no view). It is ``usable`` without a problem,
+        and ``same`` when it is a usable one of ``named``: the objective a new calibration
+        replaces, so that the label says ``again`` for no other (FM-216: a per-objective value in a
+        per-position file).
+        """
+        view = self._view
+        position = turret_position(self._objective_labels, objective)
+        held = (
+            None
+            if view is None or position is None
+            else next((h for h in view.calibrations if h.position == position), None)
         )
+        usable = held is not None and held.read.problem is None
+        same = usable and held is not None and held.read.objective == named
+        return _AtPosition(position, held, usable, same)
 
     def _draw_stand_plate_buttons(self) -> None:
         """Which buttons of the Stand and Plate screens are disabled, and the reason beside each (m5 §11.2, §17.2 D11, §17.4).
@@ -4297,17 +4420,12 @@ class PlatePageView:
         connected = page.connected
         busy = None if running is None else busy_note(running, live=live)
         blocked = self._blocked.get("camera-calibration")
-        self.calibrate_button.disabled = running is not None or blocked is not None
-        # After the tool's own reason and the busy note: what this button replaces when the
-        # plate was registered with another objective than the one in place (m5 §18.6 D17).
-        self._say(
-            self.calibrate_note,
-            "\n".join(
-                line
-                for line in (blocked or busy, self._calibrate_replaces_plate_note())
-                if line
-            ),
-        )
+        note, disabled = self._stand_calibration(blocked, busy)
+        self.calibrate_button.disabled = disabled
+        self._say(self.calibrate_note, note)
+        # The routed command follows the objective in place, which is the tick's (the note, the
+        # state and the command read one decision: ``_stand_destination``, FM-169).
+        self._draw_calibrate_command()
         stage_off = not connected or (running is not None and not live)
         self._say(
             self.rows_note,
@@ -4344,29 +4462,62 @@ class PlatePageView:
         self.register_button.disabled = running is not None or reason is not None
         self._say(self.register_wait, reason or "")
 
-    def _calibrate_replaces_plate_note(self) -> str:
-        """What the Stand screen's *Calibrate the camera* would do to the registration, or ``""`` (m5 §18.6 D17, FM-216).
+    def _stand_calibration(
+        self, blocked: str | None, busy: str | None
+    ) -> tuple[str, bool]:
+        """The note under the Stand screen's *Calibrate the camera* and whether the button is disabled (m5 §18.6 D19, FM-216, FM-172).
 
-        That button runs into the run document, and the calibration the plate was registered with
-        is there: a calibration at another objective replaces it and the plate goes out of date
-        (measured on ``main``, §18.6.1). Said when the offsets block is offered (the plate was
-        registered from its walls, with an objective) and the objective in place is known and is
-        not the plate's. Text only, from the status the tick read and the view the last redraw
-        read (FM-145).
+        Drawn from the status the tick read and the view the last redraw read, never from the
+        stand (FM-145). When the click goes into the objective's own document
+        (``calibration_goes_to_a_document``, the one condition the controller's route and the
+        command read too), the note is, in this order: the tool's own reason, then
+        ``calibrate_wait``'s (it carries the busy note, the dry run and the light) or, when the
+        page's copy of the labels does not give the position, ``calibrate_position_unknown``, then
+        **after the reason and never instead of it** where the calibration goes
+        (``calibrate_stand_routed``) and, for a usable document of that objective at the
+        position, what a new calibration replaces (``calibrate_replaces``): both only when the
+        position is known, since they name its file. The button is disabled by the same reasons.
+        With another destination the run document's: the tool's own reason or the busy note,
+        and the button waits for an activity or that reason, as it always did.
         """
-        view = self._view
         status = self._status
+        goes, position = self._stand_destination()
+        view = self._view
         offer = None if view is None else view.offsets
-        if offer is None or status is None:
-            return ""
+        if not goes or status is None or offer is None:
+            note = "\n".join(line for line in (blocked or busy,) if line)
+            return note, self._running is not None or blocked is not None
         objective = status.objective
-        if (
-            objective is None
-            or not objective.strip()
-            or objective == offer.plate_objective
-        ):
-            return ""
-        return calibrate_replaces_plate(offer.plate_objective, objective)
+        plate = offer.plate_objective
+        wait = calibrate_wait(
+            connected=status.connected,
+            running=status.running,
+            live=self.page.is_live,
+            dry_run=status.dry_run,
+            objective=objective,
+            plate_objective=plate,
+            light_on=calibration_light(status.light_on, status.auto_shutter),
+        )
+        lines = [
+            blocked,
+            wait
+            or (
+                calibrate_position_unknown(objective or "")
+                if position is None
+                else None
+            ),
+        ]
+        if position is not None:
+            lines.append(
+                calibrate_stand_routed(
+                    plate, objective or "", calibration_file(position)
+                )
+            )
+            at = self._at_position(objective, objective)
+            if at.same and at.held is not None:
+                lines.append(calibrate_replaces(objective or "", at.held.read.measured))
+        note = "\n".join(line for line in lines if line)
+        return note, blocked is not None or wait is not None or position is None
 
     def _field_line(self, field: tuple[str, str]) -> str:
         """The line under one of the Wells screen's two tool fields: where its value comes from (m5 §17.2 D7, §17.10.3).
@@ -4455,16 +4606,13 @@ class PlatePageView:
             else None
         )
         self._calibrate_for = named
-        position = turret_position(self._objective_labels, objective)
-        held = next(
-            (item for item in view.calibrations if item.position == position), None
-        )
         # A usable document at the position: the one a new calibration replaces. It is `again`
         # only when it is this objective's own: a position whose label was changed since holds
         # another objective's calibration, and the line names that one as the one that is lost
         # (FM-216: a per-objective value in a per-position file, found by the review of #501).
-        usable = held is not None and held.read.problem is None
-        same = usable and held is not None and held.read.objective == named
+        # One decision for this button and the Stand screen's note (FM-247).
+        at = self._at_position(objective, named)
+        held, usable, same = at.held, at.usable, at.same
         wait = calibrate_wait(
             connected=status.connected,
             running=status.running,
@@ -4472,6 +4620,7 @@ class PlatePageView:
             dry_run=status.dry_run,
             objective=objective,
             plate_objective=plate,
+            light_on=calibration_light(status.light_on, status.auto_shutter),
         )
         self.offsets_calibrate_button.label = calibrate_label(
             objective, plate, again=same
@@ -4523,7 +4672,7 @@ class PlatePageView:
             self.objective_in_place_text.object = ""
             self.calibrate_lead_text.object = ""
             self._calibrate_for = None
-            self._held_drawn = ()
+            self._held_drawn = ((), None)
             for pane in (
                 self.calibrations_held_text,
                 self.offsets_calibrate_wait,
@@ -4545,16 +4694,19 @@ class PlatePageView:
             else offsets_lead_unread(offer.plate_objective)
         )
         self.calibrate_lead_text.object = CALIBRATE_LEAD
-        if view.calibrations != self._held_drawn:
-            # A calibration was made (or a document changed): the wait that the last read of the
-            # documents drew, `Calibrate the camera at each objective ...`, is not true any more.
-            # Nothing is read for it here; the next click on *Measure* reads again (the review of
-            # #501).
-            self._held_drawn = view.calibrations
+        held_now = (view.calibrations, view.calibrations_denied)
+        if held_now != self._held_drawn:
+            # A calibration was made (a document changed, a folder opened or closed to the
+            # account): the wait that the last read of the documents drew, `Calibrate the camera
+            # at each objective ...` or the folder's denial, is not true any more. Nothing is read
+            # for it here; the next click on *Measure* reads again (the review of #501).
+            self._held_drawn = held_now
             self._offsets_wait = ""
         self._say(
             self.calibrations_held_text,
-            self._calibrations_held_lines(view.calibrations, offer.plate_objective),
+            self._calibrations_held_lines(
+                view.calibrations, offer.plate_objective, view.calibrations_denied
+            ),
         )
         card = view.cards.get("objective-offsets")
         self._offsets_card_status = None if card is None else card.status
@@ -4571,7 +4723,10 @@ class PlatePageView:
         self._draw_offsets(self._status)
 
     def _calibrations_held_lines(
-        self, held: Sequence[HeldCalibration], plate_objective: str
+        self,
+        held: Sequence[HeldCalibration],
+        plate_objective: str,
+        denied: str | None = None,
     ) -> str:
         """The list of the calibrations the page holds, and of the objectives that have none, as plain text (m5 §18.6 D15).
 
@@ -4583,6 +4738,11 @@ class PlatePageView:
         objective is on the turret is not said and no objective is listed as missing. Nothing is
         drawn when there is nothing to list. A label, a path and a tool's words come from outside:
         every line is plain text (FM-139).
+
+        A document that is not its position's has a line of its own and names no objective (D21).
+        ``denied`` is the one line for a folder the page could not look into (D22): it is drawn
+        under the heading, before the documents the look did reach, and **while it is set no
+        objective is listed as having no calibration** (the page does not know).
         """
         labels = self._objective_labels
         lines: list[str] = []
@@ -4590,6 +4750,9 @@ class PlatePageView:
         for item in held:
             read = item.read
             index = item.position - 1
+            at_position = calibration_at_its_position(
+                labels, item.position, read.objective
+            )
             lines.append(
                 calibration_held_line(
                     item.position,
@@ -4598,22 +4761,30 @@ class PlatePageView:
                     read.measured,
                     read.problem,
                     plate_objective=plate_objective,
-                    on_turret=(
-                        None
-                        if not labels or read.objective is None
-                        else read.objective in labels
-                    ),
+                    at_position=at_position,
                 )
             )
-            if read.problem is None and read.objective is not None:
+            # A document that is not its position's names no objective (D21): the objective its
+            # file should hold is listed `no calibration yet`, and its own notes are not shown
+            # under a line that says the document is not offered.
+            if (
+                read.problem is None
+                and read.objective is not None
+                and at_position is not False
+            ):
                 named.add(read.objective)
                 lines.extend(
                     calibration_note_line(read.objective, note) for note in read.notes
                 )
-        missing = dict.fromkeys(offsets_others(labels, plate_objective))
-        lines.extend(
-            calibration_missing_line(label) for label in missing if label not in named
-        )
+        if denied is not None:
+            lines.insert(0, denied)
+        else:
+            missing = dict.fromkeys(offsets_others(labels, plate_objective))
+            lines.extend(
+                calibration_missing_line(label)
+                for label in missing
+                if label not in named
+            )
         if not lines:
             return ""
         folder = str(self.page.calibrations_folder)

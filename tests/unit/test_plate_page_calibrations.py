@@ -11,6 +11,9 @@ asserted to leave it where it was (FM-14).
 
 from __future__ import annotations
 
+import os
+import shlex
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -24,7 +27,7 @@ from pymmcore_plus import CMMCorePlus
 
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
-from smc.hardware.capabilities import ObjectiveTurret
+from smc.hardware.capabilities import LightSource, ObjectiveTurret, Shutter
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
@@ -55,9 +58,11 @@ from smc.ui.controller import (
 )
 from smc.ui.guide import (
     CALIBRATE_DRY_RUN,
+    CALIBRATE_LIGHT_OFF,
     CALIBRATE_NAMES_NONE,
     CALIBRATE_NO_OFFER,
     CALIBRATE_NOT_KNOWN,
+    CALIBRATE_REUSE_ROUTED,
     OFFSETS_NO_DOCUMENT,
     OFFSETS_TOO_MANY,
     OFFSETS_TURRET_UNREAD,
@@ -65,6 +70,7 @@ from smc.ui.guide import (
     busy_note,
     calibrate_changed,
     calibrate_is_the_plates,
+    calibrate_measured_other,
     calibrate_position_unknown,
     calibration_failed,
 )
@@ -185,12 +191,19 @@ class StubCalibration:
     assumed: ClassVar[tuple[str, ...]] = ()
     started: ClassVar[threading.Event] = threading.Event()
     release: ClassVar[threading.Event | None] = None
+    #: The operator's turn at the handset **during the run**, between the click's read of the
+    #: turret and the tool's own: the label the tool then reads is this one (m5 §18.6 D21).
+    turns_to: ClassVar[str | None] = None
 
     def run(
         self, microscope: Any, params: StubCalibrationParams, ctx: RunContext
     ) -> CameraCalibration:
         StubCalibration.seen.append(params)
         StubCalibration.started.set()
+        if StubCalibration.turns_to is not None:
+            microscope.require(ObjectiveTurret).select(
+                StubCalibration.turns_to, confirm=True
+            )
         if StubCalibration.release is not None:
             # In the tool's own way: a STOP is seen between two steps, the stage stays put.
             deadline = time.monotonic() + 10.0
@@ -236,6 +249,7 @@ def _fresh_state() -> Iterator[None]:
     StubCalibration.seen = []
     StubCalibration.fails = None
     StubCalibration.assumed = ()
+    StubCalibration.turns_to = None
     StubCalibration.started = threading.Event()
     StubCalibration.release = None
     Slow.started = threading.Event()
@@ -279,6 +293,64 @@ class Turret:
 
     def offset(self, label: str) -> Any:
         raise NotImplementedError
+
+
+class AutoShutter:
+    """The core's shutter and its auto-shutter switch, as the test sets them (m5 §18.6 D20).
+
+    On the Ti2-E the lamp (``DiaLamp``) is the core's shutter and auto-shutter is on: the lamp
+    reads closed at rest and Micro-Manager opens it around the camera's own snap.
+    """
+
+    def __init__(self, auto: bool | Exception) -> None:
+        self.auto = auto
+
+    def is_open(self) -> bool:
+        return False
+
+    def set_open(self, open_: bool) -> bool:
+        return open_
+
+    def auto_shutter(self) -> bool:
+        if isinstance(self.auto, Exception):
+            raise self.auto
+        return self.auto
+
+    def set_auto_shutter(self, on: bool) -> bool:
+        self.auto = on
+        return on
+
+
+class Light:
+    """A light source the test sets: its switch reads on, off, nothing smc knows, or raises (D20).
+
+    The page reads ``is_on()`` at a tick and again at a click: ``reading`` is what the next read
+    says, so that a test turns the light off **between** the two, with no tick in between.
+    """
+
+    def __init__(self, reading: bool | Exception | None) -> None:
+        self.reading = reading
+
+    def device(self) -> str:
+        return "LED"
+
+    def intensity_knob(self) -> Any:
+        return None
+
+    def intensity_native(self) -> float | None:
+        return None
+
+    def set_intensity_native(self, value: float) -> float:
+        return value
+
+    def is_on(self) -> bool | None:
+        if isinstance(self.reading, Exception):
+            raise self.reading
+        return self.reading
+
+    def set_on(self, on: bool) -> bool:
+        self.reading = on
+        return on
 
 
 # --- records written out by hand -------------------------------------------------------
@@ -427,9 +499,30 @@ def _dry_microscope(fake_core: FakeCore) -> Microscope:
     )
 
 
-def _calibrate(page: PlatePage, expected: str, pairs: tuple[str, ...] = ()) -> str:
-    """Press the button as the block does and wait for the run; the outcome the strip would say."""
-    page.calibrate_objective(expected, pairs)
+#: The two buttons that calibrate into a document of the objective's own: the block's (always) and
+#: the Stand screen's (for a plate registered under another objective, m5 §18.6 D19). What both
+#: refuse is the same text from the same helpers (FM-169), and the tests of it run for each.
+BUTTONS = ["the block's button", "the Stand screen's button"]
+
+
+def _click(
+    page: PlatePage, button: str, expected: str, pairs: tuple[str, ...] = ()
+) -> None:
+    """Press ``button`` once, with the label it showed, and do not wait."""
+    if button == BUTTONS[0]:
+        page.calibrate_objective(expected, pairs)
+    else:
+        page.calibrate_camera(expected, pairs)
+
+
+def _calibrate(
+    page: PlatePage,
+    expected: str,
+    pairs: tuple[str, ...] = (),
+    button: str = BUTTONS[0],
+) -> str:
+    """Press the button (the block's by default) and wait for the run; the outcome the strip would say."""
+    _click(page, button, expected, pairs)
     assert page.join(10.0)
     outcome = page.status().outcome
     assert outcome is not None
@@ -664,6 +757,9 @@ def _foreseen(
         labels[4] = FORTY
         microscope.override(ObjectiveTurret, Turret(labels, FORTY))
         return page, FORTY, calibrate_position_unknown(FORTY)
+    if case == "a typed from_run_doc":
+        # The refusal is the pairs'; the page is a plain one at the 40X (the Stand screen's).
+        return page, FORTY, CALIBRATE_REUSE_ROUTED
     assert case == "a halted stand"
     microscope.stop()
     return page, FORTY, SCAN_HALTED
@@ -720,6 +816,403 @@ def test_calibrate_objective_refuses_each_foreseen_state_and_writes_nothing(
     assert (run_doc.read_bytes() if run_doc.exists() else None) == seen_before
 
 
+# --- D19: the Stand screen's button -----------------------------------------------------
+
+
+def _press_stand(page: PlatePage, expected: str, pairs: tuple[str, ...] = ()) -> str:
+    """Press the Stand screen's button and wait for the run; the outcome the strip would say."""
+    page.calibrate_camera(expected, pairs)
+    assert page.join(10.0)
+    outcome = page.status().outcome
+    assert outcome is not None
+    return outcome
+
+
+def test_the_stand_button_runs_into_the_position_document_and_leaves_run_json_byte_identical_and_the_plate_registered(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # Acceptance 1 (FM-216): the plate was registered under the 10X, the operator turned the
+    # turret to the 40X on the Stand screen and pressed the button it showed. Into `run.json`
+    # it made the plate `unusable`, with `registered` and `offsets` gone (§18.6.1, measured).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    page = _page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        stages_before = sorted(RunDocument.load(run_doc).stages)
+        outcome = _press_stand(page, FORTY, ("step_um=40", "settle_ms=5"))
+        view = page.view()
+        after = run_doc.read_bytes()
+    finally:
+        page.close()
+
+    record = RunDocument.load(_folder(run_doc) / "position-1.json").provider(
+        "camera-calibration"
+    )
+    assert outcome.startswith("Camera calibration done in ")
+    assert after == before
+    assert sorted(RunDocument.load(run_doc).stages) == stages_before
+    assert view.registered is not None
+    assert view.offsets is not None
+    assert [item.state for item in view.checklist if item.slot == "plate"] == ["ok"]
+    assert record is not None
+    assert record.status is StageStatus.done
+    assert CameraCalibration.model_validate(record.result).objective == FORTY
+    # The fields of the form reach the tool, and nothing turned the turret (FM-14).
+    assert [(p.step_um, p.settle_ms) for p in StubCalibration.seen] == [(40.0, 5.0)]
+    assert _in_place(fake_microscope) == FORTY
+    assert [h.position for h in view.calibrations] == [1]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["a plate by eye", "the plate's own objective", "no run document"],
+)
+def test_the_stand_button_runs_into_run_json_with_no_plate_registered_from_its_walls_and_at_the_plates_own_objective(
+    fake_microscope: Microscope, run_doc: Path, case: str
+) -> None:
+    # As it was: the run document's calibration is the one `plate-walls` reads. With no offer
+    # there is no registration from walls to protect, and at the plate's own objective the
+    # calibration is the plate's. Every pair typed is sent, and the button's label need not name
+    # one for a page that has no offer (the first calibration of a stand).
+    expected = FORTY
+    turned = FORTY
+    if case == "a plate by eye":
+        _seed_plate(run_doc, by_eye=True)
+        expected = ""
+    elif case == "the plate's own objective":
+        _seed_plate(run_doc)
+        turned = expected = TEN
+    _turn(fake_microscope, turned)
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _press_stand(page, expected, ("step_um=40", "settle_ms=5"))
+    finally:
+        page.close()
+
+    record = RunDocument.load(run_doc).provider("camera-calibration")
+    assert outcome.startswith("Camera calibration done in ")
+    assert record is not None
+    assert CameraCalibration.model_validate(record.result).objective == turned
+    assert not _folder(run_doc).exists()
+    assert [(p.step_um, p.settle_ms) for p in StubCalibration.seen] == [(40.0, 5.0)]
+
+
+def test_a_stand_click_with_no_offer_is_the_runs_own_call_and_its_own_refusals(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With no offer the click is `run("camera-calibration", pairs)` and nothing else: no read of
+    # the turret, of the light or of the halt, and an unreadable run document is `run`'s refusal.
+    calls: list[tuple[str, tuple[str, ...]]] = []
+    page = _page(fake_microscope, run_doc)
+    real_run = page.run
+
+    def spy(plugin: str, params: Any, **kwargs: Any) -> None:
+        calls.append((plugin, tuple(params)))
+        real_run(plugin, params, **kwargs)
+
+    monkeypatch.setattr(page, "run", spy)
+    for name in ("_turret_reading", "_halted"):
+        monkeypatch.setattr(
+            page, name, lambda *a, _n=name: pytest.fail(f"{_n} was read")
+        )
+    try:
+        page.calibrate_camera("", ("step_um=40", "from_run_doc=cal-10x.json"))
+        refused = page.status().outcome
+        assert page.join(10.0)
+    finally:
+        page.close()
+
+    # Not the Stand's own refusals, but the call as it was: `run`'s, with every pair as typed.
+    assert calls == [
+        ("camera-calibration", ("step_um=40", "from_run_doc=cal-10x.json"))
+    ]
+    assert refused is not None
+    assert not refused.startswith("Camera calibration: ")
+
+
+def test_a_stand_click_on_an_unreadable_run_document_is_the_runs_refusal_and_writes_nothing(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _turn(fake_microscope, FORTY)
+    run_doc.write_text("{not json", encoding="utf-8")
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.calibrate_camera(FORTY)
+        outcome = page.status().outcome
+        running = page.status().running
+    finally:
+        page.close()
+
+    assert outcome is not None
+    assert outcome.startswith(
+        f"camera-calibration: RunDocumentError: {run_doc}: is not valid JSON"
+    )
+    assert CALIBRATE_NO_OFFER not in outcome
+    assert running is None
+    assert StubCalibration.seen == []
+    assert run_doc.read_text(encoding="utf-8") == "{not json"
+    assert not _folder(run_doc).exists()
+
+
+@pytest.mark.parametrize(
+    ("shown", "now"),
+    [
+        (TEN, TWENTY),
+        (FORTY, TWENTY),
+        (TWENTY, FORTY),
+        (TEN, FORTY),
+        # The turret now reads the plate's own objective: the destination would be the run
+        # document, for a label that was drawn for a document of its own.
+        (FORTY, TEN),
+    ],
+    ids=[
+        "plates-own-then-20X",
+        "40X-then-20X",
+        "20X-then-40X",
+        "plates-own-then-40X",
+        "40X-then-plates-own",
+    ],
+)
+def test_a_stand_click_that_showed_one_objective_is_refused_when_the_turret_now_reads_another(
+    fake_microscope: Microscope, run_doc: Path, shown: str, now: str
+) -> None:
+    # FM-177 and its converse (D19): the destination was chosen for the label shown. A turn at
+    # the handset since, with no tick in between, would send the 40X's calibration into
+    # `run.json` (the button showed the 10X) and put the plate out of date. Refused, with the
+    # page's own words and nothing written, started or turned.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, now)
+    page = _page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        page.calibrate_camera(shown)
+        outcome = page.status().outcome
+        running = page.status().running
+        after = run_doc.read_bytes()
+    finally:
+        page.close()
+
+    assert outcome == f"Camera calibration: {calibrate_changed(shown, now)}"
+    assert running is None
+    assert after == before
+    assert StubCalibration.seen == []
+    assert not _folder(run_doc).exists()
+    assert _in_place(fake_microscope) == now
+
+
+@pytest.mark.parametrize("case", ["closed", "not known", "a button that named none"])
+def test_a_stand_click_with_an_offer_is_refused_for_a_closed_stand_an_unknown_objective_and_no_label(
+    fake_microscope: Microscope,
+    fake_core: FakeCore,
+    run_doc: Path,
+    request: pytest.FixtureRequest,
+    case: str,
+) -> None:
+    page, expected, refusal = _foreseen(
+        case, fake_microscope, fake_core, run_doc, request
+    )
+    before = run_doc.read_bytes()
+    try:
+        page.calibrate_camera(expected)
+        outcome = page.status().outcome
+        running = page.status().running
+    finally:
+        page.close()
+
+    # The tool's own run would have written the 40X's calibration into `run.json` here.
+    assert outcome == f"Camera calibration: {refusal}"
+    assert running is None
+    assert StubCalibration.seen == []
+    assert not _folder(run_doc).exists()
+    assert run_doc.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "dry run",
+        "a halted stand",
+        "a label on two positions",
+        "a typed from_run_doc",
+    ],
+)
+def test_a_stand_click_into_a_document_is_refused_for_a_dry_run_a_halt_a_position_not_known_and_a_typed_from_run_doc(
+    fake_microscope: Microscope,
+    fake_core: FakeCore,
+    run_doc: Path,
+    request: pytest.FixtureRequest,
+    case: str,
+) -> None:
+    page, expected, refusal = _foreseen(
+        case, fake_microscope, fake_core, run_doc, request
+    )
+    pairs = ("from_run_doc=cal-10x.json",) if case == "a typed from_run_doc" else ()
+    before = run_doc.read_bytes()
+    try:
+        page.calibrate_camera(expected, pairs)
+        outcome = page.status().outcome
+        running = page.status().running
+    finally:
+        page.close()
+
+    assert outcome == f"Camera calibration: {refusal}"
+    assert running is None
+    assert StubCalibration.seen == []
+    assert not _folder(run_doc).exists()
+    assert run_doc.read_bytes() == before
+
+
+def test_a_stand_click_into_a_document_refuses_in_the_designs_order(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # D19's order for a document, after the label checks: the light, a typed from_run_doc, the
+    # position, the halt. All four are wrong at once, then put right one at a time.
+    _seed_plate(run_doc)
+    labels = _labels(fake_microscope)
+    twice = list(labels)
+    twice[4] = FORTY  # the 40X on two positions: its position cannot be named
+    light = Light(False)
+    fake_microscope.override(LightSource, light)
+    fake_microscope.override(Shutter, AutoShutter(False))
+    fake_microscope.override(ObjectiveTurret, Turret(twice, FORTY))
+    fake_microscope.stop()
+    page = _page(fake_microscope, run_doc)
+    typed = ("from_run_doc=cal-10x.json",)
+    try:
+        outcomes = [(_press(page, typed))]
+        light.reading = True
+        outcomes.append(_press(page, typed))
+        outcomes.append(_press(page, ()))
+        fake_microscope.override(ObjectiveTurret, Turret(labels, FORTY))
+        outcomes.append(_press(page, ()))
+    finally:
+        page.close()
+
+    assert outcomes == [
+        f"Camera calibration: {CALIBRATE_LIGHT_OFF}",
+        f"Camera calibration: {CALIBRATE_REUSE_ROUTED}",
+        f"Camera calibration: {calibrate_position_unknown(FORTY)}",
+        f"Camera calibration: {SCAN_HALTED}",
+    ]
+    assert StubCalibration.seen == []
+    assert not _folder(run_doc).exists()
+
+
+def _press(page: PlatePage, pairs: tuple[str, ...]) -> str | None:
+    page.calibrate_camera(FORTY, pairs)
+    return page.status().outcome
+
+
+def test_a_stand_click_into_a_document_sends_only_step_um_and_settle_ms(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The form's other fields (a blank `from_run_doc`, whatever a script adds) are not sent into
+    # the objective's own document: the tool is run with the two fields of the Stand's form.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _press_stand(
+            page, FORTY, ("step_um=40", "from_run_doc=", "unknown=1", "settle_ms=5")
+        )
+    finally:
+        page.close()
+
+    assert outcome.startswith("Camera calibration done in ")
+    assert [(p.step_um, p.settle_ms) for p in StubCalibration.seen] == [(40.0, 5.0)]
+
+
+def test_a_stand_click_while_an_activity_goes_raises_as_run_does(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.run("slow", [])
+        assert Slow.started.wait(10.0)
+        with pytest.raises(RuntimeError, match="slow is running"):
+            page.calibrate_camera(FORTY)
+        Slow.release.set()
+        assert page.join(10.0)
+    finally:
+        page.close()
+    with pytest.raises(RuntimeError, match="the page is closed"):
+        page.calibrate_camera(FORTY)
+
+    assert StubCalibration.seen == []
+    assert not _folder(run_doc).exists()
+
+
+def test_command_for_names_another_run_document_when_given_one(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ADR-0006, principle 5: the Stand screen's *Command* shows the call the click makes, which
+    # for a document is the run into that position's file. Absolute, as the page's own is.
+    monkeypatch.chdir(run_doc.parent)
+    page = PlatePage(fake_microscope, Path("run.json"), entry_points=_entry_points())
+    try:
+        own = shlex.split(page.command_for("camera-calibration", ["step_um=40"]))
+        routed = shlex.split(
+            page.command_for(
+                "camera-calibration",
+                ["step_um=40"],
+                run_doc=Path("calibrations") / "position-1.json",
+            )
+        )
+    finally:
+        page.close()
+
+    def run_document(words: list[str]) -> str:
+        return words[words.index("--run-doc") + 1]
+
+    assert run_document(own) == str(run_doc.parent.absolute() / "run.json")
+    assert run_document(routed) == str(
+        run_doc.parent.absolute() / "calibrations" / "position-1.json"
+    )
+    # Nothing else of the call changed: the same tool, profile and pairs.
+    own[own.index("--run-doc") + 1] = routed[routed.index("--run-doc") + 1]
+    assert own == routed
+    assert routed[:3] == ["smc", "run", "camera-calibration"]
+    assert routed[-2:] == ["--param", "step_um=40"]
+
+
+def test_the_stand_click_replaces_the_documents_calibration_and_a_failure_leaves_the_others(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The stand's click is the block's run: a failed one replaces its own position's document
+    # and no other (FM-216: a document per objective, never two objectives' values in one).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    other = _folder(run_doc) / "position-4.json"
+    _seed_calibration(other, TWENTY)
+    other_before = other.read_bytes()
+    StubCalibration.fails = "the frame is dark or flat"
+    page = _page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        outcome = _press_stand(page, FORTY)
+        view = page.view()
+        after = run_doc.read_bytes()
+    finally:
+        page.close()
+
+    assert (
+        outcome
+        == "Camera calibration failed: camera-calibration: the frame is dark or flat"
+    )
+    assert after == before
+    assert other.read_bytes() == other_before
+    assert view.registered is not None
+    assert [h.position for h in view.calibrations] == [1, 4]
+    assert view.calibrations[0].read.problem == calibration_failed(
+        "the frame is dark or flat"
+    )
+
+
 def test_calibrate_objective_while_an_activity_goes_raises_and_writes_nothing(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
@@ -744,6 +1237,221 @@ def test_calibrate_objective_while_an_activity_goes_raises_and_writes_nothing(
     # The slow tool's own record is the only thing the page's document gained.
     assert sorted(RunDocument.load(run_doc).stages) == ["plate-walls", "slow"]
     assert before.startswith(b"{")
+
+
+@pytest.mark.parametrize("button", BUTTONS)
+def test_a_light_that_reads_off_refuses_the_calibration_and_leaves_the_usable_document_byte_identical(
+    fake_microscope: Microscope, run_doc: Path, button: str
+) -> None:
+    # Acceptance 2, FM-206: the tool refuses a dark frame, and its refusal is a `failed` record
+    # that replaces the position's usable document. The light is read at the click: a status read
+    # (the tick's copy) says on, then it is switched off with no tick in between (FM-177).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    document = _folder(run_doc) / "position-1.json"
+    _seed_calibration(document, FORTY)
+    light = Light(True)
+    fake_microscope.override(LightSource, light)
+    # A stand whose exposure does not open the lamp (auto-shutter off): the light at rest is
+    # what the frame sees.
+    fake_microscope.override(Shutter, AutoShutter(False))
+    page = _page(fake_microscope, run_doc)
+    try:
+        assert page.status().light_on is True
+        light.reading = False
+        document_before = document.read_bytes()
+        run_before = run_doc.read_bytes()
+        _click(page, button, FORTY)
+        outcome = page.status().outcome
+        running = page.status().running
+        refused_document = document.read_bytes()
+        refused_seen = list(StubCalibration.seen)
+        held = page.view().calibrations
+        # The light switched on again, nothing else changed: the same click runs, and it is the
+        # one that replaces the document (so the check above could have seen a replacement).
+        light.reading = True
+        _click(page, button, FORTY)
+        assert page.join(10.0)
+        replaced_document = document.read_bytes()
+    finally:
+        page.close()
+
+    assert outcome == f"Camera calibration: {CALIBRATE_LIGHT_OFF}"
+    assert running is None
+    # Nothing started and nothing written: the usable document is the one it was, and listed.
+    assert refused_seen == []
+    assert refused_document == document_before
+    assert run_doc.read_bytes() == run_before
+    assert [(h.position, h.read.objective, h.read.problem) for h in held] == [
+        (1, FORTY, None)
+    ]
+    assert len(StubCalibration.seen) == 1
+    assert replaced_document != document_before
+    # Nothing in either click turned the turret (FM-14).
+    assert _in_place(fake_microscope) == FORTY
+
+
+@pytest.mark.parametrize("button", BUTTONS)
+def test_a_light_that_reads_off_leaves_every_document_alone_for_a_click_that_ran_nothing(
+    fake_microscope: Microscope, run_doc: Path, button: str
+) -> None:
+    # The refusal alone, with no second click: no file is made, none replaced, no folder.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    fake_microscope.override(LightSource, Light(False))
+    fake_microscope.override(Shutter, AutoShutter(False))
+    page = _page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        _click(page, button, FORTY, ("step_um=40",))
+        outcome = page.status().outcome
+        running = page.status().running
+    finally:
+        page.close()
+
+    assert outcome == f"Camera calibration: {CALIBRATE_LIGHT_OFF}"
+    assert running is None
+    assert StubCalibration.seen == []
+    assert not _folder(run_doc).exists()
+    assert run_doc.read_bytes() == before
+
+
+@pytest.mark.parametrize("button", BUTTONS)
+@pytest.mark.parametrize(
+    "reading",
+    [None, RuntimeError("the lamp does not answer")],
+    ids=["no switch smc knows", "a read that raises"],
+)
+def test_an_unknown_light_or_one_that_raises_refuses_nothing(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    reading: bool | Exception | None,
+    button: str,
+) -> None:
+    # An unknown is not a refusal the page can justify: the tool decides (D20).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    fake_microscope.override(LightSource, Light(reading))
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY, button=button)
+    finally:
+        page.close()
+
+    assert outcome.startswith("Camera calibration done in ")
+    assert (_folder(run_doc) / "position-1.json").is_file()
+    assert len(StubCalibration.seen) == 1
+
+
+@pytest.mark.parametrize("button", BUTTONS)
+def test_a_light_that_reads_off_while_the_core_opens_the_shutter_for_the_snap_refuses_nothing(
+    fake_microscope: Microscope, run_doc: Path, button: str
+) -> None:
+    # The review of #557 (probed on the Ti2-E's own layout, `profiles/nikon-ti2.cfg`): the lamp is
+    # the core's shutter and AutoShutter is 1, so `is_on()` reads False at rest while the camera's
+    # snap opens it. The refusal would be false, on the owner's main stand, for both buttons.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    fake_microscope.override(LightSource, Light(False))
+    fake_microscope.override(Shutter, AutoShutter(True))
+    page = _page(fake_microscope, run_doc)
+    try:
+        status = page.status()
+        outcome = _calibrate(page, FORTY, button=button)
+    finally:
+        page.close()
+
+    assert status.light_on is False
+    assert status.auto_shutter is True
+    assert outcome.startswith("Camera calibration done in ")
+    assert len(StubCalibration.seen) == 1
+
+
+@pytest.mark.parametrize("button", BUTTONS)
+@pytest.mark.parametrize(
+    "auto",
+    [False, RuntimeError("the core does not answer")],
+    ids=["auto-shutter off", "a read that raises"],
+)
+def test_a_light_that_reads_off_still_refuses_unless_the_core_is_known_to_open_the_shutter(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    auto: bool | Exception,
+    button: str,
+) -> None:
+    # Without auto-shutter, or when it cannot be read, the exposure does not open the lamp as far
+    # as the page knows: the refusal D20 designed stands (unknown does not become `fine`).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    fake_microscope.override(LightSource, Light(False))
+    fake_microscope.override(Shutter, AutoShutter(auto))
+    page = _page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        _click(page, button, FORTY)
+        outcome = page.status().outcome
+        running = page.status().running
+        after = run_doc.read_bytes()
+    finally:
+        page.close()
+
+    assert outcome == f"Camera calibration: {CALIBRATE_LIGHT_OFF}"
+    assert running is None
+    assert StubCalibration.seen == []
+    assert after == before
+
+
+def test_the_status_reads_the_auto_shutter_only_when_the_light_reads_off(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The flag matters only for a light that reads off: no extra read of the core otherwise.
+    shutter = AutoShutter(True)
+    reads: list[bool] = []
+    real = shutter.auto_shutter
+
+    def counted() -> bool:
+        reads.append(True)
+        return real()
+
+    shutter.auto_shutter = counted  # type: ignore[method-assign]
+    light = Light(True)
+    fake_microscope.override(LightSource, light)
+    fake_microscope.override(Shutter, shutter)
+    page = _page(fake_microscope, run_doc)
+    try:
+        on = page.status()
+        light.reading = None
+        unknown = page.status()
+        assert reads == []
+        light.reading = False
+        off = page.status()
+    finally:
+        page.close()
+
+    assert (on.light_on, on.auto_shutter) == (True, None)
+    assert (unknown.light_on, unknown.auto_shutter) == (None, None)
+    assert (off.light_on, off.auto_shutter) == (False, True)
+    assert reads == [True]
+
+
+def test_a_stand_with_no_light_source_refuses_nothing(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    real = Microscope.get
+
+    def get(self: Microscope, capability: type) -> Any:
+        return None if capability is LightSource else real(self, capability)
+
+    monkeypatch.setattr(Microscope, "get", get)
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY)
+    finally:
+        page.close()
+
+    assert outcome.startswith("Camera calibration done in ")
 
 
 def test_the_dry_run_text_of_the_calibration_is_the_tools_own_refusal(
@@ -826,6 +1534,129 @@ def test_a_stop_during_a_calibration_says_stopped_and_leaves_the_other_documents
     assert other.read_bytes() == other_before
     assert run_doc.read_bytes() == before
     assert view.registered is not None
+
+
+# --- D21: a document is its file's position's -------------------------------------------
+
+
+@pytest.mark.parametrize("button", BUTTONS)
+def test_a_run_that_measured_another_objective_than_the_button_named_says_so_and_not_done(
+    fake_microscope: Microscope, run_doc: Path, button: str
+) -> None:
+    # Acceptance 3 (FM-216, FM-177): the click read the 40X at position 1, and the operator turned
+    # the turret to the 20X at the handset before the tool read its own label. What is on the
+    # disk is the 20X's calibration in the 40X's file. It holds for both buttons (D21).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    StubCalibration.turns_to = TWENTY
+    page = _page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        outcome = _calibrate(page, FORTY, button=button)
+        view = page.view()
+        # The turret stands at the 20X now: the default (the empty field) must not take the 20X's
+        # calibration out of the 40X's file for the 20X's own (D16, D21).
+        step = page.offsets_step("")
+        after = run_doc.read_bytes()
+    finally:
+        page.close()
+
+    document = _folder(run_doc) / "position-1.json"
+    assert outcome == (
+        f"Camera calibration: {calibrate_measured_other(FORTY, TWENTY, 'position-1.json')}"
+    )
+    assert "done" not in outcome
+    # The run did write the record of what it measured, in the file of the label it started at.
+    held = view.calibrations
+    assert [(h.position, h.read.objective, h.read.problem) for h in held] == [
+        (1, TWENTY, None)
+    ]
+    assert (
+        CameraCalibration.model_validate(
+            RunDocument.load(document).stages["camera-calibration"].result
+        ).objective
+        == TWENTY
+    )
+    # Left out of the default: nothing to measure with, and the wait is the page's own.
+    assert step.targets == ()
+    assert step.pairs == ()
+    assert step.wait == OFFSETS_NO_DOCUMENT
+    # The page's own document is the registration's, as ever, and the turret is where the
+    # *operator* left it (the run did not turn it back, and nothing here turns it).
+    assert after == before
+    assert _in_place(fake_microscope) == TWENTY
+
+
+def test_a_run_that_measured_the_named_objective_says_what_the_tool_says(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    StubCalibration.assumed = ("the stage was not turned",)
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY)
+    finally:
+        page.close()
+
+    # The tool's own end: its title, its time and its first assumed line, not the page's check.
+    assert outcome.startswith("Camera calibration done in ")
+    assert outcome.endswith("; assumed: the stage was not turned")
+    assert "measured" not in outcome
+
+
+def test_a_calibration_that_ended_failed_says_the_tools_failure_and_never_the_objective_check(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The check runs after a run that ended `done` only. A document that reads as a usable one of
+    # another objective whatever the end (here: the read is replaced) must not turn a failure
+    # into the page's other words.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    StubCalibration.fails = "the frame is dark or flat"
+    monkeypatch.setattr(
+        controller_module,
+        "_read_calibration",
+        lambda path, *, profile, dry_run: CalibrationRead(
+            path, TWENTY, "2026-11-17T09:00:00+00:00", None
+        ),
+    )
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY)
+    finally:
+        page.close()
+
+    assert (
+        outcome
+        == "Camera calibration failed: camera-calibration: the frame is dark or flat"
+    )
+
+
+def test_a_record_that_cannot_be_read_after_the_run_leaves_the_tools_own_outcome(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing the page can say of a document it cannot read: the tool's `done` stands (FM-98).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    monkeypatch.setattr(
+        controller_module,
+        "_read_calibration",
+        lambda path, *, profile, dry_run: CalibrationRead(
+            path, None, "", "the share does not answer"
+        ),
+    )
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY)
+    finally:
+        page.close()
+
+    assert outcome.startswith("Camera calibration done in ")
 
 
 # --- D15: the held documents ------------------------------------------------------------
@@ -1068,6 +1899,8 @@ def test_offsets_step_with_an_empty_field_takes_the_held_documents_in_position_o
 def test_the_default_leaves_out_the_plates_objective_a_problem_and_an_objective_not_on_the_turret(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
+    # D21: a document is kept only when its objective is the label of its own position, so the
+    # 40X's calibration in the sixth file is left out although the 40X is on the turret.
     _seed_plate(run_doc)
     _hold(
         run_doc,
@@ -1076,6 +1909,7 @@ def test_the_default_leaves_out_the_plates_objective_a_problem_and_an_objective_
         position_3="Objective-2",  # a problem, below
         position_4=TWENTY,
         position_5="Nikon 60X Plan Apo",  # not on the turret now
+        position_6=FORTY,  # on the turret, but at position 1, not here
     )
     (_folder(run_doc) / "position-3.json").write_text("{not json", encoding="utf-8")
     page = _page(fake_microscope, run_doc)
@@ -1091,8 +1925,8 @@ def test_the_default_leaves_out_the_plates_objective_a_problem_and_an_objective_
         str(_folder(run_doc) / "position-1.json"),
         str(_folder(run_doc) / "position-4.json"),
     ]
-    # Nothing is dropped silently: the three left out are in the list the block draws.
-    assert [h.position for h in held] == [1, 2, 3, 4, 5]
+    # Nothing is dropped silently: the four left out are in the list the block draws.
+    assert [h.position for h in held] == [1, 2, 3, 4, 5, 6]
 
 
 def test_with_nothing_held_and_nothing_typed_the_wait_is_the_no_document_text(
@@ -1292,20 +2126,23 @@ def test_a_position_that_cannot_be_looked_at_is_a_line_and_the_others_are_read(
     fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The look at a position is a `stat`, so that a folder the account may not list is said the
-    # same way on every Python (`Path.exists` raised it up to 3.13 and hid it from 3.14).
+    # same way on every Python (`Path.exists` raised it up to 3.13 and hid it from 3.14). Any
+    # failure of it but a denial (D22: that one is the folder's, said once) is its position's line:
+    # here a name the OS refuses.
     _seed_plate(run_doc)
     held = _hold(run_doc, position_1=FORTY, position_4=TWENTY)
     real = Path.stat
 
     def stat(self: Path, *args: Any, **kwargs: Any) -> Any:
         if self.name == "position-2.json":
-            raise PermissionError(13, "Access is denied", str(self))
+            raise OSError(22, "Invalid argument", str(self))
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", stat)
     page = _page(fake_microscope, run_doc)
     try:
-        found = page.view().calibrations
+        view = page.view()
+        found = view.calibrations
     finally:
         page.close()
 
@@ -1314,10 +2151,199 @@ def test_a_position_that_cannot_be_looked_at_is_a_line_and_the_others_are_read(
     problem = found[1].read.problem
     assert problem is not None
     assert problem.startswith(
-        f"{_folder(run_doc) / 'position-2.json'}: PermissionError: "
-        "[Errno 13] Access is denied"
+        f"{_folder(run_doc) / 'position-2.json'}: OSError: [Errno 22] Invalid argument"
     )
     assert found[2].read.objective == TWENTY
+    # It is not a denial of the folder.
+    assert view.calibrations_denied is None
+
+
+def _deny_the_folder(
+    monkeypatch: pytest.MonkeyPatch, *names: str, reason: str = "Permission denied"
+) -> None:
+    """``Path.stat`` raises ``PermissionError`` for the files of the calibrations folder named in ``names`` (every one when none is): what a folder the account may not search does, on any platform (``chmod 0`` is POSIX only)."""
+    real = Path.stat
+
+    def stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.parent.name == "calibrations" and (not names or self.name in names):
+            raise PermissionError(13, reason, str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_a_folder_the_account_cannot_look_into_is_one_line_and_no_position(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D22: twelve near-identical `PermissionError` lines, the path twice in each, and `no
+    # calibration yet` under them for every objective, for one folder the account may not search.
+    _seed_plate(run_doc)
+    _hold(run_doc, position_1=FORTY)
+    _deny_the_folder(monkeypatch)
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        page.close()
+
+    folder = _folder(run_doc)
+    assert view.calibrations == ()
+    assert view.calibrations_denied == (
+        f"{folder}: the page cannot look into this folder (PermissionError: "
+        "Permission denied); which objectives have a calibration is not known"
+    )
+    # Plain text on one line, naming the folder and the reason and no file (FM-98, FM-139).
+    assert "\n" not in (view.calibrations_denied or "")
+    assert "position-" not in (view.calibrations_denied or "")
+    assert view.offsets is not None
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="a folder mode of 0 is POSIX's, and root searches it all the same",
+)
+def test_a_folder_with_no_right_to_search_it_is_one_line_for_the_real_os_too(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The patched `Path.stat` of the tests above is what runs everywhere; this is the same
+    # claim made by the OS itself (macOS and Linux), for the platforms that can (§18.6.1).
+    _seed_plate(run_doc)
+    _hold(run_doc, position_1=FORTY)
+    folder = _folder(run_doc)
+    folder.chmod(0)
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        folder.chmod(0o700)
+        page.close()
+
+    assert view.calibrations == ()
+    assert view.calibrations_denied == (
+        f"{folder}: the page cannot look into this folder (PermissionError: "
+        "Permission denied); which objectives have a calibration is not known"
+    )
+
+
+def test_a_denial_is_said_once_and_the_positions_the_look_reached_are_listed(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_plate(run_doc)
+    held = _hold(run_doc, position_1=FORTY, position_4=TWENTY)
+    # Positions 2, 3 and 5 are denied (three denials, one line); 1 and 4 are looked at.
+    _deny_the_folder(
+        monkeypatch,
+        "position-2.json",
+        "position-3.json",
+        "position-5.json",
+        reason="Access is denied",
+    )
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        page.close()
+
+    assert [h.read.path for h in view.calibrations] == [
+        str(held["position_1"]),
+        str(held["position_4"]),
+    ]
+    assert view.calibrations_denied == (
+        f"{_folder(run_doc)}: the page cannot look into this folder (PermissionError: "
+        "Access is denied); which objectives have a calibration is not known"
+    )
+
+
+def test_a_denial_that_gives_no_reason_says_so_and_never_the_file(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A `PermissionError` raised with no errno or message has no `strerror`: the line says the
+    # class and that no reason was given (FM-98: text, and never the error or the file).
+    _seed_plate(run_doc)
+    real = Path.stat
+
+    def stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.parent.name == "calibrations":
+            raise PermissionError()
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        page.close()
+
+    assert view.calibrations_denied == (
+        f"{_folder(run_doc)}: the page cannot look into this folder (PermissionError: "
+        "no reason given); which objectives have a calibration is not known"
+    )
+
+
+def test_a_page_with_no_offer_reads_no_folder_and_says_nothing_of_a_denial(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_plate(run_doc, by_eye=True)
+    _deny_the_folder(monkeypatch)
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        page.close()
+
+    assert view.offsets is None
+    assert view.calibrations == ()
+    assert view.calibrations_denied is None
+
+
+def test_the_offsets_wait_is_the_denied_line_when_nothing_else_was_read(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `OFFSETS_NO_DOCUMENT` would send the operator to a button that cannot work (D22).
+    _seed_plate(run_doc)
+    _hold(run_doc, position_1=FORTY, position_4=TWENTY)
+    elsewhere = run_doc.parent / "elsewhere" / "cal-20x.json"
+    _seed_calibration(elsewhere, TWENTY)
+    _deny_the_folder(monkeypatch)
+    page = _page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step("")
+        # A typed field wins and is never merged with them: the denial is not its business.
+        typed = page.offsets_step(_typed(elsewhere))
+    finally:
+        page.close()
+
+    denied = (
+        f"{_folder(run_doc)}: the page cannot look into this folder (PermissionError: "
+        "Permission denied); which objectives have a calibration is not known"
+    )
+    assert step.wait == denied
+    assert step.wait != OFFSETS_NO_DOCUMENT
+    assert step.pairs == ()
+    assert step.reads == ()
+    assert typed.wait is None
+    assert typed.targets == (TWENTY,)
+
+
+def test_the_default_measures_with_the_documents_the_look_reached_when_one_position_was_denied(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With a usable document read, the empty field measures with it and the wait is none: the
+    # denial is the list's line, said under its heading, and the step does not stop for it.
+    _seed_plate(run_doc)
+    held = _hold(run_doc, position_1=FORTY, position_4=TWENTY)
+    _deny_the_folder(monkeypatch, "position-4.json")
+    page = _page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step("")
+        view = page.view()
+    finally:
+        page.close()
+
+    assert step.wait is None
+    assert step.targets == (FORTY,)
+    assert [r.path for r in step.reads] == [str(held["position_1"])]
+    assert view.calibrations_denied is not None
 
 
 class StubPlateParams(PluginParams):

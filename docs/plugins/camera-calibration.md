@@ -289,15 +289,28 @@ page](../ui/plate-page.md#measure-the-offsets-between-objectives), #501) makes o
 document per objective, **each in a run document of its own** and never in `run.json`: a run
 document holds one `camera-calibration`, the latest attempt, and the plate registered with the
 10X was registered with the 10X's. Written into `run.json`, a calibration at the 40X replaces
-it and the plate goes out of date (FM-216; the Stand screen's *Calibrate the camera* does exactly
-that, and says so when the plate was registered from its walls). The page's button runs this
+it and the plate goes out of date (FM-216). The Stand screen's *Calibrate the camera* writes into
+the same documents instead of `run.json` when the plate was registered from its walls under
+**another** objective than the one in place, and into `run.json` otherwise (the first calibration
+of a stand, a plate registered by eye, the plate's own objective: the run document's calibration is
+the one `plate-walls` reads); the expert view's *Run camera-calibration* still writes `run.json`,
+and its `from_run_doc` reuses a position's document into it (the way to register the plate afresh
+at another objective). The page's button runs this
 tool as `smc run camera-calibration --run-doc calibrations/position-<n>.json` would, with the
 objective in place and the form's `step_um` and `settle_ms`, in a `calibrations` folder it makes
 beside the run document. `<n>` is the objective's turret position, its label's index plus one,
 and the file's name is that number and never the label (a label is free text, and the document
 holds the objective). A new calibration at the same position replaces its document, and a
 failed or stopped one leaves it with no usable calibration until one succeeds: the page says
-so before the click. `objective-offsets` reads these documents with `calibration_from`, one per
+so before the click. That includes a calibration the tool **refuses for a dark frame**: the page
+waits while the light reads off (`LightSource.is_on()`, read again at the click; an unknown light
+refuses nothing, and neither does a light that reads off while the core's auto-shutter is on, as
+on the Ti2-E, whose lamp opens for the snap), but a frame that is dark with the light on is still
+the tool's refusal and still replaces the document. A document names an objective and its file a position: the page checks the
+record it wrote against the objective of the button (a turn at the handset during the run says
+`it measured <other>, not <objective> as the button said ...`), and lists a document that is not
+its position's with a line of its own and leaves it out of the empty field's default.
+`objective-offsets` reads these documents with `calibration_from`, one per
 objective, as it reads any typed path; a terminal makes the same documents with any name.
 
 ## What reads it

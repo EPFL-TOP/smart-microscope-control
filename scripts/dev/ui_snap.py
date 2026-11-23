@@ -138,6 +138,10 @@ RESULT_ROWS = (
     "Export for NIS-Elements",
 )
 RUN_ALL = "Run all that are left"
+#: The label of the offsets block's *Measure the offsets* (``guide.OFFSETS_MEASURE_LABEL``): the
+#: script looks for the block by its button, with a copy that a test pins to the guide's and to
+#: the widget's (this script imports nothing of smc at import, FM-45; m5 §18.6 D23).
+OFFSETS_MEASURE = "Measure the offsets"
 FILES_HEADING = "Where the files are"
 DONE_ROW = re.compile(r"^Done \d{4}-\d\d-\d\d")
 #: The last control of the drive bar (m5 §17.12 D15): the *Drive* toggle, the lowest of the bar's
@@ -1114,11 +1118,39 @@ def _header_height_px(page: Any) -> float | None:
     return float(height)
 
 
+def _offsets_block_line(page: Any) -> str:
+    """Whether the offsets block is shown: ``offsets block: shown``, ``hidden``, ``not on this screen`` or ``?`` (m5 §18.6 D23).
+
+    Looked for by its *Measure the offsets* button, **including the hidden ones**
+    (``include_hidden``): the default role query counts 0 for a button inside a hidden block and
+    could not tell *hidden* from *not on this screen* (Panel draws only the screen shown), which
+    was the friction of #501's report (measured on Chromium 1255, m5 §18.6.1). None counted is
+    *not on this screen*, one counted that is not visible is *hidden* (the page does not offer
+    the block: the plate was not registered from its walls), and visible is *shown*. A browser
+    that refuses the read is ``?``, never a guess. Never an assertion: ``SKILL.md`` says to read
+    it.
+    """
+    try:
+        found = page.get_by_role(
+            "button", name=OFFSETS_MEASURE, exact=True, include_hidden=True
+        )
+        if found.count() == 0:
+            return "offsets block: not on this screen"
+        return (
+            "offsets block: shown"
+            if found.first.is_visible()
+            else "offsets block: hidden"
+        )
+    except Exception:
+        return "offsets block: ?"
+
+
 def _on_screen(page: Any, state: str | None = None) -> list[str]:
-    """One line for each part of ``_frame_parts`` (``_short_parts`` for a short-page state, ``_guided_parts`` for a guided one, ``_results_parts`` for ``results-all``): whether it is wholly in the viewport, and where.
+    """One line for each part of ``_frame_parts`` (``_short_parts`` for a short-page state, ``_guided_parts`` for a guided one, ``_results_parts`` for ``results-all``): whether it is wholly in the viewport, and where; then the header's height and whether the offsets block is shown.
 
     A part that is not drawn, or whose box the browser does not give, says so and is
-    never guessed to be in view. A page with no viewport size (a fake) gives nothing.
+    never guessed to be in view. A page with no viewport size (a fake) gives nothing. The last
+    line is ``_offsets_block_line``'s, for every state (m5 §18.6 D23).
     """
     viewport = page.viewport_size
     if not isinstance(viewport, dict):
@@ -1155,6 +1187,7 @@ def _on_screen(page: Any, state: str | None = None) -> list[str]:
     header = _header_height_px(page)
     if header is not None:
         lines.append(f"header: {header:.0f} px")
+    lines.append(_offsets_block_line(page))
     return lines
 
 

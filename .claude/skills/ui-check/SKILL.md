@@ -103,16 +103,22 @@ with `[sample]` turned as m3 §20.1 (`rotation_deg`, `camera_rotation_deg`, `mir
 `run_plugin` (since #501 the page makes the other calibrations itself, m5 §18.6 D18: no document
 of the 40X or the 20X is made beforehand); the page served **without** `--dry-run` on that profile
 and folder, on a free port; and Playwright at 1280 x 800: the Stand screen with the turret turned
-to the 40X (*Change objective*, confirmed) and the note under *Calibrate the camera* that says
-what it replaces; the Plate screen's block offered with its lead and its list of documents
-(empty, every objective `no calibration yet`) and the button naming the 40X; the click and the
-list; the same for the 20X, and a second click at the 20X (`Calibrate the camera again at ...`
-and its note); the field left empty, *Measure the offsets* and its confirmation, the block while
-it measures (twice, so that `Objective in place` shows two turns; at the demo's default 10 mm/s
-a run takes about a minute), the card and the preview, the session typed, the write, the written
-line and the profile file read. One more with a missing path typed and one with the plate's own
-document, for the waits. The dry-run states above still show the block **hidden**. The PNGs are
-cited in the develop session's Report and never committed.
+to the 40X (*Change objective*, confirmed), the note under *Calibrate the camera* that says where
+its calibration goes (the 40X's own document `calibrations/position-1.json`, the plate's
+calibration staying as it is, m5 §18.6 D19) and its *Command* disclosure (the routed call and the
+note that the page makes the folder); the click, then `calibrations/position-1.json` made and
+`run.json` byte-identical; the Plate screen's block offered with its lead and its list of
+documents (empty, every objective `no calibration yet`) and the button naming the 40X; the list
+after the click; the same for the 20X, and a second click at the 20X (`Calibrate the camera again
+at ...` and its note); the field left empty, *Measure the offsets* and its confirmation, the block
+while it measures (twice, so that `Objective in place` shows two turns; at the demo's default
+10 mm/s a run takes about a minute), the card and the preview, the session typed, the write, the
+written line and the profile file read. One more with a missing path typed and one with the
+plate's own document, for the waits. The light of the demo has no switch (`is_on()` reads
+`None`), so the refusal for a light that reads off (D20) is not walked: the tests hold it. The
+dry-run states above still show the block **hidden** or off the screen: read the `offsets block:`
+line of `summary.txt` (below). The PNGs are cited in the develop session's Report and never
+committed.
 
 **A chain in motion** (*Run all that are left* with a step running and the others waiting:
 `Running now`, `after <step>`, the chain's line `Running <step> (k of 5).`) is the same kind
@@ -133,7 +139,7 @@ the script reads.
    state the change touches. Start here. `<state>-full.png` is the whole page and is
    shown too small to read: use it for the part below the fold only.
 3. **`summary.txt`** for what a PNG cannot give: the strip, the outcome, the
-   checklist and the result cards as text, the step shown (`step:`, the button of the class `smc-step-shown`; with the expert view on, none is), what is on screen (`on screen:` says for the strip's STOP, the step bar, the map, the image and the last control of the drive bar whether each is wholly in the viewport and where; for `stand-620` and `plate-620` it says it for STOP, the step bar, the screen's title and its first action, and for `wells-laid-out`, `wells-timed`, `scanned` and `results-all` for the frame's parts and the screen's title and its first action; `wells-timed` also says `time (autofocus default|off|required):`, the Wells screen's `Time` line read under each mode, `scanned` says `progress:` and `result:`, the progress lines and the result line, and `results-all` says `row <name>:` for each of the five rows, then `chain:` and `files:`), the Wells box, how the
+   checklist and the result cards as text, the step shown (`step:`, the button of the class `smc-step-shown`; with the expert view on, none is), what is on screen (`on screen:` says for the strip's STOP, the step bar, the map, the image and the last control of the drive bar whether each is wholly in the viewport and where; for `stand-620` and `plate-620` it says it for STOP, the step bar, the screen's title and its first action, and for `wells-laid-out`, `wells-timed`, `scanned` and `results-all` for the frame's parts and the screen's title and its first action; `wells-timed` also says `time (autofocus default|off|required):`, the Wells screen's `Time` line read under each mode, `scanned` says `progress:` and `result:`, the progress lines and the result line, and `results-all` says `row <name>:` for each of the five rows, then `chain:` and `files:`; **every** state ends its `on screen:` lines with `offsets block: shown`, `hidden`, `not on this screen` or `?` (the browser refused the read), from the block's *Measure the offsets* button counted with the hidden ones: `hidden` is the block on a screen that draws it while the page does not offer it, `not on this screen` a screen that does not draw it at all (Panel draws only the screen shown), and the dry-run states of the Plate and expert screens are `hidden`: a `shown` there would be the regression, m5 §18.6 D23; never an assertion, read it), the Wells box, how the
    server stopped, the server's error lines and the browser's. The map and the image
    are **canvas**: they are in the PNGs only.
 4. **`server.log`** (the server's stdout and stderr as it wrote them) when the

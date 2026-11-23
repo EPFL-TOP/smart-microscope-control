@@ -1324,6 +1324,8 @@ def _box(x: float, y: float, width: float, height: float) -> dict[str, float]:
 def test_on_screen_says_where_each_part_is_and_never_guesses(snap, monkeypatch) -> None:
     page = MagicMock()
     page.viewport_size = {"width": 1280, "height": 800}
+    # No *Measure the offsets* anywhere: the last line is the block's, said as such (D23).
+    page.get_by_role.return_value.count.return_value = 0
     parts = _located(
         {
             "STOP": _box(1200, 5, 60, 30),
@@ -1341,6 +1343,7 @@ def test_on_screen_says_where_each_part_is_and_never_guesses(snap, monkeypatch) 
         "map: yes (y 195 to 595 of 800, x 400 to 840 of 1280)",
         "image: yes (y 178 to 638 of 800, x 840 to 1280 of 1280)",
         "drive bar: NO (y 760 to 810 of 800, x 850 to 950 of 1280)",
+        "offsets block: not on this screen",
     ]
     # A part the browser draws no box for, and one that is not on the page, are said so,
     # never guessed to be in view.
@@ -1355,6 +1358,107 @@ def test_on_screen_says_where_each_part_is_and_never_guesses(snap, monkeypatch) 
     assert snap._on_screen(page)[0].startswith("STOP: NO (")
     # A page with no viewport (a fake) says nothing.
     assert snap._on_screen(MagicMock()) == []
+
+
+# --- the offsets block's line (m5 §18.6 D23, #557) -------------------------------------
+
+
+def _offsets_page(*, count: int, visible: bool = False) -> MagicMock:
+    """A page that finds ``count`` *Measure the offsets* buttons, the first one visible or not."""
+    page = MagicMock()
+    found = page.get_by_role.return_value
+    found.count.return_value = count
+    found.first.is_visible.return_value = visible
+    return page
+
+
+def test_the_offsets_block_line_says_shown_hidden_not_on_this_screen_or_unknown(
+    snap,
+) -> None:
+    # Panel draws only the screen shown, so a button that is not found at all is another fact
+    # than one found and not visible: the default role query counts 0 for both (§18.6.1).
+    assert snap._offsets_block_line(_offsets_page(count=0)) == (
+        "offsets block: not on this screen"
+    )
+    assert snap._offsets_block_line(_offsets_page(count=1, visible=False)) == (
+        "offsets block: hidden"
+    )
+    assert snap._offsets_block_line(_offsets_page(count=1, visible=True)) == (
+        "offsets block: shown"
+    )
+
+    # The query names the button whole and asks for the hidden ones too: without that a hidden
+    # block would count 0 and read as *not on this screen*.
+    page = _offsets_page(count=1, visible=True)
+    snap._offsets_block_line(page)
+    page.get_by_role.assert_called_once_with(
+        "button", name="Measure the offsets", exact=True, include_hidden=True
+    )
+
+    # A browser that refuses the read, in the query or in the answer, is `?` and never a guess.
+    refusing = _offsets_page(count=1)
+    refusing.get_by_role.side_effect = _FakeError("Locator: the page is closed")
+    assert snap._offsets_block_line(refusing) == "offsets block: ?"
+    broken = _offsets_page(count=1)
+    broken.get_by_role.return_value.first.is_visible.side_effect = _FakeError("closed")
+    assert snap._offsets_block_line(broken) == "offsets block: ?"
+    counting = _offsets_page(count=1)
+    counting.get_by_role.return_value.count.side_effect = _FakeError("closed")
+    assert snap._offsets_block_line(counting) == "offsets block: ?"
+
+
+def test_on_screen_ends_with_the_offsets_block_line_and_a_page_without_a_viewport_gives_nothing(
+    snap, monkeypatch
+) -> None:
+    # For every kind of state: the frame's, a short page's, a guided state's, the Results screen's.
+    parts = _located({"STOP": _box(1200, 5, 60, 30)})
+    monkeypatch.setattr(snap, "_frame_parts", lambda page: parts)
+    monkeypatch.setattr(snap, "_short_parts", lambda page, state: parts)
+    monkeypatch.setattr(snap, "_guided_parts", lambda page, state: parts)
+    monkeypatch.setattr(snap, "_results_parts", lambda page: parts)
+    for state in (None, "snap", "stand-620", "plate-620", "scanned", "results-all"):
+        for count, visible, line in (
+            (0, False, "offsets block: not on this screen"),
+            (1, False, "offsets block: hidden"),
+            (1, True, "offsets block: shown"),
+        ):
+            page = _offsets_page(count=count, visible=visible)
+            page.viewport_size = {"width": 1280, "height": 800}
+            page.evaluate.return_value = 137.4
+            lines = snap._on_screen(page, state)
+            # After the header's line, which stays where it was.
+            assert lines[-2:] == ["header: 137 px", line], state
+            assert lines[0].startswith("STOP: yes ("), state
+
+    # A page with no viewport size (a fake) gives nothing, the block's line included, and does
+    # not ask the browser for the button.
+    fake = MagicMock()
+    assert snap._on_screen(fake) == []
+    fake.get_by_role.assert_not_called()
+
+
+def test_the_offsets_measure_words_are_the_guides_and_the_widgets(
+    snap, fake_microscope, tmp_path
+) -> None:
+    from smc.ui.guide import OFFSETS_MEASURE_LABEL
+
+    # The script imports nothing of smc at import, so its copy of the label is pinned (FM-45)
+    # to the guide's and to the button the page draws: a label changed in one place and not in
+    # the others would make every state say `not on this screen`.
+    assert snap.OFFSETS_MEASURE == OFFSETS_MEASURE_LABEL == "Measure the offsets"
+    if os.environ.get("SMC_REQUIRE_UI"):
+        import panel  # noqa: F401  # CI must fail, not skip, when the extra is missing
+    else:
+        pytest.importorskip("panel")
+    from smc.ui.controller import PlatePage
+    from smc.ui.plate_page import PlatePageView
+
+    page = PlatePage(fake_microscope, tmp_path / "run.json")
+    try:
+        view = PlatePageView(page)
+        assert view.offsets_measure_button.label == snap.OFFSETS_MEASURE
+    finally:
+        page.close()
 
 
 # --- the short-page states of D12 (m5 §17.2, §17.8, #444) -----------------------------
@@ -1456,6 +1560,7 @@ def test_on_screen_reports_the_title_and_the_first_action_of_a_short_page(
 ) -> None:
     page = MagicMock()
     page.viewport_size = {"width": 1280, "height": 620}
+    page.get_by_role.return_value.count.return_value = 0
     seen: list[tuple[str, object]] = []
 
     def part(name: str, box: dict[str, float] | None) -> tuple[str, MagicMock]:
@@ -1479,6 +1584,7 @@ def test_on_screen_reports_the_title_and_the_first_action_of_a_short_page(
         "step bar: yes (y 73 to 104 of 620, x 10 to 180 of 1280)",
         "title: yes (y 142 to 159 of 620, x 10 to 380 of 1280)",
         "first action: NO (y 592 to 623 of 620, x 10 to 83 of 1280)",
+        "offsets block: not on this screen",
     ]
 
 
@@ -1687,6 +1793,7 @@ def test_on_screen_reads_the_results_parts_of_results_all_and_only_there(
 ) -> None:
     page = MagicMock()
     page.viewport_size = {"width": 1280, "height": 800}
+    page.get_by_role.return_value.count.return_value = 0
     found = MagicMock()
     found.count.return_value = 1
     # The button past the page's bottom: what the summary must say as NO.
@@ -1700,11 +1807,13 @@ def test_on_screen_reads_the_results_parts_of_results_all_and_only_there(
     assert snap._on_screen(page, "results-all") == [
         "title: yes (y 142 to 159 of 800, x 10 to 380 of 1280)",
         "first action: yes (y 150 to 181 of 800, x 10 to 180 of 1280)",
+        "offsets block: not on this screen",
     ]
     # Another state reads the frame's parts, as before.
     monkeypatch.setattr(snap, "_frame_parts", lambda page: [("STOP", title)])
     assert snap._on_screen(page, "snap") == [
-        "STOP: yes (y 142 to 159 of 800, x 10 to 380 of 1280)"
+        "STOP: yes (y 142 to 159 of 800, x 10 to 380 of 1280)",
+        "offsets block: not on this screen",
     ]
 
 
@@ -1834,6 +1943,7 @@ def test_on_screen_reads_the_guided_parts_of_a_guided_state_and_only_there(
 ) -> None:
     page = MagicMock()
     page.viewport_size = {"width": 1280, "height": 800}
+    page.get_by_role.return_value.count.return_value = 0
 
     def part(name: str, box: dict[str, float]) -> tuple[str, MagicMock]:
         found = MagicMock()
@@ -1853,6 +1963,7 @@ def test_on_screen_reads_the_guided_parts_of_a_guided_state_and_only_there(
             "STOP: yes (y 5 to 35 of 800, x 1200 to 1260 of 1280)",
             "title: yes (y 142 to 159 of 800, x 10 to 380 of 1280)",
             "first action: NO (y 790 to 821 of 800, x 10 to 130 of 1280)",
+            "offsets block: not on this screen",
         ]
     # A state that is not guided reads the frame's parts, as before.
     frame = _located({"STOP": _box(1200, 5, 60, 30)})
@@ -1860,7 +1971,8 @@ def test_on_screen_reads_the_guided_parts_of_a_guided_state_and_only_there(
     assert snap._on_screen(page, "snap")[0] == (
         "STOP: yes (y 5 to 35 of 800, x 1200 to 1260 of 1280)"
     )
-    assert len(snap._on_screen(page, "snap")) == 5
+    # The frame's five parts, then the offsets block's line.
+    assert len(snap._on_screen(page, "snap")) == 6
 
 
 def test_scan_facts_say_the_progress_and_the_result_or_that_they_are_not_on_the_page(
@@ -2140,13 +2252,15 @@ def test_on_screen_adds_the_headers_height_when_the_browser_says_it(
 ) -> None:
     page = MagicMock()
     page.viewport_size = {"width": 1280, "height": 800}
+    page.get_by_role.return_value.count.return_value = 0
     parts = _located({"STOP": _box(1200, 5, 60, 30)})
     monkeypatch.setattr(snap, "_frame_parts", lambda page: parts)
     page.evaluate.return_value = 137.4
 
     lines = snap._on_screen(page)
 
-    assert lines[-1] == "header: 137 px"
+    # The header's height comes before the offsets block's line, which ends every state.
+    assert lines[-2:] == ["header: 137 px", "offsets block: not on this screen"]
     assert lines[0].startswith("STOP: yes (")
     # The script it ran reads the sticky element's height through the shadow roots.
     page.evaluate.assert_called_once_with(snap._HEADER_HEIGHT_JS)

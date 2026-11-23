@@ -47,6 +47,7 @@ from smc.hardware.capabilities import (
     Camera,
     LightSource,
     ObjectiveTurret,
+    Shutter,
     XYStage,
     ZStage,
 )
@@ -135,6 +136,8 @@ from smc.ui.guide import (
     ASSUMED_LINE_CHARS,
     CALIBRATE_NAMES_NONE,
     CALIBRATE_NO_OFFER,
+    CALIBRATE_NOT_KNOWN,
+    CALIBRATE_REUSE_ROUTED,
     CALIBRATIONS_FOLDER,
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
@@ -169,10 +172,15 @@ from smc.ui.guide import (
     a1_corner,
     busy_note,
     calibrate_changed,
+    calibrate_measured_other,
     calibrate_position_unknown,
     calibrate_wait,
+    calibration_at_its_position,
+    calibration_denied,
     calibration_failed,
     calibration_file,
+    calibration_goes_to_a_document,
+    calibration_light,
     calibration_paths,
     centres_reach_note,
     checkpoint_note,
@@ -209,6 +217,7 @@ if TYPE_CHECKING:
     from smc.hardware.profile import HolderSection
 
 __all__ = [
+    "CALIBRATE_FIELDS",
     "JOG_WALL_MARGIN_UM",
     "KEY_PARAMS",
     "LIVE_PERIOD_S",
@@ -241,6 +250,11 @@ __all__ = [
 ]
 
 log = logging.getLogger("smc.ui")
+
+#: The fields of the ``camera-calibration`` form that a click into an objective's own document sends
+#: (m5 §18.6 D13, D19): the step and the settle, so that a stand that needs a settle has it. The
+#: form's advanced ``from_run_doc`` is never sent there, and the controller drops every other pair.
+CALIBRATE_FIELDS = ("step_um", "settle_ms")
 
 #: The tools of the workflow in the order the page shows them, grouped by stage.
 #: Every other registered plugin is on the page too, under ``MORE_STAGE``, by name
@@ -762,6 +776,9 @@ class PlateView:
     ``calibrations`` are the camera-calibration documents the page holds, one per turret
     position at most (m5 §18.6 D15): read here, beside the run document, and only when the
     block is offered; ``()`` otherwise, and a tick never reads them (FM-145).
+    ``calibrations_denied`` is one line about the folder when the page could not look into it
+    (``None`` otherwise, and with no offer, m5 §18.6 D22): no position is listed for it, and the
+    block lists no objective as having no calibration while it is set.
     """
 
     plate: str
@@ -790,6 +807,7 @@ class PlateView:
     offsets: OffsetsOffer | None = None
     checkpoint_notes: Mapping[str, str] = field(default_factory=dict)
     calibrations: tuple[HeldCalibration, ...] = ()
+    calibrations_denied: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -848,6 +866,17 @@ class _Handed(NamedTuple):
     name: str
     run: Callable[[], str]
     switch_off: bool
+
+
+class _Held(NamedTuple):
+    """What a look into the calibrations folder found: the documents it read, and the one line for a folder it could not look into (m5 §18.6 D22).
+
+    ``denied`` is ``calibration_denied``'s line when the look met a ``PermissionError`` at any
+    position, and ``None`` otherwise; the documents are the positions the look reached.
+    """
+
+    documents: tuple[HeldCalibration, ...]
+    denied: str | None
 
 
 class _Prepared(NamedTuple):
@@ -1064,6 +1093,11 @@ class PageStatus:
     locked (PFS searching: the scan refuses it, so no note advises a lock then), ``False`` for
     off only (m5 §20 D1, as amended by the owner's decision on #546). A decision (a note that
     says how to lock again) reads it and never the words of ``autofocus`` (FM-155).
+    ``auto_shutter`` is whether the core opens the shutter around each exposure, read in the same
+    pass as ``light_on`` **only when the light reads off** (``None`` otherwise, and with no shutter
+    or a read that failed): a light that reads off at rest says nothing of the frame while the
+    core's auto-shutter opens it for the snap, so a calibration does not wait for it
+    (``calibration_light``, m5 §18.6 D20 as amended by the review of #557).
     """
 
     stand: str
@@ -1088,6 +1122,7 @@ class PageStatus:
     goto_answer: GotoAnswer | None = None
     stop_segments_um: tuple[tuple[str, float], ...] = ()
     autofocus_locked: bool | None = None
+    auto_shutter: bool | None = None
 
 
 def _stop_segments_um(safety: SafetySection) -> tuple[tuple[str, float], ...]:
@@ -1127,6 +1162,7 @@ class _StandRead:
     halted: bool
     problems: tuple[str, ...]
     autofocus_locked: bool | None = None
+    auto_shutter: bool | None = None
 
 
 def jog_crossing(
@@ -1665,6 +1701,20 @@ def _assumed_tail(record: StageRecord) -> str:
     FM-139), and empty unless the record ended ``done`` (FM-154).
     """
     return _assumed_tail_of(_card(record).assumed)
+
+
+def _calibrate_label_refusal(expected: str, now: str) -> str | None:
+    """Why a calibration click is refused for the label its button showed, or ``None``: the one check both calibrate buttons make (m5 §18.6 D12, D19, FM-177, FM-169).
+
+    The button named none, or another objective than the turret reads now: a label drawn up to a
+    second ago is not what the turret says, and the destination (and the document) was chosen for
+    it.
+    """
+    if not expected.strip():
+        return CALIBRATE_NAMES_NONE
+    if expected != now:
+        return calibrate_changed(expected, now)
+    return None
 
 
 def _assumed_tail_of(lines: Sequence[str]) -> str:
@@ -4761,6 +4811,7 @@ class PlatePage:
             stop_refused=stop_refused,
             problems=read.problems,
             connected=read.connected,
+            auto_shutter=read.auto_shutter,
             goto=goto,
             clock=clock,
             chain=chain,
@@ -4787,6 +4838,7 @@ class PlatePage:
                 state = microscope.state()
                 problems = list(state.errors)
                 light_on: bool | None = None
+                auto_shutter: bool | None = None
                 light = microscope.get(LightSource)
                 if light is not None:
                     try:
@@ -4798,6 +4850,11 @@ class PlatePage:
                         self._note_light_read(microscope, light, None, raised=True)
                     else:
                         self._note_light_read(microscope, light, light_on, raised=False)
+                        if light_on is False:
+                            # Only then does it matter (a calibration waits for a light that
+                            # reads off): the one flag of the core's, and no read when the
+                            # light is on or unknown.
+                            auto_shutter = self._auto_shutter_of(microscope)
                 autofocus = (
                     describe_autofocus(state)
                     if microscope.has(Autofocus)
@@ -4830,6 +4887,7 @@ class PlatePage:
                         halted=state.halted,
                         problems=tuple(problems),
                         autofocus_locked=autofocus_locked,
+                        auto_shutter=auto_shutter,
                     )
         return _StandRead(
             began_s=began_s,
@@ -5330,6 +5388,9 @@ class PlatePage:
         )
         self._note_plate_attempt(plate_record)
         offer = self._offsets_offer(registered)
+        # Beside the run document, which it is read with, and only for the block that lists
+        # them (m5 §18.6 D15): the tick reads nothing of it.
+        held = _Held((), None) if offer is None else self._held_calibrations()
         return PlateView(
             plate=self._plate,
             nominal=pose.kind in ("estimated", "unplaced"),
@@ -5380,9 +5441,8 @@ class PlatePage:
                 tool: checkpoint_note(stage, self._end_word(stage, status, doc))
                 for tool, (stage, status) in self._checkpoint_feeders(doc).items()
             },
-            # Beside the run document, which it is read with, and only for the block that
-            # lists them (m5 §18.6 D15): the tick reads nothing of it.
-            calibrations=() if offer is None else self._held_calibrations(),
+            calibrations=held.documents,
+            calibrations_denied=held.denied,
         )
 
     def _scan_end(self, doc: RunDocument) -> ScanEnd | None:
@@ -5632,7 +5692,12 @@ class PlatePage:
         return found, tuple(problems)
 
     def command_for(
-        self, plugin: str, params: Sequence[str], *, resume: bool = False
+        self,
+        plugin: str,
+        params: Sequence[str],
+        *,
+        resume: bool = False,
+        run_doc: Path | None = None,
     ) -> str:
         """The ``smc run`` command that makes the call of ``plugin`` with ``params`` on this page (ADR-0006, principle 5).
 
@@ -5640,9 +5705,14 @@ class PlatePage:
         next step builds, with the profile's file when there is one (a name otherwise),
         this page's run document, its dry run and the loaded preset. One builder, so
         that a button's command and the next step's cannot say two things. ``resume``
-        names ``--resume``: the command of *Continue the scan* (m5 §17.12 D17).
+        names ``--resume``: the command of *Continue the scan* (m5 §17.12 D17). ``run_doc``
+        is the document the call is run into when it is not the page's own: the Stand
+        screen's *Calibrate the camera* into an objective's document (m5 §18.6 D19), made
+        absolute where the server runs, as the page's own is.
         """
-        return self._command(plugin, params, self.preset, resume=resume)
+        return self._command(
+            plugin, params, self.preset, resume=resume, run_doc=run_doc
+        )
 
     def _command(
         self,
@@ -5651,13 +5721,14 @@ class PlatePage:
         loaded: LoadedPreset | None,
         *,
         resume: bool = False,
+        run_doc: Path | None = None,
     ) -> str:
         """``command_for`` for the preset the caller already read: a step's pairs and its command name one preset (FM-151)."""
         return command_line(
             plugin,
             params,
             profile=self.profile_argument,
-            run_doc=self.run_doc,
+            run_doc=self.run_doc if run_doc is None else run_doc.absolute(),
             dry_run=self._dry_run,
             preset=None if loaded is None else str(loaded.file.path),
             resume=resume,
@@ -5960,12 +6031,25 @@ class PlatePage:
             RuntimeError: An activity is going (``<name> is running``), or the page is closed.
         """
         self._refuse_if_busy()
-        title = tool_title("camera-calibration")
         found = self._calibrate_target(expected)
         if isinstance(found, str):
-            self._set_outcome(f"{title}: {found}")
+            self._set_outcome(f"{tool_title('camera-calibration')}: {found}")
             return
-        path = found
+        self._calibrate_into(found, expected, pairs)
+
+    def _calibrate_into(self, path: Path, expected: str, pairs: Sequence[str]) -> None:
+        """Start ``camera-calibration`` into the position's document ``path``: the tail both calibrate buttons share (m5 §18.6 D13, D14, D19, D21).
+
+        The folder is made on the worker, the run is ``_prepare(..., doc_path=path)`` and the
+        activity is named ``camera-calibration`` (the strip, STOP, a second run refused, the
+        clock: as any run). **After a run that ended ``done``** the record it wrote is read
+        again and, when it names another objective than ``expected`` (the label the button
+        showed), the outcome is the page's words and not ``done``: the operator can turn the
+        turret at the handset between the click's read and the tool's own, and what is on the
+        disk is then the other objective's calibration in this position's file (D21, FM-177).
+        The page cannot undo it, and a record it cannot read is the tool's outcome to say.
+        """
+        title = tool_title("camera-calibration")
         loaded = self.preset
         preset = None if loaded is None else loaded.file.name
         prepared = self._prepare("camera-calibration", pairs, doc_path=path)
@@ -5974,6 +6058,8 @@ class PlatePage:
             return
         entry, parsed, planned = prepared
         folder = self.calibrations_folder
+        profile = self._profile.microscope.name
+        dry_run = self._dry_run
 
         def body(event: threading.Event) -> str:
             # Made on the worker: a folder on a share that does not answer must not hold the
@@ -5983,7 +6069,7 @@ class PlatePage:
                 folder.mkdir(exist_ok=True)
             except OSError as exc:
                 return f"{title} failed: could not make {folder}: {_one_line(exc)}"
-            return self._run_plugin(
+            ended = self._run_plugin(
                 "camera-calibration",
                 entry,
                 parsed,
@@ -5991,7 +6077,13 @@ class PlatePage:
                 preset,
                 planned=planned,
                 doc_path=path,
-            ).outcome
+            )
+            if ended.status != "done":
+                return ended.outcome
+            read = _read_calibration(str(path), profile=profile, dry_run=dry_run)
+            if read.problem is None and read.objective != expected:
+                return f"{title}: {calibrate_measured_other(expected, read.objective, path.name)}"
+            return ended.outcome
 
         self._start_activity("camera-calibration", body)
 
@@ -6012,7 +6104,7 @@ class PlatePage:
         offer = self._offsets_offer(self._slot(doc, "plate", PlateResult, []))
         if offer is None:
             return CALIBRATE_NO_OFFER
-        now, labels = self._turret_reading()
+        now, labels, light_on = self._turret_reading()
         wait = calibrate_wait(
             connected=True,
             running=None,
@@ -6020,15 +6112,26 @@ class PlatePage:
             dry_run=self._dry_run,
             objective=now,
             plate_objective=offer.plate_objective,
+            light_on=light_on,
         )
         if wait is not None:
             return wait
         if now is None:  # unreachable: ``calibrate_wait`` says an objective not known
             return CALIBRATE_NAMES_NONE
-        if not expected.strip():
-            return CALIBRATE_NAMES_NONE
-        if expected != now:
-            return calibrate_changed(expected, now)
+        label = _calibrate_label_refusal(expected, now)
+        if label is not None:
+            return label
+        return self._calibrate_position_target(now, labels)
+
+    def _calibrate_position_target(self, now: str, labels: Sequence[str]) -> Path | str:
+        """The document of the position ``now`` is at, or the text that refuses a run into it: the refusals both calibrate buttons end with (m5 §18.6 D13, D19, FM-169).
+
+        The position is not known (the labels could not be read, two positions carry the label,
+        or it is past ``MAX_POSITIONS``), or the stand is halted: the tool would switch the
+        autofocus off and fail at its first move, and its failed record would replace the
+        position's usable document. The halt is read last and only here, after a busy page has
+        been refused: it reads every device (``_halted``), which a drawer must never do (FM-145).
+        """
         position = turret_position(labels, now)
         if position is None:
             return calibrate_position_unknown(now)
@@ -6036,18 +6139,156 @@ class PlatePage:
             return SCAN_HALTED
         return self.calibrations_folder / calibration_file(position)
 
-    def _turret_reading(self) -> tuple[str | None, tuple[str, ...]]:
-        """The objective in place and every position's label, read together inside one read a Disconnect waits for (m5 §18.6 D13).
+    def calibrate_camera(self, expected: str, pairs: Sequence[str] = ()) -> None:
+        """The Stand screen's *Calibrate the camera*: into the objective's own document when the plate was registered under another objective, into the run document otherwise (m5 §18.6 D19).
 
-        ``(None, ())`` with the stand closed. The label is ``None`` for a turret that cannot be
-        read or reads nothing (``_objective_in_place``); the labels are ``()`` when they cannot
+        ``expected`` is the label the button showed (``_stand_calibrate_for``, the tick's
+        objective, ``""`` for none) and ``pairs`` what the click sends: the page's pairs and the
+        form's typed fields. The destination is decided here, from the turret **read again at the
+        click**, by the pure function the button's note, command and disabled state read too
+        (``calibration_goes_to_a_document``, FM-169): into ``calibrations/position-<n>.json``
+        (``calibrate_objective``'s run: the folder, ``_prepare(..., doc_path=...)``, the
+        activity ``camera-calibration``, the check after the run) when the block is offered and
+        the objective in place is known and is not the plate's; into ``run.json`` otherwise, as
+        before, since at the plate's own objective the run document's calibration is the one
+        ``plate-walls`` reads, and a plate registered by eye has none to protect.
+
+        **With no offer** (no plate registered from its walls, an unreadable run document
+        included: those refusals are ``run``'s and write nothing) it is ``run("camera-calibration",
+        pairs)`` and nothing else. **With one** the refusals are the outcome ``Camera calibration:
+        <text>``, with nothing written and nothing started, in this order: the stand is closed,
+        the objective in place is not known (the destination cannot be chosen, and ``run.json``
+        is not a safe default), the button named none or another objective than the turret reads
+        now (the destination was chosen for the label shown: a turn at the handset since would
+        send the 40X's calibration into ``run.json`` and put the plate out of date, the converse
+        of FM-177), and then, for a document only: a dry run and the light (``calibrate_wait``),
+        a typed ``from_run_doc`` (``CALIBRATE_REUSE_ROUTED``), the position not known and the halt.
+        For a document only ``CALIBRATE_FIELDS`` are sent; for ``run.json`` every pair typed is.
+        **Nothing here turns the turret** (FM-14).
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page is closed.
+        """
+        self._refuse_if_busy()
+        doc, unreadable = self._document()
+        offer = (
+            None
+            if unreadable is not None
+            else self._offsets_offer(self._slot(doc, "plate", PlateResult, []))
+        )
+        if offer is None:
+            self.run("camera-calibration", pairs)
+            return
+        found = self._stand_calibration_target(expected, offer.plate_objective, pairs)
+        if isinstance(found, str):
+            self._set_outcome(f"{tool_title('camera-calibration')}: {found}")
+            return
+        if found is None:
+            self.run("camera-calibration", pairs)
+            return
+        self._calibrate_into(
+            found,
+            expected,
+            [pair for pair in pairs if pair.partition("=")[0] in CALIBRATE_FIELDS],
+        )
+
+    def _stand_calibration_target(
+        self, expected: str, plate_objective: str, pairs: Sequence[str]
+    ) -> Path | str | None:
+        """Where the Stand screen's click goes: the position's document, ``None`` for the run document, or the text that refuses it (m5 §18.6 D19).
+
+        D19's order, in one read of the turret (label, labels and light together, inside a read a
+        Disconnect waits for). The label checks are the block's (``_calibrate_label_refusal``), and
+        a document ends with the block's position and halt (``_calibrate_position_target``).
+        """
+        if self._microscope is None:
+            return NOT_CONNECTED
+        now, labels, light_on = self._turret_reading()
+        if now is None or not now.strip():
+            return CALIBRATE_NOT_KNOWN
+        label = _calibrate_label_refusal(expected, now)
+        if label is not None:
+            return label
+        if not calibration_goes_to_a_document(plate_objective, now):
+            return None
+        wait = calibrate_wait(
+            connected=True,
+            running=None,
+            live=False,
+            dry_run=self._dry_run,
+            objective=now,
+            plate_objective=plate_objective,
+            light_on=light_on,
+        )
+        if wait is not None:
+            return wait
+        if any(
+            pair.partition("=")[0] == "from_run_doc" and pair.partition("=")[2].strip()
+            for pair in pairs
+        ):
+            return CALIBRATE_REUSE_ROUTED
+        return self._calibrate_position_target(now, labels)
+
+    def _turret_reading(self) -> tuple[str | None, tuple[str, ...], bool | None]:
+        """The objective in place, every position's label and the light, read together inside one read a Disconnect waits for (m5 §18.6 D13, D20).
+
+        ``(None, (), None)`` with the stand closed. The label is ``None`` for a turret that cannot
+        be read or reads nothing (``_objective_in_place``); the labels are ``()`` when they cannot
         be read (``objective_labels``). The position is the label's index in these labels, so
-        the two come from one read and not from two ticks apart.
+        the two come from one read and not from two ticks apart. The light is
+        ``LightSource.is_on()`` **now**, never the tick's copy (FM-177: the operator may have
+        switched it off since the last tick): ``None`` when the stand has no light source, when
+        its switch is not one smc knows, or when the read raises (FM-98, nothing is kept), and
+        an unknown light refuses nothing (``calibrate_wait``).
         """
         with self._reading() as microscope:
             if microscope is None:
-                return None, ()
-            return self._objective_in_place(microscope), self._labels_of(microscope)
+                return None, (), None
+            return (
+                self._objective_in_place(microscope),
+                self._labels_of(microscope),
+                self._light_in_place(microscope),
+            )
+
+    @staticmethod
+    def _light_in_place(microscope: Microscope) -> bool | None:
+        """Whether the light reads on now as ``calibrate_wait`` takes it, or ``None``: no light source, no switch smc knows, a read that raised, or a light that reads off while the core's auto-shutter opens it for the exposure (m5 §18.6 D20).
+
+        The last is ``calibration_light``'s: on the Ti2-E the lamp is the core's shutter and
+        auto-shutter is on, so it reads closed at rest and open for the camera's own snap, and a
+        refusal would be false (found by the review of #557).
+        """
+        light = microscope.get(LightSource)
+        if light is None:
+            return None
+        try:
+            on = light.is_on()
+        except Exception as exc:
+            log.warning(
+                "light: its state could not be read before a calibration: %s: %s",
+                type(exc).__name__,
+                _one_line(exc),
+            )
+            return None
+        return calibration_light(
+            on, PlatePage._auto_shutter_of(microscope) if on is False else None
+        )
+
+    @staticmethod
+    def _auto_shutter_of(microscope: Microscope) -> bool | None:
+        """Whether the core opens the shutter around each exposure, or ``None``: no shutter, or a read that raised (nothing is kept)."""
+        shutter = microscope.get(Shutter)
+        if shutter is None:
+            return None
+        try:
+            return shutter.auto_shutter()
+        except Exception as exc:
+            log.warning(
+                "shutter: its auto-shutter could not be read: %s: %s",
+                type(exc).__name__,
+                _one_line(exc),
+            )
+            return None
 
     def _offsets_offer(self, registered: PlateResult | None) -> OffsetsOffer | None:
         """The block's offer for the usable ``plate`` result ``registered``: it is the page's plate and was registered from its walls (m5 §18.2 D2).
@@ -6059,8 +6300,8 @@ class PlatePage:
             return None
         return _offsets_offer_of(registered)
 
-    def _held_calibrations(self) -> tuple[HeldCalibration, ...]:
-        """The calibration documents the page holds, for the turret positions 1 to ``MAX_POSITIONS`` in order (m5 §18.6 D11, D15).
+    def _held_calibrations(self) -> _Held:
+        """The calibration documents the page holds, for the turret positions 1 to ``MAX_POSITIONS`` in order, and one line when the folder cannot be looked into (m5 §18.6 D11, D15, D22).
 
         A file that exists is read as the tool reads it (``_read_calibration``); one that
         cannot be read, a folder named like a document, a document of another stand or
@@ -6070,10 +6311,18 @@ class PlatePage:
         the operator acts on, and the strip's outcome is gone at the next activity). Only the
         twelve names the page writes are looked at, so a folder with 10 000 files costs nothing
         (D11). Called by ``view()`` and ``offsets_step``, never by the tick (FM-145).
+
+        **A ``PermissionError`` of the look (``stat``) is the folder's**, said once as
+        ``denied`` (``calibration_denied``: the folder and the error's class and ``strerror``,
+        never a file name) and no position is listed for it: a file's ``stat`` asks only to
+        search its folder (POSIX), so twelve denials are one fact, and one line is read
+        where twelve were not (D22, FM-139). The positions the look did reach are listed as
+        before. Any other failure of the look stays its position's line.
         """
         folder = self.calibrations_folder
         profile = self._profile.microscope.name
         held: list[HeldCalibration] = []
+        denied: str | None = None
         for position in range(1, MAX_POSITIONS + 1):
             path = folder / calibration_file(position)
             try:
@@ -6081,9 +6330,16 @@ class PlatePage:
                     path.stat()
                 except (FileNotFoundError, NotADirectoryError):
                     # Nothing held at this position (or a file where the folder should be:
-                    # ``calibrate_objective`` says that one). Any other failure of the look, a
-                    # folder the account may not list, is a line: ``Path.exists`` raised it up to
-                    # Python 3.13 and hid it from 3.14, and the list must not depend on that.
+                    # ``calibrate_objective`` says that one). Any other failure of the look is a
+                    # line, but a denial: ``Path.exists`` raised it up to Python 3.13 and hid it
+                    # from 3.14, and the list must not depend on that.
+                    continue
+                except PermissionError as exc:
+                    if denied is None:
+                        reason = (
+                            f"{type(exc).__name__}: {exc.strerror or 'no reason given'}"
+                        )
+                        denied = calibration_denied(str(folder), reason)
                     continue
                 read = _read_calibration(
                     str(path), profile=profile, dry_run=self._dry_run
@@ -6101,33 +6357,50 @@ class PlatePage:
                     _flat(f"{path}: {type(exc).__name__}: {_one_line(exc)}"),
                 )
             held.append(HeldCalibration(position, read))
-        return tuple(held)
+        return _Held(tuple(held), denied)
 
-    def _default_calibrations(self) -> tuple[CalibrationRead, ...]:
-        """The held documents that an empty field measures with: usable, not the plate's objective, and on the turret now, in position order (m5 §18.6 D16).
+    def _default_calibrations(
+        self,
+    ) -> tuple[tuple[CalibrationRead, ...], str | None]:
+        """The held documents that an empty field measures with, and the line for a folder that could not be looked into: usable, not the plate's objective, and its position's own now, in position order (m5 §18.6 D16, D21).
 
         As if their paths were typed: ``offsets_step`` reads them, waits for them and
-        refuses them as it does a typed line. Each document left out has its reason in the
-        block's list (D15), so nothing is dropped silently. The turret's labels are read once
-        for the filter; labels that cannot be read filter nothing out, and the step's own wait
-        says so (``OFFSETS_TURRET_UNREAD``) rather than a list that looks empty. Nothing is read
-        for a page with no offer: the step's wait is the reason.
+        refuses them as it does a typed line. A document is kept only when its objective is the
+        label of **its own position** now (``calibration_at_its_position``): one that is on the
+        turret but in another objective's file is left out, as is one naming an objective that is
+        no label (D21: the file names a position and the document an objective, and a turn at the
+        handset during a run or a relabelled turret makes them differ). Each document left out
+        has its reason in the block's list (D15), so nothing is dropped silently. The turret's
+        labels are read once for the filter; labels that cannot be read filter nothing out, and
+        the step's own wait says so (``OFFSETS_TURRET_UNREAD``) rather than a list that looks
+        empty. Nothing is read for a page with no offer: the step's wait is the reason.
+
+        The second item is ``calibration_denied``'s line when the look met a ``PermissionError``
+        (D22): the documents it did reach are used, and with none the step's wait is that line.
         """
         doc, unreadable = self._document()
         if unreadable is not None:
-            return ()
+            return (), None
         offer = self._offsets_offer(self._slot(doc, "plate", PlateResult, []))
         if offer is None:
-            return ()
+            return (), None
         labels = self.objective_labels()
-        return tuple(
+        found = self._held_calibrations()
+        reads = tuple(
             held.read
-            for held in self._held_calibrations()
+            for held in found.documents
             if held.read.problem is None
             and held.read.objective is not None
             and held.read.objective != offer.plate_objective
-            and (not labels or held.read.objective in labels)
+            and (
+                not labels
+                or calibration_at_its_position(
+                    labels, held.position, held.read.objective
+                )
+                is True
+            )
         )
+        return reads, found.denied
 
     # --- the offsets block (m5 §18) -----------------------------------------------------
 
@@ -6157,7 +6430,9 @@ class PlatePage:
         now, in position order, as if their paths were typed (``_default_calibrations``): the
         same reads, waits, refusals, ``MAX_TARGETS`` and pairs. ``measure_offsets`` asks this
         again with the same text, so D4's comparison of the armed objectives with what would run
-        now is as it was. A typed field wins and is never merged with them.
+        now is as it was. A typed field wins and is never merged with them. With none usable and
+        a folder the page could not look into, the wait is that folder's line and not
+        ``OFFSETS_NO_DOCUMENT`` (D22).
         """
         paths = calibration_paths(calibrations_text)
         profile = self._profile.microscope.name
@@ -6166,6 +6441,7 @@ class PlatePage:
         # is the activity's, and the lines under the field come back with the next edit or click.
         busy = self._current_run is not None
         reads: tuple[CalibrationRead, ...]
+        denied: str | None = None
         if busy:
             reads = ()
         elif paths:
@@ -6174,7 +6450,7 @@ class PlatePage:
                 for path in paths[:MAX_TARGETS]
             )
         else:
-            held = self._default_calibrations()
+            held, denied = self._default_calibrations()
             paths = tuple(read.path for read in held)
             reads = held[:MAX_TARGETS]
         targets = tuple(
@@ -6182,7 +6458,7 @@ class PlatePage:
             for read in reads
             if read.objective is not None and read.problem is None
         )
-        wait = self._offsets_wait(paths, reads)
+        wait = self._offsets_wait(paths, reads, denied)
         pairs: tuple[str, ...] = ()
         if wait is None:
             pairs = (
@@ -6192,9 +6468,17 @@ class PlatePage:
         return OffsetsStep(pairs, targets, reads, wait)
 
     def _offsets_wait(
-        self, paths: Sequence[str], reads: Sequence[CalibrationRead]
+        self,
+        paths: Sequence[str],
+        reads: Sequence[CalibrationRead],
+        denied: str | None = None,
     ) -> str | None:
-        """The first reason ``offsets_step`` has nothing to run, in the order its docstring gives, or ``None``."""
+        """The first reason ``offsets_step`` has nothing to run, in the order its docstring gives, or ``None``.
+
+        ``denied`` is the line for a calibrations folder the page could not look into: with no
+        document to use it is the wait, where ``OFFSETS_NO_DOCUMENT`` would send the operator to a
+        button that cannot work (m5 §18.6 D22).
+        """
         if self._microscope is None:
             return NOT_CONNECTED
         doc, unreadable = self._document()
@@ -6210,7 +6494,7 @@ class PlatePage:
         if current is not None:
             return busy_note(current[0], live=current[0] == "live")
         if not paths:
-            return OFFSETS_NO_DOCUMENT
+            return denied or OFFSETS_NO_DOCUMENT
         for read in reads:
             if read.problem is not None:
                 return read.problem

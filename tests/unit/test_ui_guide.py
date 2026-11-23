@@ -71,9 +71,11 @@ from smc.ui.guide import (
     AUTOFOCUS_WORDS,
     CALIBRATE_DRY_RUN,
     CALIBRATE_LEAD,
+    CALIBRATE_LIGHT_OFF,
     CALIBRATE_NAMES_NONE,
     CALIBRATE_NO_OFFER,
     CALIBRATE_NOT_KNOWN,
+    CALIBRATE_REUSE_ROUTED,
     CALIBRATIONS_FOLDER,
     CAMERA_NOT_CALIBRATED_NOTE,
     CAPTURE_FAR,
@@ -98,6 +100,7 @@ from smc.ui.guide import (
     NO_FILES_YET,
     NOT_CONNECTED,
     NOTHING_LEFT,
+    OFFSETS_MEASURE_LABEL,
     OFFSETS_NO_DOCUMENT,
     OFFSETS_NOTHING_ARMED,
     OFFSETS_TOO_MANY,
@@ -149,16 +152,22 @@ from smc.ui.guide import (
     again_note,
     busy_note,
     calibrate_changed,
+    calibrate_command_folder_note,
     calibrate_is_the_plates,
     calibrate_label,
+    calibrate_measured_other,
     calibrate_position_unknown,
     calibrate_replaces,
-    calibrate_replaces_plate,
+    calibrate_stand_routed,
     calibrate_wait,
+    calibration_at_its_position,
+    calibration_denied,
     calibration_failed,
     calibration_file,
+    calibration_goes_to_a_document,
     calibration_held_line,
     calibration_how_text,
+    calibration_light,
     calibration_missing_line,
     calibration_note_line,
     calibration_paths,
@@ -4667,6 +4676,7 @@ def _wait(**changes: Any) -> str | None:
         "dry_run": False,
         "objective": _FORTY_X,
         "plate_objective": _TEN_X,
+        "light_on": True,
     }
     kwargs.update(changes)
     return calibrate_wait(**kwargs)
@@ -4694,6 +4704,124 @@ def test_the_calibrate_wait_gives_the_first_reason_in_its_order(
     changes: dict[str, Any], expected: str | None
 ) -> None:
     assert _wait(**changes) == expected
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        # The light is the last reason in D12's order (D20): every other one comes first.
+        ({"light_on": False}, CALIBRATE_LIGHT_OFF),
+        ({"light_on": False, "connected": False}, NOT_CONNECTED),
+        ({"light_on": False, "running": "scan"}, busy_note("scan", live=False)),
+        ({"light_on": False, "dry_run": True}, CALIBRATE_DRY_RUN),
+        ({"light_on": False, "objective": None}, CALIBRATE_NOT_KNOWN),
+        ({"light_on": False, "objective": " "}, CALIBRATE_NOT_KNOWN),
+        ({"light_on": False, "objective": _TEN_X}, calibrate_is_the_plates(_TEN_X)),
+        # A light that is on, or one nobody can read, refuses nothing: the tool decides.
+        ({"light_on": True}, None),
+        ({"light_on": None}, None),
+    ],
+)
+def test_calibrate_wait_says_the_light_is_off_last_and_refuses_nothing_for_an_unknown_light(
+    changes: dict[str, Any], expected: str | None
+) -> None:
+    assert _wait(**changes) == expected
+
+
+def test_calibrate_wait_has_no_default_for_the_light() -> None:
+    # Required, so that the view, the controller and the Stand screen cannot forget it (FM-169).
+    with pytest.raises(TypeError, match="light_on"):
+        calibrate_wait(  # type: ignore[call-arg]
+            connected=True,
+            running=None,
+            live=False,
+            dry_run=False,
+            objective=_FORTY_X,
+            plate_objective=_TEN_X,
+        )
+
+
+@pytest.mark.parametrize(
+    ("light_on", "auto_shutter", "expected"),
+    [
+        # A light that reads off while the core opens the shutter around the exposure is unknown:
+        # the Ti2-E's lamp is the core's shutter, closed at rest (the review of #557).
+        (False, True, None),
+        # Without auto-shutter, or when it could not be read, a light that reads off stands.
+        (False, False, False),
+        (False, None, False),
+        # A light that reads on or is unknown is what it is, whatever the auto-shutter says.
+        (True, True, True),
+        (True, False, True),
+        (True, None, True),
+        (None, True, None),
+        (None, False, None),
+        (None, None, None),
+    ],
+)
+def test_calibration_light_is_unknown_for_a_light_off_under_auto_shutter_and_as_read_otherwise(
+    light_on: bool | None, auto_shutter: bool | None, expected: bool | None
+) -> None:
+    assert calibration_light(light_on, auto_shutter) is expected
+    # What the controller and the view hand to calibrate_wait refuses exactly when it is False.
+    refused = _wait(light_on=calibration_light(light_on, auto_shutter))
+    assert (refused == CALIBRATE_LIGHT_OFF) is (expected is False)
+
+
+@pytest.mark.parametrize(
+    ("plate", "objective", "expected"),
+    [
+        # The block is offered (the plate is registered from its walls) and the objective is
+        # known and is not the plate's: the one case that goes to a document of its own.
+        (_TEN_X, _FORTY_X, True),
+        (_TEN_X, _TWENTY_X, True),
+        # The plate's own objective: its calibration is the run document's.
+        (_TEN_X, _TEN_X, False),
+        # No offer: no registration from walls to protect.
+        (None, _FORTY_X, False),
+        (None, None, False),
+        # An objective not known, or an empty position: the destination cannot be chosen.
+        (_TEN_X, None, False),
+        (_TEN_X, "", False),
+        (_TEN_X, "  ", False),
+        # A blank plate objective is still an offer: only ``None`` is no offer.
+        ("", _FORTY_X, True),
+    ],
+)
+def test_calibration_goes_to_a_document_only_when_the_block_is_offered_and_the_objective_is_known_and_not_the_plates(
+    plate: str | None, objective: str | None, expected: bool
+) -> None:
+    assert calibration_goes_to_a_document(plate, objective) is expected
+
+
+def test_calibration_at_its_position_is_none_without_labels_false_past_them_and_for_no_objective() -> (
+    None
+):
+    labels = (_FORTY_X, _TEN_X, "", _TWENTY_X)
+
+    # No labels: they were not read, nothing is known (and not False).
+    assert calibration_at_its_position((), 1, _FORTY_X) is None
+    assert calibration_at_its_position((), 1, None) is None
+    # The label at the position, counting empty positions: the index plus one.
+    assert calibration_at_its_position(labels, 1, _FORTY_X) is True
+    assert calibration_at_its_position(labels, 2, _TEN_X) is True
+    assert calibration_at_its_position(labels, 4, _TWENTY_X) is True
+    # Another label at that position.
+    assert calibration_at_its_position(labels, 1, _TEN_X) is False
+    assert calibration_at_its_position(labels, 4, _FORTY_X) is False
+    # The last position is in range, the one after it is not (an off-by-one at len(labels)).
+    assert calibration_at_its_position(labels, len(labels), _TWENTY_X) is True
+    assert calibration_at_its_position(labels, len(labels) + 1, _TWENTY_X) is False
+    assert calibration_at_its_position(labels, 0, _FORTY_X) is False
+    # Position 0 and a negative one are no position, whatever Python's negative indexes say:
+    # the last label is the 20X, and position 0 would read it.
+    assert calibration_at_its_position(labels, 0, _TWENTY_X) is False
+    assert calibration_at_its_position(labels, -1, _TWENTY_X) is False
+    assert calibration_at_its_position(labels, -len(labels), _FORTY_X) is False
+    # No objective, or a blank one, is at no position, an empty position's included.
+    assert calibration_at_its_position(labels, 1, None) is False
+    assert calibration_at_its_position(labels, 3, "") is False
+    assert calibration_at_its_position(labels, 3, "  ") is False
 
 
 def test_the_calibrate_label_names_the_objective_says_again_when_one_is_held_and_names_another_for_the_plates_or_none() -> (
@@ -4755,12 +4883,6 @@ def test_the_calibrate_texts_say_what_they_say() -> None:
         "A new calibration replaces the one of an unknown time: if it fails or is "
         f"stopped, {_FORTY_X} has none until one succeeds."
     )
-    assert calibrate_replaces_plate(_TEN_X, _FORTY_X) == (
-        f"The plate was registered with {_TEN_X} using this calibration: a "
-        f"calibration at {_FORTY_X} here replaces it, and the plate goes out of date. "
-        f"To measure the offsets, calibrate at {_FORTY_X} in Measure the offsets "
-        "between objectives (Plate screen): it keeps a document of its own."
-    )
     assert calibrations_held_heading("run/calibrations") == (
         "Camera calibrations the page holds, one document per objective, in "
         "run/calibrations:"
@@ -4771,6 +4893,61 @@ def test_the_calibrate_texts_say_what_they_say() -> None:
     )
     assert calibration_failed("the frame is dark or flat") == (
         "the last calibration failed: the frame is dark or flat"
+    )
+
+
+def test_the_stand_routed_note_the_folder_note_and_the_measured_other_text_are_the_designs() -> (
+    None
+):
+    """Whole texts of m5 §18.6.3, written out here and not read back from the code (FM-45)."""
+    assert OFFSETS_MEASURE_LABEL == "Measure the offsets"
+    assert CALIBRATE_LIGHT_OFF == (
+        "the light reads off, so the camera's frame would be dark and the "
+        "calibration would fail: switch it on (Light on, in the drive bar), then "
+        "press the button again"
+    )
+    assert CALIBRATE_REUSE_ROUTED == (
+        "the form's from_run_doc reuses a calibration into the run document, where "
+        "it would replace the plate's: clear it to calibrate into the objective's own "
+        "document, or use Run camera-calibration in the expert view"
+    )
+    assert calibrate_stand_routed(_TEN_X, _FORTY_X, "position-1.json") == (
+        f"The plate was registered with {_TEN_X}: a calibration at {_FORTY_X} here is "
+        "kept in its own document, calibrations/position-1.json, and the plate's "
+        "calibration stays as it is. Measure the offsets between objectives (Plate "
+        "screen) uses it."
+    )
+    assert calibrate_command_folder_note("run/calibrations") == (
+        "The folder run/calibrations must exist first: the page makes it, a "
+        "terminal does not."
+    )
+    assert calibrate_measured_other(_FORTY_X, _TWENTY_X, "position-1.json") == (
+        f"it measured {_TWENTY_X}, not {_FORTY_X} as the button said (the turret was "
+        f"turned during the run): position-1.json holds a calibration of {_TWENTY_X} "
+        f"and {_FORTY_X} has none; put {_FORTY_X} in place and press the button again"
+    )
+    # A record that names no objective: the words say so.
+    assert calibrate_measured_other(_FORTY_X, None, "position-1.json") == (
+        "it measured an unknown objective, not "
+        f"{_FORTY_X} as the button said (the turret was turned during the run): "
+        "position-1.json holds a calibration of an unknown objective and "
+        f"{_FORTY_X} has none; put {_FORTY_X} in place and press the button again"
+    )
+
+
+def test_calibration_denied_names_the_folder_and_the_reason_and_never_a_file() -> None:
+    assert calibration_denied(
+        "run/calibrations", "PermissionError: Permission denied"
+    ) == (
+        "run/calibrations: the page cannot look into this folder (PermissionError: "
+        "Permission denied); which objectives have a calibration is not known"
+    )
+    # One line whatever the folder's or the reason's text holds (FM-139).
+    odd = calibration_denied("a\nb", "PermissionError: no\r\nright")
+    assert "\n" not in odd
+    assert "\r" not in odd
+    assert "position-" not in calibration_denied(
+        "run/calibrations", "PermissionError: Permission denied"
     )
 
 
@@ -4787,7 +4964,7 @@ def test_the_held_calibration_lines_say_objective_date_problem_and_why_a_documen
             "measured": when,
             "problem": None,
             "plate_objective": _TEN_X,
-            "on_turret": True,
+            "at_position": True,
         }
         kwargs.update(changes)
         return calibration_held_line(**kwargs)
@@ -4800,12 +4977,8 @@ def test_the_held_calibration_lines_say_objective_date_problem_and_why_a_documen
         f"{_TEN_X}: calibrated on 2026-11-17; the plate's objective, not measured "
         "from itself"
     )
-    assert line(on_turret=False) == (
-        f"{_FORTY_X}: calibrated on 2026-11-17; not on the turret now: calibrate its "
-        "position again, or type the documents to use"
-    )
-    # Not known whether it is on the turret: nothing is said about it.
-    assert line(on_turret=None) == f"{_FORTY_X}: calibrated on 2026-11-17"
+    # Not known whether the document is its position's: nothing is said about it.
+    assert line(at_position=None) == f"{_FORTY_X}: calibrated on 2026-11-17"
     # A problem is the position's line, with the label when the page knows it.
     problem = "in c/position-4.json: the last run of camera-calibration ended stopped"
     assert line(position=4, objective=None, measured="", problem=problem) == (
@@ -4815,6 +4988,55 @@ def test_the_held_calibration_lines_say_objective_date_problem_and_why_a_documen
         assert line(position=4, label=unknown, objective=None, problem=problem) == (
             f"position 4: {problem}"
         )
+
+
+def test_a_document_that_is_not_at_its_position_has_a_line_of_its_own_with_or_without_a_label() -> (
+    None
+):
+    when = "2026-11-17T10:20:30+00:00"
+
+    def line(**changes: Any) -> str:
+        kwargs: dict[str, Any] = {
+            "position": 1,
+            "label": _FORTY_X,
+            "objective": _TEN_X,
+            "measured": when,
+            "problem": None,
+            "plate_objective": _TEN_X,
+            "at_position": False,
+        }
+        kwargs.update(changes)
+        return calibration_held_line(**kwargs)
+
+    tail = (
+        "not of the objective at this position now (the turret was turned during a "
+        "run, or relabelled since): "
+    )
+    # The position and its label say where, the document's objective says what it holds, and
+    # the way out names the objective that file should hold.
+    assert line() == (
+        f"position 1 ({_FORTY_X}): the document holds a calibration of {_TEN_X}, "
+        f"{tail}calibrate {_FORTY_X} again, or type the documents to use"
+    )
+    # The old suffix of the usable line is gone, and so is its date: it is not that line.
+    assert "not on the turret now" not in line()
+    assert "calibrated on" not in line()
+    # A position whose label the page does not know: no objective to calibrate again.
+    for unknown in (None, "", "  "):
+        assert line(position=4, label=unknown, objective=_FORTY_X) == (
+            f"position 4: the document holds a calibration of {_FORTY_X}, "
+            f"{tail}type the documents to use"
+        )
+    # A record that names no objective says so.
+    assert line(objective=None) == (
+        "position 1 (" + _FORTY_X + "): the document holds a calibration of an unknown "
+        f"objective, {tail}calibrate {_FORTY_X} again, or type the documents to use"
+    )
+    # A problem still has the position's own line, whatever ``at_position`` says.
+    problem = "in c/position-4.json: the last run of camera-calibration ended stopped"
+    assert line(position=4, objective=None, measured="", problem=problem) == (
+        f"position 4 ({_FORTY_X}): {problem}"
+    )
 
 
 def test_the_held_lines_are_one_line_each_for_a_label_with_a_line_break() -> None:
@@ -4828,7 +5050,7 @@ def test_the_held_lines_are_one_line_each_for_a_label_with_a_line_break() -> Non
             "2026-11-17T10:20:30+00:00",
             None,
             plate_objective=_TEN_X,
-            on_turret=False,
+            at_position=False,
         ),
         calibration_held_line(
             2,
@@ -4837,7 +5059,7 @@ def test_the_held_lines_are_one_line_each_for_a_label_with_a_line_break() -> Non
             "",
             calibration_failed(words),
             plate_objective=_TEN_X,
-            on_turret=None,
+            at_position=None,
         ),
         calibration_missing_line(label),
         calibration_note_line(label, "an assumed\nline"),
@@ -4845,7 +5067,10 @@ def test_the_held_lines_are_one_line_each_for_a_label_with_a_line_break() -> Non
         calibrate_changed(label, label),
         calibrate_position_unknown(label),
         calibrate_replaces(label, "2026-11-17T10:20:30+00:00"),
-        calibrate_replaces_plate(label, label),
+        calibrate_stand_routed(label, label, "position-1.json"),
+        calibrate_command_folder_note(label),
+        calibrate_measured_other(label, label, "position-1.json"),
+        calibration_denied(label, label),
         calibrations_held_heading(label),
         calibrate_is_the_plates(label),
     )
