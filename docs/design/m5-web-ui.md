@@ -6986,10 +6986,11 @@ Chromium 1255 (the project asks 1.64), `demo-sample` turned as above and registe
     typed is sent, as before.
   - **The note and the button** (`calibrate_note`, from the status and the last view, FM-145): the
     tool's own reason (`_blocked`) first; then, when a document is the destination, `calibrate_wait`'s
-    reason (it carries the busy note), else `calibrate_position_unknown` when the view's copy of
-    the labels does not give the position, or, with none, `calibrate_stand_routed` and, for a usable
-    document of that objective at the position, D13's `calibrate_replaces` (FM-172); when `run.json`
-    is the destination the busy note, as before. The button is disabled by the same reasons. D17's
+    reason (it carries the busy note) or, when the view's copy of the labels does not give the
+    position, `calibrate_position_unknown`; then, **after the reason and never instead of it** (as
+    D17's note followed the busy note), `calibrate_stand_routed` and, for a usable document of that
+    objective at the position, D13's `calibrate_replaces` (FM-172), both only when the position is
+    known (they name its file); when `run.json` is the destination the busy note, as before. The button is disabled by the same reasons. D17's
     `calibrate_replaces_plate` is deleted: it described a click that no longer happens.
   - **The *Command* disclosure shows the call the click makes** (ADR-0006, principle 5): for a document
     `smc run camera-calibration -p ... --run-doc <the position's path> --param ...` and under it
