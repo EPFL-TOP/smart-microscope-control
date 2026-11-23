@@ -29,7 +29,7 @@ else:
     pn = pytest.importorskip("panel")
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import ObjectiveTurret
+from smc.hardware.capabilities import LightSource, ObjectiveTurret
 from smc.hardware.errors import HardwareError
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
@@ -52,6 +52,7 @@ from smc.ui.controller import PlatePage
 from smc.ui.guide import (
     CALIBRATE_DRY_RUN,
     CALIBRATE_LEAD,
+    CALIBRATE_LIGHT_OFF,
     CALIBRATE_NOT_KNOWN,
     NOT_CONNECTED,
     OFFSETS_NO_DOCUMENT,
@@ -213,6 +214,32 @@ def _fresh_state() -> Iterator[None]:
         yield
     finally:
         Slow.release.set()
+
+
+class Light:
+    """A light source the test sets: its switch reads on, off or nothing smc knows (m5 §18.6 D20)."""
+
+    def __init__(self, reading: bool | None) -> None:
+        self.reading = reading
+
+    def device(self) -> str:
+        return "LED"
+
+    def intensity_knob(self) -> Any:
+        return None
+
+    def intensity_native(self) -> float | None:
+        return None
+
+    def set_intensity_native(self, value: float) -> float:
+        return value
+
+    def is_on(self) -> bool | None:
+        return self.reading
+
+    def set_on(self, on: bool) -> bool:
+        self.reading = on
+        return on
 
 
 class Turret:
@@ -495,6 +522,38 @@ def test_the_calibrate_button_names_the_objective_in_place_and_waits_for_each_re
         assert closed_view.offsets_calibrate_wait.object == NOT_CONNECTED
     finally:
         closed.close()
+
+
+def test_the_blocks_button_waits_with_the_light_off(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # FM-206 (D20): a calibration that the tool refuses for a dark frame replaces the position's
+    # usable document, so the button waits for the light, with the reason beside it.
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+    light = Light(False)
+    fake_microscope.override(LightSource, light)
+    view.tick()
+
+    assert view.offsets_calibrate_button.disabled is True
+    assert view.offsets_calibrate_wait.object == CALIBRATE_LIGHT_OFF
+    # It still names the objective in place, and the click would carry it.
+    assert view.offsets_calibrate_button.label == f"Calibrate the camera at {FORTY}"
+    assert view._calibrate_for == FORTY
+
+    # The light on, or one nobody can read: nothing to wait for (an unknown refuses nothing).
+    for reading in (True, None):
+        light.reading = reading
+        view.tick()
+        assert view.offsets_calibrate_button.disabled is False
+        assert view.offsets_calibrate_wait.object == ""
+
+    # The other reasons come first, as the pure function orders them: the plate's own objective.
+    light.reading = False
+    _turn(fake_microscope, TEN)
+    view.tick()
+    assert view.offsets_calibrate_wait.object == calibrate_is_the_plates(TEN)
 
 
 def test_a_page_that_does_not_offer_the_block_says_nothing_of_the_calibrations(

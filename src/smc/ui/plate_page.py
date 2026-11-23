@@ -4474,7 +4474,7 @@ class PlatePageView:
             dry_run=status.dry_run,
             objective=objective,
             plate_objective=plate,
-            light_on=None,
+            light_on=status.light_on,
         )
         self.offsets_calibrate_button.label = calibrate_label(
             objective, plate, again=same

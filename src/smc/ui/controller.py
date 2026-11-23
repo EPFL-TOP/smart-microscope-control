@@ -6012,7 +6012,7 @@ class PlatePage:
         offer = self._offsets_offer(self._slot(doc, "plate", PlateResult, []))
         if offer is None:
             return CALIBRATE_NO_OFFER
-        now, labels = self._turret_reading()
+        now, labels, light_on = self._turret_reading()
         wait = calibrate_wait(
             connected=True,
             running=None,
@@ -6020,7 +6020,7 @@ class PlatePage:
             dry_run=self._dry_run,
             objective=now,
             plate_objective=offer.plate_objective,
-            light_on=None,
+            light_on=light_on,
         )
         if wait is not None:
             return wait
@@ -6037,18 +6037,42 @@ class PlatePage:
             return SCAN_HALTED
         return self.calibrations_folder / calibration_file(position)
 
-    def _turret_reading(self) -> tuple[str | None, tuple[str, ...]]:
-        """The objective in place and every position's label, read together inside one read a Disconnect waits for (m5 §18.6 D13).
+    def _turret_reading(self) -> tuple[str | None, tuple[str, ...], bool | None]:
+        """The objective in place, every position's label and the light, read together inside one read a Disconnect waits for (m5 §18.6 D13, D20).
 
-        ``(None, ())`` with the stand closed. The label is ``None`` for a turret that cannot be
-        read or reads nothing (``_objective_in_place``); the labels are ``()`` when they cannot
+        ``(None, (), None)`` with the stand closed. The label is ``None`` for a turret that cannot
+        be read or reads nothing (``_objective_in_place``); the labels are ``()`` when they cannot
         be read (``objective_labels``). The position is the label's index in these labels, so
-        the two come from one read and not from two ticks apart.
+        the two come from one read and not from two ticks apart. The light is
+        ``LightSource.is_on()`` **now**, never the tick's copy (FM-177: the operator may have
+        switched it off since the last tick): ``None`` when the stand has no light source, when
+        its switch is not one smc knows, or when the read raises (FM-98, nothing is kept), and
+        an unknown light refuses nothing (``calibrate_wait``).
         """
         with self._reading() as microscope:
             if microscope is None:
-                return None, ()
-            return self._objective_in_place(microscope), self._labels_of(microscope)
+                return None, (), None
+            return (
+                self._objective_in_place(microscope),
+                self._labels_of(microscope),
+                self._light_in_place(microscope),
+            )
+
+    @staticmethod
+    def _light_in_place(microscope: Microscope) -> bool | None:
+        """Whether the light reads on now, or ``None``: no light source, no switch smc knows, or a read that raised (m5 §18.6 D20)."""
+        light = microscope.get(LightSource)
+        if light is None:
+            return None
+        try:
+            return light.is_on()
+        except Exception as exc:
+            log.warning(
+                "light: its state could not be read before a calibration: %s: %s",
+                type(exc).__name__,
+                _one_line(exc),
+            )
+            return None
 
     def _offsets_offer(self, registered: PlateResult | None) -> OffsetsOffer | None:
         """The block's offer for the usable ``plate`` result ``registered``: it is the page's plate and was registered from its walls (m5 §18.2 D2).

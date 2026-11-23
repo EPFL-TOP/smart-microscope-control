@@ -24,7 +24,7 @@ from pymmcore_plus import CMMCorePlus
 
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
-from smc.hardware.capabilities import ObjectiveTurret
+from smc.hardware.capabilities import LightSource, ObjectiveTurret
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
@@ -55,6 +55,7 @@ from smc.ui.controller import (
 )
 from smc.ui.guide import (
     CALIBRATE_DRY_RUN,
+    CALIBRATE_LIGHT_OFF,
     CALIBRATE_NAMES_NONE,
     CALIBRATE_NO_OFFER,
     CALIBRATE_NOT_KNOWN,
@@ -279,6 +280,38 @@ class Turret:
 
     def offset(self, label: str) -> Any:
         raise NotImplementedError
+
+
+class Light:
+    """A light source the test sets: its switch reads on, off, nothing smc knows, or raises (D20).
+
+    The page reads ``is_on()`` at a tick and again at a click: ``reading`` is what the next read
+    says, so that a test turns the light off **between** the two, with no tick in between.
+    """
+
+    def __init__(self, reading: bool | Exception | None) -> None:
+        self.reading = reading
+
+    def device(self) -> str:
+        return "LED"
+
+    def intensity_knob(self) -> Any:
+        return None
+
+    def intensity_native(self) -> float | None:
+        return None
+
+    def set_intensity_native(self, value: float) -> float:
+        return value
+
+    def is_on(self) -> bool | None:
+        if isinstance(self.reading, Exception):
+            raise self.reading
+        return self.reading
+
+    def set_on(self, on: bool) -> bool:
+        self.reading = on
+        return on
 
 
 # --- records written out by hand -------------------------------------------------------
@@ -744,6 +777,120 @@ def test_calibrate_objective_while_an_activity_goes_raises_and_writes_nothing(
     # The slow tool's own record is the only thing the page's document gained.
     assert sorted(RunDocument.load(run_doc).stages) == ["plate-walls", "slow"]
     assert before.startswith(b"{")
+
+
+def test_a_light_that_reads_off_refuses_the_calibration_and_leaves_the_usable_document_byte_identical(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # Acceptance 2, FM-206: the tool refuses a dark frame, and its refusal is a `failed` record
+    # that replaces the position's usable document. The light is read at the click: a status read
+    # (the tick's copy) says on, then it is switched off with no tick in between (FM-177).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    document = _folder(run_doc) / "position-1.json"
+    _seed_calibration(document, FORTY)
+    light = Light(True)
+    fake_microscope.override(LightSource, light)
+    page = _page(fake_microscope, run_doc)
+    try:
+        assert page.status().light_on is True
+        light.reading = False
+        document_before = document.read_bytes()
+        run_before = run_doc.read_bytes()
+        page.calibrate_objective(FORTY)
+        outcome = page.status().outcome
+        running = page.status().running
+        refused_document = document.read_bytes()
+        refused_seen = list(StubCalibration.seen)
+        held = page.view().calibrations
+        # The light switched on again, nothing else changed: the same click runs, and it is the
+        # one that replaces the document (so the check above could have seen a replacement).
+        light.reading = True
+        page.calibrate_objective(FORTY)
+        assert page.join(10.0)
+        replaced_document = document.read_bytes()
+    finally:
+        page.close()
+
+    assert outcome == f"Camera calibration: {CALIBRATE_LIGHT_OFF}"
+    assert running is None
+    # Nothing started and nothing written: the usable document is the one it was, and listed.
+    assert refused_seen == []
+    assert refused_document == document_before
+    assert run_doc.read_bytes() == run_before
+    assert [(h.position, h.read.objective, h.read.problem) for h in held] == [
+        (1, FORTY, None)
+    ]
+    assert len(StubCalibration.seen) == 1
+    assert replaced_document != document_before
+    # Nothing in either click turned the turret (FM-14).
+    assert _in_place(fake_microscope) == FORTY
+
+
+def test_a_light_that_reads_off_leaves_every_document_alone_for_a_click_that_ran_nothing(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The refusal alone, with no second click: no file is made, none replaced, no folder.
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    fake_microscope.override(LightSource, Light(False))
+    page = _page(fake_microscope, run_doc)
+    try:
+        before = run_doc.read_bytes()
+        page.calibrate_objective(FORTY, ("step_um=40",))
+        outcome = page.status().outcome
+        running = page.status().running
+    finally:
+        page.close()
+
+    assert outcome == f"Camera calibration: {CALIBRATE_LIGHT_OFF}"
+    assert running is None
+    assert StubCalibration.seen == []
+    assert not _folder(run_doc).exists()
+    assert run_doc.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [None, RuntimeError("the lamp does not answer")],
+    ids=["no switch smc knows", "a read that raises"],
+)
+def test_an_unknown_light_or_one_that_raises_refuses_nothing(
+    fake_microscope: Microscope, run_doc: Path, reading: bool | Exception | None
+) -> None:
+    # An unknown is not a refusal the page can justify: the tool decides (D20).
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    fake_microscope.override(LightSource, Light(reading))
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY)
+    finally:
+        page.close()
+
+    assert outcome.startswith("Camera calibration done in ")
+    assert (_folder(run_doc) / "position-1.json").is_file()
+    assert len(StubCalibration.seen) == 1
+
+
+def test_a_stand_with_no_light_source_refuses_nothing(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_plate(run_doc)
+    _turn(fake_microscope, FORTY)
+    real = Microscope.get
+
+    def get(self: Microscope, capability: type) -> Any:
+        return None if capability is LightSource else real(self, capability)
+
+    monkeypatch.setattr(Microscope, "get", get)
+    page = _page(fake_microscope, run_doc)
+    try:
+        outcome = _calibrate(page, FORTY)
+    finally:
+        page.close()
+
+    assert outcome.startswith("Camera calibration done in ")
 
 
 def test_the_dry_run_text_of_the_calibration_is_the_tools_own_refusal(
