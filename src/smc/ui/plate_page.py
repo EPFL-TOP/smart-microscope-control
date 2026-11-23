@@ -4948,7 +4948,10 @@ class PlatePageView:
             str(widget.value).strip() or self._field_defaults.get(_AUTOFOCUS_FIELD, "")
         )
         return scan_lock_note(
-            mode, autofocus_locked=status.autofocus_locked, dry_run=status.dry_run
+            mode,
+            autofocus_locked=status.autofocus_locked,
+            dry_run=status.dry_run,
+            halted=status.halted,
         )
 
     def _scan_end_offered(self) -> ScanEnd | None:
@@ -5118,6 +5121,7 @@ class PlatePageView:
                 chain,
                 autofocus_locked=status.autofocus_locked,
                 dry_run=status.dry_run,
+                halted=status.halted,
             ),
         )
 

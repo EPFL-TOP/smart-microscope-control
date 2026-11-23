@@ -1784,7 +1784,9 @@ def scan_lead(
     return f"{fields}{at}. {stop}"
 
 
-def scan_lock_note(mode: str, *, autofocus_locked: bool | None, dry_run: bool) -> str:
+def scan_lock_note(
+    mode: str, *, autofocus_locked: bool | None, dry_run: bool, halted: bool
+) -> str:
     """What the Scan screen says before the click when the scan's ``autofocus`` field wants a lock the stand does not have (m5 §20 D3).
 
     ``mode`` is the field's value as the click would send it (the typed text stripped, or the
@@ -1794,10 +1796,12 @@ def scan_lock_note(mode: str, *, autofocus_locked: bool | None, dry_run: bool) -
     (read on the CLI too) does not (D6). ``off``, an unknown read (an autofocus that is on and
     not locked reads unknown too: the scan refuses it and the engage is refused at an offset
     not seen locked, FM-252) and a value the tool would refuse say nothing. It is a note and
-    never a wait: the scan's check is the one guard (FM-169). Not on a dry run (D4, FM-182).
-    Plain text (FM-139).
+    never a wait: the scan's check is the one guard (FM-169). Not on a dry run (D4, FM-182),
+    and not while the stand is halted: after a STOP the autofocus reads off and *Autofocus
+    on* is refused until *Resume*, so the advice would be wrong (D40, FM-252). ``halted``
+    has no default: a caller decides. Plain text (FM-139).
     """
-    if dry_run or autofocus_locked is not False:
+    if dry_run or halted or autofocus_locked is not False:
         return ""
     if mode == "required":
         return SCAN_NEEDS_A_LOCK
@@ -2591,7 +2595,11 @@ def chain_line(chain: ChainStatus | None) -> str:
 
 
 def relock_note(
-    chain: ChainStatus | None, *, autofocus_locked: bool | None, dry_run: bool
+    chain: ChainStatus | None,
+    *,
+    autofocus_locked: bool | None,
+    dry_run: bool,
+    halted: bool,
 ) -> str:
     """What the Wells screen says under the chain's line once *Measure the time* has ended with the autofocus not locked (m5 §20 D2).
 
@@ -2602,7 +2610,12 @@ def relock_note(
     unknown, FM-252), never the tool's own flag or the words of its
     ``assumed`` line (FM-155): an autofocus the timing found off, or one the operator locked
     again at the stand's controls since, is drawn as it reads. Not on a dry run, where
-    *Autofocus on* sends nothing (D4, FM-182). Plain text (FM-139).
+    *Autofocus on* sends nothing (D4, FM-182), and not while the stand is halted: a STOP
+    switches the autofocus off first, so it reads off, and the halt refuses the click the
+    note advises (``press Resume to continue``); the page already says what comes first
+    (``HALTED`` in the strip, *Resume* on the page), so the note is silent and is drawn
+    again from the same read after *Resume* (D40, FM-252). ``halted`` has no default: a
+    caller decides. Plain text (FM-139).
     """
     if (
         chain is None
@@ -2610,6 +2623,7 @@ def relock_note(
         or chain.label != MEASURE_THE_TIME
         or chain.current is not None
         or dry_run
+        or halted
         or autofocus_locked is not False
     ):
         return ""

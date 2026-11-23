@@ -4888,30 +4888,32 @@ def test_the_lock_notes_are_m5_section_20_3s_words() -> None:
 def test_relock_note_is_said_only_after_measure_the_time_with_the_autofocus_not_locked() -> (
     None
 ):
-    """One input changed at a time from the one full case: each other value says nothing (D2, D4)."""
-    full = relock_note(_measured_chain(), autofocus_locked=False, dry_run=False)
+    """One input changed at a time from the one full case: each other value says nothing (D2, D4, D40)."""
+
+    def note(
+        chain: ChainStatus | None,
+        *,
+        locked: bool | None = False,
+        dry_run: bool = False,
+        halted: bool = False,
+    ) -> str:
+        return relock_note(
+            chain, autofocus_locked=locked, dry_run=dry_run, halted=halted
+        )
+
+    full = note(_measured_chain())
     assert full == RELOCK_NOTE
 
-    assert (
-        relock_note(
-            _measured_chain(label=RUN_ALL_LABEL), autofocus_locked=False, dry_run=False
-        )
-        == ""
-    )
-    assert (
-        relock_note(
-            _measured_chain(current="timing"), autofocus_locked=False, dry_run=False
-        )
-        == ""
-    )
-    assert relock_note(_measured_chain(), autofocus_locked=True, dry_run=False) == ""
-    assert relock_note(_measured_chain(), autofocus_locked=None, dry_run=False) == ""
-    assert relock_note(_measured_chain(), autofocus_locked=False, dry_run=True) == ""
-    assert relock_note(None, autofocus_locked=False, dry_run=False) == ""
-    assert (
-        relock_note(_measured_chain(plugins=()), autofocus_locked=False, dry_run=False)
-        == ""
-    )
+    assert note(_measured_chain(label=RUN_ALL_LABEL)) == ""
+    assert note(_measured_chain(current="timing")) == ""
+    assert note(_measured_chain(), locked=True) == ""
+    assert note(_measured_chain(), locked=None) == ""
+    assert note(_measured_chain(), dry_run=True) == ""
+    assert note(None) == ""
+    assert note(_measured_chain(plugins=())) == ""
+    # D40: after a STOP the autofocus reads off and the stand is halted, so *Autofocus on*
+    # would be refused (``press Resume to continue``): the one input changed alone says nothing.
+    assert note(_measured_chain(), halted=True) == ""
 
 
 @pytest.mark.parametrize(
@@ -4928,14 +4930,30 @@ def test_relock_note_is_said_only_after_measure_the_time_with_the_autofocus_not_
 def test_scan_lock_note_names_autofocus_on_for_required_and_if_engaged_only(
     mode: str, said: str
 ) -> None:
-    assert scan_lock_note(mode, autofocus_locked=False, dry_run=False) == said
+    assert (
+        scan_lock_note(mode, autofocus_locked=False, dry_run=False, halted=False)
+        == said
+    )
 
 
 @pytest.mark.parametrize("mode", ["required", "if-engaged"])
-def test_scan_lock_note_says_nothing_for_a_lock_that_reads_locked_or_unknown_or_in_a_dry_run(
+def test_scan_lock_note_says_nothing_for_a_lock_that_reads_locked_or_unknown_or_in_a_dry_run_or_while_halted(
     mode: str,
 ) -> None:
-    assert scan_lock_note(mode, autofocus_locked=True, dry_run=False) == ""
-    assert scan_lock_note(mode, autofocus_locked=None, dry_run=False) == ""
-    assert scan_lock_note(mode, autofocus_locked=False, dry_run=True) == ""
-    assert scan_lock_note(mode, autofocus_locked=False, dry_run=False) != ""
+    assert (
+        scan_lock_note(mode, autofocus_locked=True, dry_run=False, halted=False) == ""
+    )
+    assert (
+        scan_lock_note(mode, autofocus_locked=None, dry_run=False, halted=False) == ""
+    )
+    assert (
+        scan_lock_note(mode, autofocus_locked=False, dry_run=True, halted=False) == ""
+    )
+    # D40: a halted stand refuses the click the note advises, so the note is silent; the
+    # one input changed alone, from the full case below it.
+    assert (
+        scan_lock_note(mode, autofocus_locked=False, dry_run=False, halted=True) == ""
+    )
+    assert (
+        scan_lock_note(mode, autofocus_locked=False, dry_run=False, halted=False) != ""
+    )

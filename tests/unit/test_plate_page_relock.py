@@ -27,8 +27,8 @@ from smc.hardware.capabilities import Autofocus, ZStage
 from smc.hardware.errors import SafetyRefusedError
 from smc.hardware.profile import AutofocusSection, Profile
 from smc.testing import FakeCore
-from smc.ui.controller import PlatePage
-from smc.ui.guide import MEASURE_THE_TIME
+from smc.ui.controller import PageStatus, PlatePage
+from smc.ui.guide import MEASURE_THE_TIME, SCAN_NEEDS_A_LOCK, scan_lock_note
 
 #: A bound for a slow CI runner, never a wait for something that must happen (FM-44).
 WAIT_S = 30.0
@@ -156,3 +156,35 @@ def test_the_status_says_locked_after_the_relock_and_not_locked_after_the_timing
     page.autofocus(True)
     assert page.join(WAIT_S), "Autofocus on did not end"
     assert page.status().autofocus_locked is True
+
+
+def test_a_stop_hides_the_scan_note_and_resume_brings_it_back(
+    stand: tuple[FakeCore, Microscope, PlatePage],
+) -> None:
+    """D40 on the declared stand: a STOP switches the autofocus off and halts, so *Autofocus on* is refused until *Resume*.
+
+    The note advised that click, a click the halt refuses. The read after the STOP says
+    ``autofocus_locked`` False (so the note is silent for ``halted`` alone) and the one
+    after *Resume* reads the same off, so the only input that moved is ``halted``.
+    """
+    _core, _microscope, page = stand
+
+    def scan_note(status: PageStatus) -> str:
+        return scan_lock_note(
+            "required",
+            autofocus_locked=status.autofocus_locked,
+            dry_run=status.dry_run,
+            halted=status.halted,
+        )
+
+    page.stop()
+    stopped = page.status()
+    assert stopped.halted is True
+    assert stopped.autofocus_locked is False
+    assert scan_note(stopped) == ""
+
+    page.resume()
+    resumed = page.status()
+    assert resumed.halted is False
+    assert resumed.autofocus_locked is False
+    assert scan_note(resumed) == SCAN_NEEDS_A_LOCK

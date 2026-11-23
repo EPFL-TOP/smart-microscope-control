@@ -3339,6 +3339,61 @@ def test_the_notes_say_nothing_while_the_autofocus_is_on_and_still_searching(
     assert view.scan_lock_text.object == ""
 
 
+def test_the_lock_notes_say_nothing_while_the_stand_is_halted(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D40: after a STOP the autofocus reads off, and *Autofocus on* is refused until *Resume*: neither pane advises it.
+
+    The one input changed is ``halted`` (the read of the autofocus stays off), and the
+    notes are drawn again from the same read once it clears.
+    """
+    page, view = _after_measure_the_time(make_page, run_doc)
+    view.tool_fields["scan"]["autofocus"].value = "required"
+    view.tick()
+    assert page.status().autofocus_locked is False
+    assert view.wells_relock_text.object == RELOCK_NOTE
+    assert view.scan_lock_text.object == SCAN_NEEDS_A_LOCK
+
+    _with_status(monkeypatch, page, halted=True)
+    view.tick()
+    assert view.wells_relock_text.object == ""
+    assert view.wells_relock_text.visible is False
+    assert view.scan_lock_text.object == ""
+    assert view.scan_lock_text.visible is False
+
+    _with_status(monkeypatch, page, halted=False)
+    view.tick()
+    assert view.wells_relock_text.object == RELOCK_NOTE
+    assert view.wells_relock_text.visible is True
+    assert view.scan_lock_text.object == SCAN_NEEDS_A_LOCK
+    assert view.scan_lock_text.visible is True
+
+
+def test_a_snap_ends_the_chain_line_and_the_note_goes_with_it_while_the_autofocus_still_reads_off(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    """D39: the Wells note leaves with the chain's line, as it always has; the Scan screen's note says it where it matters.
+
+    Every activity (a jog, a light, a Snap) starts with no chain, so the note goes with the
+    line while the autofocus still reads off. A memory of *Measure the time ran since this
+    Connect* was weighed and not built (m5 §17.12.12 D39): this pins what is decided.
+    """
+    page, view = _after_measure_the_time(make_page, run_doc)
+    assert view.wells_relock_text.object == RELOCK_NOTE
+
+    page.snap()
+    assert page.join(BOUND_S)
+    view.tick()
+
+    status = page.status()
+    assert status.chain is None
+    assert status.autofocus_locked is False
+    assert view.wells_relock_text.object == ""
+    assert view.wells_relock_text.visible is False
+
+
 def test_the_scan_screen_names_autofocus_on_over_a_checkpoint_too_and_continue_stays_enabled(
     make_page: Callable[..., PlatePage], run_doc: Path
 ) -> None:
