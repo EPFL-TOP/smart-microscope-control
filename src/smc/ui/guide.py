@@ -1668,27 +1668,53 @@ def stop_segments_clause(segments_um: Sequence[tuple[str, float]]) -> str:
     return f"; a long one ends at the end of its current segment (at most {', '.join(sizes)})"
 
 
-#: The closing phrases the layer writes for a program, and what the page says in their
-#: place: the operator's way out is the **Resume** button, never a call (FM-254, #544).
-#: The layer's texts are right for the CLI and for a caller, so they are not changed there.
+#: The phrases the layer writes for a program, and what the page says in their place: the
+#: operator's way out is the **STOP** and **Resume** buttons, never a call (FM-254, #544,
+#: m5 §17.12.12 D36). The layer's texts are right for the CLI and for a caller, so they are
+#: not changed there. The order matters: the two motion errors' endings contain ``check the
+#: stand and call `resume()` ``, so they come before it, and the first three entries stay first.
 _LAYER_PHRASES = (
     (" (`Microscope.stop()`)", ""),
     ("call `resume()` to continue", "press Resume to continue"),
     ("then call `resume()`", "then press Resume"),
+    (
+        "wait for it (`wait()`) or stop it (`stop()`), or, if it never settles, check the stand and call `resume()`",
+        "wait for it or press STOP; if it never settles, press STOP, check the stand, then press Resume",
+    ),
+    (
+        "wait for them (`wait()`) or stop them (`stop()`), or, if them never settles, check the stand and call `resume()`",
+        "wait for them or press STOP; if they never settle, press STOP, check the stand, then press Resume",
+    ),
+    (
+        "`wait()` stops nothing, so it may still be moving. Stop it (`stop()`) if it should not be, or wait longer.",
+        "the wait stops nothing, so it may still be moving. Press STOP if it should not be, or wait longer.",
+    ),
+    ("check the stand and call `resume()`", "check the stand and press Resume"),
+    (
+        "stop() and check the stand, then resume()",
+        "press STOP and check the stand, then press Resume",
+    ),
 )
 
 
 def page_words(text: str) -> str:
-    """``text``, an error's message from the layer, with its closing advice said as the page says it (FM-254).
+    """``text``, an error's message from the layer, with its advice said as the page says it (FM-254, m5 §17.12.12 D36).
 
-    ``MicroscopeHaltedError`` ends "call `resume()` to continue" and the facade's failed
-    emergency stop "then call `resume()`", advice to a program; on the page the halt is
-    cleared with **Resume**, and no API name is shown (m5 §17.12 D20, #544). Only these
-    three phrases are replaced, each where it stands: any other text, a backtick call
-    included, comes back as it is, since a phrase the page cannot honour (the advice of
-    ``MotionInProgressError``, which is given while nothing is halted, and the page offers
-    **Resume** only while it is) must stay the layer's until it is decided. The tests build
-    the layer's real errors, so that a rewording there fails there.
+    The layer advises a program in calls: ``MicroscopeHaltedError`` ends "call `resume()`
+    to continue", the facade's failed emergency stop "then call `resume()`", a motion still
+    tracked "wait for it (`wait()`) or stop it (`stop()`), or ... call `resume()`", and the
+    autofocus's texts "stop() and check the stand, then resume()". On the page the same ways
+    out are the **STOP** and **Resume** buttons, said as a sequence the page can always
+    follow (STOP is always there, and pressed with nothing running it halts the stand, which
+    is what offers **Resume**): ``Resume`` alone is not offered while nothing is halted, and
+    it drops every tracked motion, so it is never advised before a STOP.
+
+    Only the phrases of ``_LAYER_PHRASES`` are replaced, each where it stands; any other
+    text, a backtick call included, comes back as it is (a device name in backticks is not
+    a call). A test walks the layer's string literals and fails on one that still names
+    ``stop()``, ``resume()`` or ``wait()`` after this function, so that a new advice worded
+    with a call is said here before it reaches the page (D37). The tests build the layer's
+    real errors, so that a rewording there fails there.
     """
     for layer, page in _LAYER_PHRASES:
         text = text.replace(layer, page)
