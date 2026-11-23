@@ -7272,8 +7272,8 @@ Throwaway scripts, not committed, on `main` at `ef80c91`, in the worktree's own 
   holds the chosen algorithm's summary, or `NOT_INSTALLED` for a value that is not an
   installed name (D6).
 - **D3 The parameters of the chosen algorithm are fields under its Select.** One group per
-  algorithm, built once, only the chosen algorithm's group visible. For an algorithm named
-  in `ROUTE_OWN_PARAMS` (`most-cells`: `min_cells` and `candidate_step_fraction`, the two
+  algorithm, a `pn.Column` built once, only the chosen algorithm's group visible. For an
+  algorithm named in `ROUTE_OWN_PARAMS` (`most-cells`: `min_cells` and `candidate_step_fraction`, the two
   parameters `RouteParams` keeps for it) the group is `route`'s own two fields, the same
   instances as in *Advanced* (so a preset and a profile fill them as they do). For any other
   algorithm, one `TextInput` per row of `describe_params(Params)`: `label` the key,
@@ -7350,11 +7350,12 @@ Throwaway scripts, not committed, on `main` at `ef80c91`, in the worktree's own 
 - **D11 The report shows the score in two places, and only when there is one.** A stop's
   field `<title>` (hover) ends `, score 0.823` and, with measures, ` (density_per_mm2 41.2,
   …)` after `name: held`; a well that has a stop with a score gets one line under its
-  counts, `<p class="scores">Selector scores: E8_r000 0.823, E8_r001 0.791, and 3 more</p>`
-  (the stops in visiting order that have a score, the first 12, then `and N more`), styled as
-  `.counts` is. No visible number is added in the drawing: a 40× field is smaller than a
-  score's text at the number's font. A route with no score on any stop is written
-  **byte for byte as before**. Every name and key in them is escaped (FM-139).
+  counts, `<p class="counts scores">Selector scores: E8_r000 0.823, E8_r001 0.791, and 3
+  more</p>` (the stops in visiting order that have a score, the first 12, then `and N
+  more`; `counts` is the class that already gives the line its style, so the stylesheet is
+  not touched). No visible number is added in the drawing: a 40× field is smaller than a
+  score's text at the number's font. A route with no score on any stop is written **byte
+  for byte as before**. Every name and key in them is escaped (FM-139).
 - **D12 What `route` is sent is what the card shows.** `_typed("route")` is unchanged: the
   non-empty fields in the tool's order. The command under the row, a click on *Run*, *Run all
   that are left* and *Save as* read it. `selector=my-selector` and
@@ -7433,6 +7434,10 @@ def stop_tip(
   number as `repr`, anything else `json.dumps`), the keys it lacks in the text's order, and
   `None`. Anything else (not JSON, or JSON that is not an object) gives `({}, (), "<what
   `json` says, or 'a JSON object is expected'>")`.
+- In the texts, `{carrier}` is `selector_params` or `orderer_params`, `{keys}` the keys
+  joined by `, `, `{name}` the algorithm's name, `{names}` the installed names sorted and
+  joined by `, `, and `{problem}` the third item `params_from_text` returned. Plain text,
+  never markup (FM-139).
 
 `smc/ui/controller.py`:
 
@@ -7460,8 +7465,8 @@ bool`; `_draw_algorithm_choices()`; `_ensure_option(select, name)`;
 `self.route_points` (the scatter of the route's circles). A `Select` is a locked callback
 (FM-171), and every handler of this section still goes through `_handler`.
 
-`smc/ui/guide.py`: `RESULT_CHOICES["route"]` (D1). `smc/plugins/report/render.py`: `_route_fields`
-and `_panel` (D11).
+`smc/ui/guide.py`: `RESULT_CHOICES["route"]` (D1). `smc/plugins/report/render.py`:
+`_route_fields` and `_panel` (D11).
 
 ### 21.4 Tests and failure modes
 
@@ -7495,10 +7500,10 @@ and `_panel` (D11).
   with the installed names; a registry with no selector leaves the text fields and the
   problem; `run_all` sends the pairs to the chain; a hostile summary, key and description
   stay plain text (FM-139); `test_every_handler_the_page_registers_is_guarded` and the
-  results view's plain-text test still pass with the new widgets in the screens. The one
-  existing assertion that the route card holds exactly two `TextInput`s
-  (`test_a_rows_run_is_the_tools_own_handler_with_the_typed_choices`) is edited to name the
-  four now there.
+  results view's plain-text test still pass with the new widgets in the screens. The
+  existing assertion that the card's own `TextInput`s are `labels` and `fields_per_well`
+  (`test_a_rows_run_is_the_tools_own_handler_with_the_typed_choices`) stays as it is: the
+  groups are `Column`s, whose fields are not the card's own objects.
 - The map: `route_source` carries a `tip` of the length of the stops' columns, the hover
   names the wells' renderer **and** `route_points`, the frame renderer is in none
   (a test beside FM-174's).
