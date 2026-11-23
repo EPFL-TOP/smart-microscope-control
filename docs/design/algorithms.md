@@ -47,7 +47,8 @@ the 10× scan with cells of 2026-11-19 and a 40× scan of the same wells taken
 the same day.
 
 Out of scope: the acquisition loop (#556, its engine is an ADR), decisions
-taken *during* an acquisition (#32), the page's choice of a selector (#569).
+taken *during* an acquisition (#32), the page's choice of a selector (#569: the
+page's half is fixed in [m5 §21](m5-web-ui.md)).
 
 ## 1. Measured (2026-11-18)
 
@@ -922,7 +923,7 @@ cells, a working example to replace), `tests/test_selector_<module>.py`
 | #568 | §6 drawing | #565, #567 | `src/smc/data/`, `scripts/dev/select_fields.py`, `pyproject.toml` |
 | #554 | §7 guide, template, CODEOWNERS, labels, skill | #564–#568 | `docs/`, `.github/`, `.claude/skills/`, `CONTRIBUTING.md`, `CLAUDE.md` |
 | #570 | the first task (collaborator) | #554, a dataset of 2026-11-19 | `src/smc/selection/<name>.py` |
-| #569 | the page's choice (owner) | #567 | `src/smc/ui/` |
+| #569 | the page's choice (owner), m5 §21 | #567 | `src/smc/ui/`, `src/smc/plugins/report/render.py`, `src/smc/plugins/slots/route.py` |
 
 #564 and #566 both edit `src/smc/cli.py` and do not run at the same time.
 

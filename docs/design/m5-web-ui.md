@@ -21,7 +21,9 @@
   registered plate); the page as one guided scan fixed by #431's plan with the owner
   (§17, 2026-11-11: five screens, one decision each, the map and the image side by
   side, the expert view behind a switch; built by #443 to #446; B4's interface, §17.11,
-  by #446's plan, 2026-11-12).
+  by #446's plan, 2026-11-12); the Results screen's choice of the selector and the
+  orderer of `route`, and a stop's score on the map and in the report, fixed by #569's
+  plan (§21, 2026-11-23).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -7186,3 +7188,363 @@ did not load.
 **Not verified (for the owner)**: *Autofocus on* at the Ti2-E after *Measure the time*, in
 the same connection, at the 10× and at the 40× (that PFS locks again at the timed offset
 with Z within the band); the three texts read at the stand.
+
+## 21. The Results screen chooses how `route` selects and orders the fields (#569)
+
+Fixed by #569's plan (2026-11-23). Since #567 `route` takes a selector and an orderer by
+name (algorithms §5.6), and `smc run route --param selector=my-selector` runs a
+collaborator's algorithm. The page offers the four parameters as four plain text fields
+under *Advanced* (§21.1): choosing an algorithm there means knowing its name and writing
+JSON. This section is the page's half of the issue pair of algorithms §7.2: the *Route*
+row of the Results screen offers the installed selectors and orderers, each with its
+summary, their parameters as fields, and a preset keeps what was entered; the map and the
+report show a stop's score. It adds no plugin, slot, command, key of the run document or
+guard, and changes none: `route` still validates everything the page sends it, with the
+words it has. **Merging this section decides it.**
+
+### 21.1 What was measured (2026-11-23, planning #569)
+
+Throwaway scripts, not committed, on `main` at `ef80c91`, in the worktree's own `.venv`
+(Python 3.13.0, Panel 1.10.0, macOS):
+
+- **What the page offers today.** `describe_params(RouteParams)` has `selector` (`str`,
+  default `'most-cells'`), `selector_params` (`dict[str, JsonValue]`, `{}`), `orderer`
+  (`'nearest'`) and `orderer_params`. `KEY_PARAMS["route"]` names two keys, so the four are
+  `TextInput`s under *Advanced*, and the row's *Choices and command* holds `labels` and
+  `fields_per_well` only (`RESULT_CHOICES`).
+- **The registry.** `selector_names()` is `('most-cells',)`, `orderer_names()` is
+  `('as-chosen', 'nearest')`; `selector('most-cells').Params` is `MostCellsParams`, whose
+  fields are `min_cells` and `candidate_step_fraction`, the two `RouteParams` keeps for it
+  (algorithms §5.4). `describe_params` reads a selector's `Params` (a `SelectorParams`, not a
+  `PluginParams`). Importing `smc.selection.registry` and calling `selectors()` leaves
+  `pymmcore_plus` out of `sys.modules`.
+- **The CLI's rule on a selector's `Params`.** `parse_params(Params, pairs)` works at run
+  time on a `SelectorParams` subclass (mypy wants a `cast`: its bound is `PluginParams`). On a
+  model of a float, an int, a `tuple[str, ...]`, a bool and a str, the pairs
+  `min_density_per_mm2=20`, `keep=4`, `tags=["a","b"]`, `on=yes`, `mode=20` give, through
+  `model_dump(mode="json")` and `json.dumps`,
+  `{"min_density_per_mm2": 20.0, "keep": 4, "tags": ["a", "b"], "on": true, "mode": "20"}`.
+  A bad value raises `ParamsError` whose `problems` is a tuple of one line per key
+  (`keep: Input should be a valid integer, unable to parse string as an integer`).
+- **What `route` says** (`parse_params(RouteParams, ...)`): `selector: Value error,
+  selector 'nope' is not registered; known: most-cells`; `parameters: Value error,
+  selector_params: x: Extra inputs are not permitted` (also for `orderer_params`);
+  `orderer=as-chosen` with `min_cells=2` is accepted. The refusal of `min_cells` beside
+  *another* selector was **not** measured (only `most-cells` was registered); algorithms
+  §5.6 says it, and a test with a second selector registered shows it.
+- **Panel's `Select`.** A value that is not among its `options` is assigned with no
+  exception and no warning (warnings as errors), fires the watcher and draws blank; the value
+  stays when `options` are replaced (Panel 1.10.0). Panel 1.9.x, which the py3.10 job
+  resolves, was **not** measured: the page adds an option before it assigns a name.
+- **Presets, by reading** `smc/plugins/presets.py` and `PlatePage.save_preset`: `check_preset`
+  looks at keys and never at values, so a preset naming a selector that is not installed
+  loads; `save_preset` validates the pairs through `parse_params(RouteParams, ...)`, so a
+  preset whose `selector_params` the selector refuses is not written.
+- **The map.** The route is a `figure.line` and a `figure.scatter` of 5 px circles over
+  `route_source` (columns `x`, `y`, `order`, `well`); the hover is the wells' only
+  (`self.hover.renderers = [renderer]` in `_ensure_renderer`), and `RouteStop` holds the
+  order, the well and the position.
+- **The report.** `_route_fields` draws a stop as a rectangle with
+  `<title>name: held</title>` and the number `order + 1`; the route's `assumed` lines, which
+  name a selector or an orderer other than the default (algorithms §5.8), are already under
+  *What was assumed*. `RoutePosition.score` and `.measures` are finite (`SlotValue`'s
+  `allow_inf_nan=False`). `f"{score:.3g}"` of `0.0`, `0.823456` and `1234.5678` is `0`,
+  `0.823` and `1.23e+03`; `smc.data.draw.label_of` writes `3 (0.823)` with the same rule.
+
+### 21.2 Decisions
+
+- **D1 The two names are the tools' own fields, as `Select`s.** In the route row's closed
+  *Choices and command* card, after `labels` and `fields_per_well`, come *Select the fields
+  with* and *Visit the fields in this order*. Each is `tool_fields["route"]["selector"]`
+  (`["orderer"]`): the same instance in the expert view's *Advanced* (D5 of §17.2), so a
+  run, a chain, a preset, the *from …* line, the command and the preset note read it as they
+  read any field. Its `.value` is a `str`: `""` for the default entry, as an empty field
+  means the tool's default everywhere on the page, and the algorithm's name for any other.
+  The default's name is read from the route tool's row (`_field_defaults[("route",
+  "selector")]` through `plain_default`), never written in the page. Options are `{label:
+  value}`: the default first (value `""`), then the others by name; a label is
+  `<name> (default) — <summary>` or `<name> — <summary>`, the summary cut at 80 characters
+  with `…`. `RESULT_CHOICES["route"]` becomes `("labels", "fields_per_well", "selector",
+  "orderer")`, so each Select has the *from …* line of the other choices: *the tool's
+  default: most-cells*, *typed on this page*, *from the preset X*.
+- **D2 The summary of the chosen algorithm is under its Select, whole.** The label is cut
+  and a closed `<select>` clips; a plain-text pane (`_wrapped_text`, hidden while empty)
+  holds the chosen algorithm's summary, or `NOT_INSTALLED` for a value that is not an
+  installed name (D6).
+- **D3 The parameters of the chosen algorithm are fields under its Select.** One group per
+  algorithm, a `pn.Column` built once, only the chosen algorithm's group visible. For an
+  algorithm named in `ROUTE_OWN_PARAMS` (`most-cells`: `min_cells` and `candidate_step_fraction`, the two
+  parameters `RouteParams` keeps for it) the group is `route`'s own two fields, the same
+  instances as in *Advanced* (so a preset and a profile fill them as they do). For any other
+  algorithm, one `TextInput` per row of `describe_params(Params)`: `label` the key,
+  `placeholder` `plain_default(default)`, `description` `<type>  <notes>`, as
+  `_tool_section` makes a tool's own. An algorithm with no row has no group: the built-in
+  orderers show a Select and a summary, nothing else.
+- **D4 The JSON text is the truth, and the group's fields edit it.** `selector_params` and
+  `orderer_params` stay as they are, `TextInput`s in *Advanced*, because a preset, a run and a
+  command carry them as the one pair `selector_params={...}` (§10.1: a preset *is* the
+  command's call). The fields of a group (not the route's own two) follow them both ways, with
+  `_syncing_algorithms` set while the page itself writes, so that neither direction calls the
+  other:
+  - *fields to text*: an edit of a field rewrites the whole text: `algorithm_params_text(model,
+    values)` of the group's fields, `""` when all are blank; a problem it returns is drawn in
+    the group's note;
+  - *text to fields*: a change of the text that the page did not write (a preset's load, an
+    edit in the expert view, the end of `_fill_fields`) puts each key's text in its field and
+    empties the fields the text does not hold: `params_from_text(text, model)`. A key the
+    algorithm lacks, or a text that is not a JSON object, is named in the note
+    (`UNKNOWN_KEYS`, `NOT_A_JSON_OBJECT`) and left in the text: Run refuses it with `route`'s
+    own words, which a rewrite would hide. The next edit of a field rewrites the text whole
+    and the note goes.
+  - **A value the algorithm refuses is kept as typed**: `algorithm_params_text` puts the typed
+    strings in the JSON object (`{"keep": "abc"}`) and returns the problem, so that the
+    run's refusal, `selector_params: keep: Input should be a valid integer …`, names the
+    same key as the note. An accepted value is typed (`20.0`, `true`, `["a", "b"]`): the
+    run document records what `smc run --param 'selector_params={"x": 20}'` records.
+- **D5 A change of algorithm drops what belonged to the old one.** A Select that changes (the
+  operator's, not a load's) empties its own text (`selector_params`, `orderer_params`) and,
+  for the selector, the route fields of the algorithm it left when that is in
+  `ROUTE_OWN_PARAMS` (`min_cells` and `candidate_step_fraction`: `route` refuses a value
+  other than their default beside another selector, so they must not travel hidden), then
+  fills the new group from the empty text. The old group's hidden fields are emptied the
+  next time they are chosen, by the same fill. A preset's load assigns every field as it
+  holds it and is not "a change" (D6).
+- **D6 A name that is not an option is shown, not lost.** A preset or the profile's
+  `[suggest.route]` may name an algorithm that is not installed on this PC (values are never
+  checked on load). Before it assigns such a value to a Select, the page adds the option
+  `{"<name> (not installed)": "<name>"}`, so the Select says what the preset says; the summary
+  pane says `NOT_INSTALLED`; no group is visible; Run is refused by `route` with the
+  registered names (§21.1). The option stays until the page is reloaded.
+- **D7 No algorithm, or one that does not load.** The names are read from the registry once,
+  with the tools, never by the tick (FM-145): `PlatePage.algorithms(kind)`, from
+  `selector_names()` and `orderer_names()`, then `selector(name)` or `orderer(name)` for
+  each, and `describe_params` of its `Params`. An algorithm that raises on either is **no
+  option and a line of `problems`**, in the registry's own words (`selector 'x' could not be
+  imported: ModuleNotFoundError: …`; a `describe_params` failure is `<kind> <name>:
+  <Type>: <message>`), as a plugin's is (FM-113): text, never the exception (FM-98). A kind
+  with **no** installed algorithm (a venv not reinstalled after the entry points were
+  written, FM-112) keeps its generic `TextInput` and one line of `problems`, the registry's
+  refusal for the default name. A `route` that did not load builds none of this.
+- **D8 Where the fields are drawn.** Built with the route row (`_build_results`: the card's
+  `inside` list gains, after a choice that has them, its summary pane, its note and its
+  group); drawn by `_draw_algorithm_choices()`: the summary, the note, which group is
+  visible. Called at the end of the build, from `_on_field_changed` (after the sync of D4 and
+  D5, which it runs first: one watcher per widget, so the order is not Panel's), and at the
+  end of `_fill_fields` after its guard is down (a load must also fill the groups). The tick
+  and `refresh()` do not call it (FM-145, FM-151: another tab's change comes through the
+  shared preset and the shared run document, which this page draws as it does the other
+  fields).
+- **D9 One text for a score.** `score_text(score)` is `f"{score:.3g}"` and `measures_text(
+  measures)` is `key value` pairs sorted by key, at most six, then `, +N more`, both in
+  `smc/plugins/slots/route.py` next to `RoutePosition`; the page's hover and the report
+  import them, and a test pins `score_text` to the rule of `smc.data.draw.label_of`
+  (the drawing of §6 writes `3 (0.823)`).
+- **D10 The map says what a stop is.** `RouteStop` gains `name`, `score` and `measures`
+  (all with defaults, so every caller that builds one by position stays valid);
+  `route_source` gains a `tip` column, one text per stop (`stop_tip`: `A1_r002 (visit 3)`,
+  then `, score 0.823` when it has one, then `; density_per_mm2 41.2, nn_median_um 35` when
+  it has measures); the route's circles are `self.route_points`, and `_ensure_renderer`
+  sets `self.hover.renderers = [renderer, self.route_points]`. The frame renderer stays in
+  no hover's list (FM-174). A stop of the default route has a tip too (its name and visit):
+  the map's route was not hoverable before, and `docs/ui/plate-page.md` says so.
+- **D11 The report shows the score in two places, and only when there is one.** A stop's
+  field `<title>` (hover) ends `, score 0.823` and, with measures, ` (density_per_mm2 41.2,
+  …)` after `name: held`; a well that has a stop with a score gets one line under its
+  counts, `<p class="counts scores">Selector scores: E8_r000 0.823, E8_r001 0.791, and 3
+  more</p>` (the stops in visiting order that have a score, the first 12, then `and N
+  more`; `counts` is the class that already gives the line its style, so the stylesheet is
+  not touched). No visible number is added in the drawing: a 40× field is smaller than a
+  score's text at the number's font. A route with no score on any stop is written **byte
+  for byte as before**. Every name and key in them is escaped (FM-139).
+- **D12 What `route` is sent is what the card shows.** `_typed("route")` is unchanged: the
+  non-empty fields in the tool's order. The command under the row, a click on *Run*, *Run all
+  that are left* and *Save as* read it. `selector=my-selector` and
+  `selector_params={"min_density_per_mm2": 20.0}` are pairs like `labels=["single",
+  "doublet"]`, and the Windows note under every command (`posix_quoting_note`, FM-175) holds
+  for them; on Windows the saved preset is the way in.
+
+### 21.3 The interface
+
+`smc/plugins/slots/route.py` (public, in `__all__`):
+
+```python
+def score_text(score: float) -> str: ...
+
+
+def measures_text(measures: Mapping[str, float], *, limit: int = 6) -> str: ...
+```
+
+`smc/ui/selection.py` (new, pure: no Panel, no Bokeh, no registry; `cast` of the model for
+`parse_params`, with the reason in a comment):
+
+```python
+#: The algorithms whose parameters are fields of RouteParams itself (algorithms §5.6).
+ROUTE_OWN_PARAMS: Mapping[str, tuple[str, ...]] = {
+    "most-cells": ("min_cells", "candidate_step_fraction")
+}
+SELECT_LABEL = "Select the fields with"
+ORDER_LABEL = "Visit the fields in this order"
+LABEL_SUMMARY_CHARS = 80
+NOT_INSTALLED = "{name} is not installed on this PC; installed: {names}."
+UNKNOWN_KEYS = (
+    "{carrier} also holds {keys}, which {name} does not take: Run will refuse it."
+)
+NOT_A_JSON_OBJECT = "{carrier} is not a JSON object ({problem}): Run will refuse it."
+
+
+@dataclass(frozen=True, slots=True)
+class AlgorithmChoice:
+    name: str
+    summary: str
+    params: tuple[tuple[str, str, str, str], ...]  # describe_params rows
+    model: type[BaseModel]
+
+
+def option_label(name: str, summary: str, *, default: bool) -> str: ...
+def options(
+    choices: Sequence[AlgorithmChoice], default_name: str
+) -> dict[str, str]: ...
+def summary_text(
+    value: str, choices: Sequence[AlgorithmChoice], default_name: str
+) -> str: ...
+def algorithm_params_text(
+    model: type[BaseModel], values: Mapping[str, str]
+) -> tuple[str, str | None]: ...
+def params_from_text(
+    text: str, model: type[BaseModel]
+) -> tuple[dict[str, str], tuple[str, ...], str | None]: ...
+def stop_tip(
+    *, name: str, order: int, score: float | None, measures: Mapping[str, float]
+) -> str: ...
+```
+
+- `options`: `{option_label(default, …): ""}` first, then the others sorted by name,
+  `{label: name}`; `default_name` not among `choices` gives no default entry (the
+  caller's fallback, D7).
+- `summary_text(value, …)`: the summary, whitespace collapsed, of `value or default_name`
+  when it is in `choices`; else `NOT_INSTALLED` with the installed names, sorted and joined
+  by `, `.
+- `algorithm_params_text(model, values)`: blank texts (after `strip()`) are left out; none
+  left: `("", None)`. Else the rest go through `parse_params(model, [f"{k}={v.strip()}",
+  …])`: accepted, the text is `json.dumps` of those keys' typed values in the model's
+  field order (`model_dump(mode="json")`), and the problem is `None`; refused, the text is
+  `json.dumps` of `{key: typed string}` and the problem is `"; ".join(exc.problems)`.
+- `params_from_text(text, model)`: blank text gives `({}, (), None)`. A JSON object gives
+  each key the model has as text (`format_param`'s: a `str` as it is, `true`, `null`, a
+  number as `repr`, anything else `json.dumps`), the keys it lacks in the text's order, and
+  `None`. Anything else (not JSON, or JSON that is not an object) gives `({}, (), "<what
+  `json` says, or 'a JSON object is expected'>")`.
+- In the texts, `{carrier}` is `selector_params` or `orderer_params`, `{keys}` the keys
+  joined by `, `, `{name}` the algorithm's name, `{names}` the installed names sorted and
+  joined by `, `, and `{problem}` the third item `params_from_text` returned. Plain text,
+  never markup (FM-139).
+
+`smc/ui/controller.py`:
+
+```python
+class PlatePage:
+    def algorithms(
+        self, kind: Literal["selector", "orderer"]
+    ) -> tuple[AlgorithmChoice, ...]: ...
+```
+
+Read once (like `_tools_found`), `()` when `route` did not load; its findings are
+`_algorithm_problems()` and are appended to `PlateView.problems` after `_plugin_problems()`.
+`RouteStop` gains `name: str = ""`, `score: float | None = None` and `measures:
+tuple[tuple[str, float], ...] = ()` (the record's, sorted by key); `view()` fills them from
+the `RoutePosition`.
+
+`smc/ui/plate_page.py`: `_tool_section` builds `selector` and `orderer` of `route` as
+`pn.widgets.Select(label=…, options=options(...), value=<suggestion or "">,
+sizing_mode="stretch_width")` when `algorithms(kind)` is not empty (a suggestion that is
+not an option is added first, D6), through `self._handler(self._on_field_changed)` like
+every field; `_build_results` adds the summary panes, the notes and the groups (D8);
+`_algorithms: dict[str, _AlgorithmWidgets]` holds, by kind, the Select, the summary, the
+note, the carrier key, and per algorithm its group and its fields; `_syncing_algorithms:
+bool`; `_draw_algorithm_choices()`; `_ensure_option(select, name)`;
+`self.route_points` (the scatter of the route's circles). A `Select` is a locked callback
+(FM-171), and every handler of this section still goes through `_handler`.
+
+`smc/ui/guide.py`: `RESULT_CHOICES["route"]` (D1). `smc/plugins/report/render.py`:
+`_route_fields` and `_panel` (D11).
+
+### 21.4 Tests and failure modes
+
+- `tests/unit/test_slots_route_text.py` (new): `score_text` and `measures_text`
+  (`0.0` is `0`, sorted keys, the limit and `+N more`, an empty mapping is `""`), and the
+  pin of `score_text` against `smc.data.draw.label_of` on `0.0`, `0.823456`, `1234.5678`,
+  `0.00012345`.
+- `tests/unit/test_ui_selection.py` (new): every function of §21.3 on its cases, whole
+  texts (FM-45): the labels and the cut, the default first with value `""`, the summary of
+  a name that is not installed, the typed JSON, the refused value kept as typed with its
+  problem, an empty field left out, the text-to-fields direction for a string, a bool, a
+  list and a key the model lacks, a text that is not an object, `stop_tip`, and the pin
+  `ROUTE_OWN_PARAMS` against `MostCellsParams.model_fields` and `RouteParams.model_fields`.
+  A mutant that changes a rule is killed by one of them.
+- `tests/unit/test_plate_page_algorithms.py` (new): `PlatePage.algorithms` over a registry
+  replaced as `tests/unit/test_route_selection.py` does (`registry.entry_points`): the
+  installed ones with their rows; one that does not import is no option and a problem line
+  in the registry's words; none registered says to reinstall and lists none; read once (a
+  second call and a `view()` import nothing again); `RouteStop` carries the name, the
+  score and the measures of a stop, and a default route's stops have none.
+- `tests/unit/test_plate_page_algorithms_view.py` (new, Panel): D1 to D8 and D12 on the real
+  `route` with a second selector registered: the options and their labels; the default is
+  chosen and a run sends no `selector` pair; choosing the second sends its name and the
+  command shows it; its fields write `selector_params` as typed JSON and a refused value as
+  typed; a text typed in the expert view fills the fields; a key the selector lacks is
+  named in the note and stays in the text; choosing another selector empties the old text
+  and the two most-cells fields, and choosing most-cells again shows them empty; a preset
+  saved with the second selector and its parameters loads into a fresh page (the Select, the
+  fields, the *from the preset* line) and its file holds the one pair; a preset naming an
+  algorithm that is not installed loads, shows `<name> (not installed)` and a run is refused
+  with the installed names; a registry with no selector leaves the text fields and the
+  problem; `run_all` sends the pairs to the chain; a hostile summary, key and description
+  stay plain text (FM-139); `test_every_handler_the_page_registers_is_guarded` and the
+  results view's plain-text test still pass with the new widgets in the screens. The
+  existing assertion that the card's own `TextInput`s are `labels` and `fields_per_well`
+  (`test_a_rows_run_is_the_tools_own_handler_with_the_typed_choices`) stays as it is: the
+  groups are `Column`s, whose fields are not the card's own objects.
+- The map: `route_source` carries a `tip` of the length of the stops' columns, the hover
+  names the wells' renderer **and** `route_points`, the frame renderer is in none
+  (a test beside FM-174's).
+- `tests/unit/test_report.py`: a stop with a score has it in its `<title>`; a well with scored
+  stops has the `scores` line, capped at 12 with `and N more`; a stop with measures and no
+  score has them in its title and no `scores` line; a route with no score is written as
+  before (no `scores`, no `score` in a title); hostile names and keys are escaped.
+- `tests/test_plate_page_algorithms_demo.py` (new, `@pytest.mark.demo`): on `demo-sample`,
+  with a throwaway selector registered, choosing it on the page and running `route` gives a
+  route whose stops have the selector's scores, the map's `tip` names them, `report` writes
+  them, and `nis-export` ends `done` with `positions` equal to the number of stops and
+  the route's names in the route's order (the score travels nowhere into the list).
+- **Failure modes**: FM-113 and FM-112 (a registry read at the page's start: findings, and a
+  stale install), FM-98 and FM-139 (text, plain), FM-145 and FM-151 (the tick reads nothing;
+  every tab draws the shared preset and run document), FM-147 (`label=` on every widget),
+  FM-169 (a disabled Run is a courtesy; the controller refuses), FM-171 (`_handler` on every
+  new watcher, the Select's included), FM-125 (a record's score is what its model reads),
+  FM-174 (the frame renderer in no hover), FM-175 (the command's quoting), FM-45 (whole
+  texts). **A new entry**, named by its text: *a control whose options are read when the page
+  starts and whose value can arrive from a file* (a preset, a profile) *names something the
+  options do not hold*; the *Check*: the option is added before the assignment, whatever
+  the widget library does with a value it does not know (Panel 1.10.0 accepts it silently,
+  older releases were not measured).
+
+### 21.5 What this does not do
+
+- It does not change `route`, the registry, a selector's contract, `parse_params`, the
+  preset file or the run document: the page sends pairs and reads records.
+- It does not preview a selector's choice (that is `route`'s run), draw a stop's
+  `measures` on the map (they are in the hover and in the record), or put a score in
+  `nis-export`'s list (it ignores both, algorithms §5.6).
+- It does not rename the row (*Route through the densest fields*), which is the tool's
+  name for the default; a rename is a separate decision for the owner.
+- It does not install or register an algorithm: entry points are read when smc is
+  installed (FM-112), and a page started before a `pip install -e .` does not see the new
+  one until it is restarted.
+- It does not add `/ui-check` state: the card is closed in every state. The build is looked
+  at once in a one-off session with the card open and a throwaway selector registered,
+  cited in its Report and not committed (§17.10.4's way).
+
+**Not verified (for the owner)**: the choice made at a stand with a selector other than
+the default and its positions loaded in NIS-Elements (#569's last criterion; #570's
+selector or a throwaway one); the hover on the map in a real browser at 1280 px, on the
+stand PC and over RDP; the long option labels in the stand PC's browser; Panel 1.9.x.
