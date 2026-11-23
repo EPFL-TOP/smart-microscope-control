@@ -17,12 +17,14 @@ passed by absolute path (a name is looked up in the working directory and in
 ``$SMC_PROFILES``, and an operator's directory can shadow it). The page is always
 served with ``--dry-run``. The chain of tools that fills the run document runs
 *without* it, on the demo's simulated stage: in dry run the stage does not move,
-every frame is plastic, and no state past the first three could be reached. The two
-guided states (``wells-laid-out``, ``scanned``) press the guided screens' own buttons,
-*Register the plate*, *Lay out the fields* and *Start the scan*, on the dry-run page, where
-each is a run that moves nothing, and so does ``results-all``, which presses the Results
+every frame is plastic, and no state past the first three could be reached. The three
+guided states (``wells-laid-out``, ``wells-timed``, ``scanned``) press the guided screens' own
+buttons, *Register the plate*, *Lay out the fields* and *Start the scan*, on the dry-run page,
+where each is a run that moves nothing, and so does ``results-all``, which presses the Results
 screen's *Run all that are left* over the chain's results (the report and the export, which
-move nothing); the script never presses a tool's own *Run*.
+move nothing); ``wells-timed`` runs one real ``timing`` beside the page, as the chain's steps
+are, and reads the Wells screen's ``Time`` line under the scan's three autofocus modes; the
+script never presses a tool's own *Run*.
 
 Exit codes: 0 every state reached, the server logged no error and stopped by
 Ctrl-C; 1 the job could not be done (no playwright, no browser, the server never
@@ -83,12 +85,14 @@ KILL_GRACE_S = 5.0
 #: that: m5 §17.8); the next four need the results of a real run of the workflow
 #: (``results-all`` presses *Run all that are left* over them, m5 §17.11.4); the next
 #: two are the short-page shots of D12 (m5 §17.2, §17.8), reached alone again, after them; the
-#: last two walk the Wells and Scan screens by their own buttons (m5 §17.10.4, #445): they
-#: need a sample to register the plate from, so ``demo-sample`` only, and nothing of the chain.
+#: last three walk the Wells and Scan screens by their own buttons (m5 §17.10.4, #445), the
+#: middle one reading the Wells screen's ``Time`` line under the scan's three autofocus modes
+#: (§17.12.12 D42, #592): they need a sample to register the plate from, so ``demo-sample``
+#: only, and nothing of the chain.
 ALONE_STATES = ("empty", "wells-selected", "snap", "expert")
 CHAIN_STATES = ("after-density", "with-route", "results-all", "turned")
 SHORT_STATES = ("stand-620", "plate-620")
-GUIDED_STATES = ("wells-laid-out", "scanned")
+GUIDED_STATES = ("wells-laid-out", "wells-timed", "scanned")
 STATE_NAMES = (*ALONE_STATES, *CHAIN_STATES, *SHORT_STATES, *GUIDED_STATES)
 REACHABLE_ALONE = len(ALONE_STATES)
 
@@ -114,6 +118,8 @@ SCREEN_TITLE_OF = {
     # The Scan screen's title names the plan's wells (``guide.scan_title``): the two wells
     # ``wells-laid-out`` types, in plate order.
     "wells-laid-out": "Which wells?",
+    # ``wells-timed`` stays on the Wells screen (m5 §17.12.12 D42).
+    "wells-timed": "Which wells?",
     "scanned": "Scan B2 and B11",
     # The Results screen's title is the screen's own name (``guide.SCREEN_TITLES``).
     "results-all": "Results",
@@ -183,6 +189,21 @@ CHAIN = (
     Step("density"),
 )
 ROUTE_STEP = Step("route", (("labels", json.dumps(["single", "doublet"])),))
+#: The one ``timing`` run of ``wells-timed`` (m5 §17.12.12 D42): one repeat, a real run on the
+#: demo's simulated stage like the chain's steps, since ``timing`` refuses a dry run (its calls
+#: take no time to measure) and so cannot be a click of the page.
+TIMING_STEP = Step("timing", (("repeats", "1"),))
+
+#: The label of the ``scan`` tool's ``autofocus`` field on the Wells screen (``plate_page``'s
+#: ``_AUTOFOCUS_FIELD``, which a test pins this to: this script imports nothing of smc at import).
+AUTOFOCUS_FIELD = "autofocus"
+#: What the Wells screen's known block says once a plan has a duration (``guide.time_line``):
+#: the wait of ``wells-timed`` is for this text, never a delay (FM-162), and it is not in the
+#: unknown line (``Time: not known``), so a plan with no timing does not satisfy it.
+TIME_LINE = re.compile(r"Time: about")
+#: What ``wells-timed`` types into the field for each read of the ``Time`` line: nothing (the
+#: tool's default, ``if-engaged``), then ``off`` and ``required``.
+TIME_READS = (("default", ""), ("off", "off"), ("required", "required"))
 
 
 @dataclass(frozen=True)
@@ -902,6 +923,57 @@ def _act_wells_laid_out(page: Any, stand: Stand) -> None:
     ).first.wait_for()
 
 
+def _time_line(page: Any) -> str:
+    """The Wells screen's ``Time`` line as the page shows it now, or ``not on the page`` (m5 §17.12.12 D42).
+
+    The known block is one pane of several lines (the objective, the fields, the time, the
+    assumptions), so the line is picked out of it by its start. A page that has none is said so
+    and never guessed.
+    """
+    text = str(page.locator("pre").filter(has_text=TIME_LINE).first.inner_text())
+    return next(
+        (line.strip() for line in text.splitlines() if line.startswith("Time:")),
+        "not on the page",
+    )
+
+
+def _act_wells_timed(page: Any, stand: Stand) -> list[tuple[str, str]]:
+    """What the Wells screen's ``Time`` line says under the scan's three autofocus modes, after a real ``timing`` (m5 §17.12.12 D42).
+
+    It goes on from ``wells-laid-out``, on the Wells screen with the plate registered and the
+    two wells typed. ``timing`` runs beside the dry-run page, on the simulated stage, **before**
+    anything is clicked (it refuses a dry run, so it is no click of the page); *Refresh* (in the
+    map's header row) makes the page read the run document again, and *Lay out the fields* once
+    more makes a plan that reads the new timings (the plan before it read none, so it is out of
+    date). The wait is for ``Time: about``, which only the new plan says, and the block before
+    it says ``Time: not known`` or that the plan is out of date. Then the line is read with the
+    ``autofocus`` field left empty, typed ``off`` and typed ``required``, Enter each time and a
+    wait for the line to change (never a delay, FM-162), and the field is put back before the
+    photograph. Returns the three reads, which the summary says: a page cannot hand them to
+    ``state_facts`` through its texts, since the photograph shows the field back as it was.
+    """
+    stand.run_chain([TIMING_STEP])
+    page.get_by_role("button", name="Refresh").click()
+    page.get_by_role("button", name="Lay out the fields").click()
+    page.locator("pre").filter(has_text=TIME_LINE).first.wait_for()
+    box = page.get_by_label(AUTOFOCUS_FIELD, exact=True)
+    first_name = TIME_READS[0][0]
+    readings = [(first_name, _time_line(page))]
+    for name, typed in TIME_READS[1:]:
+        previous = readings[-1][1]
+        box.fill(typed)
+        box.press("Enter")
+        # The line that is not the last one read: the redrawn block, never the old one.
+        page.locator("pre").filter(has_text=TIME_LINE).filter(
+            has_not_text=previous
+        ).first.wait_for()
+        readings.append((name, _time_line(page)))
+    box.fill(TIME_READS[0][1])
+    box.press("Enter")
+    page.locator("pre").filter(has_text=readings[0][1]).first.wait_for()
+    return readings
+
+
 def _act_scanned(page: Any, stand: Stand) -> None:
     """*4. Scan*, then *Start the scan*, and the wait for the run's own outcome line (m5 §17.10.4).
 
@@ -927,6 +999,7 @@ ACTIONS = {
     "stand-620": _act_stand_620,
     "plate-620": _act_plate_620,
     "wells-laid-out": _act_wells_laid_out,
+    "wells-timed": _act_wells_timed,
     "scanned": _act_scanned,
 }
 
@@ -982,7 +1055,8 @@ def _guided_parts(page: Any, state: str) -> list[tuple[str, Any]]:
     summary says whether its title and its first action, *Lay out the fields* or *Start the
     scan*, are inside the page, and the figures and the drive bar as for any other state.
     """
-    action = "Lay out the fields" if state == "wells-laid-out" else "Start the scan"
+    # The Wells screen's first action is *Lay out the fields*, for both states that stay on it.
+    action = "Start the scan" if state == "scanned" else "Lay out the fields"
     return [
         *_frame_parts(page),
         ("title", page.locator("pre").filter(has_text=SCREEN_TITLE_OF[state])),
@@ -1152,12 +1226,23 @@ def results_facts(texts: Sequence[str]) -> list[str]:
     return lines
 
 
-def state_facts(name: str, texts: Sequence[str]) -> list[str]:
-    """The facts a state is about, by name: ``scanned`` the scan's, ``results-all`` the chain's; none for the others."""
+def time_facts(readings: Sequence[tuple[str, str]]) -> list[str]:
+    """What ``wells-timed`` is about: the ``Time`` line under each autofocus mode it read, as ``time (autofocus <mode>): <line>`` (m5 §17.12.12 D42)."""
+    return [f"time (autofocus {mode}): {line}" for mode, line in readings]
+
+
+def state_facts(
+    name: str,
+    texts: Sequence[str],
+    readings: Sequence[tuple[str, str]] = (),
+) -> list[str]:
+    """The facts a state is about, by name: ``scanned`` the scan's, ``results-all`` the chain's, ``wells-timed`` the three ``Time`` lines its action read (``readings``); none for the others."""
     if name == "scanned":
         return scan_facts(texts)
     if name == "results-all":
         return results_facts(texts)
+    if name == "wells-timed":
+        return time_facts(readings)
     return []
 
 
@@ -1225,7 +1310,9 @@ def drive(
             records.append(StateRecord(plan.name, False, plan.reason))
             continue
         try:
-            ACTIONS[plan.name](page, stand)
+            # An action may hand back what it read and the photograph cannot show
+            # (``wells-timed``: three reads of one line, with the field put back).
+            readings = ACTIONS[plan.name](page, stand) or []
             page.wait_for_timeout(SETTLE_MS)
             page.screenshot(path=str(out / f"{plan.name}.png"))
             page.screenshot(path=str(out / f"{plan.name}-full.png"), full_page=True)
@@ -1258,7 +1345,7 @@ def drive(
                 wells,
                 texts,
                 on_screen,
-                state_facts(plan.name, texts),
+                state_facts(plan.name, texts, readings),
             )
         )
     return records, errors, warnings[0]
