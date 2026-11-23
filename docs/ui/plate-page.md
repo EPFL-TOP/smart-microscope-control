@@ -697,9 +697,38 @@ all that are left.` From the top:
     line that says where its value comes from (`from the profile's suggestions`, `from the
     preset <name>`, `typed on this page`, or `the tool's default: ...`), and the `smc run` line
     the row makes, with the note that the line is quoted for a POSIX shell on a Windows PC. The
-    choices are `detector` for *Count the cells* and `labels` and `fields_per_well` for *Route*;
-    a step with none holds the command only. They are **the tools' own fields**: what you type
-    here is what the expert view's section holds, and the other way round;
+    choices are `detector` for *Count the cells* and `labels`, `fields_per_well` and the two
+    algorithms (next) for *Route*; a step with none holds the command only. They are **the
+    tools' own fields**: what you type here is what the expert view's section holds, and the
+    other way round;
+  - on *Route*'s card, **the two algorithms** (m5 §21): *Select the fields with* and *Visit the
+    fields in this order* are lists of the selectors and the orderers **installed on this PC**,
+    each entry `<name> — <summary>` (the summary cut at 80 characters), the tool's default
+    first and marked `(default)`: a choice of the default sends nothing, and any other sends
+    `selector=<name>` (`orderer=<name>`), which the line under the list and the command show.
+    Under the list, the chosen algorithm's **summary, whole**. Under that, its **parameters as
+    fields**, one per parameter, an empty field meaning the algorithm's own default (the
+    placeholder): `most-cells` shows `min_cells` and `candidate_step_fraction`, which are the
+    tool's own fields of those names, and another selector shows one field for each parameter
+    it declares, with its type and bounds in the field's description. A selector's fields write
+    **one** JSON text, `selector_params` (`orderer_params`), which the expert view shows and
+    edits and a preset keeps as the one pair `selector_params={...}`: a value the algorithm
+    accepts is written typed (`20` as `20.0`, `true`, `["a", "b"]`), a value it refuses is
+    written **as typed** and named under the fields (`keep: Input should be a valid integer ...`),
+    so that Run's refusal names the same key. A text typed in the expert view fills the fields;
+    a key the algorithm does not take, or a text that is not a JSON object, is named under the
+    fields and **left in the text**, and the next edit of a field writes the text again from the
+    fields. **Choosing another algorithm empties** the old text and, for the selector,
+    `min_cells` and `candidate_step_fraction` (the tool refuses them beside another selector);
+    **loading a preset is not a choice**: every field takes the preset's value. A name that a
+    preset or the profile gives and this PC lacks is **shown** (`<name> (not installed)`), its
+    summary says the installed ones, and Run is refused by the tool with the same names (the
+    default named explicitly, `selector=most-cells`, is installed and reads `most-cells (default,
+    named)`). The
+    algorithms are read **once, when the page starts**: one installed afterwards (`pip install
+    -e .`) is there after the page is restarted, and one that does not import is no entry and
+    a line of the problems under the header; with no selector at all the field stays the
+    generic text field and the problems line says to run `pip install -e .`;
 - **Where the files are**: one line for each file a step wrote, `<the step's name>: <path>`
   (`Scan frames`, *Count the cells*, *Report*, *Export for NIS-Elements*), `No step has written a
   file yet.` before any; a stopped or failed step names none. **A file inside the run document's
@@ -851,8 +880,12 @@ high (the footprint's bounding box in stage axes, so a camera turned by another 
 than 0° or 90° shows a box larger than its frame), centred on the field. They are the
 plan's own wells, whatever the *Wells* box says now: the plan is what `scan` will do, and
 a selection changed since has not changed it. The title ends with the count, `; scan plan:
-72 fields in 2 wells`. The route is drawn over the fields; no field is hoverable, labelled
-or joined to the next (the plan's order is on the card, in the order of its wells).
+72 fields in 2 wells`. The route is drawn over the fields; no field of the plan is hoverable,
+labelled or joined to the next (the plan's order is on the card, in the order of its wells).
+**The route's stops are hoverable** (m5 §21): the hover on a stop's circle says its name and
+its visit number, `A1_r002 (visit 3)`, then `, score 0.823` when the selector gave one and
+`; density_per_mm2 41.2, nn_median_um 35` for its measures (at most six, then `, +N more`). The
+default selector gives neither, so its stops say the name and the visit.
 **A plan that is not usable draws nothing**, as the density does not: stale (the plate or
 the timings were produced again since: the checklist says so and the card is marked),
 made on another stand, or a dry run's on a page that is not one. **A plan of more than

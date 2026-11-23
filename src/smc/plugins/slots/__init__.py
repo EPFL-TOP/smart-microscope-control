@@ -40,7 +40,13 @@ from smc.plugins.slots.plate import (
 )
 from smc.plugins.slots.plate_check import CheckedWell, PlateCheck, PlateCheckResult
 from smc.plugins.slots.report import ReportResult
-from smc.plugins.slots.route import OffsetFromFocus, RoutePosition, RouteResult
+from smc.plugins.slots.route import (
+    OffsetFromFocus,
+    RoutePosition,
+    RouteResult,
+    measures_text,
+    score_text,
+)
 from smc.plugins.slots.scan import (
     FailedField,
     FocusState,
@@ -95,7 +101,9 @@ __all__ = [
     "holder_estimate",
     "load_cells",
     "load_frame",
+    "measures_text",
     "normalise_well",
     "refuse_image_side",
+    "score_text",
     "well_geometry",
 ]

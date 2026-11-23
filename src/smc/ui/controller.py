@@ -129,6 +129,7 @@ from smc.plugins.slots.plate import (
     turned_well,
 )
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
+from smc.selection import SelectionError, registry
 from smc.ui.frames import Frame
 from smc.ui.guide import (
     ASSUMED_LINE_CHARS,
@@ -199,6 +200,7 @@ from smc.ui.guide import (
     walls_centres_problem,
     walls_square_wells,
 )
+from smc.ui.selection import AlgorithmChoice
 
 if TYPE_CHECKING:
     from types import TracebackType
@@ -448,12 +450,21 @@ class WellView:
 
 @dataclass(frozen=True, slots=True)
 class RouteStop:
-    """One stop of the route, in stage µm."""
+    """One stop of the route, in stage µm, with what the selector said of it.
+
+    ``name``, ``score`` and ``measures`` are the record's own (algorithms §5.2): the map's
+    hover says them (m5 §21, D10). ``score`` is ``None`` when the selector gave none, and a
+    score of ``0.0`` is a score; ``measures`` are sorted by key. All three have defaults so that
+    a stop built by position stays valid.
+    """
 
     order: int
     well: str
     x_um: float
     y_um: float
+    name: str = ""
+    score: float | None = None
+    measures: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1829,6 +1840,11 @@ class PlatePage:
         self._entry_points = None if entry_points is None else list(entry_points)
         self._registry_found: Registry | None = None
         self._tools_found: tuple[tuple[ToolView, ...], tuple[str, ...]] | None = None
+        # The selectors and the orderers `route` can be given by name, read with the
+        # tools and never again: entry points change only with an install (FM-112).
+        self._algorithms_found: (
+            tuple[dict[str, tuple[AlgorithmChoice, ...]], tuple[str, ...]] | None
+        ) = None
         # Checked once, against the registry, before any tool is described: a tool's
         # form starts with a suggested value (m5 §8.3).
         self._suggested, self._suggest_problems = self._check_suggestions(profile)
@@ -5138,6 +5154,85 @@ class PlatePage:
             self._tools_found = (tuple(views), tuple(problems))
         return self._tools_found
 
+    def algorithms(
+        self, kind: Literal["selector", "orderer"]
+    ) -> tuple[AlgorithmChoice, ...]:
+        """The installed selectors or orderers of ``route``, by name, each with its summary and its parameters' rows (m5 §21, D7).
+
+        Read once, with the tools: the page's tick never reads the registry (FM-145). ``()``
+        when ``route`` did not load or its parameters have no such name (a ``route`` of another
+        kind), and for a kind with no algorithm that loads; what could not be read is a line of
+        ``view().problems``, never an error here (FM-113).
+        """
+        return self._algorithms_and_problems()[0][kind]
+
+    def _algorithm_problems(self) -> tuple[str, ...]:
+        """A line for each algorithm that did not load, and for a kind with none registered."""
+        return self._algorithms_and_problems()[1]
+
+    def _algorithms_and_problems(
+        self,
+    ) -> tuple[dict[str, tuple[AlgorithmChoice, ...]], tuple[str, ...]]:
+        if self._algorithms_found is None:
+            self._algorithms_found = self._read_algorithms()
+        return self._algorithms_found
+
+    def _read_algorithms(
+        self,
+    ) -> tuple[dict[str, tuple[AlgorithmChoice, ...]], tuple[str, ...]]:
+        """What the registry holds for each name of ``route`` that has a field, and the findings.
+
+        The names first (nothing is imported), then each algorithm on its own: a class that
+        does not import, breaks a rule or has parameters that cannot be described is a finding
+        and the others load, as a plugin's is (FM-113). A finding is text, never the exception
+        (FM-98): the registry's message as it stands for what it refused, ``<kind> <name>:
+        <Type>: <message>`` for anything else. A kind with no name at all gets the refusal the
+        registry gives for the route's default name, which says to reinstall (FM-112).
+        """
+        found: dict[str, tuple[AlgorithmChoice, ...]] = {"selector": (), "orderer": ()}
+        problems: list[str] = []
+        route = self._registry().plugins.get("route")
+        if route is None:
+            return found, ()
+        fields = route.plugin.Params.model_fields
+        for kind, names, load_one in (
+            ("selector", registry.selector_names, registry.selector),
+            ("orderer", registry.orderer_names, registry.orderer),
+        ):
+            if kind not in fields:
+                continue
+            installed = names()
+            if not installed:
+                try:
+                    load_one(str(fields[kind].get_default(call_default_factory=True)))
+                except SelectionError as exc:
+                    problems.append(_one_line(exc))
+                except Exception as exc:
+                    problems.append(f"{kind}: {type(exc).__name__}: {_one_line(exc)}")
+                continue
+            choices: list[AlgorithmChoice] = []
+            for name in installed:
+                try:
+                    algorithm = load_one(name)
+                    model = algorithm.Params
+                    # `describe_params` is typed for PluginParams and reads only
+                    # `model_fields`, which a selector's or an orderer's Params has too.
+                    rows = describe_params(cast("type[PluginParams]", model))
+                    summary = algorithm.summary
+                except SelectionError as exc:
+                    problems.append(_one_line(exc))
+                    continue
+                except Exception as exc:
+                    # Third-party code: a `Params` that cannot be described is a finding,
+                    # not the end of the page (FM-113).
+                    problems.append(
+                        f"{kind} {name}: {type(exc).__name__}: {_one_line(exc)}"
+                    )
+                    continue
+                choices.append(AlgorithmChoice(name, summary, tuple(rows), model))
+            found[kind] = tuple(choices)
+        return found, tuple(problems)
+
     def view(self) -> PlateView:
         """A snapshot built from a fresh read of the run document; it raises nothing for it.
 
@@ -5188,7 +5283,15 @@ class PlatePage:
             ()
             if route is None
             else tuple(
-                RouteStop(p.order, p.well, p.x_um, p.y_um)
+                RouteStop(
+                    p.order,
+                    p.well,
+                    p.x_um,
+                    p.y_um,
+                    name=p.name,
+                    score=p.score,
+                    measures=tuple(sorted(p.measures.items())),
+                )
                 for p in sorted(route.positions, key=lambda p: p.order)
             )
         )
@@ -5225,7 +5328,12 @@ class PlatePage:
             route=stops,
             checklist=checklist,
             blocked=blocked,
-            problems=(*problems, *self._plugin_problems(), *self._suggest_problems),
+            problems=(
+                *problems,
+                *self._plugin_problems(),
+                *self._algorithm_problems(),
+                *self._suggest_problems,
+            ),
             cards=cards,
             next_step=self._next_step(checklist, blocked, cards, doc),
             replaces=self._replace_notes(doc),

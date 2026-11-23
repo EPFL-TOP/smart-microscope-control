@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import useq
@@ -16,7 +17,39 @@ from smc.plugins.api import PluginResult
 from smc.plugins.geometry import Matrix2
 from smc.plugins.slots.base import SlotValue
 
-__all__ = ["OffsetFromFocus", "RoutePosition", "RouteResult"]
+__all__ = [
+    "OffsetFromFocus",
+    "RoutePosition",
+    "RouteResult",
+    "measures_text",
+    "score_text",
+]
+
+
+def score_text(score: float) -> str:
+    """A selector's score as the page, the report and the drawing write it: three significant digits.
+
+    The rule is ``smc.data.draw.label_of``'s, so that the number on the map's hover
+    and in the report's titles is the number printed beside a stop in the drawing
+    (m5 §21, D9; a test pins the two together). A score of ``0.0`` is ``0``: it is
+    a score, and the caller tests ``is None``, never falsiness.
+    """
+    return f"{score:.3g}"
+
+
+def measures_text(measures: Mapping[str, float], *, limit: int = 6) -> str:
+    """A stop's measures as ``key value`` pairs sorted by key, the first ``limit``, then ``, +N more``.
+
+    A selector may record many numbers and a hover or a title holds a line, so the
+    text is bounded and the omitted count is said (FM-74); sorted so that two
+    stops read alike whatever order the selector filled the mapping in. ``""``
+    for no measures: the caller decides whether that leaves out the parentheses.
+    """
+    pairs = [f"{key} {score_text(value)}" for key, value in sorted(measures.items())]
+    shown = ", ".join(pairs[:limit])
+    if len(pairs) > limit:
+        shown += f", +{len(pairs) - limit} more"
+    return shown
 
 
 class OffsetFromFocus(SlotValue):

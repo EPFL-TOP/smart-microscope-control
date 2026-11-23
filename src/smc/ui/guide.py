@@ -2294,7 +2294,9 @@ RESULT_OPTIONAL_READS: Mapping[str, tuple[str, ...]] = {
 #: The parameters a row shows under *Choices and command*, which a profile or a preset fills.
 RESULT_CHOICES: Mapping[str, tuple[str, ...]] = {
     "cells": ("detector",),
-    "route": ("labels", "fields_per_well"),
+    # The two names are Selects over the installed algorithms (m5 §21, D1): the row's card
+    # holds each with its summary and the chosen algorithm's fields.
+    "route": ("labels", "fields_per_well", "selector", "orderer"),
 }
 
 #: What a row says while the scan it reads has not run: its step is the screen before.

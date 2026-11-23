@@ -709,6 +709,10 @@ def test_the_autofocus_placeholder_has_no_quotes_and_neither_has_any_string_defa
     assert view.tool_fields["scan"]["autofocus"].placeholder == "if-engaged"
     quoted = 0
     for (tool, key), default in view._field_defaults.items():
+        # `route`'s two algorithm names are Selects: their default is an option's label, not a
+        # placeholder (m5 §21, D1), and the label is a plain-text pane of its own.
+        if isinstance(view.tool_fields[tool][key], pn.widgets.Select):
+            continue
         placeholder = view.tool_fields[tool][key].placeholder
         assert placeholder == plain_default(default), (tool, key)
         if default[:1] in ("'", '"'):
@@ -1761,7 +1765,7 @@ def test_the_imaged_layer_is_a_green_rect_over_the_fields_under_the_route_and_no
         assert green.fill_color != orange.fill_color
         # Visible over the orange: not clear, and more opaque than the plan's fields.
         assert 0.0 < orange.fill_alpha < green.fill_alpha < 1.0
-        assert view.hover.renderers == [view.wells_renderer]
+        assert view.hover.renderers == [view.wells_renderer, view.route_points]
 
 
 def test_a_dry_run_scan_marks_no_field_while_it_runs(
@@ -1953,6 +1957,8 @@ def test_each_of_the_two_fields_has_its_words_above_it_and_a_tuple_default_has_n
     )
     # No field of any tool shows a tuple's repr as its default (`('single',)`, #446's Report).
     for tool, key in view._field_defaults:
+        if isinstance(view.tool_fields[tool][key], pn.widgets.Select):
+            continue  # a Select has options, not a placeholder (m5 §21, D1)
         placeholder = view.tool_fields[tool][key].placeholder
         assert not (placeholder.startswith("(") and placeholder.endswith(",)")), (
             tool,

@@ -113,6 +113,11 @@ list: in `cmd.exe` and PowerShell 5.1 the quotes need the escaping of the
 - **`score` and `measures`** of a choice are written on its stop when the selector gave
   them, and left out of the JSON when it did not (the default route's is written as it
   always was). `nis-export` ignores them.
+- **The plate page offers it.** The *Route* row of the Results screen lists the installed
+  selectors and orderers with their summaries, shows the chosen one's parameters as fields
+  that write `selector_params` (`orderer_params`), and a preset keeps the pair; a stop's
+  score and measures are on the map's hover and in the report
+  ([the page](../ui/plate-page.md), [the report](report.md)).
 
 How to write one, with a run folder on a laptop and no stand, is the collaborator's
 guide; the contract is [`algorithms.md`](../design/algorithms.md) §5.

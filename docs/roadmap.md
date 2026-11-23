@@ -194,8 +194,11 @@ move, and only one program holds the stand at a time, so the page's
   load in NIS-Elements; whether beads were in view at those points was not
   settled ([session 5](hardware/nikon-ti2.md#scans-and-the-page)).
 - **Open.** A selector chosen in `route` by a parameter (#567) and on the
-  plate page (#569), and the owner's wiring issue that carries a selector
-  such as #570's to a stand. When the fields are chosen on a 10× scan and
+  plate page (#569) are built: the page lists the installed selectors and
+  orderers, shows a chosen one's parameters as fields, keeps them in a preset
+  and shows a stop's score on the map and in the report; what is open is the
+  choice made at a stand, and the owner's wiring issue that carries a selector
+  such as #570's there. When the fields are chosen on a 10× scan and
   imaged at 40×, the offset between the two objectives decides where they
   land: `objective-offsets` read three wells with a spread of 10.89 µm
   against a bound of 2.25 µm, so it wrote nothing (#548,

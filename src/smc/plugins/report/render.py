@@ -54,7 +54,9 @@ from smc.plugins.slots import (
     ScanPlanResult,
     ScanResult,
     WellGeometry,
+    measures_text,
     normalise_well,
+    score_text,
     well_geometry,
 )
 
@@ -857,6 +859,7 @@ def _panel(
         f'<section class="well-detail" id="w{k}" data-well="{escape(well)}">'
         f"<h3>{escape(well)}</h3>"
         f'<p class="counts">{_counts_line(reported, scene.density)}</p>'
+        f"{_scores_line(stops_here)}"
         f'<svg class="well-panel" role="img" '
         f'aria-label="Well {escape(well)}: its fields, its cells and the route" '
         f'viewBox="{_plate_num(-view)} {_plate_num(-view)} '
@@ -865,6 +868,32 @@ def _panel(
         f'<p class="caption">{_caption(reported, len(failed_here), drawn, sum(total.values()), outside, scene.cap)}</p>'
         "</section>"
     )
+
+
+#: The most stops a well's scores line names; the rest are counted (FM-74).
+_SCORES_LINE_STOPS = 12
+
+
+def _scores_line(stops_here: Sequence[RoutePosition]) -> str:
+    """The selector's scores of one well in visiting order, or nothing when no stop has one.
+
+    The number is in a stop's hover as well, but a hover is not printed: this line
+    is what a printed report holds. Bounded at ``_SCORES_LINE_STOPS`` entries then
+    ``and N more``, since a route can put hundreds of stops in a well (FM-74). The
+    ``counts`` class gives it the style of the line above, so the stylesheet is not
+    touched. Names are escaped (FM-139); a stop without a score is left out, and a
+    well with none gets no line, so a default route's page is unchanged.
+    """
+    scored = [(stop.name, stop.score) for stop in stops_here if stop.score is not None]
+    if not scored:
+        return ""
+    text = ", ".join(
+        f"{escape(name)} {score_text(score)}"
+        for name, score in scored[:_SCORES_LINE_STOPS]
+    )
+    if len(scored) > _SCORES_LINE_STOPS:
+        text += f", and {len(scored) - _SCORES_LINE_STOPS} more"
+    return f'<p class="counts scores">Selector scores: {text}</p>'
 
 
 def _frame_corners(
@@ -1033,6 +1062,14 @@ def _route_fields(
             ", ".join(f"{n} {label}" for label, n in stop.counts.items())
             or "no wanted cell"
         )
+        # The selector's own score and measures (algorithms §5.2), in the hover only: a
+        # 40x field is smaller than a score's text at the number's font. `is not None`
+        # and not falsy, a score of 0.0 is a score; a route whose stops have neither is
+        # written exactly as before.
+        if stop.score is not None:
+            held += f", score {score_text(stop.score)}"
+        if stop.measures:
+            held += f" ({measures_text(stop.measures)})"
         fields.append(
             f'<path class="field" data-order="{stop.order}" data-name="{escape(stop.name)}" '
             f'd="{_polygon(corners, _stop_num)}">'

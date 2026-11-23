@@ -34,7 +34,9 @@ The work is split between two people. **You** write the algorithm: data in, a de
 out, tested on synthetic data and looked at on a real dataset. **The owner** (the
 repository's maintainer) connects the result to the tool that drives the microscope, in a second issue, and checks it at
 the stand. What you write runs unchanged there, because the tool that drives the stand
-(`route`) calls your selector by name.
+(`route`) calls your selector by name, and the plate page lists the installed selectors
+and orderers with their summaries and parameters, so that the owner chooses yours there
+(`pip install -e .` once, so that its entry point is known, then restart the page).
 
 The kit that makes this possible on a laptop:
 
