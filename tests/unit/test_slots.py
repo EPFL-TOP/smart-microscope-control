@@ -1567,8 +1567,10 @@ SLOTS_MAP = {
     "holder_estimate",
     "load_cells",
     "load_frame",
+    "measures_text",
     "normalise_well",
     "refuse_image_side",
+    "score_text",
     "well_geometry",
 }
 
