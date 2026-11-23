@@ -1230,6 +1230,133 @@ def test_the_route_is_drawn_in_the_order_of_its_stops_whatever_the_list_order() 
     assert re.findall(r'class="order"[^>]*>(\d+)</text>', text) == ["1", "2", "3", "4"]
 
 
+def _scored(
+    records: Records,
+    stops: Sequence[tuple[str, str, float | None, dict[str, float]]],
+    *,
+    base: int = 0,
+) -> tuple[str, Audit]:
+    """A route of ``(well, name, score, measures)`` stops, laid on a small grid of each well.
+
+    The grid keeps every stop inside its well, so the page reads as a report of
+    a real route and the only thing that differs between two tests is the score.
+    """
+    positions = []
+    for k, (well, name, score, measures) in enumerate(stops):
+        cx, cy = _centre(well, records.rotation_deg)
+        positions.append(
+            RoutePosition(
+                order=base + k,
+                well=well,
+                name=name,
+                x_um=cx + (k % 5 - 2) * 500.0,
+                y_um=cy + (k // 5 % 3 - 1) * 500.0,
+                z_um=None,
+                pfs_offset=None,
+                counts={"single": 1},
+                score=score,
+                measures=measures,
+            )
+        )
+    route = _route(records).model_copy(update={"positions": tuple(positions)})
+    return _page(records, route=route)
+
+
+def test_a_stop_with_a_score_has_it_in_its_title() -> None:
+    text, _ = _scored(
+        _records(),
+        [
+            (
+                "A1",
+                "A1_r000",
+                0.823456,
+                {"nn_median_um": 35.0, "density_per_mm2": 41.2},
+            ),
+            ("A1", "A1_r001", 0.0, {}),
+            ("A2", "A2_r000", None, {}),
+        ],
+    )
+    assert (
+        "<title>A1_r000: 1 single, score 0.823 (density_per_mm2 41.2, nn_median_um 35)"
+        "</title>"
+    ) in text
+    # A score of 0.0 is a score: it is written, and no empty parentheses follow it.
+    assert "<title>A1_r001: 1 single, score 0</title>" in text
+    assert "<title>A2_r000: 1 single</title>" in text
+
+
+def test_a_well_with_scored_stops_has_a_scores_line_that_stops_at_twelve() -> None:
+    scores = [(f"A1_r{i:03d}", i / 10) for i in range(15)]
+    stops = [("A1", name, score, {}) for name, score in scores]
+    text, page = _scored(_records(), [*stops, ("A2", "A2_r000", None, {})])
+    names = [f"A1_r{i:03d}" for i in range(12)]
+    shown = [
+        "0",
+        "0.1",
+        "0.2",
+        "0.3",
+        "0.4",
+        "0.5",
+        "0.6",
+        "0.7",
+        "0.8",
+        "0.9",
+        "1",
+        "1.1",
+    ]
+    line = ", ".join(f"{n} {s}" for n, s in zip(names, shown, strict=True))
+    assert f'<p class="counts scores">Selector scores: {line}, and 3 more</p>' in text
+    # Only the well that has a score gets the line, and it follows the counts line.
+    assert text.count('class="counts scores"') == 1
+    assert re.search(
+        r'<h3>A1</h3><p class="counts">[^<]*</p><p class="counts scores">', text
+    )
+    assert page.unbalanced == []
+
+
+def test_a_well_with_exactly_twelve_scored_stops_says_no_more_and_skips_unscored_ones() -> (
+    None
+):
+    stops: list[tuple[str, str, float | None, dict[str, float]]] = [
+        ("A1", f"A1_r{i:03d}", 0.5, {}) for i in range(12)
+    ]
+    stops.insert(3, ("A1", "A1_unscored", None, {}))
+    text, _ = _scored(_records(), stops)
+    (line,) = re.findall(r'<p class="counts scores">(.*?)</p>', text)
+    assert line.startswith("Selector scores: A1_r000 0.5, A1_r001 0.5, ")
+    assert line.endswith("A1_r011 0.5")
+    assert "more" not in line
+    assert "A1_unscored" not in line
+
+
+def test_measures_without_a_score_are_in_the_title_and_make_no_scores_line() -> None:
+    text, _ = _scored(_records(), [("A1", "A1_r000", None, {"keep_um": 12.5})])
+    assert "<title>A1_r000: 1 single (keep_um 12.5)</title>" in text
+    assert "scores" not in text
+
+
+def test_a_route_with_no_score_has_no_scores_line_and_no_score_in_a_title() -> None:
+    records = _records()
+    text, _ = _page(records, route=_route(records))
+    assert "scores" not in text
+    assert ", score" not in text
+
+
+def test_names_and_measure_keys_in_the_titles_and_the_scores_line_are_escaped() -> None:
+    records = _records()
+    text, page = _scored(
+        records, [("A1", _HOSTILE, 0.5, {_HOSTILE: 2.0}), ("A2", "A2_r000", None, {})]
+    )
+    escaped = "&lt;img src=x onerror=alert(1)&gt;&quot;&#x27;"
+    # The stop's name in its attribute and its title, and in the scores line; the key
+    # of the measure in the title.
+    assert f"<title>{escaped}: 1 single, score 0.5 ({escaped} 2)</title>" in text
+    assert f"Selector scores: {escaped} 0.5</p>" in text
+    assert "<img" not in text
+    assert not any("onerror" in attrs for _, attrs in page.tags)
+    assert page.unbalanced == []
+
+
 def test_the_report_without_a_route_says_so() -> None:
     text, page = _page(_records())
     assert (
