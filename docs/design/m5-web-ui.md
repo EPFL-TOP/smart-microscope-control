@@ -23,7 +23,10 @@
   side, the expert view behind a switch; built by #443 to #446; B4's interface, §17.11,
   by #446's plan, 2026-11-12); the Results screen's choice of the selector and the
   orderer of `route`, and a stop's score on the map and in the report, fixed by #569's
-  plan (§21, 2026-11-23).
+  plan (§21, 2026-11-23); the leftovers of the session-5 fixes (a stop's call names on
+  the page, the strip's STOP line, the lock notes while the stand is halted, the card's
+  cap on assumed lines, a `/ui-check` state for the time line) fixed by #592's plan
+  (§17.12.12, 2026-11-23).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -255,7 +258,7 @@ give a card of 620,035 characters, an `error` of 100 kB one of 100,038, and an
 | What | Bound | When it is cut |
 |---|---|---|
 | `lines` | at most 8, `_CARD_LINES` | then `… <n> more` as the last line (as today) |
-| `assumed` | at most 8, the same constant | then `… <n> more` as its **last entry**, so `card_text` shows `assumed: … 3 more` and needs no new code |
+| `assumed` | at most 12, `_CARD_ASSUMED_LINES` (§17.12.12 D41: it was 8, the constant of `lines`) | then `… <n> more` as its **last entry**, so `card_text` shows `assumed: … 3 more` and needs no new code |
 | a key, a string value, `profile` | 80 characters, `_CARD_CHARS` | the text and `…` (as today; `profile` is new) |
 | an assumption, `error` | 600 characters, `_CARD_TEXT_CHARS` (new) | the text and `…` |
 
@@ -267,7 +270,8 @@ line for 1536 stops; measured), so no assumption a plugin writes today is cut,
 and an error is a diagnosis whose end often says what to do, so it is cut late.
 The worst card is about 7,000 characters (a prototype of the format, not the
 code: a header with an 80-character profile, 8 lines of 166, 8 assumptions of
-610, an error of 607), two orders of magnitude under the cases above. The run
+610, an error of 607), two orders of magnitude under the cases above; with the
+12 assumptions of §17.12.12 D41 it is about 9,400. The run
 document and the log hold the rest; a card never changes a record.
 `profile` is cut so that the bound is the card's, not only two of its fields: a
 profile longer than 80 characters then differs from `stand` and is named on
@@ -5492,7 +5496,8 @@ after the other (both edit `controller.py`, `guide.py` and `plate_page.py`):
 - **D20 Plain words and local time.** The outcome line names a tool by its plain
   title (`TOOL_TITLES`), never its plugin name; a tool's exception is its one-line
   message without the type name (the type goes to the log) and with no API call in it
-  (`resume()`, `Microscope.stop()`: the page says *press Resume*, #544); the guided screens give
+  (`resume()`, `Microscope.stop()`: the page says *press Resume*, #544; `stop()` and
+  `wait()` too, §17.12.12 D36); the guided screens give
   times in local time to the minute (`local_time`); the expert view's cards keep UTC.
   The Wells screen says in plain words what `coverage` and `autofocus` are, on a line
   above each (the fields are the tools' own, one instance, D5, and keep their names in
@@ -5849,7 +5854,10 @@ is renamed or removed, and D23's "what stays" is answered for one case (the firs
 - **D25 The STOP note names the segments.** `PageStatus` gains `stop_segments_um:
   tuple[tuple[str, float], ...] = ()` (last field): `(role, segment_um)` for each role of
   `stop_refused_by` whose key is set (`xy_stage` with `max_segment_um`, `focus` with
-  `max_z_segment_um`), in the profile's order. `stop_refused_note(roles, segments_um)`
+  `max_z_segment_um`), in the profile's order. **The strip's words below are replaced by
+  §17.12.12 D38** (the strip says that a move is cut, and the note after a STOP and the Scan
+  lead say where and by how much); the field, the order and the unsegmented text stand.
+  `stop_refused_note(roles, segments_um)`
   (`plate_page.py`) is the strip's words: with no role cut they are as they were (`a move
   under way runs to its target`); a cut role says `an xy_stage move ends at the end of its
   current segment (sent in segments of at most 500 µm)` (`a focus move …` for focus; the
@@ -6111,6 +6119,266 @@ CHAIN_ASSUMED = "Assumed: {line}"
 - **Not here.** A way to give a checkpoint up without running the scan; notes under *Calibrate
   the camera* and *Register the plate* (above); `Left` per well (D23); the strip's three lines
   on the Ti2-E's profile (#529).
+
+#### 17.12.12 Leftovers of the session-5 fixes: a stop's call names, the strip's STOP line, the lock notes while halted, the card's cap on assumed lines (#592, 2026-11-23)
+
+Fixed by #592's plan, from the Reports of #578, #582, #588 and #589 and the lane notes of
+2026-11-18. None of it blocks a session. Of the issue's five items, items 1 to 3 are decided
+here; item 4 (a profile default for *Plate lies*) is the owner's, on #613, and item 5
+(`camera-calibration`'s reason) is a feature of its own, #614. **Merging this section decides
+it.** Where a decision below is one the owner may prefer otherwise, it says what the
+alternative costs.
+
+**What was measured** (2026-11-23, `main` at `c271baf`, Python 3.13 and, for the walk, 3.10;
+throwaway scripts, not committed; Chromium 1280 x 800, Panel 1.10.0):
+
+- A walk of the syntax tree of `src/smc` (without `ui/` and `cli.py`) over the string literals
+  that are not docstrings, an f-string with each formatted value written `it`, finds **11** that
+  name `stop()`, `resume()` or `wait()`, all in `src/smc/hardware` (the walk gives the same
+  literals under Python 3.10 and 3.13). `page_words` (D20, FM-254) says 3 of them in the
+  page's words: the halted error's and the emergency stop's two endings. **8 reach the page as
+  the layer wrote them**, through the same `page_words` that does not know them (`_one_line`,
+  the cards' errors, the Scan screen's text), so into every outcome line, note and card error:
+  - `MotionInProgressError`: ``wait for it (`wait()`) or stop it (`stop()`), or, if it never
+    settles, check the stand and call `resume()` `` (for several devices the layer reads
+    ``wait for them (`wait()`) or stop them (`stop()`), or, if them never settles, …``), then
+    the error's detail in brackets;
+  - `Executor.wait`'s `DeviceTimeoutError`: ``… is still busy after 0.05 s; `wait()` stops
+    nothing, so it may still be moving. Stop it (`stop()`) if it should not be, or wait
+    longer.``;
+  - a device that cannot be stopped from smc, the line inside `the stop failed: …`:
+    ``… cannot be stopped from smc; wait for it, or check the stand and call `resume()` ``;
+  - five autofocus texts of `mm.py` that end `it may still move Z: stop() and check the
+    stand, then resume()`.
+  The same walk finds other call names that are **not** this section's: the autofocus's
+  `engage()`, `disengage()`, `focus_by_um()`, `offset_by_native()` and DF2's
+  `learn_reference()`, `stabilize_now()` (*Not here*).
+- The *Resume* button is `visible = status.halted`. STOP is always on the page and, pressed
+  with nothing running, ends halted (`PlatePage.stop()`, then `status().halted` is True). So
+  *STOP, check the stand, then Resume* is a sequence the page can always follow; *Resume* alone
+  is not, while nothing is halted. `Executor.resume()` also **drops every tracked motion**: a
+  *Resume* offered to a stand that is not halted, with a motion still tracked, would let the
+  next action run over a stage that may still be moving, which is the case the layer's guard
+  exists for.
+- The strip's note on the Ti2-E's three safety keys (`stop_refused_by`, `max_segment_um` 5000,
+  `max_z_segment_um` 100) is **296 characters**; the note after a STOP that three devices
+  refuse, 334; the clause the Scan lead and that note share (`stop_segments_clause`), 88.
+  Served in dry run on a copy of `demo-sample.toml` with those three keys, #529's recipe: the
+  strip's box is **985 px** wide, and the strip wraps to three lines with the current note
+  (arming *Drive* moves the page up by 9 px, *Refresh* at y 179.0 then 170.0, the *Drive*
+  toggle's bottom at y 809 of 800: #529's symptoms, reproduced). With the note shortened to
+  191 characters (the Scan lead's clause in place of the strip's own, sizes kept, a strip of
+  292 characters) it is **still three lines**, the same y. With 169 characters (a strip of
+  270) it is two lines, nothing moves and the bottom is at 792, but it fills the two lines
+  (a 292-character strip does not fit) and the Ti2-E's own values (XY, Z, objective, autofocus,
+  light) are about ten characters longer than the demo's. With the note of D38 (the strip says
+  *that* a move is cut, without the sizes; a strip of 241 characters) it is **two lines**,
+  nothing moves when *Drive* is armed (*Refresh* at y 161.8 before and after) and the toggle's
+  bottom is at **792**, with about twenty characters to spare on the Ti2-E's values.
+- After *Measure the time* on the declared fake stand (§20.1) the status's chain is the chain
+  (`label` `Measure the time`), `autofocus_locked` is `False` and the Wells note is drawn.
+  After a **Snap** the chain is `None` (every activity starts with `_chain = None`) and the note
+  is gone while `autofocus_locked` is still `False`. After a **STOP**, `halted` is True,
+  `autofocus_locked` is `False` and `scan_lock_note("required", …)` still returns D3's text,
+  which advises *Autofocus on*, a click the halt refuses.
+- `scan-plan`'s `assumed` at its longest, counted from the code (not run): the frame's one
+  line, the camera basis's three, the timings' five (each with its `timings: ` prefix) and the
+  estimate's two, **11**. Session 5's run documents carry one or two (they predate #549's two
+  `estimate:` lines). The card keeps 8 and a `… <n> more` entry, so a plan that reaches 9
+  loses its last `estimate:` line behind `… 1 more` (the review of #588 reproduced it with
+  seven earlier lines).
+
+**What the page shows of a stop** (the contract that §17.12 D20 and #544 leave to the code,
+and the one #592's acceptance asks for; every text is the page's, and the command line keeps
+the layer's own):
+
+| What happened | Where | The page says |
+| --- | --- | --- |
+| STOP, taken | the stop note under the outcome (`run_text`) | `[<Tool> told to stop; ]stopped: the stand is halted (Resume clears the halt)` |
+| STOP with nothing connected | the same | `[<Tool> told to stop; ]the stand is not connected: nothing to stop` |
+| STOP, refused as the profile declares | the same | `[prefix]the stand is halted (Resume clears the halt) and the autofocus (<label>) is switched off. <devices> refuse a stop on this stand: a move already sent finishes first[; a long one ends at the end of its current segment (at most <size> µm in XY, <size> µm in Z)]. Use the stand's own controls to stop a move that must not finish.` (§17.12 D25's fields; #544) |
+| STOP, failed (a device would not take it, not declared) | the same | `[prefix]the stop failed: <the facade's text, in the page's words>`, ending `then press Resume` (D36 for the per-device clause) |
+| the stand refuses a stop, always | the strip | `STOP is refused by <roles> on this stand: a move under way runs to its target[, or to the end of its segment if cut]` (D38) |
+| an action while halted | its outcome | `… press Resume to continue` (D20) |
+| an action refused because a motion is still tracked | its outcome | `` `<name>` is still moving; wait for it or press STOP; if it never settles, press STOP, check the stand, then press Resume `` (`are`, `them` and `they` for several; D36) |
+| the Scan screen on a stand that refuses | the lead (D29) | `A move already sent finishes first on this stand[; a long one ends … (at most … µm in XY, … µm in Z)].` |
+
+**Decisions**
+
+- **D36 The stop family's call names are said as the page's buttons.** The layer's advice
+  is "wait, or stop, or if it never settles check the stand and resume"; the page's words for
+  its calls are *STOP* and *Resume*, and a *Resume* is on the page only after a STOP. So
+  `page_words` (`guide.py`) says each of the eight texts above as the sequence the page can
+  follow, and the layer's texts do not change (the CLI keeps them). Its table
+  `_LAYER_PHRASES` is the three entries it has and five new ones, each written whole as the
+  layer writes it (the plural's `if them never settles` included) and said as the page does:
+
+  ```python
+  _LAYER_PHRASES = (
+      (" (`Microscope.stop()`)", ""),
+      ("call `resume()` to continue", "press Resume to continue"),
+      ("then call `resume()`", "then press Resume"),
+      (
+          "wait for it (`wait()`) or stop it (`stop()`), or, if it never settles, check the stand and call `resume()`",
+          "wait for it or press STOP; if it never settles, press STOP, check the stand, then press Resume",
+      ),
+      (
+          "wait for them (`wait()`) or stop them (`stop()`), or, if them never settles, check the stand and call `resume()`",
+          "wait for them or press STOP; if they never settle, press STOP, check the stand, then press Resume",
+      ),
+      (
+          "`wait()` stops nothing, so it may still be moving. Stop it (`stop()`) if it should not be, or wait longer.",
+          "the wait stops nothing, so it may still be moving. Press STOP if it should not be, or wait longer.",
+      ),
+      ("check the stand and call `resume()`", "check the stand and press Resume"),
+      (
+          "stop() and check the stand, then resume()",
+          "press STOP and check the stand, then press Resume",
+      ),
+  )
+  ```
+
+  The order matters: the two motion-error phrases contain ``check the stand and call
+  `resume()` ``, so they come before it (measured on the real errors; the existing three
+  entries stay first, and none of the new phrases contains one of them). Why a sequence and not a
+  *Resume* button that shows while a motion is tracked: see the measure above (`resume()`
+  drops the tracked motions, so offered unhalted it invites the unsafe order). Why not a
+  sentence built from `error.moving`: a stored `record.error` is text only, and the cards and
+  the Calibrations list read it. **Owner's alternative**: show *Resume* whenever
+  `status.moving` is not empty; it costs a button state and the unsafe order above.
+- **D37 A walk keeps the table complete.** `tests/unit/test_ui_guide.py` walks the syntax tree
+  of `src/smc` (without `ui/` and `cli.py`) exactly as the measure above does, and asserts that
+  after `page_words` no literal that names `stop()`, `resume()` or `wait()` still does
+  (`\b(?:stop|resume|wait)\(\)`). A layer that words a new advice with a call fails there
+  until the table says it. The test also asserts that the walk **finds** the families it
+  guards (a sentinel literal for the motion error, the busy timeout, the device that cannot be
+  stopped and the autofocus), so that moving a text in the source cannot make the walk empty
+  and the test vacuous (FM-45). The tuple of call names the walk looks for is a constant:
+  extending the page's words to the autofocus's calls adds names and table entries, nothing
+  else.
+- **D38 The strip says that a move is cut; the note after a STOP and the lead say where.**
+  The strip's permanent line was 296 characters on the Ti2-E and wrapped to three lines. Its
+  new text for a stand where a refused role is cut (`stop_segments_um` holds a pair whose role
+  is in `stop_refused` and in `STOP_SEGMENT_AXES`) is
+  `STOP is refused by <roles> on this stand: a move under way runs to its target, or to the
+  end of its segment if cut`, and the unsegmented text is unchanged
+  (`... a move under way runs to its target`, pinned since #514). The sizes leave the strip:
+  they are in the note a STOP gives and in the Scan lead (D29), both from the profile through
+  `stop_segments_clause`, so that no text of the page types a size. `stop_refused_note(roles,
+  segments_um)` keeps its signature (`segments_um` now says whether a refused role is cut)
+  and loses `_SEGMENTED_MOVE_NAMES`. The owner's remark on #589 is answered this way round
+  because the strip is always on screen and in the header's height budget (D15), while the
+  note appears when a STOP has been pressed and is the text that says what to do next. **Not
+  chosen**: the lead's clause in the strip, sizes kept (a strip of 292 characters, measured:
+  still three lines), and a 169-character note (a strip of 270: two lines, and the Ti2-E's
+  values add about ten). **#529 is the same line**: this decision is its first of the two remedies; the build measures the header on the
+  Ti2-E's keys as #529 describes and says whether #529's two symptoms are gone, which closes
+  #529 or narrows it.
+- **D39 The Wells note leaves with the chain's line.** D2 hangs the note on the chain
+  `Measure the time` has ended, and every activity (a jog, a light, a Snap) starts with
+  `_chain = None`, so the note goes with the line, measured above. It stays so. The Scan
+  screen's note (D3) says the same thing where the consequence is, before the scan, whatever the
+  operator did since, and the strip says `autofocus off` all along. A note that outlived its
+  chain would need a memory of *Measure the time ran since this Connect* with its own resets
+  (a Connect, a Disconnect, a second *Measure the time*, a STOP, a lock read), for a line the
+  operator reads once, and FM-155 says to read the stand and not the page's own flags.
+  **Owner's alternative**: that memory, one boolean in the controller, cleared by those five
+  events; it costs a test for each reset.
+- **D40 The lock notes say nothing while the stand is halted.** After a STOP the autofocus
+  reads off (the stop switches it off first) and the stand is halted, so both notes would say
+  *press Autofocus on*, a click that the halt refuses (its outcome reads `… press Resume to
+  continue`, D20). FM-252's rule applies: where the advice is wrong in a state, the note stays
+  silent in it, and the page already says what comes first (`HALTED` in the strip, *Resume*
+  on the page, `SCAN_HALTED` over the checkpoint's buttons). So `relock_note` and
+  `scan_lock_note` take `halted: bool`, keyword-only **with no default** (a caller decides),
+  and say `""` when it is true; the view passes `status.halted`. After *Resume* the next tick
+  draws them again from the same read. No note names *Resume*: the item's second half is
+  answered by silence, not by a longer text. **Owner's alternative**: a clause *press Resume
+  first* in each text while halted; it costs two texts and their pins.
+- **D41 The card keeps 12 assumed lines.** The cap on `assumed` is its own constant,
+  `_CARD_ASSUMED_LINES = 12` (`controller.py`), no longer `_CARD_LINES` (8, which stays for
+  `lines`). 11 is the longest list of the one plugin whose lists were counted (`scan-plan`'s,
+  above; the other built-ins were not), and 12 is one more. The bound is still a bound (FM-140:
+  2000 assumptions give 12 lines and `… 1988 more`, at most about 7.3 kB for the assumed lines
+  at the 600-character cut, and the worst card about 9.4 kB where §2.4 said 7 kB). The
+  estimate's two `estimate:` lines stay **last**, as m3 §7.4 D5 orders them (the CLI prints them in that order
+  and the frame's line first is what the rest rests on); a test builds `scan-plan`'s longest
+  list and asserts none of it is cut. Not chosen: moving the `estimate:` lines first in the
+  plugin (it changes the CLI and D5 for a card's sake), a cut from the middle (a card that
+  knows the prefix `estimate:`), and leaving the cap (the caveat on the figure the Wells screen
+  shows would be the line that disappears). The notes of a calibration read for
+  `objective-offsets` (`CalibrationRead`, the Plate screen's list) keep `_CARD_LINES`: they are
+  not a card.
+- **D42 `/ui-check` reads the time line: the state `wells-timed`.** `ui_snap.py` gains the
+  state, after `wells-laid-out` and before `scanned` (`GUIDED_STATES = ("wells-laid-out",
+  "wells-timed", "scanned")`, 13 states). Its action: a real `smc run timing --param repeats=1`
+  beside the dry-run page (`Stand.run_chain([Step("timing", (("repeats", "1"),))])`, on the
+  simulated stage as the chain's steps are: `timing` refuses a dry run, so it cannot be a click
+  of the page), *Refresh* in the map's header row (the page reads the run document again), *Lay
+  out the fields* again (the plan reads `timings` optionally, so the old plan is out of date),
+  and a wait for the known block's `Time:` line to read a duration (`Time: about`, never a
+  delay, FM-162). It then reads that line for the three values of the scan's `autofocus` field,
+  the default `if-engaged` (the field left empty), `off` and `required` (typed, Enter, a wait
+  for the line to change), and puts the field back before the photograph. `summary.txt` says
+  `time (autofocus default): …`, `time (autofocus off): …` and `time (autofocus required): …`.
+  Reached on `demo-sample` only, with or without `--no-results` (it needs no result of the
+  chain); on `demo`: `not reached: the demo has no sample to register from`. A `timing` step
+  that fails is named as every chain failure is. The one-off session #588 ran for these three
+  lines is what this state repeats: `Time: about 14 s, with the autofocus locked again in each
+  well; about 13 s if it is off at the start`, `… about 13 s, with the autofocus not used`,
+  `… about 14 s, with the autofocus locked again in each well` on the demo.
+
+**The interface.** `smc/ui/guide.py` (pure): `page_words` and `_LAYER_PHRASES` (D36),
+`relock_note(..., halted)` and `scan_lock_note(..., halted)` (D40, §20.3). `smc/ui/plate_page.py`:
+`stop_refused_note` (D38), `_draw_chain_line` and `_scan_lock_note` pass `status.halted`.
+`smc/ui/controller.py`: `_CARD_ASSUMED_LINES` and the cut of `assumed` in `_card` (D41). No new
+`PageStatus` field, no new read of the stand (FM-178, FM-239). `scripts/dev/ui_snap.py`,
+`.claude/skills/ui-check/SKILL.md`, `docs/ui/plate-page.md` (D42, D38, D36, D41). No change in
+`smc.hardware`.
+
+**Tests and failure modes.**
+
+- `tests/unit/test_ui_guide.py`: `page_words` over the real errors, each built from the layer
+  (`MotionInProgressError` for one, two and with a detail; `Executor.wait` on a motion that
+  stays busy; `Executor.stop` on a motion that cannot be stopped; the autofocus texts are held
+  by D37's walk), the whole page text asserted (FM-45) and no backtick call left; D37's walk and
+  its sentinels; `relock_note` and `scan_lock_note` with `halted`.
+- `tests/unit/test_plate_page.py::test_the_stop_note_says_where_a_segmented_move_ends` is
+  rewritten for D38 (the four shapes and the closed stand), the unsegmented text pinned
+  unedited.
+- `tests/unit/test_plate_page_stop_words.py`: a scan that ends on the layer's real
+  `MotionInProgressError` says the page's words and no call (the helper that asserts no call
+  names `stop()` and `wait()` too).
+- `tests/unit/test_plate_page_relock.py` (or the view tests of the Wells and Scan screens): the
+  panes empty while halted by a STOP and drawn again after *Resume*; the Wells note gone after a
+  Snap (D39, pinned).
+- `tests/unit/test_plate_page_controller.py`: the assumed cap (12 shown whole, 13 cut to 12 and
+  a count; the 2000-assumption bound), and `scan-plan`'s longest list through `_card`.
+- `tests/test_dev_ui_snap.py`: the state's place, its reach on both stands, its steps and the
+  three `time (…)` facts, on the fake page the module already uses.
+- **Failure modes**: FM-254 (extended: the stop family is done; its last sentence says what
+  remains), FM-243 (the sizes are said by the two texts that read them from the profile through one
+  function, and the strip no longer types them), FM-252 (a fourth state,
+  halted, where the advice is wrong: silent), FM-205 (extended: a bound on a **count** of lines,
+  held above the longest list a built-in writes), FM-155, FM-169 (the notes never disable a
+  button), FM-139, FM-140, FM-117 (the strip says no more than the stop does), FM-162 (D42
+  waits on text), FM-45. No new entry is planned; one found by the build's review is named by
+  its text.
+- **`/ui-check`.** D42 adds a state; the other twelve are unchanged. The strip on the Ti2-E's
+  keys is not a state (the script serves `demo-sample` and `demo` only): the build measures it
+  in a one-off session as #529 describes and cites it.
+
+**Not here.** Items 4 and 5 (#613, #614). The other call names of the layer's texts, found by
+D37's walk and not said by the page: the autofocus's (`engage()`, `disengage()`,
+`focus_by_um()`, `offset_by_native()`; `mm.py` words a Z move refused while the autofocus is on
+and not locked as `wait for the lock (engage()), or disengage() it to focus with Z`, read from
+the code and not run) and DF2's (`learn_reference()`, `stabilize_now()`).
+Each has a button or a plain name on the page (*Autofocus on*, *Autofocus off*, the Z jog), so
+the same table can say them; they are a follow-up of their own, listed by the build's Report
+from the walk, because each text's words are a choice (D37 makes the walk the way to find
+them). A *Resume* that shows while a motion is tracked (D36's alternative), a memory behind
+the Wells note (D39's), a *press Resume first* clause (D40's), and the strip's sizes (D38's)
+are the owner's if the owner prefers them.
 
 ## 18. The page measures the offsets between objectives (#382)
 
@@ -7067,6 +7335,9 @@ Throwaway scripts, not committed, on `main` at `1aeee0e`, Python 3.13, on
   (FM-155): an autofocus the timing found off, or one the operator locked again at the
   stand's own controls since, is drawn as it reads. The chain's line itself is unchanged:
   it quotes the tool's `assumed` line, which is the plugin's, for the CLI too.
+  **Amended by #592 (§17.12.12 D39, D40)**: the note **leaves with the chain's line**, by
+  decision, and it says nothing **while the stand is halted** (*Autofocus on* is refused then;
+  the strip says `HALTED` and *Resume* is on the page).
 - **D3 The Scan screen says it before the click.** A plain-text pane `scan_lock_text`,
   right after `scan_wait_text` on the Scan screen, says `SCAN_NEEDS_A_LOCK` when the scan's
   `autofocus` field means `required`, and `SCAN_WITHOUT_A_LOCK` when it means
@@ -7087,7 +7358,9 @@ Throwaway scripts, not committed, on `main` at `1aeee0e`, Python 3.13, on
   has been read, the status does not say which offsets were, and *Autofocus on* is then
   refused by design (m2 §12.5). The note is shown on every default scan of such a stand
   until a lock has been read; the refusal of a click is a finding, not a hazard (no
-  motion).
+  motion). **Amended by #592 (§17.12.12 D40)**: both texts are also silent **while the stand
+  is halted** (a STOP switches the autofocus off, so it reads off and the note would advise a
+  click the halt refuses).
 - **D4 Not on a dry-run page.** *Autofocus on* sends nothing in a dry run, so pressing it
   never locks: both notes say nothing there (FM-182). `timing` refuses a dry run anyway
   (§17.12.11 D33).
@@ -7126,21 +7399,28 @@ SCAN_WITHOUT_A_LOCK = (
 
 
 def relock_note(
-    chain: ChainStatus | None, *, autofocus_locked: bool | None, dry_run: bool
+    chain: ChainStatus | None,
+    *,
+    autofocus_locked: bool | None,
+    dry_run: bool,
+    halted: bool,
 ) -> str: ...
 
 
 def scan_lock_note(
-    mode: str, *, autofocus_locked: bool | None, dry_run: bool
+    mode: str, *, autofocus_locked: bool | None, dry_run: bool, halted: bool
 ) -> str: ...
 ```
 
+(`halted` was added by #592, §17.12.12 D40: a keyword with no default, so that a caller
+decides and a new one cannot forget it.)
+
 `relock_note` is D2's rule: `RELOCK_NOTE` when `chain` is not `None`, has `plugins`, its
-`label` is `MEASURE_THE_TIME`, `current is None`, `not dry_run` and `autofocus_locked is
-False`; `""` otherwise. `scan_lock_note` is D3's text for `mode` (already through
-`plain_default`): `SCAN_NEEDS_A_LOCK` for `"required"`, `SCAN_WITHOUT_A_LOCK` for
-`"if-engaged"`, each only when `not dry_run` and `autofocus_locked is False`; `""` for any
-other mode or state. The view passes the connection and the activity by not calling it
+`label` is `MEASURE_THE_TIME`, `current is None`, `not dry_run`, `not halted` and
+`autofocus_locked is False`; `""` otherwise. `scan_lock_note` is D3's text for `mode`
+(already through `plain_default`): `SCAN_NEEDS_A_LOCK` for `"required"`,
+`SCAN_WITHOUT_A_LOCK` for `"if-engaged"`, each only when `not dry_run`, `not halted` and
+`autofocus_locked is False`; `""` for any other mode or state. The view passes the connection and the activity by not calling it
 (D3). Both return plain text (FM-139).
 
 `smc/ui/controller.py`: `PageStatus.autofocus_locked` (D1), filled where `autofocus` is
@@ -7168,6 +7448,10 @@ did not load.
   locked (`None`), a failed read and a closed stand; and the two panes driven through the
   real read of an autofocus that is on and not locked, which say nothing (FM-252).
 - The view: each pane drawn and empty in its states, on a page with a fake status.
+- **Added by #592** (§17.12.12 D39, D40): both functions over `halted` (True says nothing,
+  one input changed at a time), both panes on a page whose stand was halted by a STOP
+  (empty) and after *Resume* (drawn again, from the same read), and the Wells note after a
+  Snap (gone with the chain's line, the autofocus still reading off: D39's decision, pinned).
 - **Failure modes**: FM-155 (the notes follow the read, not the tool's flag or its
   words), FM-178 (no new read on the tick), FM-169 (the notes never disable a button; the
   scan's check stays the guard), FM-182 (dry run), FM-151 (from the status every tab
