@@ -821,9 +821,10 @@ class PlatePageView:
         # The objective the *Calibrate the camera* button names, per view (m5 §18.6 D12, FM-151:
         # another tab draws its own, FM-177: the click sends this label, drawn with the button's).
         self._calibrate_for: str | None = None
-        # The documents the page held at the last redraw of the block: the wait beside *Measure
-        # the offsets* was read for them, and says nothing true once they change.
-        self._held_drawn: tuple[HeldCalibration, ...] = ()
+        # The documents the page held at the last redraw of the block, and the line for a folder
+        # it could not look into: the wait beside *Measure the offsets* was read for them, and
+        # says nothing true once either changes (FM-247, m5 §18.6 D22).
+        self._held_drawn: tuple[tuple[HeldCalibration, ...], str | None] = ((), None)
         self._offsets_step_drawn: OffsetsStep | None = None
         self._offsets_shown: tuple[str, ...] = ()
         self._offsets_wait = ""
@@ -4526,7 +4527,7 @@ class PlatePageView:
             self.objective_in_place_text.object = ""
             self.calibrate_lead_text.object = ""
             self._calibrate_for = None
-            self._held_drawn = ()
+            self._held_drawn = ((), None)
             for pane in (
                 self.calibrations_held_text,
                 self.offsets_calibrate_wait,
@@ -4548,16 +4549,19 @@ class PlatePageView:
             else offsets_lead_unread(offer.plate_objective)
         )
         self.calibrate_lead_text.object = CALIBRATE_LEAD
-        if view.calibrations != self._held_drawn:
-            # A calibration was made (or a document changed): the wait that the last read of the
-            # documents drew, `Calibrate the camera at each objective ...`, is not true any more.
-            # Nothing is read for it here; the next click on *Measure* reads again (the review of
-            # #501).
-            self._held_drawn = view.calibrations
+        held_now = (view.calibrations, view.calibrations_denied)
+        if held_now != self._held_drawn:
+            # A calibration was made (a document changed, a folder opened or closed to the
+            # account): the wait that the last read of the documents drew, `Calibrate the camera
+            # at each objective ...` or the folder's denial, is not true any more. Nothing is read
+            # for it here; the next click on *Measure* reads again (the review of #501).
+            self._held_drawn = held_now
             self._offsets_wait = ""
         self._say(
             self.calibrations_held_text,
-            self._calibrations_held_lines(view.calibrations, offer.plate_objective),
+            self._calibrations_held_lines(
+                view.calibrations, offer.plate_objective, view.calibrations_denied
+            ),
         )
         card = view.cards.get("objective-offsets")
         self._offsets_card_status = None if card is None else card.status
@@ -4574,7 +4578,10 @@ class PlatePageView:
         self._draw_offsets(self._status)
 
     def _calibrations_held_lines(
-        self, held: Sequence[HeldCalibration], plate_objective: str
+        self,
+        held: Sequence[HeldCalibration],
+        plate_objective: str,
+        denied: str | None = None,
     ) -> str:
         """The list of the calibrations the page holds, and of the objectives that have none, as plain text (m5 §18.6 D15).
 
@@ -4586,6 +4593,11 @@ class PlatePageView:
         objective is on the turret is not said and no objective is listed as missing. Nothing is
         drawn when there is nothing to list. A label, a path and a tool's words come from outside:
         every line is plain text (FM-139).
+
+        A document that is not its position's has a line of its own and names no objective (D21).
+        ``denied`` is the one line for a folder the page could not look into (D22): it is drawn
+        under the heading, before the documents the look did reach, and **while it is set no
+        objective is listed as having no calibration** (the page does not know).
         """
         labels = self._objective_labels
         lines: list[str] = []
@@ -4619,10 +4631,15 @@ class PlatePageView:
                 lines.extend(
                     calibration_note_line(read.objective, note) for note in read.notes
                 )
-        missing = dict.fromkeys(offsets_others(labels, plate_objective))
-        lines.extend(
-            calibration_missing_line(label) for label in missing if label not in named
-        )
+        if denied is not None:
+            lines.insert(0, denied)
+        else:
+            missing = dict.fromkeys(offsets_others(labels, plate_objective))
+            lines.extend(
+                calibration_missing_line(label)
+                for label in missing
+                if label not in named
+            )
         if not lines:
             return ""
         folder = str(self.page.calibrations_folder)

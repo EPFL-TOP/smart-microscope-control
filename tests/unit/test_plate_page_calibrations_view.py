@@ -1018,6 +1018,112 @@ def test_with_nothing_held_and_nothing_typed_the_wait_says_how_to_make_one(
     assert "the button above" in OFFSETS_NO_DOCUMENT
 
 
+def _deny(monkeypatch: pytest.MonkeyPatch, state: dict[str, bool], *names: str) -> None:
+    """``Path.stat`` raises ``PermissionError`` for the calibrations folder's files named in ``names`` (every one when none is) while ``state["on"]``: a folder the account may not search, on any platform."""
+    real = Path.stat
+
+    def stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if (
+            state["on"]
+            and self.parent.name == "calibrations"
+            and (not names or self.name in names)
+        ):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_a_denied_folder_is_one_line_under_the_heading_and_no_objective_is_listed_missing(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # D22: twelve lines for one folder the account cannot search, and `no calibration yet` under
+    # them for every objective, said that nothing was calibrated when the page did not know.
+    _hold(run_doc, 1, FORTY)
+    _deny(monkeypatch, {"on": True})
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+
+    folder = run_doc.parent / "calibrations"
+    denied = (
+        f"{folder}: the page cannot look into this folder (PermissionError: "
+        "Permission denied); which objectives have a calibration is not known"
+    )
+    assert view.calibrations_held_text.object.splitlines() == [
+        f"Camera calibrations the page holds, one document per objective, in {folder}:",
+        denied,
+    ]
+    assert "no calibration yet" not in view.calibrations_held_text.object
+    assert view.calibrations_held_text.visible is True
+    assert type(view.calibrations_held_text) is pn.pane.Str
+
+
+def test_a_denied_folder_wait_is_the_line_and_is_taken_back_when_the_folder_opens(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-247: the wait beside *Measure the offsets* was read for the documents (and the denial)
+    # that were there at the click; once either changes it must not be drawn as the truth.
+    state = {"on": True}
+    _hold(run_doc, 1, FORTY)
+    _deny(monkeypatch, state)
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+    denied = view.page.view().calibrations_denied
+    assert denied is not None
+
+    _click(view.offsets_measure_button)
+    assert view._offsets_armed is None
+    assert view.offsets_wait_text.object == denied
+    assert view.offsets_wait_text.object != OFFSETS_NO_DOCUMENT
+
+    # The folder is opened to the account: the redraw reads it, the line is gone with the wait.
+    state["on"] = False
+    view.refresh()
+    view.tick()
+    assert view.offsets_wait_text.object == ""
+    lines = view.calibrations_held_text.object.splitlines()
+    assert lines[1] == f"{FORTY}: calibrated on 2026-11-17"
+    assert denied not in lines
+    # Its absence is a fact again: the objectives with no document are listed.
+    assert f"{TWENTY}: no calibration yet" in lines
+
+
+def test_a_denial_alone_changing_takes_the_wait_of_the_documents_back(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-247: the documents held do not change (there are none), only the denial does: the wait
+    # drawn for the folder as it was (`OFFSETS_NO_DOCUMENT`) is dropped with it, and the next
+    # click says the folder's line.
+    state = {"on": False}
+    _deny(monkeypatch, state, "position-2.json")
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+    _click(view.offsets_measure_button)
+    assert view.offsets_wait_text.object == OFFSETS_NO_DOCUMENT
+    assert view.page.view().calibrations == ()
+
+    state["on"] = True
+    view.refresh()
+    view.tick()
+
+    assert view.page.view().calibrations == ()
+    assert view.offsets_wait_text.object == ""
+    folder = run_doc.parent / "calibrations"
+    assert view.calibrations_held_text.object.splitlines() == [
+        f"Camera calibrations the page holds, one document per objective, in {folder}:",
+        f"{folder}: the page cannot look into this folder (PermissionError: "
+        "Permission denied); which objectives have a calibration is not known",
+    ]
+    _click(view.offsets_measure_button)
+    assert view.offsets_wait_text.object == view.page.view().calibrations_denied
+
+
 def test_a_calibration_made_after_the_wait_was_drawn_takes_the_stale_wait_back(
     make_view: Callable[..., PlatePageView],
     fake_microscope: Microscope,

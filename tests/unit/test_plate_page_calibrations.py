@@ -11,6 +11,8 @@ asserted to leave it where it was (FM-14).
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import time
 from collections.abc import Iterator
@@ -1573,20 +1575,23 @@ def test_a_position_that_cannot_be_looked_at_is_a_line_and_the_others_are_read(
     fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The look at a position is a `stat`, so that a folder the account may not list is said the
-    # same way on every Python (`Path.exists` raised it up to 3.13 and hid it from 3.14).
+    # same way on every Python (`Path.exists` raised it up to 3.13 and hid it from 3.14). Any
+    # failure of it but a denial (D22: that one is the folder's, said once) is its position's line:
+    # here a name the OS refuses.
     _seed_plate(run_doc)
     held = _hold(run_doc, position_1=FORTY, position_4=TWENTY)
     real = Path.stat
 
     def stat(self: Path, *args: Any, **kwargs: Any) -> Any:
         if self.name == "position-2.json":
-            raise PermissionError(13, "Access is denied", str(self))
+            raise OSError(22, "Invalid argument", str(self))
         return real(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", stat)
     page = _page(fake_microscope, run_doc)
     try:
-        found = page.view().calibrations
+        view = page.view()
+        found = view.calibrations
     finally:
         page.close()
 
@@ -1595,10 +1600,173 @@ def test_a_position_that_cannot_be_looked_at_is_a_line_and_the_others_are_read(
     problem = found[1].read.problem
     assert problem is not None
     assert problem.startswith(
-        f"{_folder(run_doc) / 'position-2.json'}: PermissionError: "
-        "[Errno 13] Access is denied"
+        f"{_folder(run_doc) / 'position-2.json'}: OSError: [Errno 22] Invalid argument"
     )
     assert found[2].read.objective == TWENTY
+    # It is not a denial of the folder.
+    assert view.calibrations_denied is None
+
+
+def _deny_the_folder(
+    monkeypatch: pytest.MonkeyPatch, *names: str, reason: str = "Permission denied"
+) -> None:
+    """``Path.stat`` raises ``PermissionError`` for the files of the calibrations folder named in ``names`` (every one when none is): what a folder the account may not search does, on any platform (``chmod 0`` is POSIX only)."""
+    real = Path.stat
+
+    def stat(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.parent.name == "calibrations" and (not names or self.name in names):
+            raise PermissionError(13, reason, str(self))
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+
+
+def test_a_folder_the_account_cannot_look_into_is_one_line_and_no_position(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # D22: twelve near-identical `PermissionError` lines, the path twice in each, and `no
+    # calibration yet` under them for every objective, for one folder the account may not search.
+    _seed_plate(run_doc)
+    _hold(run_doc, position_1=FORTY)
+    _deny_the_folder(monkeypatch)
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        page.close()
+
+    folder = _folder(run_doc)
+    assert view.calibrations == ()
+    assert view.calibrations_denied == (
+        f"{folder}: the page cannot look into this folder (PermissionError: "
+        "Permission denied); which objectives have a calibration is not known"
+    )
+    # Plain text on one line, naming the folder and the reason and no file (FM-98, FM-139).
+    assert "\n" not in (view.calibrations_denied or "")
+    assert "position-" not in (view.calibrations_denied or "")
+    assert view.offsets is not None
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="a folder mode of 0 is POSIX's, and root searches it all the same",
+)
+def test_a_folder_with_no_right_to_search_it_is_one_line_for_the_real_os_too(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The patched `Path.stat` of the tests above is what runs everywhere; this is the same
+    # claim made by the OS itself (macOS and Linux), for the platforms that can (§18.6.1).
+    _seed_plate(run_doc)
+    _hold(run_doc, position_1=FORTY)
+    folder = _folder(run_doc)
+    folder.chmod(0)
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        folder.chmod(0o700)
+        page.close()
+
+    assert view.calibrations == ()
+    assert view.calibrations_denied == (
+        f"{folder}: the page cannot look into this folder (PermissionError: "
+        "Permission denied); which objectives have a calibration is not known"
+    )
+
+
+def test_a_denial_is_said_once_and_the_positions_the_look_reached_are_listed(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_plate(run_doc)
+    held = _hold(run_doc, position_1=FORTY, position_4=TWENTY)
+    # Positions 2, 3 and 5 are denied (three denials, one line); 1 and 4 are looked at.
+    _deny_the_folder(
+        monkeypatch,
+        "position-2.json",
+        "position-3.json",
+        "position-5.json",
+        reason="Access is denied",
+    )
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        page.close()
+
+    assert [h.read.path for h in view.calibrations] == [
+        str(held["position_1"]),
+        str(held["position_4"]),
+    ]
+    assert view.calibrations_denied == (
+        f"{_folder(run_doc)}: the page cannot look into this folder (PermissionError: "
+        "Access is denied); which objectives have a calibration is not known"
+    )
+
+
+def test_a_page_with_no_offer_reads_no_folder_and_says_nothing_of_a_denial(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_plate(run_doc, by_eye=True)
+    _deny_the_folder(monkeypatch)
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+    finally:
+        page.close()
+
+    assert view.offsets is None
+    assert view.calibrations == ()
+    assert view.calibrations_denied is None
+
+
+def test_the_offsets_wait_is_the_denied_line_when_nothing_else_was_read(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `OFFSETS_NO_DOCUMENT` would send the operator to a button that cannot work (D22).
+    _seed_plate(run_doc)
+    _hold(run_doc, position_1=FORTY, position_4=TWENTY)
+    elsewhere = run_doc.parent / "elsewhere" / "cal-20x.json"
+    _seed_calibration(elsewhere, TWENTY)
+    _deny_the_folder(monkeypatch)
+    page = _page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step("")
+        # A typed field wins and is never merged with them: the denial is not its business.
+        typed = page.offsets_step(_typed(elsewhere))
+    finally:
+        page.close()
+
+    denied = (
+        f"{_folder(run_doc)}: the page cannot look into this folder (PermissionError: "
+        "Permission denied); which objectives have a calibration is not known"
+    )
+    assert step.wait == denied
+    assert step.wait != OFFSETS_NO_DOCUMENT
+    assert step.pairs == ()
+    assert step.reads == ()
+    assert typed.wait is None
+    assert typed.targets == (TWENTY,)
+
+
+def test_the_default_measures_with_the_documents_the_look_reached_when_one_position_was_denied(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With a usable document read, the empty field measures with it and the wait is none: the
+    # denial is the list's line, said under its heading, and the step does not stop for it.
+    _seed_plate(run_doc)
+    held = _hold(run_doc, position_1=FORTY, position_4=TWENTY)
+    _deny_the_folder(monkeypatch, "position-4.json")
+    page = _page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step("")
+        view = page.view()
+    finally:
+        page.close()
+
+    assert step.wait is None
+    assert step.targets == (FORTY,)
+    assert [r.path for r in step.reads] == [str(held["position_1"])]
+    assert view.calibrations_denied is not None
 
 
 class StubPlateParams(PluginParams):

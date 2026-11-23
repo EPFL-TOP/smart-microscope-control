@@ -173,6 +173,7 @@ from smc.ui.guide import (
     calibrate_position_unknown,
     calibrate_wait,
     calibration_at_its_position,
+    calibration_denied,
     calibration_failed,
     calibration_file,
     calibration_paths,
@@ -764,6 +765,9 @@ class PlateView:
     ``calibrations`` are the camera-calibration documents the page holds, one per turret
     position at most (m5 §18.6 D15): read here, beside the run document, and only when the
     block is offered; ``()`` otherwise, and a tick never reads them (FM-145).
+    ``calibrations_denied`` is one line about the folder when the page could not look into it
+    (``None`` otherwise, and with no offer, m5 §18.6 D22): no position is listed for it, and the
+    block lists no objective as having no calibration while it is set.
     """
 
     plate: str
@@ -792,6 +796,7 @@ class PlateView:
     offsets: OffsetsOffer | None = None
     checkpoint_notes: Mapping[str, str] = field(default_factory=dict)
     calibrations: tuple[HeldCalibration, ...] = ()
+    calibrations_denied: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -850,6 +855,17 @@ class _Handed(NamedTuple):
     name: str
     run: Callable[[], str]
     switch_off: bool
+
+
+class _Held(NamedTuple):
+    """What a look into the calibrations folder found: the documents it read, and the one line for a folder it could not look into (m5 §18.6 D22).
+
+    ``denied`` is ``calibration_denied``'s line when the look met a ``PermissionError`` at any
+    position, and ``None`` otherwise; the documents are the positions the look reached.
+    """
+
+    documents: tuple[HeldCalibration, ...]
+    denied: str | None
 
 
 class _Prepared(NamedTuple):
@@ -5332,6 +5348,9 @@ class PlatePage:
         )
         self._note_plate_attempt(plate_record)
         offer = self._offsets_offer(registered)
+        # Beside the run document, which it is read with, and only for the block that lists
+        # them (m5 §18.6 D15): the tick reads nothing of it.
+        held = _Held((), None) if offer is None else self._held_calibrations()
         return PlateView(
             plate=self._plate,
             nominal=pose.kind in ("estimated", "unplaced"),
@@ -5382,9 +5401,8 @@ class PlatePage:
                 tool: checkpoint_note(stage, self._end_word(stage, status, doc))
                 for tool, (stage, status) in self._checkpoint_feeders(doc).items()
             },
-            # Beside the run document, which it is read with, and only for the block that
-            # lists them (m5 §18.6 D15): the tick reads nothing of it.
-            calibrations=() if offer is None else self._held_calibrations(),
+            calibrations=held.documents,
+            calibrations_denied=held.denied,
         )
 
     def _scan_end(self, doc: RunDocument) -> ScanEnd | None:
@@ -6107,8 +6125,8 @@ class PlatePage:
             return None
         return _offsets_offer_of(registered)
 
-    def _held_calibrations(self) -> tuple[HeldCalibration, ...]:
-        """The calibration documents the page holds, for the turret positions 1 to ``MAX_POSITIONS`` in order (m5 §18.6 D11, D15).
+    def _held_calibrations(self) -> _Held:
+        """The calibration documents the page holds, for the turret positions 1 to ``MAX_POSITIONS`` in order, and one line when the folder cannot be looked into (m5 §18.6 D11, D15, D22).
 
         A file that exists is read as the tool reads it (``_read_calibration``); one that
         cannot be read, a folder named like a document, a document of another stand or
@@ -6118,10 +6136,18 @@ class PlatePage:
         the operator acts on, and the strip's outcome is gone at the next activity). Only the
         twelve names the page writes are looked at, so a folder with 10 000 files costs nothing
         (D11). Called by ``view()`` and ``offsets_step``, never by the tick (FM-145).
+
+        **A ``PermissionError`` of the look (``stat``) is the folder's**, said once as
+        ``denied`` (``calibration_denied``: the folder and the error's class and ``strerror``,
+        never a file name) and no position is listed for it: a file's ``stat`` asks only to
+        search its folder (POSIX), so twelve denials are one fact, and one line is read
+        where twelve were not (D22, FM-139). The positions the look did reach are listed as
+        before. Any other failure of the look stays its position's line.
         """
         folder = self.calibrations_folder
         profile = self._profile.microscope.name
         held: list[HeldCalibration] = []
+        denied: str | None = None
         for position in range(1, MAX_POSITIONS + 1):
             path = folder / calibration_file(position)
             try:
@@ -6129,9 +6155,16 @@ class PlatePage:
                     path.stat()
                 except (FileNotFoundError, NotADirectoryError):
                     # Nothing held at this position (or a file where the folder should be:
-                    # ``calibrate_objective`` says that one). Any other failure of the look, a
-                    # folder the account may not list, is a line: ``Path.exists`` raised it up to
-                    # Python 3.13 and hid it from 3.14, and the list must not depend on that.
+                    # ``calibrate_objective`` says that one). Any other failure of the look is a
+                    # line, but a denial: ``Path.exists`` raised it up to Python 3.13 and hid it
+                    # from 3.14, and the list must not depend on that.
+                    continue
+                except PermissionError as exc:
+                    if denied is None:
+                        reason = (
+                            f"{type(exc).__name__}: {exc.strerror or 'no reason given'}"
+                        )
+                        denied = calibration_denied(str(folder), reason)
                     continue
                 read = _read_calibration(
                     str(path), profile=profile, dry_run=self._dry_run
@@ -6149,10 +6182,12 @@ class PlatePage:
                     _flat(f"{path}: {type(exc).__name__}: {_one_line(exc)}"),
                 )
             held.append(HeldCalibration(position, read))
-        return tuple(held)
+        return _Held(tuple(held), denied)
 
-    def _default_calibrations(self) -> tuple[CalibrationRead, ...]:
-        """The held documents that an empty field measures with: usable, not the plate's objective, and its position's own now, in position order (m5 §18.6 D16, D21).
+    def _default_calibrations(
+        self,
+    ) -> tuple[tuple[CalibrationRead, ...], str | None]:
+        """The held documents that an empty field measures with, and the line for a folder that could not be looked into: usable, not the plate's objective, and its position's own now, in position order (m5 §18.6 D16, D21).
 
         As if their paths were typed: ``offsets_step`` reads them, waits for them and
         refuses them as it does a typed line. A document is kept only when its objective is the
@@ -6164,17 +6199,21 @@ class PlatePage:
         labels are read once for the filter; labels that cannot be read filter nothing out, and
         the step's own wait says so (``OFFSETS_TURRET_UNREAD``) rather than a list that looks
         empty. Nothing is read for a page with no offer: the step's wait is the reason.
+
+        The second item is ``calibration_denied``'s line when the look met a ``PermissionError``
+        (D22): the documents it did reach are used, and with none the step's wait is that line.
         """
         doc, unreadable = self._document()
         if unreadable is not None:
-            return ()
+            return (), None
         offer = self._offsets_offer(self._slot(doc, "plate", PlateResult, []))
         if offer is None:
-            return ()
+            return (), None
         labels = self.objective_labels()
-        return tuple(
+        found = self._held_calibrations()
+        reads = tuple(
             held.read
-            for held in self._held_calibrations()
+            for held in found.documents
             if held.read.problem is None
             and held.read.objective is not None
             and held.read.objective != offer.plate_objective
@@ -6186,6 +6225,7 @@ class PlatePage:
                 is True
             )
         )
+        return reads, found.denied
 
     # --- the offsets block (m5 §18) -----------------------------------------------------
 
@@ -6215,7 +6255,9 @@ class PlatePage:
         now, in position order, as if their paths were typed (``_default_calibrations``): the
         same reads, waits, refusals, ``MAX_TARGETS`` and pairs. ``measure_offsets`` asks this
         again with the same text, so D4's comparison of the armed objectives with what would run
-        now is as it was. A typed field wins and is never merged with them.
+        now is as it was. A typed field wins and is never merged with them. With none usable and
+        a folder the page could not look into, the wait is that folder's line and not
+        ``OFFSETS_NO_DOCUMENT`` (D22).
         """
         paths = calibration_paths(calibrations_text)
         profile = self._profile.microscope.name
@@ -6224,6 +6266,7 @@ class PlatePage:
         # is the activity's, and the lines under the field come back with the next edit or click.
         busy = self._current_run is not None
         reads: tuple[CalibrationRead, ...]
+        denied: str | None = None
         if busy:
             reads = ()
         elif paths:
@@ -6232,7 +6275,7 @@ class PlatePage:
                 for path in paths[:MAX_TARGETS]
             )
         else:
-            held = self._default_calibrations()
+            held, denied = self._default_calibrations()
             paths = tuple(read.path for read in held)
             reads = held[:MAX_TARGETS]
         targets = tuple(
@@ -6240,7 +6283,7 @@ class PlatePage:
             for read in reads
             if read.objective is not None and read.problem is None
         )
-        wait = self._offsets_wait(paths, reads)
+        wait = self._offsets_wait(paths, reads, denied)
         pairs: tuple[str, ...] = ()
         if wait is None:
             pairs = (
@@ -6250,9 +6293,17 @@ class PlatePage:
         return OffsetsStep(pairs, targets, reads, wait)
 
     def _offsets_wait(
-        self, paths: Sequence[str], reads: Sequence[CalibrationRead]
+        self,
+        paths: Sequence[str],
+        reads: Sequence[CalibrationRead],
+        denied: str | None = None,
     ) -> str | None:
-        """The first reason ``offsets_step`` has nothing to run, in the order its docstring gives, or ``None``."""
+        """The first reason ``offsets_step`` has nothing to run, in the order its docstring gives, or ``None``.
+
+        ``denied`` is the line for a calibrations folder the page could not look into: with no
+        document to use it is the wait, where ``OFFSETS_NO_DOCUMENT`` would send the operator to a
+        button that cannot work (m5 §18.6 D22).
+        """
         if self._microscope is None:
             return NOT_CONNECTED
         doc, unreadable = self._document()
@@ -6268,7 +6319,7 @@ class PlatePage:
         if current is not None:
             return busy_note(current[0], live=current[0] == "live")
         if not paths:
-            return OFFSETS_NO_DOCUMENT
+            return denied or OFFSETS_NO_DOCUMENT
         for read in reads:
             if read.problem is not None:
                 return read.problem
