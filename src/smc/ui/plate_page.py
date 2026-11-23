@@ -2632,7 +2632,7 @@ class PlatePageView:
 
     @staticmethod
     def _ensure_option(select: Any, name: str) -> None:
-        """Add the option ``<name> (not installed)`` when ``name`` is not a value of ``select``, once (m5 §21, D6, FM-262).
+        """Add the option ``<name> (not installed)`` when ``name`` is not a value of ``select``, once (m5 §21, D6, FM-264).
 
         A preset or the profile's suggestion may name an algorithm that is not installed on this
         PC, and what a widget library does with a value it was not given is its own affair

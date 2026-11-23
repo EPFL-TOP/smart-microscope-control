@@ -63,6 +63,18 @@ In this order:
    line. A caption says how many fields, how many cells are drawn of how many, and how
    many detections lie outside the well's shape and are not drawn.
 
+   **A selector's score** (a route made by a selector that gives one, `route`'s default
+   gives none) is in two places and nowhere else: a stop's field **title** (the hover)
+   ends `, score 0.823` in three significant digits and, with measures, a parenthesis after
+   it, `(density_per_mm2 41.2, nn_median_um 35)` (at most six, then `, +N more`); and a well
+   with a scored stop has one line under its counts, `Selector scores: E8_r000 0.823,
+   E8_r001 0.791, and 3 more`: the stops that have a score, in visiting order, the first 12
+   and then `and N more`. A stop with measures and no score has them in its title and makes
+   no line.
+   No number is added to the drawing (a 40× field is smaller than a score's text), and a
+   route with no score is written exactly as before. The names and keys are escaped like
+   every text of a record.
+
 ### Reading a density
 
 - A well with **no frame** (every field failed) is `no frame: unknown`: grey, `n/a`.
