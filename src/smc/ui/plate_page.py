@@ -54,6 +54,7 @@ from bokeh.models import (
 )
 from bokeh.palettes import Greys256, Viridis256
 from bokeh.plotting import figure
+from pydantic import BaseModel
 from tornado.web import HTTPError, RequestHandler
 
 from smc.hardware.capabilities import (
@@ -187,7 +188,19 @@ from smc.ui.guide import (
     wells_from_line,
     wells_known_lines,
 )
-from smc.ui.selection import stop_tip
+from smc.ui.selection import (
+    NOT_A_JSON_OBJECT,
+    ORDER_LABEL,
+    ROUTE_OWN_PARAMS,
+    SELECT_LABEL,
+    UNKNOWN_KEYS,
+    AlgorithmChoice,
+    algorithm_params_text,
+    options,
+    params_from_text,
+    stop_tip,
+    summary_text,
+)
 
 __all__ = [
     "PlatePageView",
@@ -687,6 +700,34 @@ class _ResultRow:
     command_note: Any
     card: Any
     box: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _AlgorithmWidgets:
+    """What the route row draws for one of ``route``'s two algorithm names: its Select, summary, note and groups (m5 §21, D1 to D8).
+
+    ``select`` is ``tool_fields["route"][kind]`` (one instance, the expert view's too), its
+    value ``""`` for the tool's default. ``carrier`` is the key of the JSON text that holds
+    the chosen algorithm's parameters (``selector_params`` or ``orderer_params``): the text is
+    the truth, a preset and a run carry it, and the group's fields edit it. ``fields`` are, by
+    algorithm name, the fields of each one that has any: ``route``'s own two for an algorithm of
+    ``ROUTE_OWN_PARAMS`` (the same instances as under *Advanced*), a ``TextInput`` per row of its
+    ``Params`` for any other. ``groups`` hold them, one column each, only the chosen one visible.
+    """
+
+    kind: str
+    carrier: str
+    default_name: str
+    select: Any
+    summary: Any
+    note: Any
+    choices: tuple[AlgorithmChoice, ...]
+    groups: dict[str, Any]
+    fields: dict[str, dict[str, Any]]
+
+
+class _NoFields(BaseModel):
+    """The parameters of an algorithm that takes none in its JSON text: every key it holds is one it does not take."""
 
 
 class PlatePageView:
@@ -1211,6 +1252,11 @@ class PlatePageView:
 
         self.tool_runs: dict[str, Any] = {}
         self.tool_fields: dict[str, dict[str, Any]] = {}
+        # The route row's two algorithm choices, by kind (m5 §21): built with the row, empty
+        # for a kind with no algorithm. Set while the page itself writes a group's fields or
+        # the JSON text they edit, so that neither direction calls the other (D4).
+        self._algorithms: dict[str, _AlgorithmWidgets] = {}
+        self._syncing_algorithms = False
         # Each field's default as ``describe_params`` prints it, by ``(tool, key)``.
         self._field_defaults: dict[tuple[str, str], str] = {}
         self.tool_notes: dict[str, Any] = {}
@@ -1764,6 +1810,10 @@ class PlatePageView:
                 if field is not None:
                     from_lines[key] = _wrapped_text()
                     inside += [field, from_lines[key]]
+                    if tool == "route" and isinstance(field, pn.widgets.Select):
+                        built = self._algorithm_widgets(key, field)
+                        self._algorithms[key] = built
+                        inside += [built.summary, built.note, *built.groups.values()]
             command = _wrapped_text()
             command_note = _wrapped_text()
             command_note.visible = False
@@ -1802,6 +1852,8 @@ class PlatePageView:
                 card,
                 box,
             )
+        # Each chosen algorithm's summary and group, drawn once the row exists (m5 §21, D8).
+        self._draw_algorithm_choices()
         self.files_heading = _wrapped_text(FILES_HEADING, {"font-weight": "bold"})
         # The one HTML pane of the page (m5 §17.12 D21): links to the files the run document
         # names, through the server's ``/run-files/`` route. ``files_html`` escapes every text
@@ -1809,6 +1861,217 @@ class PlatePageView:
         self.files_text = pn.pane.HTML(
             f"<div>{NO_FILES_YET}</div>", width=_TEXT_WIDTH, margin=(5, 10)
         )
+
+    def _algorithm_widgets(self, kind: str, select: Any) -> _AlgorithmWidgets:
+        """The summary, the note and one group of fields for each algorithm of ``kind`` that has parameters (m5 §21, D2, D3).
+
+        A group is a ``Column`` built once, only the chosen algorithm's visible
+        (``_draw_algorithm_choices``). For an algorithm named in ``ROUTE_OWN_PARAMS`` it holds
+        ``route``'s own fields (the instances of *Advanced*, so that a preset and a profile fill
+        them as they fill every field); for any other, a ``TextInput`` per row of its ``Params``:
+        the key as the label, the default as the placeholder (an empty field is the algorithm's
+        default), the type and the notes as the description. The chosen algorithm's fields start
+        from the JSON text the profile may suggest, and their watchers are registered after
+        that, so that the build reads nothing half-built. Plain text only (FM-139): a summary, a
+        key and a description are a third party's words.
+        """
+        typed_kind: Literal["selector", "orderer"] = (
+            "selector" if kind == "selector" else "orderer"
+        )
+        choices = self.page.algorithms(typed_kind)
+        route_fields = self.tool_fields["route"]
+        carrier = f"{kind}_params"
+        default_name = plain_default(self._field_defaults[("route", kind)])
+        chosen = str(select.value) or default_name
+        groups: dict[str, Any] = {}
+        fields: dict[str, dict[str, Any]] = {}
+        for choice in choices:
+            if typed_kind == "selector" and choice.name in ROUTE_OWN_PARAMS:
+                own = {
+                    key: route_fields[key]
+                    for key in ROUTE_OWN_PARAMS[choice.name]
+                    if key in route_fields
+                }
+                if own:
+                    fields[choice.name] = own
+            elif choice.params:
+                texts: dict[str, str] = {}
+                if choice.name == chosen:
+                    texts = params_from_text(
+                        str(route_fields[carrier].value), choice.model
+                    )[0]
+                fields[choice.name] = {
+                    key: pn.widgets.TextInput(
+                        label=key,
+                        placeholder=plain_default(default),
+                        description=f"{type_name}  {notes}".strip(),
+                        value=texts.get(key, ""),
+                    )
+                    for key, type_name, default, notes in choice.params
+                }
+            if choice.name in fields:
+                groups[choice.name] = pn.Column(
+                    *fields[choice.name].values(), visible=False
+                )
+        summary = _wrapped_text()
+        summary.visible = False
+        note = _wrapped_text(extra={"color": _WARNING})
+        note.visible = False
+        built = _AlgorithmWidgets(
+            kind, carrier, default_name, select, summary, note, choices, groups, fields
+        )
+        for name, group_fields in fields.items():
+            if not self._is_own(kind, name):
+                for widget in group_fields.values():
+                    widget.param.watch(self._handler(self._on_field_changed), "value")
+        self._draw_algorithm_notes(built)
+        return built
+
+    @staticmethod
+    def _is_own(kind: str, name: str) -> bool:
+        """Whether the algorithm's parameters are ``route``'s own fields (``most-cells``), not a ``Params`` of its own."""
+        return kind == "selector" and name in ROUTE_OWN_PARAMS
+
+    @staticmethod
+    def _chosen_algorithm(widgets: _AlgorithmWidgets) -> str:
+        """The name the Select stands for: the default's for ``""``."""
+        return str(widgets.select.value) or widgets.default_name
+
+    def _draw_algorithm_notes(self, widgets: _AlgorithmWidgets) -> None:
+        """The note of the chosen algorithm's JSON text: a key it lacks, or a text that is not an object (D4).
+
+        Drawn from the text as it is, and left alone by what the page writes itself: a problem a
+        group's fields found (``_write_algorithm_text``) is the note until the next edit.
+        """
+        name = self._chosen_algorithm(widgets)
+        choice = next((c for c in widgets.choices if c.name == name), None)
+        if choice is None:
+            self._say(widgets.note, "")
+            return
+        model: type[BaseModel] = (
+            _NoFields if self._is_own(widgets.kind, name) else choice.model
+        )
+        _fields, unknown, problem = params_from_text(
+            str(self.tool_fields["route"][widgets.carrier].value), model
+        )
+        if problem is not None:
+            text = NOT_A_JSON_OBJECT.format(carrier=widgets.carrier, problem=problem)
+        elif unknown:
+            text = UNKNOWN_KEYS.format(
+                carrier=widgets.carrier, keys=", ".join(unknown), name=name
+            )
+        else:
+            text = ""
+        self._say(widgets.note, text)
+
+    def _follow_algorithm_choices(self, changed: Any) -> None:
+        """What a change of the Select, of its JSON text or of one of its fields does to the other two (m5 §21, D4, D5).
+
+        Skipped while the page itself writes (``_syncing_algorithms``): each direction would
+        call the other. A load never comes here (``_filling``): it assigns every field as the
+        preset holds it and fills the groups at its end (``_sync_algorithm_choices``).
+        """
+        if self._syncing_algorithms:
+            return
+        for widgets in self._algorithms.values():
+            if changed is widgets.select:
+                self._algorithm_chosen(widgets)
+                return
+            if changed is self.tool_fields["route"][widgets.carrier]:
+                self._fill_algorithm_fields(widgets)
+                return
+            for name, fields in widgets.fields.items():
+                if not self._is_own(widgets.kind, name) and any(
+                    changed is widget for widget in fields.values()
+                ):
+                    self._write_algorithm_text(widgets, name)
+                    return
+
+    def _algorithm_chosen(self, widgets: _AlgorithmWidgets) -> None:
+        """The operator chose another algorithm: what belonged to the old one goes (D5).
+
+        The JSON text is emptied, and for the selector the fields of ``ROUTE_OWN_PARAMS``
+        (``route`` refuses ``min_cells`` other than its default beside another selector, so it
+        must not travel hidden); the new group starts from the empty text.
+        """
+        self._syncing_algorithms = True
+        try:
+            self.tool_fields["route"][widgets.carrier].value = ""
+            if widgets.kind == "selector":
+                for keys in ROUTE_OWN_PARAMS.values():
+                    for key in keys:
+                        if key in self.tool_fields["route"]:
+                            self.tool_fields["route"][key].value = ""
+            name = self._chosen_algorithm(widgets)
+            if not self._is_own(widgets.kind, name):
+                for widget in widgets.fields.get(name, {}).values():
+                    widget.value = ""
+        finally:
+            self._syncing_algorithms = False
+        self._say(widgets.note, "")
+
+    def _write_algorithm_text(self, widgets: _AlgorithmWidgets, name: str) -> None:
+        """A group's field changed: the JSON text is written again, whole, from every field of the group (D4).
+
+        A value the algorithm refuses is written as typed and its problem is the note, so that
+        the run's refusal names the same key.
+        """
+        choice = next(c for c in widgets.choices if c.name == name)
+        text, problem = algorithm_params_text(
+            choice.model,
+            {key: str(w.value) for key, w in widgets.fields[name].items()},
+        )
+        self._syncing_algorithms = True
+        try:
+            self.tool_fields["route"][widgets.carrier].value = text
+        finally:
+            self._syncing_algorithms = False
+        self._say(widgets.note, problem or "")
+
+    def _fill_algorithm_fields(self, widgets: _AlgorithmWidgets) -> None:
+        """The JSON text changed and the page did not write it: the chosen group shows it, and the note says what it cannot (D4).
+
+        Each key the text holds is its field's text and a field the text does not hold is
+        emptied. The text is **not** rewritten: a key the algorithm lacks stays in it, because
+        ``route`` refuses it in its own words, which a rewrite would hide.
+        """
+        name = self._chosen_algorithm(widgets)
+        if not self._is_own(widgets.kind, name) and name in widgets.fields:
+            choice = next(c for c in widgets.choices if c.name == name)
+            texts = params_from_text(
+                str(self.tool_fields["route"][widgets.carrier].value), choice.model
+            )[0]
+            self._syncing_algorithms = True
+            try:
+                for key, widget in widgets.fields[name].items():
+                    widget.value = texts.get(key, "")
+            finally:
+                self._syncing_algorithms = False
+        self._draw_algorithm_notes(widgets)
+
+    def _sync_algorithm_choices(self) -> None:
+        """After a load: each chosen group shows the text its preset put in the JSON field, and the page draws what it chose (D8)."""
+        for widgets in self._algorithms.values():
+            self._fill_algorithm_fields(widgets)
+        self._draw_algorithm_choices()
+
+    def _draw_algorithm_choices(self) -> None:
+        """The summary of each chosen algorithm, whole, and which group is visible (m5 §21, D2, D8).
+
+        Called at the end of the build, from a field's change and at the end of a load; the tick
+        and ``refresh()`` do not call it (FM-145, FM-151): another tab's change comes through the
+        shared preset and the shared run document, which this page draws as it does every field.
+        """
+        for widgets in self._algorithms.values():
+            self._say(
+                widgets.summary,
+                summary_text(
+                    str(widgets.select.value), widgets.choices, widgets.default_name
+                ),
+            )
+            chosen = self._chosen_algorithm(widgets)
+            for name, group in widgets.groups.items():
+                group.visible = name == chosen
 
     def _centre_slot(self, index: int) -> _CentreSlot:
         """One centre row's widgets: its sentence, *Go to*, *Capture the centre of* (or *Redo*) and its note (m5 §17.4.2)."""
@@ -2267,11 +2530,18 @@ class PlatePageView:
             # default comes without the quotes ``describe_params`` prints (finding 13 of the
             # walk), and the raw default is kept for the "from" lines (m5 §17.10.3).
             self._field_defaults[(tool.name, name)] = default
-            fields[name] = pn.widgets.TextInput(
-                label=name,
-                placeholder=plain_default(default),
-                description=description,
-                value=suggested.get(name, ""),
+            chosen = self._algorithm_select(
+                tool.name, name, default, description, suggested.get(name, "")
+            )
+            fields[name] = (
+                chosen
+                if chosen is not None
+                else pn.widgets.TextInput(
+                    label=name,
+                    placeholder=plain_default(default),
+                    description=description,
+                    value=suggested.get(name, ""),
+                )
             )
             # After the field has its first value: a change of any field redraws the
             # note, unless a load is assigning them all (m5 §10.6).
@@ -2325,6 +2595,54 @@ class PlatePageView:
             parts.append(pn.Card(*advanced_widgets, title="Advanced", collapsed=True))
         parts += [run, note, card]
         return pn.Column(pn.pane.Str(tool.name, styles={"font-weight": "bold"}), *parts)
+
+    def _algorithm_select(
+        self, tool: str, name: str, default: str, description: str, value: str
+    ) -> Any:
+        """``route``'s ``selector`` or ``orderer`` as a ``Select`` over the installed algorithms, or ``None`` to keep the text field (m5 §21, D1, D7).
+
+        The value is a ``str`` as every field's is: ``""`` for the default entry (an empty
+        field is the tool's default everywhere on the page) and the algorithm's name for any
+        other. A suggestion that is not an option (the profile names an algorithm this PC lacks)
+        is added before it is assigned (D6). With the default not installed there is still an
+        entry for ``""``, so that the Select never shows an algorithm nobody chose.
+        """
+        if tool != "route" or name not in ("selector", "orderer"):
+            return None
+        kind: Literal["selector", "orderer"] = (
+            "selector" if name == "selector" else "orderer"
+        )
+        choices = self.page.algorithms(kind)
+        if not choices:
+            return None
+        default_name = plain_default(default)
+        shown = options(choices, default_name)
+        if "" not in shown.values():
+            shown = {f"{default_name} (default, not installed)": "", **shown}
+        select = pn.widgets.Select(
+            label=SELECT_LABEL if kind == "selector" else ORDER_LABEL,
+            options=shown,
+            value="",
+            description=description,
+            sizing_mode="stretch_width",
+        )
+        self._ensure_option(select, value)
+        select.value = value
+        return select
+
+    @staticmethod
+    def _ensure_option(select: Any, name: str) -> None:
+        """Add the option ``<name> (not installed)`` when ``name`` is not a value of ``select``, once (m5 §21, D6, FM-262).
+
+        A preset or the profile's suggestion may name an algorithm that is not installed on this
+        PC, and what a widget library does with a value it was not given is its own affair
+        (Panel 1.10.0 accepts it silently and draws it blank; older releases were not measured):
+        the option is added **before** the assignment, so that the Select says what the preset
+        says and ``route`` refuses it with the installed names.
+        """
+        if name in select.options.values():
+            return
+        select.options = {**select.options, f"{name} (not installed)": name}
 
     def _runner(self, plugin: str) -> Callable[[Any], None]:
         def clicked(event: Any) -> None:
@@ -2984,12 +3302,18 @@ class PlatePageView:
         try:
             for tool, fields in self.tool_fields.items():
                 for key, widget in fields.items():
+                    if isinstance(widget, pn.widgets.Select):
+                        # A name the preset gives that this PC lacks is shown (D6).
+                        self._ensure_option(widget, expected[tool][key])
                     widget.value = expected[tool][key]
         finally:
             # Always: a guard left up would stop the note following the edits.
             self._filling = False
         self._preset_expected = expected
         self._expected_of = loaded
+        # With the guard down: the groups of the algorithms the load chose show the text it put
+        # in their JSON fields, and the page draws them (m5 §21, D8).
+        self._sync_algorithm_choices()
 
     def on_save_preset(self) -> None:
         """*Save*: the plate, the *Wells* box and the non-empty fields, under the name typed.
@@ -3063,6 +3387,8 @@ class PlatePageView:
         """A tool's field changed: the note says how the page differs from the preset, unless a load is filling them."""
         if self._filling:
             return
+        self._follow_algorithm_choices(event.obj)
+        self._draw_algorithm_choices()
         self._draw_preset_note()
         # *Calibrate the camera*, *Lay out the fields* and *Start the scan* run the same
         # fields: their commands follow them, and so do the lines that say where the Wells
