@@ -2545,21 +2545,24 @@ def _docstring_constants(tree: ast.AST) -> set[int]:
     return found
 
 
-def _layer_literals() -> Iterator[tuple[str, str]]:
+def _layer_literals(root: Path | None = None) -> Iterator[tuple[str, str]]:
     """Every string a part of ``smc`` that is not the page or the CLI can write, as ``(file, text)`` (m5 §17.12.12 D37).
 
-    The walk reads the syntax tree of each module under ``src/smc`` except ``ui/`` (it holds
-    the table whose keys name the calls) and ``cli.py`` (the CLI's texts are the CLI's). A
-    docstring is skipped; an f-string is one text with each formatted value written ``it``,
-    which is what the layer's plural texts read as (``wait for it (...)``), and the pieces
-    of an f-string are not read a second time on their own.
+    The walk reads the syntax tree of each module under ``src/smc`` (``root``) except ``ui/``
+    (it holds the table whose keys name the calls) and ``cli.py`` (the CLI's texts are the
+    CLI's). A docstring is skipped; an f-string is one text with each formatted value written
+    ``it``, which is what the layer's plural texts read as (``wait for it (...)``), and the
+    pieces of an f-string are not read a second time on their own. A file is parsed from its
+    **bytes**, as the interpreter reads it: an editor that saves a UTF-8 byte-order mark
+    (Notepad before Windows 10 1903, FM-80) leaves a module that imports and runs, and a
+    text read of it would be a ``SyntaxError`` that names no file.
     """
-    root = Path(smc.__file__).parent
+    root = Path(smc.__file__).parent if root is None else root
     for path in sorted(root.rglob("*.py")):
         parts = path.relative_to(root).parts
         if parts[0] == "ui" or parts == ("cli.py",):
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = ast.parse(path.read_bytes(), filename=str(path))
         skipped = _docstring_constants(tree)
         for node in ast.walk(tree):
             if isinstance(node, ast.JoinedStr):
@@ -2580,6 +2583,27 @@ def _layer_literals() -> Iterator[tuple[str, str]]:
                         for part in node.values
                     ),
                 )
+
+
+def test_the_walk_reads_a_module_that_starts_with_a_byte_order_mark(
+    tmp_path: Path,
+) -> None:
+    # A module saved with a BOM imports and runs, so the walk must read it too: the verifier
+    # of #592's review reproduced a SyntaxError (`<unknown>`) from a text read of such a file.
+    package = tmp_path / "layer"
+    package.mkdir()
+    bom = b"\xef\xbb\xbf"
+    (package / "texts.py").write_bytes(
+        bom + b'MESSAGE = "wait for it (`wait()`) or stop it (`stop()`)"\n'
+    )
+    # `ui/` and `cli.py` are not walked, BOM or not.
+    (tmp_path / "ui").mkdir()
+    (tmp_path / "ui" / "page.py").write_bytes(bom + b'SKIPPED = "stop()"\n')
+    (tmp_path / "cli.py").write_bytes(bom + b'SKIPPED = "resume()"\n')
+    found = list(_layer_literals(tmp_path))
+    assert found == [
+        ("layer/texts.py", "wait for it (`wait()`) or stop it (`stop()`)"),
+    ]
 
 
 def test_no_literal_of_the_layer_names_stop_resume_or_wait_after_page_words() -> None:

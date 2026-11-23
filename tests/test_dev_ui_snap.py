@@ -1951,13 +1951,17 @@ OFF_LINE = "Time: about 13 s, with the autofocus not used"
 REQUIRED_LINE = "Time: about 14 s, with the autofocus locked again in each well"
 
 
-def _timed_page() -> tuple[MagicMock, list[str]]:
+def _timed_page(
+    *, fails_waiting_after: str | None = None
+) -> tuple[MagicMock, list[str]]:
     """A page that writes what ``wells-timed`` does in order, and answers a read of the ``Time`` line with the next of the three.
 
     The block is a ``pre`` of several lines (the objective, the fields, the time), as the
     Wells screen's known block is, so that the action must pick the line out of it. A wait is
     ``wait:<text>`` for a pane that holds a text and ``wait-not:<text>`` for one that holds the
     ``Time`` line and not the last one read: the wait for the line to change, never a delay.
+    ``fails_waiting_after`` is a line whose change never comes: the wait for the line to
+    differ from it raises, as a Playwright timeout does.
     """
     page = MagicMock()
     order: list[str] = []
@@ -1978,9 +1982,13 @@ def _timed_page() -> tuple[MagicMock, list[str]]:
 
         def changed(*, has_not_text: str) -> MagicMock:
             later = MagicMock()
-            later.first.wait_for.side_effect = lambda **kw: order.append(
-                f"wait-not:{has_not_text}"
-            )
+
+            def wait_for_the_change(**kw: object) -> None:
+                order.append(f"wait-not:{has_not_text}")
+                if has_not_text == fails_waiting_after:
+                    raise _FakeError("Locator.wait_for: Timeout 10000ms exceeded.")
+
+            later.first.wait_for.side_effect = wait_for_the_change
             return later
 
         pane.filter.side_effect = changed
@@ -2034,6 +2042,30 @@ def test_the_wells_timed_state_times_the_stand_first_then_reads_the_time_line_th
     page.wait_for_timeout.assert_not_called()
     # The field is found by the label the page draws, once.
     page.get_by_label.assert_called_once_with(snap.AUTOFOCUS_FIELD, exact=True)
+
+
+@pytest.mark.parametrize(
+    ("fails_after", "typed_last"),
+    [
+        pytest.param(DEFAULT_LINE, "off", id="the line never changes for off"),
+        pytest.param(OFF_LINE, "required", id="the line never changes for required"),
+    ],
+)
+def test_a_wells_timed_that_fails_while_the_field_is_typed_puts_it_back_all_the_same(
+    snap, fails_after: str, typed_last: str
+) -> None:
+    # The state is named as not reached (the failure propagates), but the field must not
+    # stay `required` or `off` for the next state: `scanned` would then fail on the page's own
+    # `autofocus=required, and the autofocus is off` and say only that a wait timed out (the
+    # review of #592 reproduced it on the real page).
+    page, order = _timed_page(fails_waiting_after=fails_after)
+    with pytest.raises(_FakeError, match="Timeout 10000ms exceeded"):
+        snap._act_wells_timed(page, _no_chain())
+    assert f"fill:{typed_last}" in order
+    assert order[-2:] == ["fill:", "press:Enter"]
+    # Put back once, and not waited for: the page is what failed.
+    assert order.count("fill:") == 1
+    assert not any(line == f"wait:{DEFAULT_LINE}" for line in order)
 
 
 def test_the_wells_timed_state_names_what_the_page_draws(snap) -> None:

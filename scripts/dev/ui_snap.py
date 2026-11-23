@@ -959,17 +959,22 @@ def _act_wells_timed(page: Any, stand: Stand) -> list[tuple[str, str]]:
     box = page.get_by_label(AUTOFOCUS_FIELD, exact=True)
     first_name = TIME_READS[0][0]
     readings = [(first_name, _time_line(page))]
-    for name, typed in TIME_READS[1:]:
-        previous = readings[-1][1]
-        box.fill(typed)
+    try:
+        for name, typed in TIME_READS[1:]:
+            previous = readings[-1][1]
+            box.fill(typed)
+            box.press("Enter")
+            # The line that is not the last one read: the redrawn block, never the old one.
+            page.locator("pre").filter(has_text=TIME_LINE).filter(
+                has_not_text=previous
+            ).first.wait_for()
+            readings.append((name, _time_line(page)))
+    finally:
+        # Whatever failed, the field goes back: a state that is named as not reached must not
+        # leave ``required`` in it, which the next state (``scanned``) would meet as the
+        # page's own ``autofocus=required, and the autofocus is off`` (review of #592).
+        box.fill(TIME_READS[0][1])
         box.press("Enter")
-        # The line that is not the last one read: the redrawn block, never the old one.
-        page.locator("pre").filter(has_text=TIME_LINE).filter(
-            has_not_text=previous
-        ).first.wait_for()
-        readings.append((name, _time_line(page)))
-    box.fill(TIME_READS[0][1])
-    box.press("Enter")
     page.locator("pre").filter(has_text=readings[0][1]).first.wait_for()
     return readings
 
