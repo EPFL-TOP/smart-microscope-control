@@ -684,10 +684,17 @@ def test_a_position_that_holds_another_objectives_calibration_says_whose_it_repl
     assert view.offsets_calibrate_button.label == f"Calibrate the camera at {FORTY}"
     assert view.offsets_calibrate_wait.object == calibrate_replaces(TWENTY, SEEDED)
     assert FORTY not in view.offsets_calibrate_wait.object
-    # The list says the same before the click: the 20X is calibrated, the 40X is not.
+    # The list says the same before the click: position 1's document holds the 20X's calibration
+    # and is not offered as that position's (D21), so the 40X has none and neither does the 20X.
     lines = view.calibrations_held_text.object.splitlines()
-    assert f"{TWENTY}: calibrated on 2026-11-17" in lines
+    assert lines[1] == (
+        f"position 1 ({FORTY}): the document holds a calibration of {TWENTY}, not of "
+        "the objective at this position now (the turret was turned during a run, or "
+        f"relabelled since): calibrate {FORTY} again, or type the documents to use"
+    )
+    assert f"{TWENTY}: calibrated on 2026-11-17" not in lines
     assert f"{FORTY}: no calibration yet" in lines
+    assert f"{TWENTY}: no calibration yet" in lines
 
 
 def test_a_calibration_from_the_page_is_listed_with_its_objective_and_date(
@@ -743,8 +750,11 @@ def test_the_list_names_each_document_its_objective_and_date_each_objective_with
         f"{FORTY}: calibrated on 2026-11-17",
         f"{TEN}: calibrated on 2026-11-17; the plate's objective, not measured from itself",
         problem,
-        "Nikon 60X Plan Apo: calibrated on 2026-11-17; not on the turret now: "
-        "calibrate its position again, or type the documents to use",
+        # Position 5 holds an objective that is no label of the turret now: not its position's.
+        "position 5 (Objective-4): the document holds a calibration of Nikon 60X Plan "
+        "Apo, not of the objective at this position now (the turret was turned during "
+        "a run, or relabelled since): calibrate Objective-4 again, or type the "
+        "documents to use",
         # Each other objective of the turret that no usable document names, in turret order.
         "Objective-2: no calibration yet",
         f"{TWENTY}: no calibration yet",

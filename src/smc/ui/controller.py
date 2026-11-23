@@ -6020,6 +6020,7 @@ class PlatePage:
             dry_run=self._dry_run,
             objective=now,
             plate_objective=offer.plate_objective,
+            light_on=None,
         )
         if wait is not None:
             return wait

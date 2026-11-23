@@ -93,6 +93,7 @@ from smc.ui.guide import (
     MEASURE_AFTER_THE_SCAN,
     MEASURE_THE_TIME,
     NO_FILES_YET,
+    OFFSETS_MEASURE_LABEL,
     OFFSETS_NOT_TURNED_BACK,
     OFFSETS_STALE,
     OFFSETS_TITLE,
@@ -120,6 +121,7 @@ from smc.ui.guide import (
     calibrate_replaces,
     calibrate_replaces_plate,
     calibrate_wait,
+    calibration_at_its_position,
     calibration_held_line,
     calibration_how_text,
     calibration_missing_line,
@@ -1575,7 +1577,7 @@ class PlatePageView:
             sizing_mode="stretch_width",
         )
         self.offsets_measure_button = pn.widgets.Button(
-            label="Measure the offsets", color="primary"
+            label=OFFSETS_MEASURE_LABEL, color="primary"
         )
         self.offsets_wait_text = _wrapped_text()
         self.offsets_confirm_text = _wrapped_text(extra={"color": _WARNING})
@@ -4472,6 +4474,7 @@ class PlatePageView:
             dry_run=status.dry_run,
             objective=objective,
             plate_objective=plate,
+            light_on=None,
         )
         self.offsets_calibrate_button.label = calibrate_label(
             objective, plate, again=same
@@ -4590,6 +4593,9 @@ class PlatePageView:
         for item in held:
             read = item.read
             index = item.position - 1
+            at_position = calibration_at_its_position(
+                labels, item.position, read.objective
+            )
             lines.append(
                 calibration_held_line(
                     item.position,
@@ -4598,14 +4604,17 @@ class PlatePageView:
                     read.measured,
                     read.problem,
                     plate_objective=plate_objective,
-                    on_turret=(
-                        None
-                        if not labels or read.objective is None
-                        else read.objective in labels
-                    ),
+                    at_position=at_position,
                 )
             )
-            if read.problem is None and read.objective is not None:
+            # A document that is not its position's names no objective (D21): the objective its
+            # file should hold is listed `no calibration yet`, and its own notes are not shown
+            # under a line that says the document is not offered.
+            if (
+                read.problem is None
+                and read.objective is not None
+                and at_position is not False
+            ):
                 named.add(read.objective)
                 lines.extend(
                     calibration_note_line(read.objective, note) for note in read.notes

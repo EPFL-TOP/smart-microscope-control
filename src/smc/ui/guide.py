@@ -67,9 +67,11 @@ __all__ = [
     "AUTOFOCUS_WORDS",
     "CALIBRATE_DRY_RUN",
     "CALIBRATE_LEAD",
+    "CALIBRATE_LIGHT_OFF",
     "CALIBRATE_NAMES_NONE",
     "CALIBRATE_NOT_KNOWN",
     "CALIBRATE_NO_OFFER",
+    "CALIBRATE_REUSE_ROUTED",
     "CALIBRATIONS_FOLDER",
     "CALIBRATION_HOW_WINDOWS_NOTE",
     "CAMERA_NOT_CALIBRATED_NOTE",
@@ -107,6 +109,7 @@ __all__ = [
     "NO_CALIBRATION_FOR_SIDES",
     "NO_FILES_YET",
     "OFFSETS_DRY_RUN",
+    "OFFSETS_MEASURE_LABEL",
     "OFFSETS_NOTHING_ARMED",
     "OFFSETS_NOT_TURNED_BACK",
     "OFFSETS_NO_DOCUMENT",
@@ -172,14 +175,20 @@ __all__ = [
     "again_note",
     "busy_note",
     "calibrate_changed",
+    "calibrate_command_folder_note",
     "calibrate_is_the_plates",
     "calibrate_label",
+    "calibrate_measured_other",
     "calibrate_position_unknown",
     "calibrate_replaces",
     "calibrate_replaces_plate",
+    "calibrate_stand_routed",
     "calibrate_wait",
+    "calibration_at_its_position",
+    "calibration_denied",
     "calibration_failed",
     "calibration_file",
+    "calibration_goes_to_a_document",
     "calibration_held_line",
     "calibration_how_text",
     "calibration_missing_line",
@@ -3321,6 +3330,20 @@ CALIBRATE_NAMES_NONE = (
 #: after it (D12).
 CALIBRATE_LEAD = "To calibrate the camera at an objective: turn the turret to it (Stand screen, Change objective), bring a well's wall into the image (the arrows, Live), then press the button. The stage moves by about a quarter of the field in X, then in Y, and comes back."
 
+#: The label of the block's *Measure the offsets* (m5 §18.6 D23): ``plate_page.py`` draws it and
+#: ``scripts/dev/ui_snap.py`` looks for the button by it, with a copy that a test pins (FM-45).
+OFFSETS_MEASURE_LABEL = "Measure the offsets"
+
+#: Why a calibration waits while the light reads off (D20, FM-206): the tool refuses a dark frame
+#: before anything moves, and its refusal is a ``failed`` record that replaces the position's
+#: usable document. An unknown light (no switch smc knows, a read that raised) refuses nothing.
+CALIBRATE_LIGHT_OFF = "the light reads off, so the camera's frame would be dark and the calibration would fail: switch it on (Light on, in the drive bar), then press the button again"
+
+#: Why the Stand screen's button refuses a typed ``from_run_doc`` when it would write into the
+#: objective's own document (D19): that field reuses a calibration *into the run document*, where
+#: it would replace the plate's, so it is the expert view's.
+CALIBRATE_REUSE_ROUTED = "the form's from_run_doc reuses a calibration into the run document, where it would replace the plate's: clear it to calibrate into the objective's own document, or use Run camera-calibration in the expert view"
+
 
 def calibration_file(position: int) -> str:
     """The file name of a turret position's calibration document: ``position-<n>.json`` (D11).
@@ -3365,13 +3388,20 @@ def calibrate_wait(
     dry_run: bool,
     objective: str | None,
     plate_objective: str,
+    light_on: bool | None,
 ) -> str | None:
-    """Why *Calibrate the camera* waits, or ``None``: the one function the view draws and the controller refuses with (D12, FM-169, FM-206).
+    """Why *Calibrate the camera* waits, or ``None``: the one function the view draws and the controller refuses with (D12, D20, FM-169, FM-206).
 
     The first that holds: the stand is closed, an activity goes, the page is a dry run (the
     tool refuses it, and its refusal is a ``failed`` record that replaces the position's
     usable document), the objective in place is not known (a blank label is an empty
-    position), or it is the plate's own (its calibration is the run document's).
+    position), it is the plate's own (its calibration is the run document's), or the light
+    reads off (the tool refuses a dark frame the same way: ``CALIBRATE_LIGHT_OFF``).
+
+    ``light_on`` is **required**, so that the view, the controller and the Stand screen cannot
+    forget it (FM-169). ``None`` (no switch smc knows, a read that raised) refuses nothing: the
+    tool decides, and an unknown is not a refusal the page can justify. A frame that is dark
+    with the light on is still the tool's refusal (D20 says what that leaves).
     """
     if not connected:
         return NOT_CONNECTED
@@ -3383,7 +3413,49 @@ def calibrate_wait(
         return CALIBRATE_NOT_KNOWN
     if objective == plate_objective:
         return calibrate_is_the_plates(objective)
+    if light_on is False:
+        return CALIBRATE_LIGHT_OFF
     return None
+
+
+def calibration_goes_to_a_document(
+    plate_objective: str | None, objective: str | None
+) -> bool:
+    """Whether the Stand screen's *Calibrate the camera* is run into the objective's own document and not into the run document (D19, FM-169, FM-216).
+
+    ``True`` exactly when the block is offered (``plate_objective`` is the objective the plate was
+    registered with from its walls, ``None`` for no offer) and the objective in place is known and
+    is not the plate's. The one condition the Stand screen's note, its command, its disabled state
+    and the controller's route read, so that what the button says and what the click does cannot
+    differ. At the plate's own objective the run document's calibration is the one
+    ``plate-walls`` reads; with no offer there is no registration from walls to protect.
+    """
+    return (
+        plate_objective is not None
+        and objective is not None
+        and bool(objective.strip())
+        and objective != plate_objective
+    )
+
+
+def calibration_at_its_position(
+    labels: Sequence[str], position: int, objective: str | None
+) -> bool | None:
+    """Whether ``objective`` is the label at turret ``position`` now: a document is its file's position's (D21, FM-216).
+
+    The file names a position (the label's index plus one when the button was pressed) and the
+    document names an objective (the one the tool read when it ran): a turn at the handset between
+    the two reads, or a relabelled turret later, leaves the file holding another objective's
+    calibration. ``None`` for no labels (they were not read: nothing is known); else ``True``
+    exactly when ``1 <= position <= len(labels)`` and ``labels[position - 1] == objective``, so
+    that a position past the labels, an objective that is ``None`` or blank, and another label are
+    all ``False``.
+    """
+    if not labels:
+        return None
+    if objective is None or not objective.strip():
+        return False
+    return 1 <= position <= len(labels) and labels[position - 1] == objective
 
 
 def calibrate_label(objective: str | None, plate_objective: str, *, again: bool) -> str:
@@ -3447,6 +3519,55 @@ def calibrate_replaces_plate(plate_objective: str, objective: str) -> str:
     )
 
 
+def calibrate_stand_routed(plate_objective: str, objective: str, file: str) -> str:
+    """The Stand screen's note: its *Calibrate the camera* is kept in the objective's own document and the plate's calibration stays as it is (D19, FM-216).
+
+    ``file`` is ``calibration_file(position)``. It replaces D17's warning, which described a click
+    that no longer happens: the plate registered with ``plate_objective`` keeps the calibration in
+    the run document, and the block's *Measure the offsets* uses the document this one makes.
+    """
+    return _flat(
+        f"The plate was registered with {plate_objective}: a calibration at {objective} "
+        f"here is kept in its own document, {CALIBRATIONS_FOLDER}/{file}, and the "
+        f"plate's calibration stays as it is. {OFFSETS_TITLE} (Plate screen) uses it."
+    )
+
+
+def calibrate_command_folder_note(folder: str) -> str:
+    """Under the Stand screen's routed command: the page makes the folder, a terminal does not (D19, ADR-0006 principle 5)."""
+    return _flat(
+        f"The folder {folder} must exist first: the page makes it, a terminal does not."
+    )
+
+
+def calibrate_measured_other(expected: str, measured: str | None, file: str) -> str:
+    """The outcome of a calibration whose record names another objective than the button's: the turret was turned between the click's read and the tool's (D21, FM-177).
+
+    What is on the disk is the other objective's calibration in ``file``, the position's own
+    document, and the objective the button named has none: the run replaced the previous document
+    and D13 rejected a copy kept aside. ``measured`` is ``None`` for a record that names no
+    objective. The strip says ``Camera calibration: `` and this text, never ``done``.
+    """
+    named = "an unknown objective" if measured is None else measured
+    return _flat(
+        f"it measured {named}, not {expected} as the button said (the turret was "
+        f"turned during the run): {file} holds a calibration of {named} and {expected} "
+        f"has none; put {expected} in place and press the button again"
+    )
+
+
+def calibration_denied(folder: str, reason: str) -> str:
+    """The one line for a folder the account cannot look into, instead of one line per position (D22, FM-98, FM-139).
+
+    ``reason`` is the error's class and its ``strerror``, never its file name: plain text, one
+    line. Which objectives have a calibration is not known, so none is listed as missing under it.
+    """
+    return _flat(
+        f"{folder}: the page cannot look into this folder ({reason}); which "
+        "objectives have a calibration is not known"
+    )
+
+
 def calibrations_held_heading(folder: str) -> str:
     """The line above the list of the documents the page holds (D15)."""
     return _flat(
@@ -3462,33 +3583,44 @@ def calibration_held_line(
     problem: str | None,
     *,
     plate_objective: str,
-    on_turret: bool | None,
+    at_position: bool | None,
 ) -> str:
-    """One document of the list: its objective and date, or its position and why it is not usable, and why it is left out of the default (D15, D16).
+    """One document of the list: its objective and date, or its position and why it is not usable, and why it is left out of the default (D15, D16, D21).
 
     A usable document is ``<objective>: calibrated on <date>``, with what keeps it out of the
-    empty field's default added after a semicolon: it is the plate's objective, or its
-    objective is no label of the turret now (``on_turret`` ``False``; ``None`` is not
-    known, and says nothing). One with a ``problem`` is ``position <n> (<label>): <problem>``;
-    the label is the position's own, when the page knows it. Plain text on one line (FM-139):
+    empty field's default added after a semicolon when it is the plate's objective. One with a
+    ``problem`` is ``position <n> (<label>): <problem>``; the label is the position's own, when
+    the page knows it. ``at_position`` is whether the document's objective is the label of its own
+    position (``calibration_at_its_position``; ``None`` is not known, and says nothing): a
+    document that is not has a line of its own (D21), naming no objective of the turret, so that
+    the objective the file should hold is listed as having none. Plain text on one line (FM-139):
     a label, a path and a tool's words come from outside.
     """
+    where = (
+        f"position {position}"
+        if label is None or not label.strip()
+        else f"position {position} ({label})"
+    )
     if problem is not None:
-        where = (
-            f"position {position}"
-            if label is None or not label.strip()
-            else f"position {position} ({label})"
-        )
         return _flat(f"{where}: {problem}")
     named = "an unknown objective" if objective is None else objective
+    if at_position is False:
+        act = (
+            "type the documents to use"
+            if label is None or not label.strip()
+            else f"calibrate {label} again, or type the documents to use"
+        )
+        return _flat(
+            f"{where}: the document holds a calibration of {named}, not of the "
+            "objective at this position now (the turret was turned during a run, or "
+            f"relabelled since): {act}"
+        )
     when = (
         f" on {measured[:10]}" if _ISO_DATE.match(measured) else ", at an unknown time"
     )
     line = f"{named}: calibrated{when}"
     if objective is not None and objective == plate_objective:
         line += "; the plate's objective, not measured from itself"
-    if on_turret is False:
-        line += "; not on the turret now: calibrate its position again, or type the documents to use"
     return _flat(line)
 
 
