@@ -135,6 +135,8 @@ from smc.ui.guide import (
     ASSUMED_LINE_CHARS,
     CALIBRATE_NAMES_NONE,
     CALIBRATE_NO_OFFER,
+    CALIBRATE_NOT_KNOWN,
+    CALIBRATE_REUSE_ROUTED,
     CALIBRATIONS_FOLDER,
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
@@ -176,6 +178,7 @@ from smc.ui.guide import (
     calibration_denied,
     calibration_failed,
     calibration_file,
+    calibration_goes_to_a_document,
     calibration_paths,
     centres_reach_note,
     checkpoint_note,
@@ -212,6 +215,7 @@ if TYPE_CHECKING:
     from smc.hardware.profile import HolderSection
 
 __all__ = [
+    "CALIBRATE_FIELDS",
     "JOG_WALL_MARGIN_UM",
     "KEY_PARAMS",
     "LIVE_PERIOD_S",
@@ -244,6 +248,11 @@ __all__ = [
 ]
 
 log = logging.getLogger("smc.ui")
+
+#: The fields of the ``camera-calibration`` form that a click into an objective's own document sends
+#: (m5 §18.6 D13, D19): the step and the settle, so that a stand that needs a settle has it. The
+#: form's advanced ``from_run_doc`` is never sent there, and the controller drops every other pair.
+CALIBRATE_FIELDS = ("step_um", "settle_ms")
 
 #: The tools of the workflow in the order the page shows them, grouped by stage.
 #: Every other registered plugin is on the page too, under ``MORE_STAGE``, by name
@@ -1683,6 +1692,20 @@ def _assumed_tail(record: StageRecord) -> str:
     FM-139), and empty unless the record ended ``done`` (FM-154).
     """
     return _assumed_tail_of(_card(record).assumed)
+
+
+def _calibrate_label_refusal(expected: str, now: str) -> str | None:
+    """Why a calibration click is refused for the label its button showed, or ``None``: the one check both calibrate buttons make (m5 §18.6 D12, D19, FM-177, FM-169).
+
+    The button named none, or another objective than the turret reads now: a label drawn up to a
+    second ago is not what the turret says, and the destination (and the document) was chosen for
+    it.
+    """
+    if not expected.strip():
+        return CALIBRATE_NAMES_NONE
+    if expected != now:
+        return calibrate_changed(expected, now)
+    return None
 
 
 def _assumed_tail_of(lines: Sequence[str]) -> str:
@@ -5652,7 +5675,12 @@ class PlatePage:
         return found, tuple(problems)
 
     def command_for(
-        self, plugin: str, params: Sequence[str], *, resume: bool = False
+        self,
+        plugin: str,
+        params: Sequence[str],
+        *,
+        resume: bool = False,
+        run_doc: Path | None = None,
     ) -> str:
         """The ``smc run`` command that makes the call of ``plugin`` with ``params`` on this page (ADR-0006, principle 5).
 
@@ -5660,9 +5688,14 @@ class PlatePage:
         next step builds, with the profile's file when there is one (a name otherwise),
         this page's run document, its dry run and the loaded preset. One builder, so
         that a button's command and the next step's cannot say two things. ``resume``
-        names ``--resume``: the command of *Continue the scan* (m5 §17.12 D17).
+        names ``--resume``: the command of *Continue the scan* (m5 §17.12 D17). ``run_doc``
+        is the document the call is run into when it is not the page's own: the Stand
+        screen's *Calibrate the camera* into an objective's document (m5 §18.6 D19), made
+        absolute where the server runs, as the page's own is.
         """
-        return self._command(plugin, params, self.preset, resume=resume)
+        return self._command(
+            plugin, params, self.preset, resume=resume, run_doc=run_doc
+        )
 
     def _command(
         self,
@@ -5671,13 +5704,14 @@ class PlatePage:
         loaded: LoadedPreset | None,
         *,
         resume: bool = False,
+        run_doc: Path | None = None,
     ) -> str:
         """``command_for`` for the preset the caller already read: a step's pairs and its command name one preset (FM-151)."""
         return command_line(
             plugin,
             params,
             profile=self.profile_argument,
-            run_doc=self.run_doc,
+            run_doc=self.run_doc if run_doc is None else run_doc.absolute(),
             dry_run=self._dry_run,
             preset=None if loaded is None else str(loaded.file.path),
             resume=resume,
@@ -6067,16 +6101,116 @@ class PlatePage:
             return wait
         if now is None:  # unreachable: ``calibrate_wait`` says an objective not known
             return CALIBRATE_NAMES_NONE
-        if not expected.strip():
-            return CALIBRATE_NAMES_NONE
-        if expected != now:
-            return calibrate_changed(expected, now)
+        label = _calibrate_label_refusal(expected, now)
+        if label is not None:
+            return label
+        return self._calibrate_position_target(now, labels)
+
+    def _calibrate_position_target(self, now: str, labels: Sequence[str]) -> Path | str:
+        """The document of the position ``now`` is at, or the text that refuses a run into it: the refusals both calibrate buttons end with (m5 §18.6 D13, D19, FM-169).
+
+        The position is not known (the labels could not be read, two positions carry the label,
+        or it is past ``MAX_POSITIONS``), or the stand is halted: the tool would switch the
+        autofocus off and fail at its first move, and its failed record would replace the
+        position's usable document. The halt is read last and only here, after a busy page has
+        been refused: it reads every device (``_halted``), which a drawer must never do (FM-145).
+        """
         position = turret_position(labels, now)
         if position is None:
             return calibrate_position_unknown(now)
         if self._halted():
             return SCAN_HALTED
         return self.calibrations_folder / calibration_file(position)
+
+    def calibrate_camera(self, expected: str, pairs: Sequence[str] = ()) -> None:
+        """The Stand screen's *Calibrate the camera*: into the objective's own document when the plate was registered under another objective, into the run document otherwise (m5 §18.6 D19).
+
+        ``expected`` is the label the button showed (``_stand_calibrate_for``, the tick's
+        objective, ``""`` for none) and ``pairs`` what the click sends: the page's pairs and the
+        form's typed fields. The destination is decided here, from the turret **read again at the
+        click**, by the pure function the button's note, command and disabled state read too
+        (``calibration_goes_to_a_document``, FM-169): into ``calibrations/position-<n>.json``
+        (``calibrate_objective``'s run: the folder, ``_prepare(..., doc_path=...)``, the
+        activity ``camera-calibration``, the check after the run) when the block is offered and
+        the objective in place is known and is not the plate's; into ``run.json`` otherwise, as
+        before, since at the plate's own objective the run document's calibration is the one
+        ``plate-walls`` reads, and a plate registered by eye has none to protect.
+
+        **With no offer** (no plate registered from its walls, an unreadable run document
+        included: those refusals are ``run``'s and write nothing) it is ``run("camera-calibration",
+        pairs)`` and nothing else. **With one** the refusals are the outcome ``Camera calibration:
+        <text>``, with nothing written and nothing started, in this order: the stand is closed,
+        the objective in place is not known (the destination cannot be chosen, and ``run.json``
+        is not a safe default), the button named none or another objective than the turret reads
+        now (the destination was chosen for the label shown: a turn at the handset since would
+        send the 40X's calibration into ``run.json`` and put the plate out of date, the converse
+        of FM-177), and then, for a document only: a dry run and the light (``calibrate_wait``),
+        a typed ``from_run_doc`` (``CALIBRATE_REUSE_ROUTED``), the position not known and the halt.
+        For a document only ``CALIBRATE_FIELDS`` are sent; for ``run.json`` every pair typed is.
+        **Nothing here turns the turret** (FM-14).
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page is closed.
+        """
+        self._refuse_if_busy()
+        doc, unreadable = self._document()
+        offer = (
+            None
+            if unreadable is not None
+            else self._offsets_offer(self._slot(doc, "plate", PlateResult, []))
+        )
+        if offer is None:
+            self.run("camera-calibration", pairs)
+            return
+        found = self._stand_calibration_target(expected, offer.plate_objective, pairs)
+        if isinstance(found, str):
+            self._set_outcome(f"{tool_title('camera-calibration')}: {found}")
+            return
+        if found is None:
+            self.run("camera-calibration", pairs)
+            return
+        self._calibrate_into(
+            found,
+            expected,
+            [pair for pair in pairs if pair.partition("=")[0] in CALIBRATE_FIELDS],
+        )
+
+    def _stand_calibration_target(
+        self, expected: str, plate_objective: str, pairs: Sequence[str]
+    ) -> Path | str | None:
+        """Where the Stand screen's click goes: the position's document, ``None`` for the run document, or the text that refuses it (m5 §18.6 D19).
+
+        D19's order, in one read of the turret (label, labels and light together, inside a read a
+        Disconnect waits for). The label checks are the block's (``_calibrate_label_refusal``), and
+        a document ends with the block's position and halt (``_calibrate_position_target``).
+        """
+        if self._microscope is None:
+            return NOT_CONNECTED
+        now, labels, light_on = self._turret_reading()
+        if now is None or not now.strip():
+            return CALIBRATE_NOT_KNOWN
+        label = _calibrate_label_refusal(expected, now)
+        if label is not None:
+            return label
+        if not calibration_goes_to_a_document(plate_objective, now):
+            return None
+        wait = calibrate_wait(
+            connected=True,
+            running=None,
+            live=False,
+            dry_run=self._dry_run,
+            objective=now,
+            plate_objective=plate_objective,
+            light_on=light_on,
+        )
+        if wait is not None:
+            return wait
+        if any(
+            pair.partition("=")[0] == "from_run_doc" and pair.partition("=")[2].strip()
+            for pair in pairs
+        ):
+            return CALIBRATE_REUSE_ROUTED
+        return self._calibrate_position_target(now, labels)
 
     def _turret_reading(self) -> tuple[str | None, tuple[str, ...], bool | None]:
         """The objective in place, every position's label and the light, read together inside one read a Disconnect waits for (m5 §18.6 D13, D20).

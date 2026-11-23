@@ -13,6 +13,7 @@ finds the button, are for the session of ``/ui-check`` (FM-161).
 from __future__ import annotations
 
 import os
+import shlex
 import threading
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
@@ -45,7 +46,7 @@ from smc.plugins.slots import (
     WallImages,
     WellFit,
 )
-from smc.run import StageRecord, StageStatus, write_stage
+from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui import plate_page
 from smc.ui.controller import PlatePage
@@ -59,8 +60,8 @@ from smc.ui.guide import (
     busy_note,
     calibrate_changed,
     calibrate_is_the_plates,
+    calibrate_position_unknown,
     calibrate_replaces,
-    calibrate_replaces_plate,
     calibration_failed,
 )
 from smc.ui.plate_page import PlatePageView
@@ -1320,24 +1321,72 @@ def test_the_tick_makes_no_read_of_the_turret_of_its_own_for_the_calibrate_butto
     assert view.offsets_calibrate_button.label == ANOTHER
 
 
-# --- the Stand screen's button says what it replaces (D17, FM-216) ---------------------
+# --- the Stand screen's button keeps the plate's calibration (D19, FM-216) -------------
 
 
-def test_the_stand_screen_says_what_its_calibration_replaces_when_the_plate_was_registered_with_another_objective(
+def _routed(plate: str, objective: str, position: int) -> str:
+    """The Stand screen's note of where the calibration goes, as m5 §18.6.3 words it."""
+    return (
+        f"The plate was registered with {plate}: a calibration at {objective} here is "
+        f"kept in its own document, calibrations/position-{position}.json, and the "
+        "plate's calibration stays as it is. Measure the offsets between objectives "
+        "(Plate screen) uses it."
+    )
+
+
+def test_the_stand_screen_says_where_its_calibration_goes_when_the_plate_was_registered_with_another_objective(
     make_view: Callable[..., PlatePageView],
     fake_microscope: Microscope,
     run_doc: Path,
 ) -> None:
     view = _ready(make_view, fake_microscope, run_doc, FORTY)
 
-    assert view.calibrate_note.object == calibrate_replaces_plate(TEN, FORTY)
+    assert view.calibrate_note.object == _routed(TEN, FORTY, 1)
     assert view.calibrate_note.visible is True
-    # It follows the objective in place, at the next tick.
+    assert view._stand_calibrate_for == FORTY
+    # It follows the objective in place, at the next tick, and names that position's file.
     _turn(fake_microscope, TWENTY)
     view.tick()
-    assert view.calibrate_note.object == calibrate_replaces_plate(TEN, TWENTY)
-    # The button itself still runs the tool into the run document: it is not routed nor hidden.
+    assert view.calibrate_note.object == _routed(TEN, TWENTY, 4)
+    assert view._stand_calibrate_for == TWENTY
+    # The button is offered and enabled: it keeps the plate's calibration, it does not warn.
     assert view.calibrate_button.disabled is False
+    assert "goes out of date" not in view.calibrate_note.object
+
+
+def test_the_stand_note_says_what_a_new_calibration_replaces_for_the_objectives_own_document_only(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # FM-172: what a new calibration replaces is said before the click; FM-247: one decision of
+    # `again` for the block's button and this note (a usable document of THAT objective).
+    held = _hold(run_doc, 1, FORTY)
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+
+    assert view.calibrate_note.object == "\n".join(
+        [_routed(TEN, FORTY, 1), calibrate_replaces(FORTY, SEEDED)]
+    )
+    assert (
+        view.offsets_calibrate_button.label == f"Calibrate the camera again at {FORTY}"
+    )
+
+    # Another objective's calibration in the 40X's file is not the 40X's: nothing of its own to
+    # replace, and the block's button agrees (no `again`).
+    held.unlink()
+    _hold(run_doc, 1, TWENTY)
+    view.refresh()
+    view.tick()
+    assert view.calibrate_note.object == _routed(TEN, FORTY, 1)
+    assert view.offsets_calibrate_button.label == f"Calibrate the camera at {FORTY}"
+
+    # A document that is no calibration (it failed): nothing usable to replace.
+    (run_doc.parent / "calibrations" / "position-1.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    view.refresh()
+    view.tick()
+    assert view.calibrate_note.object == _routed(TEN, FORTY, 1)
 
 
 def test_the_stand_screen_says_nothing_for_the_plates_own_objective_a_plate_by_eye_or_an_unknown_objective(
@@ -1365,7 +1414,7 @@ def test_the_stand_screen_says_nothing_for_the_plates_own_objective_a_plate_by_e
     assert view.calibrate_note.object == ""
 
 
-def test_the_stand_screen_note_follows_the_tools_reason_and_the_busy_note(
+def test_the_stand_note_follows_the_reason_and_the_busy_note_and_never_replaces_them(
     make_view: Callable[..., PlatePageView],
     fake_microscope: Microscope,
     run_doc: Path,
@@ -1376,9 +1425,178 @@ def test_the_stand_screen_note_follows_the_tools_reason_and_the_busy_note(
     assert Slow.started.wait(5)
     view.tick()
 
-    # After the busy note, never instead of it (D17).
+    # After the busy note (`calibrate_wait`'s first reason here), never instead of it (D19).
     assert view.calibrate_note.object == "\n".join(
-        [busy_note("slow", live=False), calibrate_replaces_plate(TEN, FORTY)]
+        [busy_note("slow", live=False), _routed(TEN, FORTY, 1)]
+    )
+    assert view.calibrate_button.disabled is True
+    # The tool's own reason comes before them all.
+    view._blocked = {**view._blocked, "camera-calibration": "the tool's own reason"}
+    view.tick()
+    assert view.calibrate_note.object == "\n".join(
+        [
+            "the tool's own reason",
+            busy_note("slow", live=False),
+            _routed(TEN, FORTY, 1),
+        ]
     )
     Slow.release.set()
     assert view.page.join(10.0)
+
+
+def test_the_stand_button_is_disabled_for_a_dry_run_a_light_that_reads_off_and_a_position_not_known(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    fake_core: FakeCore,
+    run_doc: Path,
+) -> None:
+    # The note and the state are the controller's refusals, beside the button (FM-169): the same
+    # `calibrate_wait`, and the position that the click would name.
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+    assert view.calibrate_button.disabled is False
+
+    # The light reads off: its reason first, the destination after it, the button waits.
+    light = Light(False)
+    fake_microscope.override(LightSource, light)
+    view.tick()
+    assert view.calibrate_button.disabled is True
+    assert view.calibrate_note.object == "\n".join(
+        [CALIBRATE_LIGHT_OFF, _routed(TEN, FORTY, 1)]
+    )
+    # An unknown light refuses nothing; on neither.
+    for reading in (None, True):
+        light.reading = reading
+        view.tick()
+        assert view.calibrate_button.disabled is False
+
+    # A position the page's copy of the labels does not name (the 40X on two positions): the
+    # click would refuse it, and the note says so alone: it names a file it cannot.
+    labels = fake_microscope.require(ObjectiveTurret).labels()
+    labels[4] = FORTY
+    fake_microscope.override(ObjectiveTurret, Turret(labels, FORTY))
+    twice = make_view()
+    assert twice.calibrate_button.disabled is True
+    assert twice.calibrate_note.object == calibrate_position_unknown(FORTY)
+
+    # A dry-run page that holds a real registration: the tool's own refusal, said first. Last:
+    # closing it closes the core the fake stand shares.
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        dry_view = make_view(dry)
+        assert dry_view.calibrate_button.disabled is True
+        assert dry_view.calibrate_note.object.splitlines()[0] == CALIBRATE_DRY_RUN
+    finally:
+        dry.close()
+
+
+def test_the_stand_button_sends_the_label_it_showed_and_not_the_blocks(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-151, FM-177: at the plate's own objective the block's button names none (`_calibrate_for`
+    # is `None`) and the Stand screen's names that objective: the click sends its own label and
+    # the pairs the tool's own *Run* sends.
+    view = _ready(make_view, fake_microscope, run_doc, TEN)
+    assert view._calibrate_for is None
+    assert view._stand_calibrate_for == TEN
+    sent: list[tuple[str, tuple[str, ...]]] = []
+
+    def spy(expected: str, pairs: Any = ()) -> None:
+        sent.append((expected, tuple(pairs)))
+
+    monkeypatch.setattr(view.page, "calibrate_camera", spy)
+    view.tool_fields["camera-calibration"]["step_um"].value = "40"
+    view.tool_fields["camera-calibration"]["from_run_doc"].value = "cal-10x.json"
+
+    _click(view.calibrate_button)
+
+    # Everything the form holds is sent: it is the controller that drops what a document does
+    # not take (it chooses the destination, for the label it reads at the click).
+    assert sent == [(TEN, ("step_um=40", "from_run_doc=cal-10x.json"))]
+    monkeypatch.undo()
+
+    # The label is the one drawn: a turn at the handset with no tick makes the click stale, and
+    # the controller refuses it (the converse of FM-177: it would have chosen `run.json`).
+    before = run_doc.read_bytes()
+    _turn(fake_microscope, TWENTY)
+    assert view._stand_calibrate_for == TEN
+    _click(view.calibrate_button)
+    assert view.page.status().outcome == (
+        f"Camera calibration: {calibrate_changed(TEN, TWENTY)}"
+    )
+    assert StubCalibration.seen == []
+    assert run_doc.read_bytes() == before
+    assert not (run_doc.parent / "calibrations").exists()
+
+
+def test_the_expert_views_run_camera_calibration_is_not_routed(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # D19 changes the Stand screen's button only: the expert's *Run camera-calibration* is
+    # `on_run`, the expert's way into `run.json` (which `plate-walls` reads), as it always was.
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+    routed: list[object] = []
+    monkeypatch.setattr(view.page, "calibrate_camera", lambda *a, **k: routed.append(a))
+
+    _click(view.tool_runs["camera-calibration"])
+    assert view.page.join(10.0)
+
+    assert routed == []
+    record = RunDocument.load(run_doc).provider("camera-calibration")
+    assert record is not None
+    assert record.status is StageStatus.done
+    assert not (run_doc.parent / "calibrations").exists()
+
+
+def test_the_stands_command_is_the_routed_call_with_its_folder_note_and_the_run_documents_otherwise(
+    make_view: Callable[..., PlatePageView],
+    fake_microscope: Microscope,
+    run_doc: Path,
+) -> None:
+    # ADR-0006, principle 5: the *Command* shows the call the click makes.
+    view = _ready(make_view, fake_microscope, run_doc, FORTY)
+    fields = view.tool_fields["camera-calibration"]
+    fields["step_um"].value = "40"
+    fields["from_run_doc"].value = "cal-10x.json"
+    folder = run_doc.parent / "calibrations"
+
+    def words() -> list[str]:
+        return shlex.split(view.calibrate_command.object)
+
+    # The routed call: the position's file, the step alone (a from_run_doc is refused by the
+    # click and never sent), and the folder note under it.
+    command = words()
+    assert command[:3] == ["smc", "run", "camera-calibration"]
+    assert command[command.index("--run-doc") + 1] == str(
+        (folder / "position-1.json").absolute()
+    )
+    assert command[command.index("--param") + 1] == "step_um=40"
+    assert "from_run_doc=cal-10x.json" not in command
+    assert view.calibrate_command_note.object == (
+        f"The folder {folder.absolute()} must exist first: the page makes it, a "
+        "terminal does not."
+    )
+
+    # The plate's own objective: the run document's call as it always was, every field typed,
+    # and no folder note.
+    _turn(fake_microscope, TEN)
+    view.tick()
+    command = words()
+    assert command[command.index("--run-doc") + 1] == str(run_doc.absolute())
+    assert "from_run_doc=cal-10x.json" in command
+    assert view.calibrate_command_note.object == ""
+
+    # A position the page cannot name: no command to copy, for the click is refused.
+    labels = fake_microscope.require(ObjectiveTurret).labels()
+    labels[4] = FORTY
+    fake_microscope.override(ObjectiveTurret, Turret(labels, FORTY))
+    twice = make_view()
+    assert twice.calibrate_command.object == ""
+    assert twice.calibrate_command_note.object == ""

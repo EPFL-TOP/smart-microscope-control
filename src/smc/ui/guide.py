@@ -181,7 +181,6 @@ __all__ = [
     "calibrate_measured_other",
     "calibrate_position_unknown",
     "calibrate_replaces",
-    "calibrate_replaces_plate",
     "calibrate_stand_routed",
     "calibrate_wait",
     "calibration_at_its_position",
@@ -3506,16 +3505,6 @@ def calibrate_replaces(objective: str, measured: str) -> str:
     return _flat(
         f"A new calibration replaces the one of {when}: if it fails or is stopped, "
         f"{objective} has none until one succeeds."
-    )
-
-
-def calibrate_replaces_plate(plate_objective: str, objective: str) -> str:
-    """The Stand screen's note: its *Calibrate the camera* runs into the run document and replaces the one the plate was registered with (D17, FM-216)."""
-    return _flat(
-        f"The plate was registered with {plate_objective} using this calibration: a "
-        f"calibration at {objective} here replaces it, and the plate goes out of date. "
-        f"To measure the offsets, calibrate at {objective} in {OFFSETS_TITLE} (Plate "
-        "screen): it keeps a document of its own."
     )
 
 

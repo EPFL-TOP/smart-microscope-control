@@ -158,7 +158,6 @@ from smc.ui.guide import (
     calibrate_measured_other,
     calibrate_position_unknown,
     calibrate_replaces,
-    calibrate_replaces_plate,
     calibrate_stand_routed,
     calibrate_wait,
     calibration_at_its_position,
@@ -4852,12 +4851,6 @@ def test_the_calibrate_texts_say_what_they_say() -> None:
         "A new calibration replaces the one of an unknown time: if it fails or is "
         f"stopped, {_FORTY_X} has none until one succeeds."
     )
-    assert calibrate_replaces_plate(_TEN_X, _FORTY_X) == (
-        f"The plate was registered with {_TEN_X} using this calibration: a "
-        f"calibration at {_FORTY_X} here replaces it, and the plate goes out of date. "
-        f"To measure the offsets, calibrate at {_FORTY_X} in Measure the offsets "
-        "between objectives (Plate screen): it keeps a document of its own."
-    )
     assert calibrations_held_heading("run/calibrations") == (
         "Camera calibrations the page holds, one document per objective, in "
         "run/calibrations:"
@@ -5042,7 +5035,6 @@ def test_the_held_lines_are_one_line_each_for_a_label_with_a_line_break() -> Non
         calibrate_changed(label, label),
         calibrate_position_unknown(label),
         calibrate_replaces(label, "2026-11-17T10:20:30+00:00"),
-        calibrate_replaces_plate(label, label),
         calibrate_stand_routed(label, label, "position-1.json"),
         calibrate_command_folder_note(label),
         calibrate_measured_other(label, label, "position-1.json"),

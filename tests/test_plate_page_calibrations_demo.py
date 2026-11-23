@@ -308,9 +308,78 @@ def test_calibrating_another_objective_leaves_run_json_byte_identical_and_the_pl
     # The run document's own calibration is still the 10X's, as the Stand screen says.
     assert view.camera_calibration is not None
     assert view.camera_calibration.objective == TEN
-    # The Stand screen's button says what it would replace, before it is pressed.
-    assert TEN in rig.view.calibrate_note.object
-    assert FORTY in rig.view.calibrate_note.object
+    # The Stand screen's button says where its calibration goes, and what a new one replaces
+    # when the position holds one: here the block's own document, so both.
+    assert rig.view.calibrate_note.object == "\n".join(
+        [_routed(TEN, FORTY, POSITION[FORTY]), _replaces(rig.document(FORTY))]
+    )
+
+
+def _routed(plate: str, objective: str, position: int) -> str:
+    """The Stand screen's note of where the calibration goes, as m5 §18.6.3 words it."""
+    return (
+        f"The plate was registered with {plate}: a calibration at {objective} here is "
+        f"kept in its own document, calibrations/position-{position}.json, and the "
+        "plate's calibration stays as it is. Measure the offsets between objectives "
+        "(Plate screen) uses it."
+    )
+
+
+def _replaces(document: Path) -> str:
+    """What a new calibration replaces, said before the click (FM-172): the date is the one the document's record ends (UTC, as ``calibration_from`` says it)."""
+    finished = _record(document).finished_utc
+    assert finished is not None
+    return (
+        f"A new calibration replaces the one of {finished.date().isoformat()}: if it "
+        f"fails or is stopped, {FORTY} has none until one succeeds."
+    )
+
+
+def test_the_stand_buttons_calibration_goes_into_its_own_document_and_the_block_measures_with_it(
+    make_rig: Callable[..., Rig],
+) -> None:
+    # Acceptance 1 on the demo stand (m3 §20.1's shifts): the plate is registered under the 10X,
+    # the operator turns the turret to the 40X on the Stand screen and presses the button it
+    # shows. Into `run.json` that put the plate out of date and took the block away.
+    rig = make_rig()
+    view, turret = rig.view, rig.stand.require(ObjectiveTurret)
+    rig.turn(FORTY)
+    before = rig.run_doc.read_bytes()
+    assert view.calibrate_box.visible is True
+    assert view.calibrate_note.object == _routed(TEN, FORTY, POSITION[FORTY])
+    assert view.calibrate_button.disabled is False
+
+    _click(view.calibrate_button)
+    rig.finish()
+
+    outcome = rig.page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("Camera calibration done in "), outcome
+    # The registration is the one it was, and the page is documented: the 40X's calibration is
+    # in the file of its position, with the 40X inside it.
+    assert rig.run_doc.read_bytes() == before
+    assert _calibration(rig.document(FORTY)).objective == FORTY
+    assert _record(rig.document(FORTY)).status is StageStatus.done
+    page_view = rig.page.view()
+    assert page_view.registered is not None
+    assert page_view.offsets is not None
+    assert view.offsets_box.visible is True
+    # The list says it, and *Measure the offsets* is armed with the 40X (the field stays empty).
+    lines = view.calibrations_held_text.object.splitlines()
+    assert any(line.startswith(f"{FORTY}: calibrated on ") for line in lines)
+    assert view.calibrations_input.value == ""
+    assert turret.current() == FORTY
+    _click(view.offsets_measure_button)
+    assert view._offsets_armed == (FORTY,)
+    _click(view.offsets_turn_button)
+    rig.finish()
+
+    record = RunDocument.load(rig.run_doc).stages["objective-offsets"]
+    assert record.status is StageStatus.done, rig.page.status().outcome
+    result = ObjectiveOffsetsResult.model_validate(record.result)
+    shifts = {m.objective: m.shift_xy_um for m in result.measures}
+    _within(shifts[FORTY], (-37.5, 12.25))
+    assert turret.current() == FORTY
 
 
 def test_a_stop_during_a_calibration_says_stopped_and_leaves_the_other_documents_and_run_json_alone(
