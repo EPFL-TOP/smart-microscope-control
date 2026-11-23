@@ -303,14 +303,33 @@ disclosure shows the `smc run` line it makes.
   connected, `Disconnect releases <stand> for NIS-Elements or ZEN.`;
 - **Calibrate the camera**, shown only when there is no calibration or it was made at
   another objective. It runs `camera-calibration` with what the profile suggests, as the
-  tool's own *Run* does, **into the run document**: that replaces the calibration the plate was
-  registered with. So when the plate was registered from its walls (the offsets block is
-  offered) and the objective in place is known and is not the plate's, a note under it says so:
-  `The plate was registered with <O> using this calibration: a calibration at <X> here
-  replaces it, and the plate goes out of date. To measure the offsets, calibrate at <X> in
-  Measure the offsets between objectives (Plate screen): it keeps a document of its own.` The
-  button is not hidden or routed elsewhere: it is the way to register the plate with another
-  objective.
+  tool's own *Run* does, and **where the calibration goes depends on the plate**. **Into the run
+  document** when the plate was not registered from its walls (the first calibration of a stand,
+  a plate registered by eye) or when the objective in place is the plate's own: the run
+  document's calibration is the one `plate-walls` reads. **Into the objective's own document**,
+  `calibrations/position-<n>.json` beside the run document (the block's document, below), when
+  the plate was registered from its walls under **another** objective: a calibration at the 40X
+  written into the run document would replace the 10X's one the plate was registered with and
+  put the plate out of date (FM-216; this button did that until #557). A note under the button
+  says it before the click: `The plate was registered with <O>: a calibration at <X> here is
+  kept in its own document, calibrations/position-<n>.json, and the plate's calibration stays
+  as it is. Measure the offsets between objectives (Plate screen) uses it.`, and, when that
+  position already holds a usable calibration of `<X>`, what a new one replaces. The *Command*
+  disclosure shows the call the click makes (`smc run camera-calibration ... --run-doc
+  <the position's file> ...`) and says that the page makes the folder and a terminal does not.
+  **The click carries the objective the button showed**, and the page reads the turret again: it
+  runs only if it still reads it, since the destination was chosen for that objective. The button
+  waits, with the reason beside it, for the same things as the block's (a dry run, the light, a
+  position the page cannot name); with a document as the destination it sends `step_um` and
+  `settle_ms` only, and refuses a typed `from_run_doc` (that field reuses a calibration into the
+  run document: it is the expert view's *Run camera-calibration*, which still writes the run
+  document and is not routed). To register the plate afresh at another objective, reuse the
+  position's document into the run document with that field in the expert view. **Not yet done**
+  (#617): the Wells and Scan screens read the run document's calibration, so at another objective
+  `scan-plan` sets it aside and plans with rotation 0 and no mirror, with its own words; give it
+  the `calibration` field of the expert view. A plate registered from its walls **before the
+  objective was recorded** has no block, so this button still writes the run document and puts that
+  plate out of date.
 
 **2. Plate: "Where is the plate?"** From the top:
 
@@ -421,12 +440,19 @@ objective's turret position (its label's index plus one: the demo's 40X is posit
 position 4). The file's name is a number the page writes and never a label, which is free text; the
 objective measured is the one inside it. **The run document is not touched**, so the plate stays
 registered and the block stays offered (a calibration run into `run.json` replaces the one the plate
-was registered with, which is why the Stand screen's button says so, above). The button names the
+was registered with: the Stand screen's *Calibrate the camera* writes the same document for a plate
+registered under another objective, above). The button names the
 objective in place, and **the click carries that name**: the page reads the turret again and runs
 only if it still reads it (another tab, or the operator at the turret, may have turned it since).
 It waits with its reason beside it: the stand is not connected, an activity goes, a dry run (the
-tool refuses it), the objective is not known, or it is the plate's own (its calibration is the run
-document's: Stand screen, *Calibrate the camera*). A new calibration **replaces** the position's
+tool refuses it), the objective is not known, it is the plate's own (its calibration is the run
+document's: Stand screen, *Calibrate the camera*), or **the light reads off**: the tool refuses a
+dark frame, and its refusal would replace the position's usable document, so the line says
+`the light reads off, so the camera's frame would be dark and the calibration would fail: switch
+it on (Light on, in the drive bar), then press the button again`. The light is read again at the
+click; a light whose state is not known (the demo's, a lamp with no switch smc knows) refuses
+nothing, and a frame that is dark with the light on (the light path on the eyepiece, the step
+leaving the lit sample) is still the tool's refusal. A new calibration **replaces** the position's
 document, and a failed or stopped one leaves it with none until one succeeds: when the position
 holds a usable one of that objective, the button says `Calibrate the camera again at <objective>`
 and the line beside it says `A new calibration replaces the one of <date>: if it fails or is
@@ -435,19 +461,39 @@ another objective's (the turret was relabelled since), the button does not say `
 line names **that** objective as the one that loses its calibration. The button sends the camera
 calibration's `step_um` and `settle_ms` as typed in its form, and not its advanced `from_run_doc`.
 
+**After a run that ended `done`** the page reads the record it wrote: when it names **another
+objective than the button's** (the operator turned the turret at the handset between the click's read
+and the tool's own), the strip says `Camera calibration: it measured <other>, not <objective> as
+the button said (the turret was turned during the run): position-<n>.json holds a calibration of
+<other> and <objective> has none; put <objective> in place and press the button again`, and not
+`done`. The run had replaced the previous document, and the page cannot undo it. It holds for the
+Stand screen's button as for the block's.
+
 Above the button, the block lists **the documents the page holds**, `Camera calibrations the page
 holds, one document per objective, in <folder>:` and one line each: `<objective>: calibrated on
-<date>`, with `; the plate's objective, not measured from itself` or `; not on the turret now:
-calibrate its position again, or type the documents to use` for a usable one that the empty field
-leaves out; `position <n> (<label>): <problem>` for one that cannot be used, a calibration that
+<date>`, with `; the plate's objective, not measured from itself` for a usable one that the empty
+field leaves out; `position <n> (<label>): <problem>` for one that cannot be used, a calibration that
 failed in the tool's own words (`the last calibration failed: the frame is dark or flat ...`: the
 light path, a field with no texture, a step that wrapped); the calibration's own `assumed` lines
 under it; and `<label>: no calibration yet` for each other objective of the turret that no usable
-document names. Only the twelve names `position-1.json` to `position-12.json` are looked at.
+document names. **A document is its file's position's**: the file names a position and the document
+an objective, and a turn during a run, or a turret relabelled since, leaves them different. A
+document whose objective is **not the label of its own position** is not offered as that
+position's calibration: its line is `position <n> (<label>): the document holds a calibration of
+<objective>, not of the objective at this position now (the turret was turned during a run, or
+relabelled since): calibrate <label> again, or type the documents to use`, it names no objective
+(so the one the file should hold is listed `no calibration yet`, and its notes are not shown), and
+the empty field leaves it out. Nothing is moved or deleted. **A folder the account cannot look into**
+(a `PermissionError`) is **one line** under the heading, `<folder>: the page cannot look into this
+folder (PermissionError: <reason>); which objectives have a calibration is not known`, and no
+objective is listed `no calibration yet` while it is there (the page does not know); with no
+document read, *Measure the offsets* waits with that line and not with the one that sends the
+operator to the button. Only the twelve names `position-1.json` to `position-12.json` are looked at.
 
 **The field is optional.** *Other calibration documents (optional), one path per line, in the
 order the turret turns*: **empty, *Measure the offsets* measures with the documents the page holds**
-that are usable, not the plate's objective, and on the turret now, in turret order, as if their
+that are usable, not the plate's objective, and their own position's (the label of their file's
+position now), in turret order, as if their
 paths were typed (the page never writes into the field). A typed field is used instead, never
 merged with them, as it always was: the objective to measure is the one **the document holds**,
 so a document with no target and a target with no document cannot be typed. Under the field,
