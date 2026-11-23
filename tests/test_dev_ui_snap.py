@@ -370,7 +370,10 @@ def test_the_chain_is_the_documented_workflow_on_the_demo_sample_stand(snap) -> 
         "density",
     ]
     assert snap.ROUTE_STEP.plugin == "route"
-    for step in [*snap.CHAIN, snap.ROUTE_STEP]:
+    # `wells-timed` runs a `timing` of one repeat the same way (a real run on the simulated
+    # stage: `timing` refuses a dry run, so it cannot be a click of the page).
+    assert snap.TIMING_STEP.plugin == "timing"
+    for step in [*snap.CHAIN, snap.ROUTE_STEP, snap.TIMING_STEP]:
         command = snap.run_command("py", step, profile, run_doc)
         assert command[:5] == ["py", "-m", "smc.cli", "run", step.plugin]
         assert "--dry-run" not in command  # the chain writes what a real run writes
@@ -419,19 +422,23 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         # The short-page shots of D12 (m5 §17.8): after them, and reached with no chain.
         "stand-620",
         "plate-620",
-        # The Wells and Scan screens by their own buttons (m5 §17.10.4, #445): last.
+        # The Wells and Scan screens by their own buttons (m5 §17.10.4, #445): last, with
+        # the Wells screen's `Time` line read between the two (m5 §17.12.12 D42, #592).
         "wells-laid-out",
+        "wells-timed",
         "scanned",
     ]
     assert list(snap.STATE_NAMES) == names
+    assert snap.GUIDED_STATES == ("wells-laid-out", "wells-timed", "scanned")
     assert snap.CHAIN_STATES == ("after-density", "with-route", "results-all", "turned")
     # `expert` is the fourth, so that both stands reach it (m5 §17.8).
     alone = [True, True, True, True]
     chained = [False, False, False, False]
     short = [True, True]
-    # The guided states register the plate from the sample themselves and need no chain.
-    guided = [True, True]
-    no_sample = [False, False]
+    # The guided states register the plate from the sample themselves and need no chain
+    # (`wells-timed` runs its own `timing`, and no result of the chain).
+    guided = [True, True, True]
+    no_sample = [False, False, False]
 
     full = snap.plan_states("demo-sample", results=True)
     assert [p.name for p in full] == names
@@ -449,7 +456,7 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         )
     assert [p.reason for p in demo[10:]] == [
         "the demo has no sample to register from"
-    ] * 2
+    ] * 3
     assert snap.NO_SAMPLE_TO_REGISTER == "the demo has no sample to register from"
 
     # With no chain, or after a chain that failed, the guided states are still reached:
@@ -457,7 +464,7 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     skipped = snap.plan_states("demo-sample", results=False)
     assert [p.reachable for p in skipped] == [*alone, *chained, *short, *guided]
     assert {p.reason for p in skipped[4:8]} == {"skipped by --no-results"}
-    assert [p.reason for p in skipped[10:]] == [None, None]
+    assert [p.reason for p in skipped[10:]] == [None, None, None]
 
     failed = snap.plan_states(
         "demo-sample", results=True, chain_failure="cells exited 1: no detector"
@@ -474,6 +481,13 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     assert "cells exited 1: no detector" in failed[5].reason
     assert failed[6].reason == failed[5].reason
     assert failed[7].reason == failed[5].reason
+    # `wells-timed` (D42) is the twelfth state: reached on `demo-sample` with the chain,
+    # without it and after a chain that failed (it runs its own `timing`, and reads no
+    # result of the chain), and named with the guided states' reason on the plain demo.
+    for plans in (full, skipped, failed):
+        assert (plans[11].name, plans[11].reachable) == ("wells-timed", True)
+    assert (demo[11].name, demo[11].reachable) == ("wells-timed", False)
+    assert demo[11].reason == "the demo has no sample to register from"
     # None is silent: every state that is not reached says why.
     for plans in (demo, skipped, failed):
         assert all(p.reachable or p.reason for p in plans)
@@ -1000,16 +1014,20 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         ("with-route", False),
         ("results-all", False),
         ("turned", False),
-        # The short-page shots need no chain, and nor do the guided states.
+        # The short-page shots need no chain, and nor do the guided states; `wells-timed`
+        # runs a `timing` of its own, and a `timing` that fails is named as every chain
+        # failure is (D42).
         ("stand-620", True),
         ("plate-620", True),
         ("wells-laid-out", True),
+        ("wells-timed", False),
         ("scanned", True),
     ]
     assert records[4].reason == "cells exited 1: x"
     assert records[5].reason == "needs the chain: cells exited 1: x"
     assert records[6].reason == "needs the chain: cells exited 1: x"
     assert records[7].reason == "needs the chain: cells exited 1: x"
+    assert records[11].reason == "cells exited 1: x"
     assert (errors, warnings) == ([], 0)
 
 
@@ -1034,6 +1052,7 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
         True,
         True,
         True,
+        True,
     ]
     assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
     assert records[4].reason == records[2].reason
@@ -1049,12 +1068,14 @@ def test_a_step_button_that_times_out_names_the_state_and_the_next_one_runs(
     page = _fake_page(fails_on_button="3. Wells")
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
     # `wells-laid-out` clicks the same step, so it fails on the same control, named; the
-    # states around them run.
+    # states around them run (`wells-timed` clicks no step: it goes on from the Wells
+    # screen the state before it leaves).
     assert [r.reached for r in records] == [
         True,
         False,
         *([True] * 8),
         False,
+        True,
         True,
     ]
     assert records[1].reason == "Locator.click: Timeout 10000ms exceeded."
@@ -1068,11 +1089,13 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
 ) -> None:
     page = _fake_page(fails_on_fill=True)
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    # `wells-laid-out` types the wells in the same box: the same control, named.
+    # `wells-laid-out` types the wells in the same box: the same control, named. `wells-timed`
+    # types in the autofocus field, and the fake page answers every label with one box.
     assert [r.reached for r in records] == [
         True,
         False,
         *([True] * 8),
+        False,
         False,
         True,
     ]
@@ -1347,6 +1370,8 @@ def test_the_short_page_states_name_the_screens_titles_the_guide_draws(snap) -> 
         "stand-620": SCREEN_TITLES["stand"],
         "plate-620": SCREEN_TITLES["plate"],
         "wells-laid-out": SCREEN_TITLES["wells"],
+        # `wells-timed` stays on the Wells screen (m5 §17.12.12 D42).
+        "wells-timed": SCREEN_TITLES["wells"],
         "scanned": scan_title(["B11", "B2"], []),
         # The Results screen's, which `results-all` reads (m5 §17.11.4).
         "results-all": SCREEN_TITLES["results"],
@@ -1793,6 +1818,11 @@ def test_the_guided_parts_are_the_frames_and_the_screens_title_and_first_action(
     ]
     page.get_by_role.assert_any_call("button", name="Lay out the fields")
     page.locator.return_value.filter.assert_any_call(has_text="Which wells?")
+    # `wells-timed` is on the Wells screen too: the same title, the same first action.
+    page = MagicMock()
+    snap._guided_parts(page, "wells-timed")
+    page.get_by_role.assert_any_call("button", name="Lay out the fields")
+    page.locator.return_value.filter.assert_any_call(has_text="Which wells?")
     page = MagicMock()
     snap._guided_parts(page, "scanned")
     page.get_by_role.assert_any_call("button", name="Start the scan")
@@ -1818,7 +1848,7 @@ def test_on_screen_reads_the_guided_parts_of_a_guided_state_and_only_there(
         part("first action", _box(10, 790, 120, 31)),
     ]
     monkeypatch.setattr(snap, "_guided_parts", lambda page, state: guided)
-    for state in ("wells-laid-out", "scanned"):
+    for state in ("wells-laid-out", "wells-timed", "scanned"):
         assert snap._on_screen(page, state) == [
             "STOP: yes (y 5 to 35 of 800, x 1200 to 1260 of 1280)",
             "title: yes (y 142 to 159 of 800, x 10 to 380 of 1280)",
@@ -1882,7 +1912,9 @@ def test_the_summary_says_a_states_facts_after_what_is_on_screen(snap) -> None:
     ]
 
 
-def test_only_the_scanned_and_results_all_states_carry_facts(snap, tmp_path) -> None:
+def test_only_the_scanned_wells_timed_and_results_all_states_carry_facts(
+    snap, tmp_path
+) -> None:
     page = _fake_page()
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
     by_name = {r.name: r for r in records}
@@ -1896,7 +1928,195 @@ def test_only_the_scanned_and_results_all_states_carry_facts(snap, tmp_path) -> 
         "chain: not on the page",
         "files: not on the page",
     ]
-    assert [n for n, r in by_name.items() if r.facts] == ["results-all", "scanned"]
+    # `wells-timed` says its three reads, each as not on the page when the line is not.
+    assert by_name["wells-timed"].facts == [
+        "time (autofocus default): not on the page",
+        "time (autofocus off): not on the page",
+        "time (autofocus required): not on the page",
+    ]
+    assert [n for n, r in by_name.items() if r.facts] == [
+        "results-all",
+        "wells-timed",
+        "scanned",
+    ]
+
+
+# --- `wells-timed`: the Wells screen's Time line under the three autofocus modes (m5 §17.12.12 D42, #592) ---
+
+DEFAULT_LINE = (
+    "Time: about 14 s, with the autofocus locked again in each well; about 13 s if it "
+    "is off at the start"
+)
+OFF_LINE = "Time: about 13 s, with the autofocus not used"
+REQUIRED_LINE = "Time: about 14 s, with the autofocus locked again in each well"
+
+
+def _timed_page(
+    *, fails_waiting_after: str | None = None
+) -> tuple[MagicMock, list[str]]:
+    """A page that writes what ``wells-timed`` does in order, and answers a read of the ``Time`` line with the next of the three.
+
+    The block is a ``pre`` of several lines (the objective, the fields, the time), as the
+    Wells screen's known block is, so that the action must pick the line out of it. A wait is
+    ``wait:<text>`` for a pane that holds a text and ``wait-not:<text>`` for one that holds the
+    ``Time`` line and not the last one read: the wait for the line to change, never a delay.
+    ``fails_waiting_after`` is a line whose change never comes: the wait for the line to
+    differ from it raises, as a Playwright timeout does.
+    """
+    page = MagicMock()
+    order: list[str] = []
+    reads = iter([DEFAULT_LINE, OFF_LINE, REQUIRED_LINE])
+
+    def role(*args: object, **kwargs: object) -> MagicMock:
+        found = MagicMock()
+        found.click.side_effect = lambda: order.append(f"click:{kwargs.get('name')}")
+        return found
+
+    def filtered(*, has_text: object) -> MagicMock:
+        label = getattr(has_text, "pattern", has_text)
+        pane = MagicMock()
+        pane.first.wait_for.side_effect = lambda **kw: order.append(f"wait:{label}")
+        pane.first.inner_text.side_effect = lambda: (
+            f"Objective: Nikon 10X S Fluor\nFields: 144 in 2 wells\n{next(reads)}"
+        )
+
+        def changed(*, has_not_text: str) -> MagicMock:
+            later = MagicMock()
+
+            def wait_for_the_change(**kw: object) -> None:
+                order.append(f"wait-not:{has_not_text}")
+                if has_not_text == fails_waiting_after:
+                    raise _FakeError("Locator.wait_for: Timeout 10000ms exceeded.")
+
+            later.first.wait_for.side_effect = wait_for_the_change
+            return later
+
+        pane.filter.side_effect = changed
+        return pane
+
+    page.get_by_role.side_effect = role
+    page.locator.return_value.filter.side_effect = filtered
+    box = page.get_by_label.return_value
+    box.fill.side_effect = lambda text: order.append(f"fill:{text}")
+    box.press.side_effect = lambda key: order.append(f"press:{key}")
+    return page, order
+
+
+def test_the_wells_timed_state_times_the_stand_first_then_reads_the_time_line_three_times(
+    snap,
+) -> None:
+    page, order = _timed_page()
+    stand = SimpleNamespace(
+        run_chain=lambda steps: order.append(
+            "chain:" + ",".join(f"{s.plugin}{list(s.params)}" for s in steps)
+        )
+    )
+    assert snap.ACTIONS["wells-timed"] is snap._act_wells_timed
+    readings = snap._act_wells_timed(page, stand)
+    # The `timing` of one repeat runs before the page is asked to read it again (Refresh, in
+    # the map's header row), the plan is laid out again (the old one is out of date, since it
+    # read no timings), and the first wait is for the line to read a duration. The field is
+    # left empty for the first read, typed `off` and `required` for the others, Enter each
+    # time, a wait for the line to change after each, and put back at the end: every wait is
+    # for a text the server draws, never a delay (FM-162).
+    assert order == [
+        "chain:timing[('repeats', '1')]",
+        "click:Refresh",
+        "click:Lay out the fields",
+        "wait:Time: about",
+        "fill:off",
+        "press:Enter",
+        f"wait-not:{DEFAULT_LINE}",
+        "fill:required",
+        "press:Enter",
+        f"wait-not:{OFF_LINE}",
+        "fill:",
+        "press:Enter",
+        f"wait:{DEFAULT_LINE}",
+    ]
+    assert readings == [
+        ("default", DEFAULT_LINE),
+        ("off", OFF_LINE),
+        ("required", REQUIRED_LINE),
+    ]
+    page.wait_for_timeout.assert_not_called()
+    # The field is found by the label the page draws, once.
+    page.get_by_label.assert_called_once_with(snap.AUTOFOCUS_FIELD, exact=True)
+
+
+@pytest.mark.parametrize(
+    ("fails_after", "typed_last"),
+    [
+        pytest.param(DEFAULT_LINE, "off", id="the line never changes for off"),
+        pytest.param(OFF_LINE, "required", id="the line never changes for required"),
+    ],
+)
+def test_a_wells_timed_that_fails_while_the_field_is_typed_puts_it_back_all_the_same(
+    snap, fails_after: str, typed_last: str
+) -> None:
+    # The state is named as not reached (the failure propagates), but the field must not
+    # stay `required` or `off` for the next state: `scanned` would then fail on the page's own
+    # `autofocus=required, and the autofocus is off` and say only that a wait timed out (the
+    # review of #592 reproduced it on the real page).
+    page, order = _timed_page(fails_waiting_after=fails_after)
+    with pytest.raises(_FakeError, match="Timeout 10000ms exceeded"):
+        snap._act_wells_timed(page, _no_chain())
+    assert f"fill:{typed_last}" in order
+    assert order[-2:] == ["fill:", "press:Enter"]
+    # Put back once, and not waited for: the page is what failed.
+    assert order.count("fill:") == 1
+    assert not any(line == f"wait:{DEFAULT_LINE}" for line in order)
+
+
+def test_the_wells_timed_state_names_what_the_page_draws(snap) -> None:
+    from smc.ui.guide import TIME_NOT_KNOWN
+    from smc.ui.plate_page import _AUTOFOCUS_FIELD
+
+    # The script imports nothing of smc at import: its copy of the field's label is pinned,
+    # and so is the wait's pattern, which the unknown line must not satisfy (FM-170: the
+    # state would then photograph a plan with no time and call it timed).
+    assert _AUTOFOCUS_FIELD == ("scan", snap.AUTOFOCUS_FIELD)
+    assert snap.TIME_LINE.search(DEFAULT_LINE)
+    assert snap.TIME_LINE.search(OFF_LINE)
+    assert not snap.TIME_LINE.search(TIME_NOT_KNOWN)
+    assert snap.Step("timing", (("repeats", "1"),)) == snap.TIMING_STEP
+
+
+def test_the_wells_timed_facts_say_the_three_reads_in_their_order(snap) -> None:
+    readings = [
+        ("default", DEFAULT_LINE),
+        ("off", OFF_LINE),
+        ("required", REQUIRED_LINE),
+    ]
+    assert snap.state_facts("wells-timed", [], readings) == [
+        f"time (autofocus default): {DEFAULT_LINE}",
+        f"time (autofocus off): {OFF_LINE}",
+        f"time (autofocus required): {REQUIRED_LINE}",
+    ]
+    # No other state says them, and one that was not read says nothing.
+    assert snap.state_facts("scanned", ["Field 1 of 2"], readings) == snap.scan_facts(
+        ["Field 1 of 2"]
+    )
+    assert snap.state_facts("wells-timed", []) == []
+    record = snap.StateRecord(
+        name="wells-timed",
+        reached=True,
+        step="3. Wells ✓",
+        facts=snap.state_facts("wells-timed", [], readings),
+    )
+    text = snap.format_summary(
+        [record], server="stopped by SIGINT", server_errors=[], browser_errors=[]
+    )
+    lines = text.splitlines()
+    start = lines.index("== wells-timed ==")
+    assert lines[start : start + 6] == [
+        "== wells-timed ==",
+        "reached",
+        "step: 3. Wells ✓",
+        f"time (autofocus default): {DEFAULT_LINE}",
+        f"time (autofocus off): {OFF_LINE}",
+        f"time (autofocus required): {REQUIRED_LINE}",
+    ]
 
 
 # --- the chain against the plugins ------------------------------------------
@@ -1907,7 +2127,7 @@ def test_every_param_of_the_chain_is_a_param_of_its_plugin(snap) -> None:
     from smc.plugins.params import parse_params
     from smc.plugins.registry import load
 
-    for step in [*snap.CHAIN, snap.ROUTE_STEP]:
+    for step in [*snap.CHAIN, snap.ROUTE_STEP, snap.TIMING_STEP]:
         params = load(step.plugin).plugin.Params
         parse_params(params, [f"{key}={value}" for key, value in step.params])
 

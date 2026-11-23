@@ -312,6 +312,15 @@ _CHECKLIST: tuple[tuple[str, bool], ...] = (
 _CARD_LINES = 8
 _CARD_CHARS = 80
 
+#: A card shows this many of a tool's ``assumed`` lines, then ``… <n> more`` as the last
+#: entry. It is its own bound and not ``_CARD_LINES``: ``scan-plan``'s longest list is 11
+#: (the frame's line, the camera basis's three, the timings' five and the estimate's two,
+#: m3 §7.4 D5), and 8 cut the two ``estimate:`` lines, the caveat on the figure the Wells
+#: screen shows, behind a count. The bound holds one above the longest list a built-in
+#: writes, and still holds for 2000 (FM-140, FM-205; m5 §17.12.12 D41). A test builds the
+#: longest list and asserts none of it is cut.
+_CARD_ASSUMED_LINES = 12
+
 #: An assumption and an error are diagnoses whose end often says what to do: they are
 #: cut later than a value (more than twice the longest assumption a plugin writes).
 _CARD_TEXT_CHARS = 600
@@ -1545,10 +1554,11 @@ def _card(
         found = record.result.get("assumed")
         if isinstance(found, list):
             items = [
-                _cut(_flat(str(item)), _CARD_TEXT_CHARS) for item in found[:_CARD_LINES]
+                _cut(_flat(str(item)), _CARD_TEXT_CHARS)
+                for item in found[:_CARD_ASSUMED_LINES]
             ]
-            if len(found) > _CARD_LINES:
-                items.append(f"… {len(found) - _CARD_LINES} more")
+            if len(found) > _CARD_ASSUMED_LINES:
+                items.append(f"… {len(found) - _CARD_ASSUMED_LINES} more")
             assumed = tuple(items)
         elif found is not None:
             assumed = (_cut(_flat(str(found)), _CARD_TEXT_CHARS),)

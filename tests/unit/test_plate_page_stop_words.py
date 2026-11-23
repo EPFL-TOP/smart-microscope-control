@@ -11,6 +11,7 @@ layer fails here and not at the stand. The CLI keeps the layer's text (its tests
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -23,7 +24,7 @@ from pymmcore_plus import CMMCorePlus
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Camera
-from smc.hardware.errors import MicroscopeHaltedError
+from smc.hardware.errors import MicroscopeHaltedError, MotionInProgressError
 from smc.hardware.profile import Profile, SafetySection
 from smc.hardware.roles import Role
 from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
@@ -86,6 +87,13 @@ class MeetsTheHalt(HaltedScan):
         raise MicroscopeHaltedError()
 
 
+class MeetsMotion(HaltedScan):
+    """``scan`` started while the layer still tracks a motion: the real class, its real text."""
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> NoResult:
+        raise MotionInProgressError(("xy_stage XYStage",))
+
+
 @pytest.fixture(autouse=True)
 def _fresh_state() -> None:
     HaltedScan.started = threading.Event()
@@ -127,6 +135,12 @@ def _says_no_api_call(text: str | None) -> None:
     assert text is not None
     for word in ("resume()", "halted, but", "Microscope.stop()", "`"):
         assert word not in text, text
+
+
+def _names_no_call(text: str | None) -> None:
+    """No ``name()`` call in ``text``; a device name in backticks is not a call (D36)."""
+    assert text is not None
+    assert re.search(r"\w\(\)", text) is None, text
 
 
 def test_idle_stop_on_a_refusing_stand_says_it_in_the_pages_words(
@@ -228,6 +242,30 @@ def test_a_run_that_meets_a_halt_it_was_not_stopped_by_says_press_resume(
         outcome == "Scan failed: the microscope was stopped; press Resume to continue"
     )
     _says_no_api_call(outcome)
+
+
+def test_a_run_that_meets_a_tracked_motion_says_press_stop_not_call_stop(
+    tmp_path: Path,
+) -> None:
+    # The layer's real `MotionInProgressError`, which a scan meets when a device it was
+    # told to wait for still answers busy: its advice is a sequence of calls, and the page
+    # says the same sequence with its buttons (D36). The device's name stays in backticks:
+    # a name is not a call.
+    microscope = _stand(refused=set(), declared=(), segments=False)
+    scan = EntryPoint(name="scan", value=f"{__name__}:MeetsMotion", group=GROUP)
+    page = PlatePage(microscope, tmp_path / "run.json", entry_points=[scan])
+    try:
+        page.run("scan", [])
+        assert page.join(BOUND_S)
+        outcome = page.status().outcome
+    finally:
+        page.close()
+        microscope.close()
+    assert outcome == (
+        "Scan failed: `xy_stage XYStage` is still moving; wait for it or press STOP; "
+        "if it never settles, press STOP, check the stand, then press Resume"
+    )
+    _names_no_call(outcome)
 
 
 def test_a_live_that_meets_the_halt_ends_without_the_api_call(

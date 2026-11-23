@@ -73,7 +73,7 @@ from smc.plugins.api import (
 from smc.plugins.errors import PluginRunError
 from smc.plugins.params import parse_params
 from smc.plugins.registry import GROUP, LoadFailure, Registry
-from smc.plugins.scan_plan.algorithm import plan_fields
+from smc.plugins.scan_plan.algorithm import estimate_assumed, plan_fields
 from smc.plugins.slots import (
     DensityResult,
     DensityWell,
@@ -5156,24 +5156,26 @@ def test_a_card_is_bounded_whatever_its_record_holds(
     result.update({f"key{i}": i for i in range(2000)})
     _record(run_doc, "stub", result=result, error="e" * 100_000, profile="p" * 5000)
     card = _page(fake_microscope, run_doc).view().cards["stub"]
-    assert len(card.assumed) == 9
-    assert card.assumed[:8] == (f"{'a' * 600}…",) * 8
-    assert card.assumed[8] == "… 1992 more"
+    # D41: `assumed` has its own bound (12), `lines` keeps the card's 8 (FM-140, FM-205).
+    assert len(card.assumed) == 13
+    assert card.assumed[:12] == (f"{'a' * 600}…",) * 12
+    assert card.assumed[12] == "… 1988 more"
     assert card.lines == (*(f"key{i}: {i}" for i in range(8)), "… 1992 more")
     assert card.error == f"{'e' * 600}…"
     assert card.profile == f"{'p' * 80}…"
 
 
-def test_eight_assumptions_are_shown_whole_and_nine_are_cut_to_eight_and_a_count(
+def test_twelve_assumptions_are_shown_whole_and_thirteen_are_cut_to_twelve_and_a_count(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
-    items = [f"assumption {i}" for i in range(9)]
-    _record(run_doc, "stub", result={"assumed": items[:8]})
+    # The two sides of the bound (m5 §17.12.12 D41): 12 is the cap, 13 is one past it.
+    items = [f"assumption {i}" for i in range(13)]
+    _record(run_doc, "stub", result={"assumed": items[:12]})
     card = _page(fake_microscope, run_doc).view().cards["stub"]
-    assert card.assumed == tuple(items[:8])
+    assert card.assumed == tuple(items[:12])
     _record(run_doc, "stub", result={"assumed": items})
     card = _page(fake_microscope, run_doc).view().cards["stub"]
-    assert card.assumed == (*items[:8], "… 1 more")
+    assert card.assumed == (*items[:12], "… 1 more")
 
 
 def test_an_assumption_a_plugin_writes_today_is_shown_whole(
@@ -5845,6 +5847,33 @@ def test_a_record_that_is_not_a_scan_plan_keeps_its_generic_card(
     assert lines[0] == "plate_plan: 5 entries"
     assert "wells: 3 items" in lines
     assert not any(line.startswith("estimate: ") for line in lines)
+
+
+def test_the_longest_assumed_list_of_a_scan_plan_is_shown_whole_with_both_estimate_lines_last(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # D41, counted from the plugin's own assembly (m3 §7.4 D5): the frame's one line, the
+    # camera basis's three, the timings' five behind their `timings: ` prefix and the
+    # estimate's two, 11 in all, the estimate last. The old cap of 8 cut the two estimate
+    # lines behind `… 3 more`: the caveat on the figure the Wells screen shows was the line
+    # that disappeared. The estimate's own lines come from the plugin, so that a reword
+    # there is the reword here.
+    frame = ("positions: the registration's, with the objective's shift applied",)
+    basis = (
+        "camera calibration not used: it was made with another objective",
+        "pixel size of Nikon 10X S Fluor from the profile, for binning 1",
+        "no camera calibration for Nikon 10X S Fluor: rotation 0 and no mirror assumed",
+    )
+    timings = tuple(f"timings: timing line {i}" for i in range(5))
+    estimate = estimate_assumed(2)
+    longest = (*frame, *basis, *timings, *estimate)
+    assert len(longest) == 11
+    assert len(estimate) == 2
+    result = _scan_plan_result().model_copy(update={"assumed": longest})
+    _seed(run_doc, "scan-plan", "scan-plan", result)
+    card = _plan_page(fake_microscope, run_doc).view().cards["scan-plan"]
+    assert card.assumed == longest
+    assert card.assumed[-2:] == estimate
 
 
 def test_the_card_of_a_clipped_plan_says_why_the_two_counts_differ(

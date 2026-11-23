@@ -929,14 +929,17 @@ def test_the_card_text_of_a_worst_case_record_is_bounded(
     page: PlatePage, run_doc: Path
 ) -> None:
     # 2000 assumptions of 700 characters, 2000 keys, an error of 100,000 and a profile
-    # of 5,000: a card of 620,000 characters before the bounds (m5 §2.4).
+    # of 5,000: a card of 620,000 characters before the bounds (m5 §2.4). The card keeps 12
+    # assumed lines since #592 (m5 §17.12.12 D41), so the worst card is about 8.2 kB here
+    # (§2.4 puts it at about 9.4 kB with a header of its own): still a bound, two orders of
+    # magnitude under the case above, and the bound is moved with the cap, not removed.
     result: dict[str, Any] = {"assumed": ["a" * 700] * 2000}
     result.update({f"key{i}": i for i in range(2000)})
     _seed_raw(run_doc, "scan", result, profile="p" * 5000, error="e" * 100_000)
     text = PlatePageView(page).tool_cards["scan"].object
-    assert len(text) < 7_500
+    assert len(text) < 9_500
     assert text.splitlines()[-1] == f"error: {'e' * 600}…"
-    assert "assumed: … 1992 more" in text.splitlines()
+    assert "assumed: … 1988 more" in text.splitlines()
 
 
 def test_a_result_card_is_plain_text_under_its_tool(
@@ -1915,32 +1918,38 @@ def test_the_stop_note_says_where_a_segmented_move_ends() -> None:
         head = "light ? | "
         return line[line.index(head) + len(head) :]
 
-    # No role cut: the words are what they were.
+    # No role cut: the words are what they were (#514), unedited.
     assert note(("xy_stage", "focus"), ()) == (
         "STOP is refused by xy_stage, focus on this stand: "
         "a move under way runs to its target"
     )
-    # Every refused role cut: no move of this stand runs to its target.
-    assert note(("xy_stage",), (("xy_stage", 500.0),)) == (
-        "STOP is refused by xy_stage on this stand: an xy_stage move ends at the end "
-        "of its current segment (sent in segments of at most 500 µm)"
+    # D38: the strip says *that* a move is cut and never how long a segment is: the sizes
+    # are the profile's, said by the note a STOP gives and by the Scan lead, so the strip
+    # stays two lines on the Ti2-E (#529). One cut text for every shape of a cut.
+    cut = (
+        "STOP is refused by {roles} on this stand: a move under way runs to its "
+        "target, or to the end of its segment if cut"
     )
-    # One role cut, one whole: each is said for its own role.
-    assert note(("xy_stage", "focus"), (("xy_stage", 500.0),)) == (
-        "STOP is refused by xy_stage, focus on this stand: an xy_stage move ends at "
-        "the end of its current segment (sent in segments of at most 500 µm); any "
-        "other move under way runs to its target"
+    # Every refused role cut.
+    assert note(("xy_stage",), (("xy_stage", 500.0),)) == cut.format(roles="xy_stage")
+    # One role cut, one whole: the strip says "if cut", which covers each.
+    assert note(("xy_stage", "focus"), (("xy_stage", 500.0),)) == cut.format(
+        roles="xy_stage, focus"
     )
-    # Both cut, each with its own size (``:g``: 25 µm, not 25.0 µm).
-    assert note(("xy_stage", "focus"), (("xy_stage", 1000.0), ("focus", 25.0))) == (
-        "STOP is refused by xy_stage, focus on this stand: an xy_stage move ends at "
-        "the end of its current segment (sent in segments of at most 1000 µm); a "
-        "focus move ends at the end of its current segment (sent in segments of at "
-        "most 25 µm)"
-    )
+    # Both cut, with sizes of the profile's own: none of them is in the text.
+    both = note(("xy_stage", "focus"), (("xy_stage", 1000.0), ("focus", 25.0)))
+    assert both == cut.format(roles="xy_stage, focus")
+    for size in ("1000", "25", "µm"):
+        assert size not in both
     # A role that is cut but is not refused is no refusal to speak of: the key is ignored.
     assert note(("focus",), (("xy_stage", 500.0),)) == (
         "STOP is refused by focus on this stand: a move under way runs to its target"
+    )
+    # A refused role the page has no axis for (a role whose cut the Scan lead cannot name)
+    # is not a cut the strip speaks of.
+    assert note(("autofocus_offset",), (("autofocus_offset", 3.0),)) == (
+        "STOP is refused by autofocus_offset on this stand: "
+        "a move under way runs to its target"
     )
     # With the stand closed the strip says no more than it did.
     assert (

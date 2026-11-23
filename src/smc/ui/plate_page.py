@@ -109,6 +109,7 @@ from smc.ui.guide import (
     SCREEN_LEADS,
     SCREEN_TITLES,
     STEPS,
+    STOP_SEGMENT_AXES,
     CentreRow,
     NextStep,
     ResultRow,
@@ -446,40 +447,32 @@ def status_line(status: PageStatus) -> str:
     return " | ".join(parts)
 
 
-#: How the strip names a move of a role whose profile key cuts it into segments.
-_SEGMENTED_MOVE_NAMES = {"xy_stage": "an xy_stage move", "focus": "a focus move"}
-
-
 def stop_refused_note(
     roles: Sequence[str], segments_um: Sequence[tuple[str, float]] = ()
 ) -> str:
-    """What STOP does not do on this stand, in the words of the strip (FM-117, #514).
+    """What STOP does not do on this stand, in the words of the strip (FM-117, #514, m5 §17.12.12 D38).
 
     A stop the device refuses lets a move already sent run to its target, **unless** the
     profile cuts that role's moves into segments (``[safety] max_segment_um``,
     ``max_z_segment_um``, #507): then the rest of the move is never sent and STOP ends it at
-    the end of the current segment. The CLI's ``!`` line says so; the strip said ``runs to its
-    target`` for every refused role. A role cut but not refused is not named (it has no
-    refusal to speak of), and the size is the profile's, never typed here.
+    the end of the current segment. The strip says **that** a move is cut (``or to the end
+    of its segment if cut``) and never by how much: it is always on screen, and the Ti2-E's
+    three safety keys made the note three lines and moved the page when *Drive* was armed
+    (#529). The sizes are the profile's and are said where they are acted on, by the note a
+    STOP gives and by the Scan lead, through ``stop_segments_clause``; no size is typed here.
+    ``segments_um`` says only whether a refused role is cut: a role cut but not refused has
+    no refusal to speak of, and one the page has no axis for (``STOP_SEGMENT_AXES``) is not
+    a cut the page speaks of.
     """
     head = f"STOP is refused by {', '.join(roles)} on this stand: "
-    cut = [
-        (role, size_um)
-        for role, size_um in segments_um
-        if role in roles and role in _SEGMENTED_MOVE_NAMES
-    ]
-    if not cut:
+    is_cut = any(
+        role in roles and role in STOP_SEGMENT_AXES for role, _size_um in segments_um
+    )
+    if not is_cut:
         return head + "a move under way runs to its target"
-    clauses = [
-        f"{_SEGMENTED_MOVE_NAMES[role]} ends at the end of its current segment "
-        f"(sent in segments of at most {size_um:g} µm)"
-        for role, size_um in cut
-    ]
-    # A refused role whose moves are sent whole still runs to its target.
-    cut_roles = {role for role, _size_um in cut}
-    if any(role not in cut_roles for role in roles):
-        clauses.append("any other move under way runs to its target")
-    return head + "; ".join(clauses)
+    return head + (
+        "a move under way runs to its target, or to the end of its segment if cut"
+    )
 
 
 def _a_connection_failed(outcome: str, stand: str) -> bool:
@@ -4955,7 +4948,10 @@ class PlatePageView:
             str(widget.value).strip() or self._field_defaults.get(_AUTOFOCUS_FIELD, "")
         )
         return scan_lock_note(
-            mode, autofocus_locked=status.autofocus_locked, dry_run=status.dry_run
+            mode,
+            autofocus_locked=status.autofocus_locked,
+            dry_run=status.dry_run,
+            halted=status.halted,
         )
 
     def _scan_end_offered(self) -> ScanEnd | None:
@@ -5125,6 +5121,7 @@ class PlatePageView:
                 chain,
                 autofocus_locked=status.autofocus_locked,
                 dry_run=status.dry_run,
+                halted=status.halted,
             ),
         )
 

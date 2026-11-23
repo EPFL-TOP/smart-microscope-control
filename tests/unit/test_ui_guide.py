@@ -6,14 +6,18 @@ shell reads it, never compared with the string the code builds (FM-45).
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import html
 import importlib
 import json
+import logging
 import math
+import re
 import shlex
+import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any, ClassVar, Literal
@@ -22,8 +26,15 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from smc.hardware.errors import MicroscopeHaltedError, SafetyRefusedError
-from smc.hardware.safety import Safety
+import smc
+from smc.hardware.errors import (
+    DeviceTimeoutError,
+    HardwareError,
+    MicroscopeHaltedError,
+    MotionInProgressError,
+    SafetyRefusedError,
+)
+from smc.hardware.safety import Executor, Motion, Safety
 from smc.plugins.api import Progress
 from smc.plugins.geometry import Matrix2
 from smc.plugins.presets import Preset, PresetCheck, PresetFile
@@ -2428,6 +2439,202 @@ def test_the_layers_own_stop_texts_say_no_api_call_once_the_page_has_said_them()
     assert "`" not in halted
 
 
+#: The stop family's call names the page says as its buttons (m5 §17.12.12 D36, D37): the
+#: tuple is the one place a next family (the autofocus's calls) is added to the walk.
+STOP_FAMILY_CALLS = ("stop", "resume", "wait")
+
+#: A call written ``name()`` after one of the family's names; a device name in backticks is
+#: not a call, so the backtick is never part of the pattern.
+STOP_FAMILY_CALL = re.compile(r"\b(?:" + "|".join(STOP_FAMILY_CALLS) + r")\(\)")
+
+
+def _real_motion() -> Motion:
+    """A motion the layer tracks that cannot be stopped from smc: the stand's State devices."""
+    return Motion(device="XY", name="xy_stage XYStage", is_busy=lambda: True, stop=None)
+
+
+def _executor() -> Executor:
+    return Executor(
+        dry_run=False,
+        lock=threading.RLock(),
+        logger=logging.getLogger("smc.hardware.test"),
+    )
+
+
+def _timeout_error() -> Exception:
+    try:
+        _executor().wait(_real_motion(), 0.05)
+    except DeviceTimeoutError as error:
+        return error
+    raise AssertionError("the wait did not time out")
+
+
+def _cannot_be_stopped_error() -> Exception:
+    try:
+        _executor().stop(_real_motion())
+    except HardwareError as error:
+        return error
+    raise AssertionError("the stop of a motion with no stop did not fail")
+
+
+_MOTION_ENDING = (
+    "wait for it or press STOP; if it never settles, press STOP, check the stand, "
+    "then press Resume"
+)
+_MOTION_ENDING_MANY = (
+    "wait for them or press STOP; if they never settle, press STOP, check the stand, "
+    "then press Resume"
+)
+
+
+@pytest.mark.parametrize(
+    ("make_error", "page_text"),
+    [
+        pytest.param(
+            lambda: MotionInProgressError(("xy_stage XYStage",)),
+            f"`xy_stage XYStage` is still moving; {_MOTION_ENDING}",
+            id="one device",
+        ),
+        pytest.param(
+            lambda: MotionInProgressError(
+                ("xy_stage XYStage", "z ZDrive"), "the stage reports busy"
+            ),
+            "`xy_stage XYStage`, `z ZDrive` are still moving; "
+            f"{_MOTION_ENDING_MANY} (the stage reports busy)",
+            id="two devices with a detail",
+        ),
+        pytest.param(
+            _timeout_error,
+            "xy_stage XYStage is still busy after 0.05 s; the wait stops nothing, so "
+            "it may still be moving. Press STOP if it should not be, or wait longer.",
+            id="a wait that timed out",
+        ),
+        pytest.param(
+            _cannot_be_stopped_error,
+            "xy_stage XYStage cannot be stopped from smc; wait for it, or check the "
+            "stand and press Resume",
+            id="a motion that cannot be stopped",
+        ),
+    ],
+)
+def test_page_words_says_a_motion_the_stand_still_tracks_as_stop_and_resume(
+    make_error: Callable[[], Exception], page_text: str
+) -> None:
+    # The layer's real errors (FM-254), made one line as the page does (`_one_line`): a
+    # rewording in the layer fails here, not at the stand. The whole text is asserted, so
+    # that an advice the page cannot follow (Resume while nothing is halted) cannot return.
+    text = page_words(" ".join(str(make_error()).split()))
+    assert text == page_text
+    assert STOP_FAMILY_CALL.search(text) is None, text
+
+
+def _docstring_constants(tree: ast.AST) -> set[int]:
+    """The ``id`` of every docstring ``Constant`` of ``tree``: prose for a reader, never shown."""
+    found: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            first = node.body[0] if node.body else None
+            if (
+                isinstance(first, ast.Expr)
+                and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                found.add(id(first.value))
+    return found
+
+
+def _layer_literals(root: Path | None = None) -> Iterator[tuple[str, str]]:
+    """Every string a part of ``smc`` that is not the page or the CLI can write, as ``(file, text)`` (m5 §17.12.12 D37).
+
+    The walk reads the syntax tree of each module under ``src/smc`` (``root``) except ``ui/``
+    (it holds the table whose keys name the calls) and ``cli.py`` (the CLI's texts are the
+    CLI's). A docstring is skipped; an f-string is one text with each formatted value written
+    ``it``, which is what the layer's plural texts read as (``wait for it (...)``), and the
+    pieces of an f-string are not read a second time on their own. A file is parsed from its
+    **bytes**, as the interpreter reads it: an editor that saves a UTF-8 byte-order mark
+    (Notepad before Windows 10 1903, FM-80) leaves a module that imports and runs, and a
+    text read of it would be a ``SyntaxError`` that names no file.
+    """
+    root = Path(smc.__file__).parent if root is None else root
+    for path in sorted(root.rglob("*.py")):
+        parts = path.relative_to(root).parts
+        if parts[0] == "ui" or parts == ("cli.py",):
+            continue
+        tree = ast.parse(path.read_bytes(), filename=str(path))
+        skipped = _docstring_constants(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.JoinedStr):
+                skipped.update(id(part) for part in node.values)
+        for node in ast.walk(tree):
+            if id(node) in skipped:
+                continue
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                yield "/".join(parts), node.value
+            elif isinstance(node, ast.JoinedStr):
+                yield (
+                    "/".join(parts),
+                    "".join(
+                        part.value
+                        if isinstance(part, ast.Constant)
+                        and isinstance(part.value, str)
+                        else "it"
+                        for part in node.values
+                    ),
+                )
+
+
+def test_the_walk_reads_a_module_that_starts_with_a_byte_order_mark(
+    tmp_path: Path,
+) -> None:
+    # A module saved with a BOM imports and runs, so the walk must read it too: the verifier
+    # of #592's review reproduced a SyntaxError (`<unknown>`) from a text read of such a file.
+    package = tmp_path / "layer"
+    package.mkdir()
+    bom = b"\xef\xbb\xbf"
+    (package / "texts.py").write_bytes(
+        bom + b'MESSAGE = "wait for it (`wait()`) or stop it (`stop()`)"\n'
+    )
+    # `ui/` and `cli.py` are not walked, BOM or not.
+    (tmp_path / "ui").mkdir()
+    (tmp_path / "ui" / "page.py").write_bytes(bom + b'SKIPPED = "stop()"\n')
+    (tmp_path / "cli.py").write_bytes(bom + b'SKIPPED = "resume()"\n')
+    found = list(_layer_literals(tmp_path))
+    assert found == [
+        ("layer/texts.py", "wait for it (`wait()`) or stop it (`stop()`)"),
+    ]
+
+
+def test_no_literal_of_the_layer_names_stop_resume_or_wait_after_page_words() -> None:
+    # A layer that words a new advice with a call fails here until the table says it (D37).
+    left = [
+        f"{where}: {text!r}"
+        for where, text in _layer_literals()
+        if STOP_FAMILY_CALL.search(page_words(text))
+    ]
+    assert left == []
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    [
+        "still moving; wait for it (",
+        "stops nothing, so it may still be moving",
+        "cannot be stopped from smc; wait for it",
+        "it may still move Z: stop() and check the stand, then resume()",
+    ],
+)
+def test_the_walk_finds_the_literals_it_guards(sentinel: str) -> None:
+    # FM-45: moving a text in the source must not leave the walk empty and the test above
+    # vacuous; each family the table says has a literal here that the walk reads.
+    texts = [text for _, text in _layer_literals()]
+    assert any(sentinel in text for text in texts), sentinel
+    assert any(STOP_FAMILY_CALL.search(text) for text in texts if sentinel in text), (
+        sentinel
+    )
+
+
 def test_scan_lead_says_where_a_cut_move_ends_on_a_stand_that_cuts_its_moves() -> None:
     stop = "STOP, at the top right, stops the scan."
     segments = (("xy_stage", 5000.0), ("focus", 100.0))
@@ -4705,30 +4912,32 @@ def test_the_lock_notes_are_m5_section_20_3s_words() -> None:
 def test_relock_note_is_said_only_after_measure_the_time_with_the_autofocus_not_locked() -> (
     None
 ):
-    """One input changed at a time from the one full case: each other value says nothing (D2, D4)."""
-    full = relock_note(_measured_chain(), autofocus_locked=False, dry_run=False)
+    """One input changed at a time from the one full case: each other value says nothing (D2, D4, D40)."""
+
+    def note(
+        chain: ChainStatus | None,
+        *,
+        locked: bool | None = False,
+        dry_run: bool = False,
+        halted: bool = False,
+    ) -> str:
+        return relock_note(
+            chain, autofocus_locked=locked, dry_run=dry_run, halted=halted
+        )
+
+    full = note(_measured_chain())
     assert full == RELOCK_NOTE
 
-    assert (
-        relock_note(
-            _measured_chain(label=RUN_ALL_LABEL), autofocus_locked=False, dry_run=False
-        )
-        == ""
-    )
-    assert (
-        relock_note(
-            _measured_chain(current="timing"), autofocus_locked=False, dry_run=False
-        )
-        == ""
-    )
-    assert relock_note(_measured_chain(), autofocus_locked=True, dry_run=False) == ""
-    assert relock_note(_measured_chain(), autofocus_locked=None, dry_run=False) == ""
-    assert relock_note(_measured_chain(), autofocus_locked=False, dry_run=True) == ""
-    assert relock_note(None, autofocus_locked=False, dry_run=False) == ""
-    assert (
-        relock_note(_measured_chain(plugins=()), autofocus_locked=False, dry_run=False)
-        == ""
-    )
+    assert note(_measured_chain(label=RUN_ALL_LABEL)) == ""
+    assert note(_measured_chain(current="timing")) == ""
+    assert note(_measured_chain(), locked=True) == ""
+    assert note(_measured_chain(), locked=None) == ""
+    assert note(_measured_chain(), dry_run=True) == ""
+    assert note(None) == ""
+    assert note(_measured_chain(plugins=())) == ""
+    # D40: after a STOP the autofocus reads off and the stand is halted, so *Autofocus on*
+    # would be refused (``press Resume to continue``): the one input changed alone says nothing.
+    assert note(_measured_chain(), halted=True) == ""
 
 
 @pytest.mark.parametrize(
@@ -4745,14 +4954,30 @@ def test_relock_note_is_said_only_after_measure_the_time_with_the_autofocus_not_
 def test_scan_lock_note_names_autofocus_on_for_required_and_if_engaged_only(
     mode: str, said: str
 ) -> None:
-    assert scan_lock_note(mode, autofocus_locked=False, dry_run=False) == said
+    assert (
+        scan_lock_note(mode, autofocus_locked=False, dry_run=False, halted=False)
+        == said
+    )
 
 
 @pytest.mark.parametrize("mode", ["required", "if-engaged"])
-def test_scan_lock_note_says_nothing_for_a_lock_that_reads_locked_or_unknown_or_in_a_dry_run(
+def test_scan_lock_note_says_nothing_for_a_lock_that_reads_locked_or_unknown_or_in_a_dry_run_or_while_halted(
     mode: str,
 ) -> None:
-    assert scan_lock_note(mode, autofocus_locked=True, dry_run=False) == ""
-    assert scan_lock_note(mode, autofocus_locked=None, dry_run=False) == ""
-    assert scan_lock_note(mode, autofocus_locked=False, dry_run=True) == ""
-    assert scan_lock_note(mode, autofocus_locked=False, dry_run=False) != ""
+    assert (
+        scan_lock_note(mode, autofocus_locked=True, dry_run=False, halted=False) == ""
+    )
+    assert (
+        scan_lock_note(mode, autofocus_locked=None, dry_run=False, halted=False) == ""
+    )
+    assert (
+        scan_lock_note(mode, autofocus_locked=False, dry_run=True, halted=False) == ""
+    )
+    # D40: a halted stand refuses the click the note advises, so the note is silent; the
+    # one input changed alone, from the full case below it.
+    assert (
+        scan_lock_note(mode, autofocus_locked=False, dry_run=False, halted=True) == ""
+    )
+    assert (
+        scan_lock_note(mode, autofocus_locked=False, dry_run=False, halted=False) != ""
+    )
