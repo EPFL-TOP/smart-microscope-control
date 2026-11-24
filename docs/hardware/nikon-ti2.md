@@ -1,6 +1,6 @@
-# Nikon Ti2-E — PC survey and the sessions at the stand (0, 1, 2, 3 and 5)
+# Nikon Ti2-E — PC survey and the sessions at the stand (0, 1, 2, 3, 5 and 6)
 
-Six visits are curated here. The **PC survey** (2026-09-25, below down to
+Seven visits are curated here. The **PC survey** (2026-09-25, below down to
 *Surprises*) read the PC without initialising anything. **Session 0**
 (2026-10-07, state re-read 2026-10-14; [its section](#session-0--the-stand-through-pymmcore))
 initialised the stand through pymmcore and moved nothing. Session 0
@@ -13,7 +13,10 @@ time. **Session 3** (2026-11-10, #405; [its section](#session-3--first-locks-fro
 locked PFS from the floor at the 10× and the 40× and calibrated the camera
 at three objectives. **Session 5** (2026-11-17, #550; [its section](#session-5--segments-at-the-stand-a-10-scan-with-pfs-the-40-in-water))
 ran a 10× scan with PFS, took the 40× into a well with water and loaded the
-export's positions in NIS-Elements.
+export's positions in NIS-Elements. **Session 6** (2026-11-24, #620; [its section](#session-6--cells-at-the-10-with-pfs-whole-wells-at-the-40-without-it-no-40-lock))
+scanned cells at the 10× with PFS and whole wells at the 40× without it, and
+found that the 40× reads PFSOffset back +1 at 0 and 1, so no lock from the
+floor can be tried there.
 
 Curated by the design session from the raw survey in `local/surveys/nikon-ti2/` (private, never committed)
 (issue #16), collected 2026-09-25 with the hardware connected and the
@@ -945,3 +948,240 @@ arrive in the console's code page. `scp -r` copied the session's folders
 - A plate with cells at the 40× (#342, #343).
 - The objective offsets on another day, on wells of one kind (#548).
 - Whether beads were in view at the NIS export's points.
+
+## Session 6 — cells at the 10× with PFS, whole wells at the 40× without it, no 40× lock
+
+2026-11-24, the owner at the stand from 10:30 (power-on) to about 16:00 CET,
+commit `d811ea0`, a guide session on a laptop beside them. Report: #620,
+with the raw excerpts; the folders stay in `local/surveys/nikon-ti2/session6/`,
+`local/scans/2026-11-24-train/` and `local/scans/2026-11-24/`. Two **Greiner
+24 Well SensoPlates, glass bottom** (`greiner-662892-24-well`), A1 at the
+back left, in turn: a practice plate until 13:45 (water and beads in B2, B3,
+C2, C3, water in D1, a sticker with a printed grid inside C4, the rest dry),
+then a plate with **cells** at different concentrations in B3, B4, C3, C4
+(liquid in D1, the rest dry). The day was reordered at the stand: the plate
+with cells came at 13:30 only. The 10× and 40×, the lever at 1.0×, the
+light path on the camera port, vendor software closed. Power-on order:
+stand, TI2-CTRE, Prime 95B.
+
+### The plate and the holder
+
+- **STOP on the page reads as designed** (#589, #616), with no plate: the
+  strip and the note name what the stand refuses to stop (`PFSOffset,
+  XYStage and ZDrive`). STOP idle, during Live and during a drive all
+  worked; a drive to B4 stopped at the end of segment 3 of 8 (X 15025.2
+  µm). The lock notes while halted could not be checked without PFS.
+- **The holder's sides are right** (#540): with `Turned 180°: A1 at the back
+  left`, a drive to B2 landed under B2 (the cross read "over B2
+  (estimated)").
+- **The SensoPlate's geometry holds** (#541): `plate-walls` on B2, C2, B5
+  gave a **residual of 19.2 µm**, rotation 179.99°, `scale_error` 0.00046,
+  wells 15 527–15 654 µm across (8 frames each); session 5's was 90.7 µm
+  under `greiner-24-well`. On the plate with cells, on B2, B5, C5 at the
+  holder's estimates: 25.5 µm, rotation 179.97°, wells 15 447–15 508 µm
+  across.
+- **The map is drawn in stage terms** (#547): reading it, the owner captured
+  C2 where C3 was meant. B2, C2, B5 was a valid set, but this is a
+  wrong-well risk in a scan's well list. The owner (translated): "We have
+  to decide that the panel's view and reality are the same, otherwise it is
+  confusing."
+- **The scan's plate check works at the stand** (#542): before the first
+  field, C2 and B5 lay within 1.0 µm of their registered centres (bound
+  25 µm), and B2 and C5 within 3.2 µm on the plate with cells. **It costs
+  about 17–18 s**, the stand's load included (#609). At the 40× the check
+  is skipped with a warning: the offset between the 10× and the 40× is not
+  measured (the profile's `[objectives]`), and a check would read it as a
+  move.
+
+### First locks from the floor at the 10×
+
+| Well | Z after `engage` from 0 | Z sharp under lock | Offset | Units/µm |
+|---|---|---|---|---|
+| C3, practice | 2964.88 µm | 4231.58 µm | 7987 | 6.31 |
+| C3, cells | 3000.06 µm | 4260.40 µm | 7950 | 6.31 |
+
+- On the practice plate the lock settled in 2.8 s, with Z 1262.2 µm below
+  the by-eye focus (4227.08 µm; session 5: 1266.5 µm). On the plate with
+  cells, the lock from the morning's plane (4227 µm, no by-eye focus)
+  settled in 2.4 s, with Z 1226.9 µm below it.
+- `smc autofocus offset --to 7987` on the plate with cells was refused by
+  the implied-Z check (Z target 4353.7 µm, outside the soft limits
+  [10.0, 4350.0] µm). The check uses the smallest factor, 5.9 units/µm;
+  the real one is 6.31. `--to 7950` passed: Z 4260.40 µm, locked, in
+  range.
+- Under the 10× lock the bottom varies from 8.6 µm (C4) to 36 µm (C2) within
+  one well.
+
+### The 40× and PFS
+
+- **PFSOffset reads back the write + 1 at the 40×, at 0 and at 1** (F8,
+  #621); at the 10× the same morning, 0 read back 0, twice. In C3, near
+  the wall, water and beads, PFS off, by-eye Z 4149.96 µm:
+
+  | Written | Read back at the 40× | `in range` |
+  |---|---|---|
+  | 17794 (the stand's own) | 17794 | **yes** |
+  | 14000, 10000, 8000, 6000, 4000, 3000, 2000, 1000 | as written | no |
+  | 0 | 1 | no, at every Z tried (below) |
+  | 1 (the floor set to 1.0 for the probe) | 2 | not read |
+
+  `in range` held at 17794 only. At offset 1, Z moved to every target from
+  10 to 200 µm under the by-eye focus (10, 20, 30, 40, 60, 80, 100, 150,
+  200), and `in range` was no at every one.
+- So `autofocus offset --floor` refuses ("offset 1 although 0 was asked",
+  D16) and `engage` refuses (offset 2 has not been seen locked at the 40×
+  since the stand was opened). **No first lock from the floor can be tried
+  at the 40×**, and the probe of #539 ended with its reads. The floor's
+  one-line change in the profile, the owner's decision for the probe, was
+  restored with `git checkout`. The probe left the 40×'s offset at 2; the
+  stand restores 17794 at the next turn to the 40×. #621 blocks #539.
+- **The dry control was not glass and air** (F9): C4's sticker is glass and
+  adhesive. By-eye Z 4228.28 µm; `in range` no at 17794, 6000 and 2000. It
+  cannot stand for session 3's dry C4.
+- **The condenser follows the objective** (F13, #628): `2-Ph1` for the 10×,
+  `7-N2` (dry DIC) for the 40×. The page cannot switch it: no role takes a
+  condenser turret (`roles.py` leaves it out of the heuristics).
+
+### Turns
+
+- 10× → 40×: Z 3731.74 → 3684.16 µm (−47.58 µm), the offset 7987 → 17794.
+  40× → 10×: Z 2999.72 → 3046.86 µm (+47.14 µm), the offset 2 → 9370
+  (session 5: −47.32 to −47.52 µm and +47.12 to +47.30 µm). The stand
+  restores 9370 and 17794 again, whatever offset was left.
+- Each console turn dropped Z on its own line first (`smc z move 3732 &&
+  smc objective set … --confirm`; 3000 µm before the return to the 10×).
+- **The turret is unchanged** (owner, and `smc objective list`).
+
+### The camera
+
+`camera-calibration`, lever 1.0×, binning 1:
+
+| Objective | Pixel size | Step | Residual | Rotation |
+|---|---|---|---|---|
+| 10× | 1.12432 µm | 396.9 µm | 0.68 µm | 178.33° |
+| 40× | 0.277555 µm | 97.5 µm | 0.42 µm | 178.32° |
+
+The 10× ran on beads in B2 (2.6 s), the 40× from the Stand screen at C3
+near the wall (three runs of 2.5–2.7 s); `mirrored` false in both.
+
+- **The camera turned by about +0.9° since session 5** (F4): 178.33° and
+  178.32°, against 177.42–177.50° in sessions 3 and 5. Someone had worked on
+  the microscope (owner); the turret is unchanged. **Inferred:** the camera
+  was turned on its port. **Any calibration older than 2026-11-24 is
+  suspect for rotation.**
+- The 10×'s pixel size agrees with session 3 (1.12432 against 1.12447 µm).
+  The 40×'s is **+0.51 %** on session 3 and **+0.66 %** on session 5; its
+  field is 391.9 µm.
+- The Stand screen's *Calibrate the camera* at the 40× on a plate
+  registered at the 10× keeps its result in `calibrations/position-3.json`,
+  with the routing note, as designed (#619). The page then shows `Camera
+  calibration done in 2.5 s` and no pixel size or rotation (F7, #627).
+- **On the plate with cells the 10× calibration refused at every field
+  tried** (F14, #625), in phase contrast (Ph1): "the two moves gave
+  parallel shifts", the probe frames spanning 6674 and 6574 counts. It
+  passed at once on beads in the morning. The page did not show the
+  refusal; the morning's calibration was reused with `from_run_doc`. A
+  reuse from the run document that is itself `--run-doc` refuses as "still
+  running or interrupted" and leaves its calibration `failed` (F15, #626).
+
+### Scans and the page
+
+- **10× scans with PFS (`required`)**: 218 of 218 fields on C3 and C2 in
+  134.6 s, and **436 of 436 on B3, B4, C3, C4 in 267.9 s**, every field
+  locked, 4 relocks. **0.54–0.57 s a field.**
+- **The estimate was short** (F6, #549, #609): the fields took
+  117.2 s against `estimate_s` 89.7 (1.31×), the whole stage 134.6 s (1.50×).
+  Session 5's estimate was 2.7–3.3 times long. The estimate leaves out each
+  frame's write, about 0.13 s a field; the plate check's 17 s is the rest.
+- `timing` in C3, 15 samples, 5.9 s: stage move 133 ms + 66.9 ms/mm, snap
+  167 ms (session 5: 133.8 ms + 63.35 ms/mm, 165.7 ms). The refocus, 400 ms,
+  is assumed: the autofocus was off, and the plugin does not switch it on.
+- **A whole well tiled at the 40× without PFS: 1544 fields in 527.4 s (C4)
+  and 534.7 s (C3), 0.34 s a field, 0 failed, twice** (`scan-plan`
+  `coverage=1`, `autofocus=off`, no sweep, Z from a by-eye focus at the
+  well's centre; Z read 4137.2–4137.6 and 4131.3–4131.7 µm). The three C4
+  frames the guide looked at hold cells sharp enough to read; one shows a
+  dried residue.
+- **The 40× per-field sweep never moved Z** (F16, F17, #622). With
+  `cell_focus=per-field`, 10 µm, 1 µm step (21 planes) and PFS off, it adds
+  **7.5–8.5 s a field** (a Z move and a snap per plane) and found a peak on
+  0 of 25 sweeps (practice C3) and 0 of 24 (B4, cells). `MIN_RISE = 0.05`,
+  chosen on the demo, calls every real 40× sweep flat: the sweeps'
+  (max − min)/max is 0.78–3.93 % on cells (median 2.03 %) and 0.36–5.68 %
+  on beads, with the best plane anywhere in 4–19 of 21 on cells, mostly
+  8–11. One sweep move failed (`FocusDriveOffTarget`: Z read 4198.30 µm
+  after a move to 4199.30 µm, exactly the previous plane), one in 504.
+  **Inferred:** a read before the stand updated its position.
+- **With PFS off the sweep is centred on the scan's start Z at every
+  field** (F11, #623), while the 10× lock shows the bottom varying 8.6–36
+  µm within a well and the sweep reaches ±10 µm. The owner (translated):
+  "Why does a 40× scan take so long? NIS is faster … otherwise searching
+  for the cells at the 40× before an experiment saves no time compared with
+  doing it by hand." Without the sweep a whole well takes 9 min.
+- **The 40× frames with cells use about 2 % of the camera's range at 10
+  ms** (median level 1 360–2 159, contrast 256–296 counts, in 40 frames
+  drawn from each scan), against a median level of 17 566 and a contrast of
+  10 093 at the 10× on the same plate.
+- **A map click is refused while Live runs**, as designed (m5 §5.2); the
+  owner expected to drive while watching (F1). The page's image view is too
+  small to judge cells: "We really need a bigger screen to see the images"
+  (F12; #627).
+- **Six `Ti2-E__0 (-10)` load failures** in the day (F5, #411): twice
+  before `autofocus offset`, twice before `scan-plan`, once at the page's
+  *Connect* and once before `nis-export`. Each time the next command loaded.
+- **From the third *Connect* of the page on, every line of its console is
+  printed twice, and 951 DEBUG lines of other libraries follow** (F18,
+  #624). Bokeh's module-level `logging.debug()` calls
+  `logging.basicConfig()` while the root logger has no handler; smc's
+  handler is on the `smc` logger only, and pymmcore-plus leaves the root at
+  DEBUG. A console flooded this way risks FM-62 (a blocked console blocks
+  the loop that handles STOP).
+
+### Cells and the deliverable
+
+- `cells` (`cell_classes_model-cat-v2.pth`, on the stand's CPU): **0.70 s a
+  frame at the 40×, 0.77 s at the 10×** (436 frames in 343.9 s). Counts by
+  class, single / doublet / debris, at the 10× on the plate with cells:
+  B4 10 / 7 / 95, B3 7 / 3 / 27, C3 2 / 9 / 29, C4 2 / 12 / 93. At the 40×,
+  B4 on 24 frames: 49 / 9 / 8, where the 10× gave 10 / 7 / 95 on 109 frames.
+  At the 40× on the practice plate, the beads of C3 count as debris
+  (2 / 1 / 3).
+- **The deliverable's geometry passes at the 40×** (#198): `cells`,
+  `select_fields.py` (4 stops), `nis-export` (4 positions, `z_mode z`, no
+  `pfs_offset`), loaded in NIS-Elements at the 40×. NIS shows the file's X,
+  Y, Z, its µm values read as mm. A frame saved at each point shows the same
+  beads as smc's frames, shifted by 2–37 µm (the beads float; one fibre was
+  gone). A sign, origin or unit error would move them by millimetres. Its
+  repeatability waits for cells fixed on the glass.
+- NIS-Elements' XY position list opens and loads session 5's file. The NIS
+  pass with cells was not done: the 10× list (8 positions, `z_mode
+  pfs-offset`) and the 40× list (5 positions, `z_mode z`) were exported,
+  neither was loaded.
+
+### SSH (read-only)
+
+`smc doctor` over SSH exits 0 again (Z 484.82 µm). It needs `SMC_PROFILE`
+set (`set SMC_PROFILE=nikon-ti2&& set PYTHONUTF8=1&& smc doctor`), or `-p`
+after the command; `smc -p … doctor` is refused. The guide read the
+run documents over SSH until 16:59, when the laptop left the institute's
+network; the laptop's VPN address cannot reach port 22. The stand's folders
+(1.0 GB and 13 GB) came back from a network disk the same evening.
+
+### Not settled by session 6
+
+- Why the Ti2-E reads PFSOffset back +1 at 0 and 1 at the 40×, and how to
+  take a first lock there (#621, #539); then a 40× scan with PFS, a Z-stack
+  and the contracts with autofocus.
+- Where a 40× field's focus comes from while PFS cannot lock, and the
+  sweep's flatness bound (#623, #622).
+- A dry glass and air control at the 40× (F9); a 40× by-eye focus at Z
+  4208.36 µm, 58 µm above the probe's 4149.96, was not located.
+- The objective offsets (#548, not run), the plate check twice and on a
+  lifted plate, the route on the Results screen.
+- The NIS pass with cells, and the deliverable's repeatability (#198).
+- A condenser role (#628) and a 10× calibration on cells in phase contrast
+  (#625).
+- The put-back: at 16:59 the plate was still on, the 40× in place with the
+  condenser at N2, and the 40×'s PFS offset at about 2. Whether the offset
+  was set back to 17794 for NIS users, and whether `sshd` and its firewall
+  rule were switched off, is not known.
