@@ -275,6 +275,7 @@ __all__ = [
     "scanned_line",
     "side_words",
     "stage_label",
+    "stand_calibration_failed",
     "step_button_label",
     "step_states",
     "stop_refused_text",
@@ -3657,6 +3658,19 @@ def calibration_failed(words: str) -> str:
     operator acts on, and the strip's outcome is gone at the next activity.
     """
     return _flat(f"the last calibration failed: {words}")
+
+
+def stand_calibration_failed(text: str) -> str:
+    """The Stand screen's line under *Calibrate the camera* after a calibration that failed: ``The last calibration failed: <text>`` (m5 §22.2 D1).
+
+    ``text`` is the tool's words (``PageView.calibration_failed``, or what follows
+    ``calibration_failed``'s own prefix in a position document's problem). It is that
+    function's line with its first letter in capitals, so that the Plate screen's block and
+    this line say one thing in the same words. Plain text on one line (FM-139): the words are
+    a tool's and a path in them is the stand's.
+    """
+    line = calibration_failed(text)
+    return line[:1].upper() + line[1:]
 
 
 def plan_calibration_used(objective: str, file: str, measured: str) -> str:

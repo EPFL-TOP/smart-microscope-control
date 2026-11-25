@@ -6889,3 +6889,144 @@ def test_the_views_read_of_a_turret_that_does_not_answer_is_not_logged_at_every_
         assert not [r for r in caplog.records if "could not be read" in r.getMessage()]
     finally:
         page.close()
+
+
+# -- the Stand screen's line of a calibration that failed: the view's field (m5 §22, #625) --------
+
+
+def _seed_calibration_record(
+    run_doc: Path,
+    *,
+    status: StageStatus,
+    error: str | None,
+    minute: int = 0,
+    result: dict[str, Any] | None = None,
+) -> None:
+    """A ``camera-calibration`` record as the runner leaves it, with the error text it writes."""
+    then = T0 + timedelta(minutes=minute)
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="camera-calibration",
+            provides="camera-calibration",
+            attempt=f"a{minute}",
+            status=status,
+            started_utc=then,
+            finished_utc=then,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=result,
+            error=error,
+        ),
+    )
+
+
+CALIBRATION_REFUSED = (
+    "PluginRunError: camera-calibration: the two moves gave parallel shifts: the frames "
+    "probably hold too little texture; the probe frames span 6674 and 6574 counts"
+)
+
+
+def test_the_view_carries_the_words_of_the_run_documents_failed_calibration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    """D2, D3: the tool's words, without the exception's type and the tool's name, from the document."""
+    _seed_calibration_record(
+        run_doc, status=StageStatus.failed, error=CALIBRATION_REFUSED
+    )
+    page = _page(fake_microscope, run_doc, _real("camera-calibration"))
+    try:
+        view = page.view()
+    finally:
+        page.close()
+
+    assert view.calibration_failed == (
+        "the two moves gave parallel shifts: the frames probably hold too little "
+        "texture; the probe frames span 6674 and 6574 counts"
+    )
+
+
+def test_the_view_has_no_failed_words_for_a_record_that_did_not_fail(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    """A calibration that ended well takes the line away: the latest record is what is read (D4)."""
+    page = _page(fake_microscope, run_doc, _real("camera-calibration"))
+    try:
+        assert page.view().calibration_failed is None
+        _seed_calibration_record(
+            run_doc, status=StageStatus.failed, error=CALIBRATION_REFUSED, minute=0
+        )
+        assert page.view().calibration_failed is not None
+        # A later attempt that ended `done`: the latest start decides, as for every reader.
+        _seed_calibration_record(run_doc, status=StageStatus.done, error=None, minute=5)
+        assert page.view().calibration_failed is None
+        # A record that is not `failed` says nothing even with a text in its error (a run
+        # that is going, or one that stopped with a checkpoint).
+        for status in (StageStatus.stopped, StageStatus.running):
+            _seed_calibration_record(
+                run_doc, status=status, error="camera-calibration: x", minute=6
+            )
+            assert page.view().calibration_failed is None
+        # And a later one that failed again says its own words, not the older ones.
+        _seed_calibration_record(
+            run_doc,
+            status=StageStatus.failed,
+            error="PluginRunError: camera-calibration: the frame is dark or flat",
+            minute=9,
+        )
+        assert page.view().calibration_failed == "the frame is dark or flat"
+    finally:
+        page.close()
+
+
+def test_a_record_that_cannot_be_read_gives_no_failed_line(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    """FM-98: a document that is not JSON, and a failed record with no error, give none and raise nothing."""
+    page = _page(fake_microscope, run_doc, _real("camera-calibration"))
+    try:
+        run_doc.write_text("{ this is not a run document", encoding="utf-8")
+        unreadable = page.view()
+        run_doc.unlink()
+        _seed_calibration_record(run_doc, status=StageStatus.failed, error=None)
+        no_error = page.view()
+        _seed_calibration_record(run_doc, status=StageStatus.failed, error="", minute=1)
+        empty_error = page.view()
+    finally:
+        page.close()
+
+    assert any("run document" in problem for problem in unreadable.problems)
+    assert unreadable.calibration_failed is None
+    assert no_error.calibration_failed is None
+    assert empty_error.calibration_failed is None
+
+
+def test_the_failed_words_are_one_line_plain_and_cut_at_the_cards_bound(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    """FM-205: markup, a path and 700 characters in a tool's words, through the bound.
+
+    This pins the model's text (one line, cut at the bound, the words as given). Whether
+    a browser shows a `Str` pane's text as text is not proved here (FM-271: it parses it
+    as HTML), and no test of the model can prove it.
+    """
+    words = "the frame is <b>dark</b>\nin C:\\Users\\lab\\run\n" + "x" * 700
+    _seed_calibration_record(
+        run_doc,
+        status=StageStatus.failed,
+        error=f"PluginRunError: camera-calibration: {words}",
+    )
+    page = _page(fake_microscope, run_doc, _real("camera-calibration"))
+    try:
+        shown = page.view().calibration_failed
+    finally:
+        page.close()
+
+    assert shown is not None
+    assert "\n" not in shown
+    # The words are kept as given and cut, not rewritten (what a browser makes of `<b>` is FM-271's).
+    assert shown.startswith("the frame is <b>dark</b> in C:\\Users\\lab\\run xxx")
+    assert len(shown) == 601
+    assert shown.endswith("…")

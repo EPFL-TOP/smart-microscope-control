@@ -36,7 +36,7 @@ from smc.hardware.profile import HolderSection, Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.errors import PluginRunError
 from smc.plugins.registry import GROUP
-from smc.plugins.slots import PlateResult
+from smc.plugins.slots import PlateResult, WallImages, WellFit
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import PlatePage
@@ -1365,7 +1365,7 @@ def test_a_windows_page_says_its_commands_are_quoted_for_a_posix_shell(
     view.refresh()
     for pane, card_of in (
         (view.register_command_note, view.register_card),
-        (view.calibrate_command_note, view.calibrate_box.objects[2]),
+        (view.calibrate_command_note, view.calibrate_box.objects[3]),
     ):
         assert pane.object == words
         assert pane.visible
@@ -1937,3 +1937,282 @@ def test_a_profile_sample_of_the_plate_keeps_the_corners(
     finally:
         page.close()
         microscope.close()
+
+
+# -- a calibration that failed, kept on the Stand screen (m5 §22, #625) -----------------------
+
+#: What the real tool says over ``fake_microscope``, whose frame is flat: the reference frame is
+#: judged before anything moves (m3 §4.2), so the words are the tool's own and need no stage.
+FLAT_FRAME_WORDS = (
+    "the camera's frame is dark or flat (the 1st to 99th percentile spans 0 counts, "
+    "under 50): is the light on and the light path on the camera? nothing was moved"
+)
+LAST_FAILED = "The last calibration failed: "
+
+
+def test_a_failed_calibration_from_the_stand_screen_stays_on_the_screen_in_the_warning_colour(
+    page: PlatePage,
+) -> None:
+    """F14: the strip said it once and the screen kept nothing; the line stays under the button."""
+    view = PlatePageView(page)
+    assert not view.calibrate_failed.visible
+    assert view.calibrate_failed.object == ""
+
+    _click(view.calibrate_button)
+    assert page.join(10.0)
+    # The end of a run reads the run document again (the tick does it when it saw the run
+    # going; this test did not tick in between), then the tick draws.
+    view.refresh()
+    view.tick()
+
+    assert view.calibrate_failed.object == LAST_FAILED + FLAT_FRAME_WORDS
+    assert view.calibrate_failed.visible
+    assert view.calibrate_failed.styles["color"] == _WARNING
+    # Between the note and the Command card, and the strip says what it always said, in its colour.
+    assert view.calibrate_box.objects[:3] == [
+        view.calibrate_button,
+        view.calibrate_note,
+        view.calibrate_failed,
+    ]
+    assert view.run_text.object == (
+        f"Camera calibration failed: camera-calibration: {FLAT_FRAME_WORDS}"
+    )
+    assert view.run_text.styles.get("color") != _WARNING
+    assert view.calibrate_box.visible
+    assert view.known_block.object.split("\n")[1] == (
+        "Camera: not calibrated (the arrows cannot say which way the image moves)"
+    )
+
+    # Refresh forgets the strip's outcome and leaves the line (D4).
+    view.on_refresh()
+
+    assert view.run_text.object == ""
+    assert view.calibrate_failed.object == LAST_FAILED + FLAT_FRAME_WORDS
+    assert view.calibrate_failed.visible
+
+
+def _seed_failed_calibration(path: Path, words: str, *, minute: int = 0) -> None:
+    """A ``camera-calibration`` record that ended ``failed``, as the runner writes its error."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    then = T0 + timedelta(minutes=minute)
+    write_stage(
+        path,
+        StageRecord(
+            plugin="camera-calibration",
+            provides="camera-calibration",
+            attempt=f"a{minute}",
+            status=StageStatus.failed,
+            started_utc=then,
+            finished_utc=then,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            error=f"PluginRunError: camera-calibration: {words}",
+        ),
+    )
+
+
+def test_a_calibration_that_ends_done_takes_the_failed_line_away(
+    page: PlatePage,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    """D4: the line lives as long as the record, and a calibration that ends well replaces the record."""
+    view = PlatePageView(page)
+    _seed_failed_calibration(run_doc, "the light is off")
+    view.on_refresh()
+    assert view.calibrate_failed.object == LAST_FAILED + "the light is off"
+    assert view.calibrate_failed.visible
+
+    # Calibrated at the objective in place: the box is gone and so is the line.
+    seed_camera_calibration(run_doc, objective=TEN_X)
+    view.on_refresh()
+    assert not view.calibrate_box.visible
+    assert view.calibrate_failed.object == ""
+    assert not view.calibrate_failed.visible
+
+    # And calibrated at another objective: the box is offered again, with no failure to say.
+    _seed_failed_calibration(run_doc, "the light is off", minute=1)
+    view.on_refresh()
+    assert view.calibrate_failed.object == LAST_FAILED + "the light is off"
+    seed_camera_calibration(run_doc, objective=FORTY_X)
+    view.on_refresh()
+    assert view.calibrate_box.visible
+    assert view.calibrate_failed.object == ""
+    assert not view.calibrate_failed.visible
+
+
+def test_the_failed_line_stays_through_a_disconnect_and_the_next_activity(
+    page: PlatePage, run_doc: Path
+) -> None:
+    """D4: *Refresh*, a closed stand and the next activity leave it; the strip's outcome does not stay."""
+    view = PlatePageView(page)
+    _seed_failed_calibration(run_doc, "the light is off")
+    view.on_refresh()
+    line = LAST_FAILED + "the light is off"
+    assert view.calibrate_failed.object == line
+
+    page.disconnect()
+    assert page.join(10.0)
+    view.refresh()
+    view.tick()
+
+    assert not page.connected
+    assert view.calibrate_failed.object == line
+    assert view.calibrate_failed.visible
+
+
+def test_a_record_that_cannot_be_read_gives_no_failed_line(
+    page: PlatePage, run_doc: Path
+) -> None:
+    """FM-98: a run document that is not JSON, and a failed record with no error, say nothing and raise nothing."""
+    view = PlatePageView(page)
+    run_doc.write_text("{ this is not a run document", encoding="utf-8")
+    view.on_refresh()
+    assert view.calibrate_failed.object == ""
+    assert not view.calibrate_failed.visible
+
+    run_doc.unlink()
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="camera-calibration",
+            provides="camera-calibration",
+            attempt="a0",
+            status=StageStatus.failed,
+            started_utc=T0,
+            finished_utc=T0,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            error=None,
+        ),
+    )
+    view.on_refresh()
+    assert view.calibrate_failed.object == ""
+    assert not view.calibrate_failed.visible
+
+
+def test_the_failed_line_is_plain_text_and_bounded(
+    page: PlatePage, run_doc: Path
+) -> None:
+    """FM-205: markup, a path and 700 characters in a tool's words; the line is one `Str`, on one line, cut.
+
+    The pane is the page's text pane and the words pass as given. That a browser shows
+    them as text is **not** proved by a pane's type: it parses a `Str` pane as HTML
+    (FM-271, read in Chromium), so a placeholder in angle brackets must not be in a tool's
+    text, and the page-wide escape is a change of its own.
+    """
+    words = f"{HOSTILE} in C:\\Users\\lab\\run\nand " + "x" * 700
+    _seed_failed_calibration(run_doc, words)
+    view = PlatePageView(page)
+
+    view.on_refresh()
+
+    assert type(view.calibrate_failed) is pn.pane.Str
+    shown = view.calibrate_failed.object
+    assert shown.startswith(f"{LAST_FAILED}{HOSTILE} in C:\\Users\\lab\\run and xxx")
+    assert "\n" not in shown
+    # The tool's words are cut at the card's bound, as the Plate screen's block cuts them.
+    assert len(shown) == len(LAST_FAILED) + 601
+    assert shown.endswith("…")
+
+
+def _seed_walls_plate(run_doc: Path, objective: str) -> None:
+    """A plate registered from images of its walls under ``objective``: the block is offered."""
+
+    def fit(well: str, centre: tuple[float, float]) -> WellFit:
+        return WellFit(
+            well=well,
+            recorded_xy_um=centre,
+            center_xy_um=centre,
+            diameter_um=6000.0,
+            size_error=0.0,
+            rms_um=0.1,
+            n_points=100,
+            walls=(),
+        )
+
+    walls = WallImages(
+        objective=objective,
+        pixel_size_um=1.1,
+        image_shape_px=(100, 100),
+        search_um=1000.0,
+        wells=(fit("A1", (0.0, 0.0)), fit("H12", (99000.0, -63000.0))),
+        frames=8,
+        folder=None,
+        elapsed_s=10.0,
+    )
+    result = PlateResult(
+        plate="96-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.0,
+        method="wall-images",
+        residual_um=1.0,
+        scale_error=None,
+        n_refs=2,
+        walls=walls,
+        objective=objective,
+    )
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="plate-walls",
+            provides="plate",
+            attempt="a0",
+            status=StageStatus.done,
+            started_utc=T0,
+            finished_utc=T0,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={"plate": "96-well"},
+            result=result.model_dump(mode="json"),
+        ),
+    )
+
+
+def test_a_routed_click_reads_the_failure_of_the_position_document_not_the_run_document(
+    page: PlatePage, run_doc: Path
+) -> None:
+    """D2: the click goes into the objective's own document when the plate was registered under another.
+
+    The 10X is in place and the plate was registered under the 40X: the click is routed
+    into ``calibrations/position-2.json`` (the 10X is position 2 of the fake turret), so the
+    failure the line says is that document's, never the run document's own record of an
+    older calibration. A problem of that document that is not a failure (no file, not
+    JSON) is the Plate screen's block's, and gives no line here.
+    """
+    view = PlatePageView(page)
+    _seed_walls_plate(run_doc, FORTY_X)
+    _seed_failed_calibration(run_doc, "THE RUN DOCUMENT'S WORDS")
+    folder = run_doc.parent / "calibrations"
+    held = folder / "position-2.json"
+
+    # Routed, with no document at the position: nothing of the run document's is said.
+    view.on_refresh()
+    assert page.status().objective == TEN_X
+    assert view._stand_destination() == (True, 2)
+    assert view.calibrate_failed.object == ""
+    assert not view.calibrate_failed.visible
+
+    # The position's own document failed: its words, whatever the run document says.
+    _seed_failed_calibration(held, "THE POSITION'S WORDS")
+    view.on_refresh()
+    assert view.calibrate_failed.object == LAST_FAILED + "THE POSITION'S WORDS"
+    assert view.calibrate_failed.visible
+    assert view.calibrate_failed.styles["color"] == _WARNING
+
+    # A document that is not one: the block says why, this line says nothing.
+    held.write_text("{ this is not a run document", encoding="utf-8")
+    view.on_refresh()
+    assert view.calibrate_failed.object == ""
+    assert not view.calibrate_failed.visible
+
+    # Registered under the objective in place the click is not routed: the run document's words.
+    _seed_walls_plate(run_doc, TEN_X)
+    view.on_refresh()
+    assert view._stand_destination() == (False, None)
+    assert view.calibrate_failed.object == LAST_FAILED + "THE RUN DOCUMENT'S WORDS"

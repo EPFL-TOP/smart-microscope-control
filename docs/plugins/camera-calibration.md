@@ -20,7 +20,10 @@ refuse another. Run it again after the camera has been turned or replaced.
 Correlation on a blank field returns a confident answer that means nothing, so
 the plugin measures how well the frames agree *after* aligning them and refuses a
 weak one (`the frames barely correlate: find a field with texture`). An
-out-of-focus field fails the same way.
+out-of-focus field fails the same way. A field that holds only a few specks of
+sample (a plate with sparse cells, two beads in water) is read by a **second look**
+before it is refused (below): it needs the specks, not a crowd of them, and a field
+that shows nothing is still refused.
 
 **With the light on and the light path on the camera**: a frame with no light on
 it is the camera's black level and its fixed pattern, and that pattern correlates
@@ -56,19 +59,22 @@ reports, with no `nan` in it, and with light on it. A colour mode (`(height,
 width, 3)`) or another region than the camera reports is refused there, with
 `nothing was moved`, and so is a dark or flat frame (below).
 
-The demo devices cannot be calibrated: the demo camera ignores the stage, so both
-probes see no motion and the plugin says so (the tests use the synthetic plate of
-`smc.testing.synthetic`, whose frames follow the stage):
+The demo devices cannot be calibrated: the demo camera ignores the stage, so its
+probes show no motion of the stage's making and the plugin says so (the tests use
+the synthetic plate of `smc.testing.synthetic`, whose frames follow the stage):
 
 ```text
 $ smc run camera-calibration -p demo --run-doc run.json
 camera-calibration: 1/3 +X probe
-✗ camera-calibration: the two moves gave parallel shifts: the frames probably hold too little texture (a sparse field, a dark or flat frame): try a field with more structure, then the light path, then the stage; the probe frames span 5138 and 5138 counts (1st to 99th percentile); step 128 µm
+✗ camera-calibration: the two moves gave parallel shifts: the frames probably hold too little texture (a sparse field, a dark or flat frame): try a field with more structure, then the light path, then the stage; the probe frames span 5138 and 5138 counts (1st to 99th percentile); step 128 µm; if this camera was calibrated at this objective before, reuse that calibration with from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)
 ```
 
 The demo's frames carry plenty of contrast (5138 counts), which tells a stand's
 reader that this refusal is not about the light: the image simply did not follow
-the stage.
+the stage. The demo camera's test pattern moves by itself, 32 px a frame (measured
+2026-11-25), so the two probes read shifts that are the same and **not** the
+camera's own pattern at zero shift: the second look (below) is not asked, and the
+refusal has no sentence about it.
 
 ## What it leaves
 
@@ -121,9 +127,12 @@ The other three are what the shifts of frames with light say:
   frames come first because they are the likelier cause: at the 40x in water, on a
   field of two 10 µm beads, the stage moved and the dust and shading fixed to the
   camera won the correlation, so both probes read a shift of zero (Ti2-E session
-  5, F12, #545); the same field with more beads calibrated. The next suspects are
+  5, F12, #545); the same field with more beads calibrated, and so does that field
+  now, by the second look below. The next suspects are
   the light path and then the stage (a stage that ignored the command, the wrong
-  camera). The two figures are the contrast of the two probe frames, as the
+  camera). When a probe read zero, the second look ran and the reason says what it
+  saw: `away from the camera's own pattern the best peaks are <a> and <b> times the
+  next (1.5 asked)`, after the two figures and before the step. The two figures are the contrast of the two probe frames, as the
   dark-frame refusal above quotes it: a dark frame spans a few tens of counts, and a
   frame whose contrast is a still background can span as much as one with a lit
   sample, so the figure rules the light out and not the texture. It follows frames
@@ -142,6 +151,58 @@ wrap: give a smaller step_um` when the step was the 50 µm fallback or more than
 `[-N/2, N/2)`, so content moved by 200 rows of a 384-row frame reads -184: a step
 beyond half the frame cannot be told from a wrong one, and the weak response
 refuses it.
+
+**A refusal for texture offers a way out that needs none.** `parallel shifts` and
+`barely correlate` both end, after the step and the wrap hint, with `; if this
+camera was calibrated at this objective before, reuse that calibration with
+from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)`. The tool reads no other
+document, so it cannot name the file: `PATH_TO_ITS_RUN_DOCUMENT` stands for the run document of
+an earlier calibration at this objective (the plate page keeps one per turret
+position, below). A refusal for another reason (a dark frame, the rigid-camera
+note) does not carry it: a reuse is no way out of a stage that did not obey. The
+whole reason stays within the 600 characters the plate page's card keeps of a
+failure (572 at the longest: five-digit spreads, a 2000 µm step and the wrap hint).
+
+### A sparse field: the second look
+
+The camera's own pattern (a vignette, the sensor's column stripes, dust) does not
+move with the stage. On a field that holds almost nothing of the sample it is the
+highest peak of the phase correlation, at zero shift, and a stage that moved a
+quarter field reads as one that did not. At the Ti2-E (session 6, F14, #625) the
+10x in phase contrast on a plate with cells was refused on every field the owner
+tried, the probe frames spanning 6674 and 6574 counts: the fields held a smooth
+vignette, the stripes, dust and a few dark specks, and no cell (the contrast the
+refusal quoted is the vignette's, not the sample's). The morning's plate of beads
+had calibrated at once, and so would F12's field with more beads.
+
+When the fit says `parallel shifts` **and** at least one probe read a shift within
+2 px of zero, the plugin correlates the three frames it already holds **again**,
+with the cells within 12 px of zero shift left out (the zero peak's skirt reaches 4
+to 5 px), takes the strongest peak that remains for each probe, and says how many
+times it stands above the highest peak more than 10 px from it. It believes the two
+shifts when **both stand out 1.5 times the next** and **they are a camera's** (as
+long as each other to 10 %, at a right angle to 10°, mirrored or not). The fit then
+judges them as it judges any shifts (the rigid-camera check, the response, the
+step), and the result is a calibration like any other, with one line of `assumed`
+(below) that says it was read this way. Otherwise the refusal stands and says what
+the second look saw. `measure_shift` is not changed: it is the answer for every
+field that calibrates without a second look, and the return check's.
+
+It moves nothing and takes no frame: it is arithmetic on the three frames in
+memory (12 MB at 1412 x 1412 and 16 bits), after the return.
+
+What it was measured on is **emulated**: the refused probes were never saved, so
+each was rebuilt from the real 10x scan of that afternoon (the fixed pattern is the
+median of 24 frames of the well; the sample's content is a frame minus it, moved by
+the morning's matrix). On 148 fields of the four wells `measure_shift` read zero for
+both probes on every one; the strongest peak away from zero was the true shift on
+124 of them, and at 1.5 times the next the second look accepts 123, none at another
+peak. On the morning's beads plate (74 fields) the figures are 67 and 60. A stage
+that did not move gave at most 1.20 times the next peak (20 pairs), an empty field
+1.19 (28 pairs). The numbers and the method are in
+[`m3-plugins.md`](../design/m3-plugins.md) §4.4.1. **No calibration of a sparse
+field was run at a stand yet**, so the two thresholds (1.5 and 12 px) are those of
+the emulation and nothing more.
 
 **The stage is returned to where it started** when the measurement ran to the
 end, whether or not the fit is usable, so an empty field still gets the stage
@@ -168,17 +229,23 @@ The slot `camera-calibration` holds a `CameraCalibration`
 | `rotation_deg` | The camera's rotation, in `(-180, 180]`. |
 | `mirrored` | Whether the image is flipped (`det M > 0`). An upright camera is **not** mirrored. |
 | `residual_um` | How far the frame's edge lies from where a rigid camera of that size and rotation would put it: near 0 for a good camera, large for a stretched or sheared image or a bad measurement. |
-| `response` | The smaller of the two probes' agreement after alignment, 0 to 1. A good field is well above the refusal threshold of 0.05. |
-| `return_error_um` | How far the stage came back from where it started, measured on the last frame; `null` (unknown, not zero) when that frame did not correlate or the calibration was reused. |
+| `response` | The smaller of the two probes' agreement after alignment, 0 to 1. A good field is well above the refusal threshold of 0.05. When the second look read the probes (`assumed` says so), it is the smaller of the two second-look responses, which counts the camera's own pattern too: it is not evidence of the sample's texture. |
+| `return_error_um` | How far the stage came back from where it started, measured on the last frame; `null` (unknown, not zero) when that frame did not correlate, when the second look read the probes (the check is blind there, below) or when the calibration was reused. |
 | `step_um` | The probe distance used. |
 | `reused_from` | The run document this was copied from, as typed but written with forward slashes (`as_posix()`), and never resolved; `null` for a measurement. |
 | `assumed` | What it rests on that was not measured: see below. |
 
 `assumed` can hold: `step of 50 µm: no pixel size was known` and `step capped at
-2000 µm: ...` (probe distances, not results); `step of 50 µm fits poorly (18 px,
+2000 µm: ...` (probe distances, not results); `sparse field: the camera's own
+pattern won at zero shift, so both shifts are the strongest peaks away from it (4.7
+and 4.9 times the next, 1.5 asked)` (the second look read the probes, after the step
+lines and before the next one; at most 160 characters, the length the page's strip
+keeps of the first line); `step of 50 µm fits poorly (18 px,
 under a tenth of the 1412 px frame; residual 10.7 µm, 21 % of the step): run again
 with step_um=970` (the next paragraph); `the return could not be checked:
-the frame after it did not correlate (<r>)`; `the stage came back <n> µm off: its
+the frame after it did not correlate (<r>)`, and `the return could not be checked: on
+this field the camera's own pattern wins the correlation at zero shift` (after a second
+look: the check cannot see a drift there); `the stage came back <n> µm off: its
 repeatability limits the scan's stitching` (reported, not refused: above the
 larger of 2 µm and four pixels); `camera calibration reused from <path>, measured
 <time>`.
@@ -222,6 +289,17 @@ plan as measured. Read the numbers before you trust them:
   the period.
 - **A step of a few pixels** gives a result of poor precision, not an error: it
   is named in `assumed`, with the step to run again with (above).
+- **A calibration the second look read rests on a few specks** (a line of
+  `assumed` says `sparse field: ...`). Its `response` counts the camera's own
+  pattern, so a response that looks fine says nothing about the sample; its
+  pixel size, rotation and mirror are what to read, against what you expect (the
+  Ti2-E's 10x measured 1.12432 µm per pixel and 178.33° on a plate of beads). And
+  the return check would read the camera's own pattern as well: on such a field the
+  frame after the return reads a shift of zero whether or not the stage came back
+  (a return 70 µm off read 0.0 in the review of #625), so the result leaves
+  `return_error_um` **unknown** (`null`) and says so in `assumed` (`the return could
+  not be checked: on this field the camera's own pattern wins the correlation at zero
+  shift`). Check where the stage is after the run. The result is as good as the specks are.
 
 These checks are not made for you yet: whether a uniform scale error or a
 periodic target should be refused, and against what, waits for the data of the
@@ -344,3 +422,11 @@ no pixel size in the profile (it should suggest about 970 µm), and the floor on
 the camera's other modes (binning, gain, a 12-bit mode: the floor follows the
 bit depth the camera reports, and no 12-bit frame was measured). A dark frame
 whose spread is above the floor, or a lit one under it, is a number to bring back.
+
+The second look (#625) was built from probes **emulated** out of the stand's own 10x
+scan, and built on a seeded synthetic sparse field. **Not run at a stand**: a
+calibration at the 10x in phase contrast (Ph1) on the plate with cells, or on any
+sparse field, which should read the morning's 1.12432 µm per pixel and 178.33°; and
+one on a field the tool must still refuse (an empty well). The two thresholds, 1.5
+times the next peak and 12 px around zero shift, are the emulation's. A ratio or a
+shift that surprises is a number to bring back.

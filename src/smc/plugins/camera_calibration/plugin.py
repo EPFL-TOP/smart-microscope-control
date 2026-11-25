@@ -18,6 +18,14 @@ harm.
   had moved. The reference frame is judged before the first move, and each
   probe frame after the return, so that "parallel shifts" follows only frames
   that carry signal.
+* **A sparse field gets a second look before it is refused** (F14, #625, m3
+  §4.4). The sensor's own pattern wins the phase correlation on a field that
+  holds almost nothing of the sample, so a stage that moved reads as one that
+  did not. When the fit says "parallel shifts" and a probe read zero, the three
+  frames already in memory are correlated again away from zero shift; what that
+  gives is believed only when it stands out and is a rigid camera's, the fit
+  then judges it as ever, and the result says it was read this way. No move, no
+  snap: the second look runs after the return, on arithmetic.
 * **The stage is waited for before its start is read** (FM-85), and the step is
   sized from the camera's own pixel size only when that is finite and positive
   (FM-104): a pixel size of 0 means "not measured".
@@ -40,15 +48,23 @@ from pydantic import Field, ValidationError
 from smc.hardware.capabilities import XY, Camera, ObjectiveTurret, XYStage
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.camera_calibration.algorithm import (
+    BARELY_CORRELATE_NOTE,
     DEFAULT_STEP_FRACTION,
     FALLBACK_STEP_UM,
+    FIXED_PATTERN_EXCLUDE_PX,
+    MIN_PEAK_RATIO,
     MIN_RESPONSE,
     PARALLEL_SHIFTS_NOTE,
+    AwayShift,
     Fit,
+    Shift,
     carries_signal,
     fit,
     measure_shift,
+    measure_shift_away_from_zero,
     precision_reasons,
+    reads_the_fixed_pattern,
+    shifts_of_a_rigid_camera,
     signal_floor_counts,
     signal_spread,
 )
@@ -74,6 +90,13 @@ _RETURN_PIXELS = 4.0
 #: calibration exists to correct: a size 100 times too large would otherwise be
 #: sent as 9.6 mm of absolute moves, which no jog guard covers (FM-121).
 _MAX_STEP_UM = 2000.0
+#: The ``assumed`` line of a calibration the second look read: its return check is blind
+#: (the camera's own pattern wins at zero shift whether or not the stage came back), so
+#: ``return_error_um`` is unknown and not 0. One line, well under the strip's 160 (FM-205).
+_BLIND_RETURN_LINE = (
+    "the return could not be checked: on this field the camera's own pattern "
+    "wins the correlation at zero shift"
+)
 
 
 class CameraCalibrationParams(PluginParams):
@@ -173,6 +196,10 @@ class CameraCalibrationPlugin:
         reference = _checked_frame(self.name, camera.snap(), shape, bit_depth)
         probes = (("+X probe", step_um, 0.0), ("+Y probe", 0.0, step_um))
         shifts = []
+        # The probe frames stay in memory (12 MB for the three frames at 1412 x
+        # 1412 and 16 bits): the second look needs them after the return, and
+        # asks the camera for nothing (FM-88).
+        probe_frames: list[npt.NDArray[Any]] = []
         # Per probe frame: whether it carries light, and the spread the message quotes.
         signals: list[tuple[bool, float]] = []
         settle_s = params.settle_ms / 1000.0
@@ -187,6 +214,7 @@ class CameraCalibrationPlugin:
                 xy.move_to_um(start.x_um + dx_um, start.y_um + dy_um)
                 ctx.wait_s(settle_s)
                 probe_frame = camera.snap()
+                probe_frames.append(probe_frame)
                 shifts.append(measure_shift(reference, probe_frame))
                 signals.append(
                     (carries_signal(probe_frame, bit_depth), signal_spread(probe_frame))
@@ -222,6 +250,22 @@ class CameraCalibrationPlugin:
                 )
 
         fitted = fit(shift_x, shift_y, step_um=step_um, image_shape_px=shape)
+        # The second look (m3 §4.4): only where the fit says "parallel shifts"
+        # and a probe read zero, for both probes or neither, on the frames in
+        # memory. It is believed when it stands out and is a camera's; the re-fit
+        # then decides, as for any pair of shifts.
+        ratios: tuple[float, float] | None = None
+        read_away = False
+        if _wants_a_second_look(fitted, (shift_x, shift_y), shape):
+            looked = (
+                measure_shift_away_from_zero(reference, probe_frames[0]),
+                measure_shift_away_from_zero(reference, probe_frames[1]),
+            )
+            ratios = (looked[0].peak_ratio, looked[1].peak_ratio)
+            if _second_look_holds(looked):
+                read_away = True
+                shift_x, shift_y = looked[0].shift, looked[1].shift
+                fitted = fit(shift_x, shift_y, step_um=step_um, image_shape_px=shape)
         if not fitted.trustworthy:
             raise PluginRunError(
                 self.name,
@@ -232,8 +276,12 @@ class CameraCalibrationPlugin:
                     reported_um,
                     used_fallback,
                     tuple(spread for _lit, spread in signals),
+                    ratios,
                 ),
             )
+        if ratios is not None and read_away:
+            # After the step lines, before the precision line's (m3 §4.4.2 D5).
+            assumed.append(sparse_field_line(ratios))
         reasons = precision_reasons(fitted, step_um, shape)
         if reasons:
             better_um = suggested_step_um(fitted.pixel_size_um, shape)
@@ -246,8 +294,13 @@ class CameraCalibrationPlugin:
         after_return = measure_shift(reference, camera.snap())
         ctx.progress(3, 3, "return")
         return_error_um: float | None = None
+        if read_away:
+            # The frame after the return is read by the first look, which finds the camera's
+            # own pattern at zero shift on exactly this field, whatever the stage did: a
+            # return error of 0 would be a measurement it is not. Unknown beats guessed.
+            assumed.append(_BLIND_RETURN_LINE)
         # `>=` as the positive test: a response that is nan goes to the else.
-        if after_return.response >= MIN_RESPONSE:
+        elif after_return.response >= MIN_RESPONSE:
             (m00, m01), (m10, m11) = fitted.matrix_um_per_px
             return_error_um = math.hypot(
                 m00 * after_return.d_col_px + m01 * after_return.d_row_px,
@@ -383,6 +436,60 @@ def precision_line(
     return line
 
 
+def _wants_a_second_look(
+    fitted: Fit, first_shifts: tuple[Shift, Shift], shape: tuple[int, int]
+) -> bool:
+    """Whether the probes are read again away from zero shift (m3 §4.4.2 D3).
+
+    Only where the fit says "parallel shifts" **and** a probe's first shift is the
+    camera's own pattern (within 2 px of zero): nothing else is the sparse-field
+    failure, so a fit whose only note is "barely correlate", a rigid-camera
+    refusal and a trustworthy fit keep their paths. A frame too small to leave a
+    peak outside the exclusion is not looked at again (the algorithm would raise
+    ``ValueError``): the first refusal stands, with no sentence about a look that
+    did not happen.
+    """
+    return (
+        PARALLEL_SHIFTS_NOTE in fitted.notes
+        and any(reads_the_fixed_pattern(shift) for shift in first_shifts)
+        and min(shape) > 4 * FIXED_PATTERN_EXCLUDE_PX
+    )
+
+
+def _second_look_holds(looked: tuple[AwayShift, AwayShift]) -> bool:
+    """Whether the second look is believed: both peaks stand out and are a rigid camera's.
+
+    Two guards that fail independently: the peak ratio (a peak that is the best of
+    a crowd is noise) and the shifts' shape (two peaks of the sample's own
+    periodicity are not at a right angle and of one length). ``>=`` as the
+    positive test, so that a ratio that is not a number is not believed. ``fit``
+    judges what comes out as it judges every pair of shifts.
+    """
+    return all(away.peak_ratio >= MIN_PEAK_RATIO for away in looked) and (
+        shifts_of_a_rigid_camera(looked[0].shift, looked[1].shift)
+    )
+
+
+def sparse_field_line(ratios: tuple[float, float]) -> str:
+    """The ``assumed`` line of a calibration the second look read (m3 §4.4.2 D5).
+
+    It says why the result was read this way, because the ``response`` of such a
+    calibration counts the camera's own pattern too and is no evidence of the
+    sample's texture. One line, under the 160 characters the page's strip keeps
+    of the first ``assumed`` line (FM-205), the ratios to one decimal.
+    """
+    return (
+        "sparse field: the camera's own pattern won at zero shift, so both "
+        "shifts are the strongest peaks away from it "
+        f"({_times(ratios)} times the next, {MIN_PEAK_RATIO:g} asked)"
+    )
+
+
+def _times(ratios: tuple[float, float]) -> str:
+    """The two peak ratios, to one decimal: ``4.7 and 4.9``."""
+    return " and ".join(f"{ratio:.1f}" for ratio in ratios)
+
+
 def _warn_left(ctx: RunContext, xy: XYStage, start: XY) -> None:
     """Say where the stage was left, reading it in a ``try`` of its own.
 
@@ -415,6 +522,7 @@ def _unusable_reason(
     reported_um: float,
     used_fallback: bool,
     probe_spreads: tuple[float, ...] = (),
+    away_ratios: tuple[float, float] | None = None,
 ) -> str:
     """Why the fit is no good, the step that was tried, and a hint when it may have wrapped.
 
@@ -423,16 +531,36 @@ def _unusable_reason(
     spread in counts: the number to bring back from a stand, which tells a
     frame with a little light from one with a lot, since the percentiles of a
     still background (dust, shading) read as contrast the sample does not have
-    (F12, #545).
+    (F12, #545). When the second look ran (``away_ratios``, the two peaks' ratios;
+    ``None`` when it did not), the message says what it saw, so that a field it
+    could not read is a number to bring back as well (m3 §4.4.2 D5).
+
+    A refusal for texture ends with the way out that needs none: the calibration
+    of an earlier run at this objective can be reused, and nothing moves (D6).
+    The tool reads no other document, so the sentence is conditional and names a
+    placeholder, not a path it does not hold. The placeholder has no angle
+    brackets: the plate page puts this text in a ``Str`` pane, which a browser
+    parses as HTML, and ``<its run document>`` vanished there as a tag (#625,
+    read in Chromium, Panel 1.11.0).
     """
     reason = "; ".join(fitted.notes)
     if PARALLEL_SHIFTS_NOTE in fitted.notes and probe_spreads:
         shown = " and ".join(f"{spread:.0f}" for spread in probe_spreads)
         reason += f"; the probe frames span {shown} counts (1st to 99th percentile)"
+    if away_ratios is not None:
+        reason += (
+            "; away from the camera's own pattern the best peaks are "
+            f"{_times(away_ratios)} times the next ({MIN_PEAK_RATIO:g} asked)"
+        )
     reason += f"; step {step_um:g} µm"
     wide = _usable(reported_um) and step_um / reported_um >= _WRAP_FRACTION * min(shape)
     if used_fallback or wide:
         reason += "; a step over 40 % of the field may wrap: give a smaller step_um"
+    if PARALLEL_SHIFTS_NOTE in fitted.notes or BARELY_CORRELATE_NOTE in fitted.notes:
+        reason += (
+            "; if this camera was calibrated at this objective before, reuse "
+            "that calibration with from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)"
+        )
     return reason
 
 

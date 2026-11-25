@@ -128,6 +128,7 @@ from smc.ui.guide import (
     calibrate_stand_routed,
     calibrate_wait,
     calibration_at_its_position,
+    calibration_failed,
     calibration_file,
     calibration_goes_to_a_document,
     calibration_held_line,
@@ -193,6 +194,7 @@ from smc.ui.guide import (
     scanned_line,
     side_words,
     stage_label,
+    stand_calibration_failed,
     step_button_label,
     step_states,
     turret_position,
@@ -1511,6 +1513,11 @@ class PlatePageView:
         self.known_block = _wrapped_text()
         self.calibrate_button = pn.widgets.Button(label="Calibrate the camera")
         self.calibrate_note = _wrapped_text()
+        # What the last calibration said when it failed, kept where the operator works: the
+        # strip's outcome is gone at the next activity (m5 §22.2 D1). Warning colour, and no
+        # height while there is nothing to say (``_say``).
+        self.calibrate_failed = _wrapped_text(extra={"color": _WARNING})
+        self.calibrate_failed.visible = False
         self.calibrate_command = _wrapped_text()
         # Under each command, on a Windows page only: the line is quoted for a POSIX shell
         # (FM-175). Hidden, and taking no height, anywhere else.
@@ -1519,6 +1526,7 @@ class PlatePageView:
         self.calibrate_box = pn.Column(
             self.calibrate_button,
             self.calibrate_note,
+            self.calibrate_failed,
             pn.Card(
                 self.calibrate_command,
                 self.calibrate_command_note,
@@ -4231,6 +4239,34 @@ class PlatePageView:
             needs_calibration(objective, calibration)
         )
 
+    def _calibration_failed_line(self) -> str:
+        """The Stand screen's line of the last calibration that failed, or ``""`` (m5 §22.2 D2, D4, D6).
+
+        From the document the click writes to, read once: the run document's record when the
+        click is not routed (the view's ``calibration_failed``, which ``view()`` read from the
+        document it holds), the problem of the document the page holds at the objective in
+        place's position when it is (``_stand_destination``, ``_at_position``). That problem is
+        the line only when it begins with the words of ``calibration_failed``, which is what a
+        record that ended ``failed`` gives: any other problem of that document (no file, not
+        JSON, another objective) is the Plate screen's block's, not this line's. A document that
+        holds a usable calibration, or none, and a view that has not been read, give no line.
+        From the last view and the status, never from the stand (FM-145). Plain text: the words
+        are a tool's (FM-139).
+        """
+        view = self._view
+        goes, _position = self._stand_destination()
+        if not goes:
+            words = None if view is None else view.calibration_failed
+            return "" if words is None else stand_calibration_failed(words)
+        status = self._status
+        objective = None if status is None else status.objective or None
+        held = self._at_position(objective, objective).held
+        problem = None if held is None else held.read.problem
+        prefix = calibration_failed("")
+        if problem is None or not problem.startswith(prefix):
+            return ""
+        return stand_calibration_failed(problem.removeprefix(prefix))
+
     def _draw_plate_screen(self) -> None:
         """The Plate screen from this redraw's view: where the plate comes from, the centre rows, what *Register* runs, what it came to (m5 §17.4.2).
 
@@ -4439,6 +4475,10 @@ class PlatePageView:
         note, disabled = self._stand_calibration(blocked, busy)
         self.calibrate_button.disabled = disabled
         self._say(self.calibrate_note, note)
+        # Right after the note, with the status and the view it reads: this runs at every tick
+        # and at the end of every ``refresh()``, so the line is there with the run's own
+        # outcome and not a tick after it (m5 §22.2 D1; FM-145: no device is read).
+        self._say(self.calibrate_failed, self._calibration_failed_line())
         # The routed command follows the objective in place, which is the tick's (the note, the
         # state and the command read one decision: ``_stand_destination``, FM-169).
         self._draw_calibrate_command()

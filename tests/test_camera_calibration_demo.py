@@ -15,6 +15,7 @@ position is asserted within 0.05 µm and never with equality (FM-85).
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 from collections.abc import Callable
@@ -24,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import smc.plugins.camera_calibration.plugin as plugin_module
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XY, Camera, Limits, ObjectiveTurret, XYStage
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError
@@ -36,25 +38,34 @@ from smc.plugins import (
     run_plugin,
 )
 from smc.plugins.camera_calibration.algorithm import (
+    BARELY_CORRELATE_NOTE,
     MIN_RESPONSE,
     MIN_SIGNAL_SPREAD_COUNTS,
     PARALLEL_SHIFTS_NOTE,
+    AwayShift,
     Fit,
+    Shift,
     carries_signal,
     measure_shift,
+    measure_shift_away_from_zero,
     precision_reasons,
     signal_spread,
 )
 from smc.plugins.camera_calibration.plugin import (
     CameraCalibrationParams,
     CameraCalibrationPlugin,
+    _second_look_holds,
+    _unusable_reason,
+    _wants_a_second_look,
     precision_line,
+    sparse_field_line,
     suggested_step_um,
 )
 from smc.plugins.slots import CameraCalibration
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing.fixtures import SampleMicroscopeFactory
 from smc.testing.synthetic import PlateSample, SampleCamera
+from smc.ui.controller import _CARD_TEXT_CHARS
 
 pytestmark = pytest.mark.demo
 
@@ -1549,43 +1560,300 @@ def test_a_field_of_a_few_beads_on_a_dark_background_is_calibrated(
     assert result.assumed == ()
 
 
-def test_parallel_shifts_on_two_beads_over_a_still_background_name_the_frames_before_the_stage(
-    demo_microscope: Microscope, tmp_path: Path
-) -> None:
-    """F12 (#545): "did the stage move?" blamed the stage when the background won the correlation.
+# -- a sparse field over the camera's own pattern: the second look (#625, F14, m3 §4.4)
 
-    The stage moved a quarter field in X and in Y and came back; the frames shifted
-    by zero, because dust and shading fixed to the sensor out-correlate two beads.
-    The message names the frames first, then the light path, then the stage, and
-    gives the contrast of the probe frames as a number to bring back.
+#: D6's last sentence, character for character: the conditional way out of a refusal for texture.
+REUSE_SENTENCE = (
+    "; if this camera was calibrated at this objective before, reuse that "
+    "calibration with from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)"
+)
+#: The line of a calibration the second look read: its return check is blind, so it says so.
+BLIND_RETURN = (
+    "the return could not be checked: on this field the camera's own pattern "
+    "wins the correlation at zero shift"
+)
+#: The page's card keeps this many characters of a failure's words (``_CARD_TEXT_CHARS``).
+CARD_TEXT_CHARS = _CARD_TEXT_CHARS
+
+
+class _DeafCamera(_StillBackgroundCamera):
+    """A camera whose beads do not follow the stage either: the whole frame is fixed to the sensor.
+
+    ``_BeadCamera`` places its beads from the stage's first position. Resetting
+    that origin at every snap puts them where they were at the first frame
+    whatever the stage did: the stage moved a quarter field and the frames
+    changed by their noise only. A stage that did not move, over the camera's own
+    pattern: the second look must find no shift in that.
     """
-    camera = _StillBackgroundCamera(
-        demo_microscope,
+
+    def snap(self) -> np.ndarray:
+        self._origin = None
+        return super().snap()
+
+
+def _over_a_still_background(
+    microscope: Microscope,
+    beads_px: tuple[tuple[int, int], ...],
+    camera_class: type[_StillBackgroundCamera] = _StillBackgroundCamera,
+    drift_um: dict[int, tuple[float, float]] | None = None,
+) -> tuple[_StillBackgroundCamera, _FlakyStage, tuple[float, float]]:
+    """The stand with a camera that has a still background, a stage that counts, and where it starts.
+
+    The first frame is taken and forgotten: it must be a lit one (it reaches the
+    fit, which is where the note is), and ``taken`` then holds the run's own
+    frames from its reference on.
+    """
+    camera = camera_class(
+        microscope,
         PlateSample(),
         pixel_size_um=1.0,
         shape=SHAPE,
-        beads_px=((120, 180), (250, 330)),
+        beads_px=beads_px,
     )
-    demo_microscope.override(Camera, camera)
-    stage = _FlakyStage(demo_microscope.require(XYStage))
-    demo_microscope.override(XYStage, stage)
-    start = _here(demo_microscope)
-    # A lit field, not a dark one: it reaches the fit, which is where the note is.
+    microscope.override(Camera, camera)
+    stage = _FlakyStage(microscope.require(XYStage), drift_um=drift_um)
+    microscope.override(XYStage, stage)
+    start = _here(microscope)
     assert carries_signal(camera.snap())
     camera.taken.clear()
+    return camera, stage, start
+
+
+def _first_look_reads_zero(reference: np.ndarray, probe: np.ndarray) -> None:
+    """The premise of every test of the second look: the first one read a stage that did not move.
+
+    Exactly ``(0, 0)``, as F12's test asserted, on lit frames that agree (a
+    response over the refusal's floor, not a blank).
+    """
+    first = measure_shift(reference, probe)
+    assert (first.d_col_px, first.d_row_px) == (0.0, 0.0)
+    assert first.response >= MIN_RESPONSE
+
+
+def test_two_beads_over_a_still_background_are_calibrated_by_the_second_look_and_it_says_so(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """F12's field (#545) is calibrated now: the stage moved, the background won, and the beads say so.
+
+    The first look reads both probes as zero (dust and shading fixed to the
+    sensor out-correlate two beads); the second look, away from zero shift, reads
+    the beads' own movement, at ratios that stand out (4.7 and 4.9 times the
+    next, measured), and the fit accepts it. The result is a calibration like any
+    other and says in ``assumed`` how it was read, because its ``response``
+    counts the camera's pattern too.
+    """
+    camera, stage, start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330))
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    reference, probe_x, probe_y = camera.taken[:3]
+    # The premise: the stage moved (two probes and the return), the frames did not.
+    assert stage.moves == 3
+    assert stage.targets[0] == (start[0] + STEP_UM, start[1])
+    assert stage.targets[1] == (start[0], start[1] + STEP_UM)
+    _first_look_reads_zero(reference, probe_x)
+    _first_look_reads_zero(reference, probe_y)
+    away_x = measure_shift_away_from_zero(reference, probe_x)
+    away_y = measure_shift_away_from_zero(reference, probe_y)
+    # Well over the 1.5 asked (4.7 to 4.9 measured): the test is about a field
+    # the second look reads, not one that sits at its threshold.
+    assert away_x.peak_ratio > 3.0
+    assert away_y.peak_ratio > 3.0
+
+    assert result.pixel_size_um == pytest.approx(1.0, rel=0.02)
+    assert result.rotation_deg == pytest.approx(0.0, abs=1.0)
+    assert result.mirrored is False
+    assert result.step_um == STEP_UM
+    assert result.reused_from is None
+    # The response is the smaller of the two second-look responses.
+    assert result.response == pytest.approx(
+        min(away_x.shift.response, away_y.shift.response)
+    )
+    line = (
+        "sparse field: the camera's own pattern won at zero shift, so both shifts "
+        f"are the strongest peaks away from it ({away_x.peak_ratio:.1f} and "
+        f"{away_y.peak_ratio:.1f} times the next, 1.5 asked)"
+    )
+    # The sparse-field line, then the return's: its check is blind on this field.
+    assert result.assumed == (line, BLIND_RETURN)
+    assert len(line) <= 160  # the strip keeps 160 characters of the first line (FM-205)
+    assert len(BLIND_RETURN) <= 160
+    # The return runs before the fit is judged, and the second look asks the
+    # camera for nothing: the three moves, then the return's frame, no more (FM-88).
+    assert stage.moves == 3
+    assert len(camera.taken) == 4
+    assert result.return_error_um is None  # unknown, not the 0 the blind check reads
+    assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
+    assert _stored(tmp_path).status is StageStatus.done
+
+
+def test_a_return_that_landed_far_off_is_not_reported_as_zero_on_a_field_the_second_look_read(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The camera's own pattern wins at zero shift on this field, so the return check cannot see a drift.
+
+    The return move lands 70 µm off in X. On a rich field that is reported (``came back
+    <n> µm off``); here the check would read zero and store it as a measurement, which
+    it is not: the result says it could not be checked and leaves the error unknown.
+    """
+    camera, stage, start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330)), drift_um={3: (-70.0, 0.0)}
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    reference, _probe_x, _probe_y = camera.taken[:3]
+    # The premise: the stage did not come back, and the frame after the return is the
+    # reference's to the first look (the pattern wins), which is what would read zero.
+    assert _here(demo_microscope)[0] == pytest.approx(start[0] - 70.0, abs=0.05)
+    assert stage.moves == 3
+    assert measure_shift(reference, camera.taken[3]).response >= MIN_RESPONSE
+    assert result.return_error_um is None
+    assert result.assumed[-1] == BLIND_RETURN
+    assert not any("came back" in line for line in result.assumed)
+
+
+def test_a_second_look_the_fit_refuses_is_a_refusal_with_the_fits_notes_and_the_ratios(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D4: a believed second look is judged by ``fit`` like any pair of shifts (FM-120, FM-122).
+
+    Both peaks stand out (4.0 times the next) and are rigid (96 px long, at a right
+    angle), but their response is 0.01: ``fit`` refuses it as a weak response. The
+    run must end ``failed`` with that note and what the second look saw, never ``done``
+    on the strength of the ratio and the shape alone, and the stage must be back.
+    """
+    camera, stage, start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330))
+    )
+    looks = iter(
+        [
+            AwayShift(Shift(-96.0, 0.0, 0.01), 4.0),
+            AwayShift(Shift(0.0, 96.0, 0.01), 4.0),
+        ]
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "measure_shift_away_from_zero",
+        lambda reference, probe: next(looks),
+    )
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(demo_microscope, tmp_path)
+
+    assert raised.value.reason == (
+        f"{BARELY_CORRELATE_NOTE}; away from the camera's own pattern the best peaks "
+        f"are 4.0 and 4.0 times the next (1.5 asked); step {STEP_UM:g} µm"
+        + REUSE_SENTENCE
+    )
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+    # Two probes and the return; the frame after the return is not taken.
+    assert stage.moves == 3
+    assert len(camera.taken) == 3
+    assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
+
+
+class _NoPixelSizeCamera(_StillBackgroundCamera):
+    """The still-background camera of a stand whose profile has no pixel size: the probe is the 50 µm fallback."""
+
+    def pixel_size_um(self) -> float:
+        return 0.0
+
+
+def test_the_sparse_field_line_follows_the_step_line_and_precedes_the_return_line(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """D5's order with a step line in front: the step's, the sparse field's, the return's.
+
+    The strip keeps the first ``assumed`` line only (FM-205), so what comes first is
+    what the operator reads: the step is a probe distance and not a result, but it
+    stays where the other tools put it.
+    """
+    camera, _stage, _start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330)), camera_class=_NoPixelSizeCamera
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    reference, probe_x, probe_y = camera.taken[:3]
+    _first_look_reads_zero(reference, probe_x)
+    _first_look_reads_zero(reference, probe_y)
+    assert result.step_um == 50.0
+    assert len(result.assumed) == 3
+    assert result.assumed[0] == "step of 50 µm: no pixel size was known"
+    assert result.assumed[1].startswith("sparse field: the camera's own pattern won")
+    assert result.assumed[2] == BLIND_RETURN
+
+
+def test_the_sparse_field_line_comes_before_the_precision_line(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """D5's order: the step lines, the sparse-field line, the precision line, the return's lines.
+
+    A probe of 30 px on a 384-row frame is under a tenth of it and fits poorly,
+    and it is further than the exclusion from zero, so the second look reads it.
+    """
+    camera, _stage, _start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330))
+    )
+
+    result = _result(_run(demo_microscope, tmp_path, step_um=30.0))
+
+    reference, probe_x, probe_y = camera.taken[:3]
+    _first_look_reads_zero(reference, probe_x)
+    _first_look_reads_zero(reference, probe_y)
+    assert len(result.assumed) == 3
+    assert result.assumed[0].startswith("sparse field: the camera's own pattern won")
+    assert result.assumed[1].startswith(
+        "step of 30 µm fits poorly (30 px, under a tenth"
+    )
+    assert result.assumed[2] == BLIND_RETURN
+
+
+def test_the_sparse_field_line_is_one_short_line_at_the_largest_ratios() -> None:
+    """99.9 times the next is the widest the line is built for: it stays at 160 characters or less."""
+    line = sparse_field_line((99.9, 99.9))
+
+    assert line == (
+        "sparse field: the camera's own pattern won at zero shift, so both shifts "
+        "are the strongest peaks away from it (99.9 and 99.9 times the next, 1.5 asked)"
+    )
+    assert len(line) <= 160
+
+
+def test_a_still_background_with_no_bead_is_refused_with_what_the_second_look_saw(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """F12 (#545) with no bead to read: the second look has nothing, and the refusal says so in numbers.
+
+    The stage moved a quarter field in X and in Y and came back; the frames shifted
+    by zero, because dust and shading fixed to the sensor are all there is. The
+    message names the frames first, then the light path, then the stage, gives the
+    contrast of the probe frames as a number to bring back, then what the second
+    look saw (1.01 and 1.06 times the next, measured: nothing stands out), and the
+    way out that needs no texture.
+    """
+    camera, stage, start = _over_a_still_background(demo_microscope, ())
 
     with pytest.raises(PluginRunError) as raised:
         _run(demo_microscope, tmp_path)
 
     reference, probe_x, probe_y = camera.taken[:3]
-    # The premise: the stage moved (two probes and the return) and the frames did not.
     assert stage.moves == 3
     assert stage.targets[0] == (start[0] + STEP_UM, start[1])
     assert stage.targets[1] == (start[0], start[1] + STEP_UM)
-    for probe in (probe_x, probe_y):
-        shift = measure_shift(reference, probe)
-        assert (shift.d_col_px, shift.d_row_px) == (0.0, 0.0)
-        assert shift.response >= MIN_RESPONSE  # lit frames that agree, not a blank
+    _first_look_reads_zero(reference, probe_x)
+    _first_look_reads_zero(reference, probe_y)
+    ratio_x = measure_shift_away_from_zero(reference, probe_x).peak_ratio
+    ratio_y = measure_shift_away_from_zero(reference, probe_y).peak_ratio
+    assert ratio_x < 1.5
+    assert ratio_y < 1.5
     reason = raised.value.reason
     assert reason.startswith(PARALLEL_SHIFTS_NOTE)
     assert "did the stage move" not in reason
@@ -1595,15 +1863,242 @@ def test_parallel_shifts_on_two_beads_over_a_still_background_name_the_frames_be
         < reason.index("light path")
         < reason.index("then the stage")
     )
-    figures = f"{round(signal_spread(probe_x))} and {round(signal_spread(probe_y))}"
-    assert (
-        reason == f"{PARALLEL_SHIFTS_NOTE}; the probe frames span {figures} counts "
-        f"(1st to 99th percentile); step {STEP_UM:g} µm"
+    assert reason == (
+        f"{PARALLEL_SHIFTS_NOTE}; the probe frames span "
+        f"{round(signal_spread(probe_x))} and {round(signal_spread(probe_y))} counts "
+        "(1st to 99th percentile); away from the camera's own pattern the best "
+        f"peaks are {ratio_x:.1f} and {ratio_y:.1f} times the next (1.5 asked); "
+        f"step {STEP_UM:g} µm" + REUSE_SENTENCE
     )
+    # The reference, the two probes; the frame after the return is not taken.
+    assert len(camera.taken) == 3
     stored = _stored(tmp_path)
     assert stored.status is StageStatus.failed
     assert stored.result is None
     assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
+
+
+def test_a_stage_that_did_not_move_over_the_cameras_pattern_is_still_refused(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Beads that stay where they were: the second look must not make a shift of the noise.
+
+    The camera is fixed to the sensor, beads included, so a stage that moved a
+    quarter field gives the frames of one that did not. Both probes read zero,
+    nothing stands out away from zero (both ratios under 1.5), and the refusal is
+    D5's, with the stage back where it started and nothing filled.
+    """
+    camera, stage, start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330)), camera_class=_DeafCamera
+    )
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(demo_microscope, tmp_path)
+
+    reference, probe_x, probe_y = camera.taken[:3]
+    assert stage.moves == 3
+    _first_look_reads_zero(reference, probe_x)
+    _first_look_reads_zero(reference, probe_y)
+    ratio_x = measure_shift_away_from_zero(reference, probe_x).peak_ratio
+    ratio_y = measure_shift_away_from_zero(reference, probe_y).peak_ratio
+    assert ratio_x < 1.5
+    assert ratio_y < 1.5
+    reason = raised.value.reason
+    assert reason.startswith(PARALLEL_SHIFTS_NOTE)
+    assert (
+        "; away from the camera's own pattern the best peaks are "
+        f"{ratio_x:.1f} and {ratio_y:.1f} times the next (1.5 asked); "
+    ) in reason
+    assert reason.endswith(REUSE_SENTENCE)
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+    assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
+
+
+def test_a_refusal_for_parallel_shifts_ends_with_the_reuse_sentence_after_what_the_second_look_saw(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """D6: a refusal for texture offers the earlier calibration, after everything else it says."""
+    _over_a_still_background(demo_microscope, ())
+
+    reason = _refusal(demo_microscope, tmp_path)
+
+    assert PARALLEL_SHIFTS_NOTE in reason
+    assert reason.endswith(REUSE_SENTENCE)
+    assert reason.count("from_run_doc") == 1
+    assert reason.index("away from the camera's own pattern") < reason.index("step ")
+    assert reason.index("step ") < reason.index("if this camera was calibrated")
+
+
+def test_a_refusal_for_a_weak_response_ends_with_the_reuse_sentence_and_names_no_second_look(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """A lit field with no texture: the other texture note, the same way out, no second look."""
+    microscope = demo_microscope_with_sample(PlateSample(texture_std=0.0), shape=SHAPE)
+
+    reason = _refusal(microscope, tmp_path)
+
+    assert BARELY_CORRELATE_NOTE in reason
+    assert "may wrap" not in reason
+    assert "away from the camera's own pattern" not in reason
+    assert reason.endswith(REUSE_SENTENCE)
+    assert reason.count("from_run_doc") == 1
+
+
+def test_the_reuse_sentence_comes_after_the_wrap_hint(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """200 rows of a 384-row frame wrap to -184 (FM-120): the fit fails, and the sentence ends it."""
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(microscope, tmp_path, step_um=200.0)
+
+    reason = raised.value.reason
+    wrap = "; a step over 40 % of the field may wrap: give a smaller step_um"
+    assert BARELY_CORRELATE_NOTE in reason
+    assert reason.endswith(wrap + REUSE_SENTENCE)
+    assert "away from the camera's own pattern" not in reason
+
+
+def test_a_refusal_that_is_not_for_texture_does_not_offer_the_reuse(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """An axis that moves a fraction of its command is the stage's fault: a reuse is no way out.
+
+    The second look does not run either (the note is not "parallel shifts"), so
+    the refusal says nothing of the camera's pattern.
+    """
+    microscope = demo_microscope_with_sample(
+        shape=SHAPE, camera_rotation_deg=30.0, mirrored=True
+    )
+    microscope.override(
+        XYStage, _FlakyStage(microscope.require(XYStage), x_fraction=0.1)
+    )
+
+    reason = _refusal(microscope, tmp_path)
+
+    assert reason == f"{RIGIDITY_NOTE}; step {STEP_UM:g} µm"
+    assert "from_run_doc" not in reason
+    assert "away from the camera's own pattern" not in reason
+
+
+def test_the_longest_parallel_shifts_refusal_stays_within_the_cards_600_characters() -> (
+    None
+):
+    """Five-digit spreads, the 2000 µm step, the wrap hint, the widest ratios: 572 characters.
+
+    The page keeps 600 characters of a failure's words, and a cut would take the
+    end of the reuse sentence, the part that says nothing moves. This is the
+    longest refusal of the design's measure, with ``parallel shifts`` as its only
+    note: a fit that has both texture notes (a weak response and parallel shifts)
+    is 628 characters in the same case, and the card clips it (FM-269, *Open*).
+    """
+    parallel = Fit(
+        ((0.0, 0.0), (0.0, 0.0)), 0.0, 0.0, False, 0.0, (PARALLEL_SHIFTS_NOTE,)
+    )
+
+    reason = _unusable_reason(
+        parallel, 2000.0, (1412, 1412), 1.0, False, (12345.0, 12345.0), (99.9, 99.9)
+    )
+
+    assert "12345 and 12345 counts" in reason
+    assert "99.9 and 99.9 times the next" in reason
+    assert "step 2000 µm" in reason
+    assert "may wrap" in reason
+    assert reason.endswith(REUSE_SENTENCE)
+    assert len(reason) == 572
+    assert len(reason) <= CARD_TEXT_CHARS
+
+
+def test_what_a_refusal_and_the_assumed_line_say_has_no_angle_bracket() -> None:
+    """The plate page shows these texts in a pane that a browser parses as HTML (#625).
+
+    ``from_run_doc=<its run document>`` read ``from_run_doc= (nothing moves)`` on the
+    Stand screen: words between angle brackets are a tag there. No text of the tool
+    that the page can carry has one, whatever the note.
+    """
+    parallel = Fit(
+        ((0.0, 0.0), (0.0, 0.0)), 0.0, 0.0, False, 0.0, (PARALLEL_SHIFTS_NOTE,)
+    )
+    weak = Fit(((0.0, 0.0), (0.0, 0.0)), 0.0, 0.0, False, 0.0, (BARELY_CORRELATE_NOTE,))
+    for fitted in (parallel, weak):
+        reason = _unusable_reason(
+            fitted, 96.0, SHAPE, 1.0, True, (5138.0, 5138.0), (1.2, 1.1)
+        )
+        assert "<" not in reason
+        assert ">" not in reason
+    line = sparse_field_line((4.7, 4.9))
+    assert "<" not in line
+    assert ">" not in line
+
+
+@pytest.mark.parametrize(
+    ("notes", "first_x", "first_y", "shape", "asked"),
+    [
+        ((PARALLEL_SHIFTS_NOTE,), (0.0, 0.0), (0.0, 0.0), SHAPE, True),
+        # One probe at zero is enough: the other may be right or wrapped.
+        ((PARALLEL_SHIFTS_NOTE,), (0.4, -0.3), (30.0, 0.0), SHAPE, True),
+        ((PARALLEL_SHIFTS_NOTE,), (30.0, 0.0), (0.0, 1.5), SHAPE, True),
+        # Neither probe is at zero: not the camera's pattern.
+        ((PARALLEL_SHIFTS_NOTE,), (30.0, 0.0), (30.0, 0.0), SHAPE, False),
+        ((PARALLEL_SHIFTS_NOTE,), (3.0, 0.0), (0.0, 3.0), SHAPE, False),
+        # Not "parallel shifts": a weak response, a fit that is no camera, a good one.
+        ((BARELY_CORRELATE_NOTE,), (0.0, 0.0), (0.0, 0.0), SHAPE, False),
+        ((RIGIDITY_NOTE,), (0.0, 0.0), (0.0, 0.0), SHAPE, False),
+        ((), (0.0, 0.0), (0.0, 0.0), SHAPE, False),
+        # A frame with no room outside the exclusion has no second look.
+        ((PARALLEL_SHIFTS_NOTE,), (0.0, 0.0), (0.0, 0.0), (48, 512), False),
+        ((PARALLEL_SHIFTS_NOTE,), (0.0, 0.0), (0.0, 0.0), (384, 48), False),
+        ((PARALLEL_SHIFTS_NOTE,), (0.0, 0.0), (0.0, 0.0), (49, 49), True),
+    ],
+    ids=[
+        "both-zero",
+        "x-zero",
+        "y-near-zero",
+        "neither-zero",
+        "both-over-two-px",
+        "barely-correlate-only",
+        "rigidity-only",
+        "trustworthy",
+        "rows-at-the-limit",
+        "columns-at-the-limit",
+        "just-over-the-limit",
+    ],
+)
+def test_the_second_look_is_asked_only_where_the_design_says(
+    notes: tuple[str, ...],
+    first_x: tuple[float, float],
+    first_y: tuple[float, float],
+    shape: tuple[int, int],
+    asked: bool,
+) -> None:
+    """D3: "parallel shifts" and a probe at zero, on a frame large enough to look away from zero."""
+    fitted = Fit(((0.0, 0.0), (0.0, 0.0)), 0.0, 0.0, False, 0.0, notes)
+    shift_x = Shift(first_x[0], first_x[1], 0.9)
+    shift_y = Shift(first_y[0], first_y[1], 0.9)
+
+    assert _wants_a_second_look(fitted, (shift_x, shift_y), shape) is asked
+
+
+def test_a_second_look_that_does_not_stand_out_or_is_no_camera_is_not_believed() -> (
+    None
+):
+    """The ratio and the rigid check each refuse on their own; both are asked, both must pass."""
+    good_x, good_y = Shift(96.0, 0.0, 0.9), Shift(0.0, -96.0, 0.9)
+    stands = (AwayShift(good_x, 4.0), AwayShift(good_y, 4.0))
+    assert _second_look_holds(stands)
+    # Either probe's ratio under 1.5, however good its shift.
+    assert not _second_look_holds((AwayShift(good_x, 1.4), AwayShift(good_y, 4.0)))
+    assert not _second_look_holds((AwayShift(good_x, 4.0), AwayShift(good_y, 1.4)))
+    assert not _second_look_holds((AwayShift(good_x, math.nan), AwayShift(good_y, 4.0)))
+    # Ratios that stand out for two shifts that are no camera's: not at a right angle.
+    slanted = Shift(60.0, -75.0, 0.9)
+    assert not _second_look_holds((AwayShift(good_x, 4.0), AwayShift(slanted, 4.0)))
+    # And not as long as each other.
+    short = Shift(0.0, -60.0, 0.9)
+    assert not _second_look_holds((AwayShift(good_x, 4.0), AwayShift(short, 4.0)))
 
 
 def test_a_lit_frame_of_a_12_bit_mode_is_calibrated_and_its_dark_frame_is_refused(
