@@ -274,6 +274,27 @@ def test_plan_calibration_refuses_a_document_of_another_frame_naming_both_frames
     )
 
 
+def test_plan_calibration_gives_the_path_as_the_page_was_given_it_never_resolved(
+    tmp_path: Path,
+) -> None:
+    # FM-24, FM-50: a run folder reached through a link (a symlink, a mapped drive) is named as
+    # the page was given it, made absolute and no more: `resolve()` would write the target's
+    # name (on Windows a host name) into the record, the card and the command.
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this account cannot make a symbolic link")
+    given = str(link / "position-1.json")
+
+    chosen = _decide(documents=(HeldCalibration(1, _read(path=given)),))
+
+    assert chosen.path == link / "position-1.json"
+    assert chosen.path != real / "position-1.json"
+
+
 def test_plan_calibration_compares_no_frame_when_the_frame_is_not_given() -> None:
     # The tick reads no camera (FM-145): a document of another frame is "used" in its note, and
     # only the click, which reads the frame, refuses it.
@@ -730,7 +751,16 @@ def test_a_document_of_another_frame_is_refused_before_anything_is_written(
     assert _in_place(stand) == FORTY
 
 
-@pytest.mark.parametrize("how", ["a frame of 0 by 0", "a read that raises"])
+@pytest.mark.parametrize(
+    "how",
+    [
+        "a frame of 0 by 0",
+        "a frame of 0 by 512",
+        "a frame of 384 by 0",
+        "a read that raises",
+        "no camera",
+    ],
+)
 def test_a_frame_that_cannot_be_read_adds_nothing_and_refuses_nothing(
     fake_core: FakeCore,
     stand: Microscope,
@@ -742,15 +772,26 @@ def test_a_frame_that_cannot_be_read_adds_nothing_and_refuses_nothing(
     _seed_plate(run_doc)
     _seed_document(run_doc, FORTY)
     _turn(stand, FORTY)
-    if how == "a frame of 0 by 0":
-        fake_core.image_shape = (0, 0)
-    else:
+    if how.startswith("a frame of "):
+        # A side under 1 is no frame (either side: the page would otherwise say `binning or the
+        # region changed` of a document that fits a camera whose region it cannot read).
+        height, _by, width = how.removeprefix("a frame of ").partition(" by ")
+        fake_core.image_shape = (int(height), int(width))
+    elif how == "a read that raises":
         camera = stand.require(Camera)
 
         def broken() -> tuple[int, int]:
             raise RuntimeError("the camera does not answer\nat all")
 
         monkeypatch.setattr(camera, "image_shape", broken)
+    else:
+        assert how == "no camera"
+        real_get = Microscope.get
+
+        def without_a_camera(self: Microscope, capability: Any) -> Any:
+            return None if capability is Camera else real_get(self, capability)
+
+        monkeypatch.setattr(Microscope, "get", without_a_camera)
     page = _page(stand, run_doc)
     try:
         with caplog.at_level(logging.WARNING, logger="smc.ui"):
@@ -860,6 +901,37 @@ def test_the_measure_the_time_chain_gives_scan_plan_the_document_too(
     (seen,) = StubScanPlan.seen
     assert _same(seen.calibration, document)
     assert _in_place(stand) == FORTY
+
+
+def test_the_measure_the_time_chain_ends_on_the_frame_refusal_after_timing_has_run(
+    fake_core: FakeCore, stand: Microscope, run_doc: Path
+) -> None:
+    # D25: a chain's `scan-plan` is prepared by the worker after `timing` wrote its record, and
+    # the refusal ends the chain as any `_prepare` refusal does: a text, `scan-plan` never started.
+    _seed_plate(run_doc)
+    _seed_document(run_doc, FORTY)
+    _turn(stand, FORTY)
+    fake_core.image_shape = (1024, 1024)
+    page = _page(stand, run_doc)
+    try:
+        page.run_chain(("timing", "scan-plan"), {"scan-plan": ("wells=A1",)})
+        assert page.join(10.0)
+        outcome = page.status().outcome
+        stages = sorted(RunDocument.load(run_doc).stages)
+    finally:
+        page.close()
+
+    refusal = (
+        f"the camera calibration of {FORTY} in calibrations/position-1.json is of a "
+        "frame of 384 by 512 px, the camera gives 1024 by 1024 px (binning or the "
+        f"region changed): calibrate the camera at {FORTY} again (Stand screen, "
+        "Calibrate the camera)"
+    )
+    assert outcome is not None
+    assert f"Field layout: {refusal}" in outcome
+    assert StubScanPlan.seen == []
+    # `timing` ran and is kept; the refused `scan-plan` wrote nothing.
+    assert stages == ["plate-walls", "timing"]
 
 
 def test_the_next_steps_run_gets_the_document_at_the_click_and_its_command_is_unchanged(

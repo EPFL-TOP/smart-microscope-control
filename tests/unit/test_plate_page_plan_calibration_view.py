@@ -379,6 +379,12 @@ def test_the_note_is_empty_and_takes_no_height_at_the_plates_own_objective_with_
     _hold(run_doc, FORTY)
     _turn(stand, TEN if case == "the plate's own objective" else FORTY)
     view = make_view(closed=case == "the stand closed")
+    if case == "the stand closed":
+        # An objective typed in the form is an objective all the same: with the stand closed the
+        # note says nothing about a stand that is not there (FM-145), and does not wait for a
+        # turret that cannot be read to say `the turret position ... is not known`.
+        view.tool_fields["scan-plan"]["objective"].value = FORTY
+        view.tick()
 
     assert view.layout_calibration_text.object == ""
     assert view.layout_calibration_text.visible is False
@@ -541,7 +547,16 @@ def test_the_note_reads_no_stand_and_no_file_across_ticks(
     _turn(stand, FORTY)
     view = make_view()
     calls: list[str] = []
-    for name in ("_held_calibrations", "_plan_reading", "view", "page_params"):
+    # The turret's labels are the page's cached copy (`_objective_labels`), never read again
+    # through `objective_labels` or `_labels_of`, each of which is a stand read.
+    for name in (
+        "_held_calibrations",
+        "_plan_reading",
+        "objective_labels",
+        "_labels_of",
+        "view",
+        "page_params",
+    ):
         real = getattr(PlatePage, name)
 
         def spy(
