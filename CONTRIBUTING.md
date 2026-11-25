@@ -64,11 +64,12 @@ test it, and what never to assume or touch.
 4. **Verify**: `ruff check . && ruff format --check . && mypy && pytest`.
 5. **Pull request** with the template. Title in Conventional Commits form
    (`feat(core): …`). One reviewer. Squash merge by the maintainer.
-   `.github/CODEOWNERS` gives `src/smc/hardware/`, `profiles/`, `docs/adr/`,
-   `docs/design/`, `.github/`, `.claude/` and `CLAUDE.md` to the owner: a pull
-   request that touches one of them needs the owner's review, once the
-   branch protection of `main` asks for code owners' reviews (the owner sets
-   it in the repository's settings; until then it only requests the review).
+   `.github/CODEOWNERS` gives the owner every path except the analysis
+   track's (`src/smc/selection/` but its `api.py` and `registry.py`,
+   `src/smc/analysis/`, `docs/algorithms/` and the selectors' tests,
+   ADR-0010): a pull request that touches any other path needs the owner's
+   approval, which the *Code owners* ruleset on `main` enforces (the owner's
+   own pull requests merge through its bypass).
 
 ## Testing
 
