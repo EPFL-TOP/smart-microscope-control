@@ -602,7 +602,8 @@ differ from the run being resumed: <keys>`), or its profile differs.
    `microscope.require()` gives. Nothing has been written.
 4. The `running` record: a new `attempt`, `started_utc` now, `reads` from
    the document (the optional slots that are `unusable` recorded as `None`
-   and logged at INFO with their reason), and, when resuming, the previous
+   and logged with their reason: at INFO when a provider exists and cannot be
+   used, at DEBUG when nothing provides the slot, m5 §23 D8), and, when resuming, the previous
    record's `checkpoint`. `write_stage`. A `RunDocumentError` here ends the
    run before any hardware is touched. When the plugin has a `stopped` or
    `failed` record with a checkpoint and `resume` is false, the runner logs

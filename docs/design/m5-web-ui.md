@@ -446,8 +446,9 @@ operator ends live with one click. Live is not ended for them:
 live is for (focusing, finding a field), so #263 decides how a drive action
 reaches the stand while live goes without two threads on the devices (for
 example, the live worker runs a queued drive action between two frames).
-A drive click on the map (`goto`) stays refused with `live is running`: it is a
-run of the `goto-well` plugin, which writes a record (§6.3).
+A drive click on the map (`goto`) stays refused: it is a
+run of the `goto-well` plugin, which writes a record (§6.3). The refusal says why and what to press
+(`GOTO_REFUSED_DURING_LIVE`, §23 D6; the other activities keep `live is running`).
 
 ### 5.3 The page
 
@@ -868,7 +869,7 @@ class PlatePage:
   because the page builds its steps while the stand may be closed (§7.3). What the
   page's step choices are bounded by (§6.4).
 - `goto` (a click on the map in drive mode) is a run of the `goto-well` plugin,
-  which writes a record: it stays refused while live goes (`live is running`).
+  which writes a record: it stays refused while live goes, with `GOTO_REFUSED_DURING_LIVE` (§23 D6).
 
 ### 6.4 The page (`smc/ui/plate_page.py`)
 
@@ -8519,3 +8520,235 @@ the controller's refusals stay), and a new one named by its text: *a failure tha
 
 **Not verified (for the owner)**: the line in a real browser at 1280 x 620, with the Stand screen's
 text at the stand PC's font size; a refused calibration at the stand after the build.
+
+## 23. The Stand screen says a calibration's numbers, and a click on the map under Live says why the stage did not move (#627)
+
+Fixed by #627's plan (2026-11-25). At the Ti2-E (session 6) the owner pressed *Calibrate the camera*
+and read `Camera calibration done in 2.5 s` and no number (F7; he pressed it three times), and
+clicked a well on the map while Live ran and nothing moved (F1). This section adds one pane to the
+Stand screen, one text to the refusal of a drive click while Live runs, and changes one log level.
+It adds no plugin, slot, command or guard, and changes none of the Stand screen's other texts.
+**The third item of the issue, a larger image view (F12), is #631's.** **Merging this section
+decides it.**
+
+### 23.1 What was measured (2026-11-25, planning #627)
+
+Throwaway scripts, not committed, on `main` at `6f5dc4b`, Python 3.13.0, Panel 1.11.0,
+`demo-sample` turned as §18.6.1 (camera 30° and mirrored, plate 1.2°), registered under the 10X from
+its walls, over the real `camera-calibration` and `goto-well`, the page's own handlers:
+
+- **After the Stand screen's click at the 40X** (routed into `calibrations/position-1.json`, D19 of
+  §18.6): the strip reads `Camera calibration done in 0.2 s`; the known block still reads `Camera:
+  calibrated at Nikon 10X S Fluor on <date>, not at Nikon 40X Plan Fluor ELWD` (it speaks of the run
+  document's calibration, as D19 left it); the note says where the document goes and `A new
+  calibration replaces the one of <date>` (the new document's date); the expert view's card is the
+  run document's own, of the 10X. The document's numbers (`pixel_size_um` 0.249966, `rotation_deg`
+  29.9891, `mirrored` true, `residual_um` 0.0437417, `step_um` 32.0) were **on no screen**; the Plate
+  screen's list says `Nikon 40X Plan Fluor ELWD: calibrated on 2026-11-25`. The strip's line is gone
+  at the next activity or at *Refresh*.
+- **Into the run document** (the plate's own objective, or a plate not registered from its walls):
+  the expert view's generic card lists, after `image_shape_px: 2 items` and `matrix_um_per_px: 2
+  items`, `pixel_size_um`, `rotation_deg`, `mirrored`, `residual_um` and `response`, then `… 3
+  more`: the numbers are there, in the expert view, as `%g` and with no unit, and only for that
+  document. It is unchanged here.
+- **A drive click under Live** (Drive armed, a well under the click): `message` reads `live is
+  running`, `drive_text` is emptied, the toggle is off (the click spent it), `status().goto` is `''`
+  and the stage did not move. The Plate screen's rows draw `GOTO_NOT_DURING_LIVE` (§17.2 D11) and
+  their *Go to* is disabled, so the map is the one place with a bare refusal. Live went on.
+- **The INFO line.** `goto-well` before a registration logs `goto-well: not using plate: the run
+  document has no plate; smc run --list shows which plugin provides it` at INFO on every drive:
+  `runner._reads_of` logs every optional slot that is not usable, whether **nothing provides it**
+  or a provider **exists and cannot be used** (failed, stale, another stand, a dry run).
+- **Not measured**: any of this at the Ti2-E; the pane in a browser at 1280 x 620.
+
+### 23.2 Decisions
+
+- **D1 Which calibration the Stand screen gives the numbers of.** The calibration **of the
+  objective in place** that the page itself would use, in this order (`stand_calibration`, pure):
+  1. the objective is not known (a closed stand, a turret that does not answer): the run document's
+     calibration, which is what the known block's `Camera:` line speaks of;
+  2. no registration from the plate's walls (no offer, §18.2 D2), or the objective in place is the
+     plate's: the run document's calibration, **when its objective is the one in place or is not
+     recorded**; the calibration of another objective is not shown as this one's (FM-216);
+  3. otherwise (an offer, and an objective that is not the plate's): the document held at the
+     turret position of the objective (`turret_position`, §18.6 D11), **when it is usable and is
+     the position's** (`calibration_at_its_position` is `True`, D21 of §18.6). A document with a
+     problem, one of another objective, a position the page cannot name: nothing.
+
+  Nothing is shown when none holds. It is a rule of the pane and **does not replace** the decisions
+  of §18.6 D19 (where a click writes) and D24 (which document `scan-plan` is given), which stay as
+  they are; the three read the same position and the same D21 check.
+- **D2 The pane.** `calibration_numbers`, a plain-text pane (`_wrapped_text`) on the Stand screen
+  **directly under the known block and outside `calibrate_box`**, which hides itself when the
+  objective in place needs no calibration: the numbers are wanted most right after the click that
+  made that so. It takes no height while empty (`_say`). It is drawn in `_draw_stand` (the tick's
+  pass) from the last `PlateView`, the status and the page's copy of the turret's labels: no device
+  is read there (FM-145), and every tab draws what the controller holds (FM-151). It is in the Stand
+  screen's list only: the expert view, the Plate and the Wells screens are unchanged.
+- **D3 The text** (`calibration_numbers_text(note)`, `guide.py`, pure), three lines and then the
+  tool's own words:
+
+  ```text
+  Camera calibration at <objective>, measured <when>.
+  Pixel size <p> µm, rotation <r>°, <mirrored | not mirrored>, residual <e> µm, probe step <s> µm.
+  Written to <where>.
+  assumed: <one line of the calibration's own assumed lines>      (each, as the card prints them)
+  ```
+
+  `<objective>` is the document's (`Camera calibration (objective not recorded), measured <when>.`
+  when it records none); `<when>` is the PC's time to the minute (`CalibrationNote.when_local`),
+  `<when_utc> UTC` when there is none, as the known block says it; `<p>` has four decimals (`:.4f`),
+  `<r>` one (`:.1f`, a negative zero shown as `0.0`), `<e>` two (`:.2f`), `<s>` as `:g`; `<where>`
+  is the file as the page spells it, never resolved (FM-24): the run document's path, or the
+  position's document's (`calibrations/position-<n>.json` under the run document's folder); with
+  no `where` the third line is left out. On the demo it reads: `Camera calibration at Nikon 40X
+  Plan Fluor ELWD, measured 2026-11-25 12:05.`, `Pixel size 0.2500 µm, rotation 30.0°, mirrored,
+  residual 0.04 µm, probe step 32 µm.`, `Written to <run folder>/calibrations/position-1.json.`
+  The words are the issue's (pixel size, rotation, residual, the objective, where it was written);
+  `mirrored` is part of the orientation, and the probe step is what the residual is read against
+  (the tool's own `assumed` line says so when the residual exceeds 5 % of it, m3 §4.1). `response`,
+  `return_error_um` and `image_shape_px` stay in the document.
+- **D4 The data.** `CalibrationNote` (the type of `PlateView.camera_calibration`) gains `numbers:
+  CalibrationNumbers | None = None`, `notes: tuple[str, ...] = ()` and `where: str = ""`, so that
+  **no `PlateView` field is added**; `known_text` reads the three fields it read and is unchanged.
+  `CalibrationRead` gains `numbers: CalibrationNumbers | None = None` (the last field), filled by
+  `_read_calibration` from the `CameraCalibration` that `calibration_from` already returns.
+  `view()` fills the run document's note from the usable slot it already holds and `self._run_doc`.
+  A document's time is read from `CalibrationRead.measured`, which is `calibration_from`'s ISO text
+  or `at an unknown time` (the unknown-time placeholder, never an exception).
+- **D5 Plain, bounded, and the tool's words.** The pane is text, never markup (FM-139): an
+  objective's label, a path and a note are the stand's and the document's. A document is data
+  (FM-125): a value no one wrote (`pixel_size_um` 1e300 in a hand-edited file) must not give an
+  unbounded line, so **each line is cut at `CALIBRATION_LINE_CHARS = 600`** (the card's bound for a
+  sentence, `_CARD_TEXT_CHARS`, which a test pins it equal to), and a note is already cut and
+  counted as D15 of §18.6 says (`_read_calibration`'s `notes`; the run document's note takes them
+  from the same helper). The fixed text is shorter than the bound, so it is never cut (FM-205).
+- **D6 A drive click under Live says why, and what to press** (this decides the issue's second
+  item). `PlatePage.goto` refuses when `is_live` with `GOTO_REFUSED_DURING_LIVE`, a `RuntimeError`,
+  before `_refuse_if_busy`:
+
+  `live is running, so the stage did not move: press End live, switch Drive on and click the well
+  again. The arrows work during Live.`
+
+  It is the text of `message` (the view's own place for a refusal, `_try`), under the strip's
+  lines, and the click spends Drive as before (the view's rule since #514: an armed stage that stays
+  armed after a click is the danger): the text says to switch it on again. `is_live` is read **at the
+  call**, never from the label a tab drew (FM-177): a Live that ended meanwhile lets the click go.
+  Every other activity keeps `<name> is running`; every other caller of `goto` (the Plate screen's
+  rows, whose *Go to* is disabled during Live and says `GOTO_NOT_DURING_LIVE`) gets the same text
+  if a stale click arrives; `goto` leaves `status().goto` as it was for a refusal of a busy page
+  (#444), and Live is never ended for the click (§5.2).
+- **D7 Why not drive under Live** (the owner's expectation in F1; §17.2 D11 had decided the other
+  way on 2026-11-11, from the first walk). Driving under Live would run `goto-well` on the live
+  worker between two frames, as a drive action does (§6.3). A jog is **one capability call that
+  returns a text**; `goto-well` is a **plugin run**: the runner's record write in the run document,
+  its progress, the page's `_goto` and `_goto_end` bookkeeping, a STOP that must end the move and
+  the live view together, and §6.3's rule that what a drive action does is not an activity (so no
+  tab redraws) against a run that changes the run document. Each is a new path in the code that
+  handles STOP (FM-70, FM-88). The gain is small: the frames while the stage crosses a plate are a
+  blur, `goto-well` switches an engaged PFS off before it moves (m3 §5.6 D1) under the operator's
+  eyes, and the arrows already drive during Live. The cost of D6 is two more clicks per well. Not
+  decided against for good: if the owner still wants it, it is its own design (a change of §5.2 and
+  of D11, with the live worker running a plugin), filed as a decision, not this issue's.
+- **D8 The INFO line.** `runner._reads_of` logs an optional slot that nothing provides at **DEBUG**,
+  and an optional slot whose provider exists and cannot be used at INFO, as before. The decision is
+  a field (`doc.provider(slot, excluding=plugin.name) is None`), never a comparison of the reason's
+  text (FM-155). An optional slot that was never produced is the normal state of a stand before its
+  first registration or calibration, and the plugin's own `assumed` says what it did without; a
+  provider that is stale, failed, of another stand or a dry run is something the operator can fix,
+  and it stays a notice. The reason's words are `RunDocument.unusable`'s and are not changed (a
+  required slot raises the same text to the operator).
+- **D9 What does not change.** The strip's outcome, the known block, `calibrate_box` and its note
+  and #625's failed line (§22), the expert view's card, the Plate screen's list of documents and
+  their lines, `calibrate_camera`'s routing and refusals, `plan_calibration` and the Wells screen's
+  note, the tool, its record and its documents, the Live and drive controllers (§5, §6.3), the
+  Plate screen's *Go to* and its note.
+
+### 23.3 Interface
+
+```python
+# smc/ui/guide.py
+CALIBRATION_LINE_CHARS = 600
+GOTO_REFUSED_DURING_LIVE = (
+    f"live is running, so the stage did not move: press {END_LIVE_LABEL}, switch Drive on "
+    "and click the well again. The arrows work during Live."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationNumbers:
+    pixel_size_um: float
+    rotation_deg: float
+    mirrored: bool
+    residual_um: float
+    step_um: float
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationNote:
+    objective: str | None
+    when_utc: str
+    when_local: str = ""
+    numbers: CalibrationNumbers | None = None  # new (D4)
+    notes: tuple[str, ...] = ()  # new
+    where: str = ""  # new
+
+
+# "" when note.numbers is None
+def calibration_numbers_text(note: CalibrationNote) -> str: ...
+```
+
+```python
+# smc/ui/controller.py
+@dataclass(frozen=True, slots=True)
+class CalibrationRead:
+    ...
+    numbers: CalibrationNumbers | None = None  # new, the last field (D4)
+
+
+def stand_calibration(
+    *,
+    objective: str | None,
+    plate_objective: str | None,
+    run_calibration: CalibrationNote | None,
+    labels: Sequence[str],
+    documents: Sequence[HeldCalibration],
+) -> CalibrationNote | None: ...
+```
+
+`stand_calibration`'s note for a document carries the read's `numbers` and `notes` and `where=read.path`
+(D1, D4). `PlatePage.goto` begins with the `is_live` refusal of D6. `PlatePageView.calibration_numbers` is a
+`_wrapped_text()` pane built beside `known_block`, listed after it in the Stand screen, drawn by
+`_draw_stand` with `_say(self.calibration_numbers, ...)`; `_draw_stand` passes `view.offsets`'s
+`plate_objective` (`None` with no offer), `view.camera_calibration`, `self._objective_labels` and
+`view.calibrations`. `runner._reads_of` takes D8.
+
+### 23.4 Tests and failure modes
+
+`tests/unit/test_plate_page_calibration_card.py` (pure: the text and the rule),
+`tests/unit/test_plate_page_calibration_card_view.py` (the pane, over seeded documents),
+`tests/test_plate_page_calibration_card_demo.py` (the real tool on `demo-sample`, as the plan names),
+`tests/unit/test_plate_page_controller.py` and `tests/unit/test_plate_page.py` (the refusal),
+`tests/unit/test_plugin_runner.py` (the level). Failure modes: FM-145, FM-151, FM-139, FM-125,
+FM-205, FM-98, FM-45, FM-24, FM-216 (the numbers of one objective are never shown as another's),
+FM-177 (the refusal is decided at the call), FM-70 and FM-88 (nothing in the drive path changes), and
+a new one named by its text: *a result the page says only as its status*.
+
+### 23.5 What this does not do
+
+- It does not put the numbers on the Plate screen's list, the Wells screen or the strip, and does
+  not change the expert view's card; the document holds `response`, `return_error_um` and the frame.
+- It does not judge the numbers (no good or bad): the page knows no threshold of its own, and the
+  tool's `assumed` line, which the pane repeats, is the judge.
+- It does not make the known block's `Camera:` line speak of the position's document: D19 left it on
+  the run document's, and the pane under it names the document it reads.
+- It does not drive under Live (D7), does not disable the *Drive* toggle while Live runs and does not
+  say anything when Drive is armed under Live before the click: the refusal says it at the click.
+- It does not add a `/ui-check` state. The develop session's acceptance is a **one-off session** of
+  the kind §18.6 D18 describes (`demo-sample` without `--dry-run`, a scratch folder with the 10X's
+  calibration and `plate-walls`, the Stand screen at 1280 x 620 before and after the click at the
+  40X, then Live with a tap on a well), cited in its Report and not committed.
+
+**Not verified (for the owner)**: the pane in a real browser at 1280 x 620 with the stand PC's font
+size and the Ti2-E's long Windows paths; a calibration at the stand after the build, read on the
+screen against `calibrations/position-<n>.json`; the refusal under Live at the stand.
