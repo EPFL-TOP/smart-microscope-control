@@ -24,6 +24,7 @@ are safety-relevant:
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import uuid
 from collections.abc import Callable
@@ -42,7 +43,12 @@ from smc.plugins.api import (
     StopRequested,
     _Attempt,
 )
-from smc.plugins.errors import RequirementsError, ResumeError, UpstreamError
+from smc.plugins.errors import (
+    ParamsError,
+    RequirementsError,
+    ResumeError,
+    UpstreamError,
+)
 from smc.run.document import (
     ReadRecord,
     RunDocument,
@@ -55,7 +61,7 @@ from smc.run.document import (
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
 
-__all__ = ["check_ready", "reachable_checkpoint", "run_plugin"]
+__all__ = ["check_ready", "check_run_doc", "reachable_checkpoint", "run_plugin"]
 
 log = logging.getLogger("smc.plugins.runner")
 
@@ -123,6 +129,68 @@ def check_ready(
             f"{name} read its inputs from an earlier run, so its checkpoint no "
             f"longer matches them; run it without --resume",
         )
+
+
+def check_run_doc(
+    plugin: Plugin[Any, Any], params: PluginParams, run_doc: Path
+) -> None:
+    """Refuse a reuse whose source is the run document the run writes (F15, #626).
+
+    A stage marks itself ``running`` in its own document before ``run`` starts,
+    and that replaces the record of the same stage, which is the very record a
+    reuse of the plugin's own slot would copy: ``from_run_doc`` naming
+    ``--run-doc`` found its own ``running`` stage, refused, and left the
+    document's calibration ``failed``, so the morning's measurement was gone. The
+    refusal has to come before the first write, so it is a check of the parameters
+    against the path, which ``check_ready`` (a document object, no path) cannot be.
+
+    A plugin declares the fields in its class attribute ``reuses_from`` (read with
+    ``getattr``, as ``offline`` is, so it is no member of the protocol). A plugin
+    that reads *another* stage of another document (``scan-plan``'s calibration)
+    declares nothing: its own document is its default. A declared name that is no
+    field of ``params`` raises ``AttributeError``: a typo would switch the guard off
+    without a word.
+
+    It writes nothing and touches no hardware; it only asks the file system whether
+    two names are one file, so the CLI calls it before the stand opens (FM-30).
+
+    Raises:
+        ParamsError: A declared field names ``run_doc``. The path is said as typed,
+            never resolved (FM-50).
+    """
+    for field in getattr(plugin, "reuses_from", ()):
+        value = getattr(params, field)
+        if value is not None and _same_file(Path(value), run_doc):
+            raise ParamsError(
+                plugin.name,
+                (
+                    f"{field} names the run document this run writes "
+                    f"({Path(value).as_posix()}), where this run replaces the "
+                    f"{plugin.provides} it would copy: name a copy of it or another "
+                    f"run document (nothing was written)",
+                ),
+            )
+
+
+def _same_file(first: Path, second: Path) -> bool:
+    """Whether two names are one file, whichever way each is spelt (FM-24).
+
+    Two files that exist are compared with ``samefile``, which sees a relative and
+    an absolute name, a link, and a volume that folds case. A file that is not there
+    yet (the run document the first write would create) has no identity to
+    compare, so the names are resolved and compared, and folded where the platform
+    folds them. The file system may fail to answer, on Windows a share that dropped
+    raises from ``resolve`` too (FM-116), and Python 3.10 and 3.11 raise
+    ``ValueError`` from it for a path with a NUL, which the page's text field can
+    hold: the answer is then no, since the run document was read a moment ago and is
+    written a moment later, and says so in its own words if the drop lasts.
+    """
+    try:
+        if first.exists() and second.exists():
+            return first.samefile(second)
+        return os.path.normcase(first.resolve()) == os.path.normcase(second.resolve())
+    except (OSError, ValueError):
+        return False
 
 
 def reachable_checkpoint(
@@ -213,6 +281,7 @@ def run_plugin(
     dry_run = microscope.dry_run
     doc = RunDocument.load_or_new(run_doc)
     check_ready(plugin, doc, params, profile=profile, dry_run=dry_run, resume=resume)
+    check_run_doc(plugin, params, run_doc)
     _require(plugin, microscope)
 
     previous = doc.stages.get(plugin.name)

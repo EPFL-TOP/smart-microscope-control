@@ -99,6 +99,9 @@ detected cells, and a `manifest.json` that lists every file with its size and it
 Datasets are never in the repository: they are zipped on the lab's share. They live in
 the folder `<lab share>/smc-datasets/`: ask the owner for the path and for the name of
 the dataset your issue names. The cell detection model's weights travel the same way.
+[datasets.md](datasets.md) lists the datasets that exist: what each holds, how big it is,
+what was checked on it and what was not. A dataset that has a `NOTES.md` beside its
+`README.md` (the datasets of 2026-11-24 do) carries what the generator cannot know: read both.
 
 Unzip it under `local/` of your clone (git ignores that folder):
 

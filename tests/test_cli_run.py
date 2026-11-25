@@ -619,6 +619,55 @@ def test_resume_with_nothing_to_resume_exits_2_before_the_stand_opens(
     assert "✗ cannot resume resumable: nothing to resume" in result.output
 
 
+@pytest.mark.usefixtures("no_stand")
+@pytest.mark.parametrize(
+    ("run_doc_text", "source_text"),
+    [
+        pytest.param("run.json", "ABSOLUTE", id="from_run_doc absolute"),
+        pytest.param("ABSOLUTE", "run.json", id="run document absolute"),
+        pytest.param("run.json", "./run.json", id="spelt another way"),
+    ],
+)
+def test_a_reuse_from_the_run_document_itself_exits_2_before_the_stand_opens_and_leaves_it_as_it_was(
+    run_doc_text: str,
+    source_text: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # F15 (#626), as the operator typed it in the practice console: the stage marked
+    # itself running in `run.json`, read its own running stage and left the morning's
+    # calibration `failed`. Nothing is opened and nothing is written.
+    monkeypatch.chdir(tmp_path)
+    _register(monkeypatch, installed=True)
+    write_stage(
+        tmp_path / "run.json",
+        _stage("camera-calibration", "camera-calibration", "c1", 0),
+    )
+    before = (tmp_path / "run.json").read_bytes()
+    absolute = str(tmp_path / "run.json")
+    given = absolute if run_doc_text == "ABSOLUTE" else run_doc_text
+    typed = absolute if source_text == "ABSOLUTE" else source_text
+
+    result = _run(
+        "run",
+        "camera-calibration",
+        "--run-doc",
+        given,
+        "--param",
+        f"from_run_doc={typed}",
+    )
+
+    assert result.exit_code == 2, result.output
+    assert (
+        "✗ parameters of camera-calibration: from_run_doc names the run document "
+        f"this run writes ({Path(typed).as_posix()}), where this run replaces the "
+        "camera-calibration it would copy: name a copy of it or another run document "
+        "(nothing was written). smc run camera-calibration --show-params lists the keys"
+    ) in " ".join(result.output.split())
+    assert (tmp_path / "run.json").read_bytes() == before
+    assert _stored(tmp_path, "camera-calibration").status is StageStatus.done
+
+
 # --- a run that opens the stand ----------------------------------------------
 
 

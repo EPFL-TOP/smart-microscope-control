@@ -173,6 +173,14 @@ class Plugin(Protocol[P, R]):
   them (§1.8). **`reads_optional`**: slots the plugin uses when they are
   usable (the scan's timings and camera calibration). The two are
   disjoint and neither holds `provides`.
+- **`reuses_from`** (#626): an optional class attribute, read with
+  `getattr(plugin, "reuses_from", ())` as `offline` is, so no member of the
+  Protocol. It names the `Params` fields, each `Path | None`, from which the
+  plugin copies **its own slot** out of another run document
+  (`camera-calibration`'s `from_run_doc`). `check_run_doc` (§1.8) refuses one that
+  names the document the run writes. A plugin that reads *another* stage out of
+  a document (`scan-plan`'s, `plate-check`'s and `objective-offsets`'
+  calibrations, §23) declares nothing: its own document is its default.
 - **`run`** is the hardware loop of ADR-0004; the pure algorithm lives in
   another module and takes no `Microscope`. It returns its `Result` and
   never writes the run document itself.
@@ -590,12 +598,54 @@ record is `done` (`<plugin> finished; run it without --resume`), its
 `params` differ from `params.model_dump(mode="json")` (`the parameters
 differ from the run being resumed: <keys>`), or its profile differs.
 
+```python
+def check_run_doc(
+    plugin: Plugin[Any, Any], params: PluginParams, run_doc: Path
+) -> None: ...
+```
+
+**A reuse never names the document the run writes** (#626, F15). The runner
+marks a stage `running` in its own document before `run`, and that replaces the
+record of the same stage, the very record a reuse of the plugin's own slot would
+copy: `smc run camera-calibration --run-doc A --param from_run_doc=A` found its
+own `running` stage, refused with `the last run of camera-calibration is still
+running or was interrupted`, and left the document's calibration `failed`
+(Ti2-E session 6: the morning's calibration was lost, and survived only in a copy).
+`check_run_doc` is the check that has to come first. For each field of the
+plugin's `reuses_from` (§1.3) that is not `None`, it asks whether the field's path
+and `run_doc` are one file, and raises `ParamsError` (exit 2, so the page says it as
+text) if so: `<field> names the run document this run writes (<path as typed, with
+forward slashes>), where this run replaces the <slot> it would copy: name a copy of
+it or another run document (nothing was written)`.
+
+- **One file has many names** (FM-24). Two files that exist are compared with
+  `Path.samefile` (a relative and an absolute name, `a/../run.json`, a symbolic or
+  a hard link, a volume that folds case). A document that is not there yet, which the
+  first write would create and then read, is compared by `Path.resolve()` and
+  `os.path.normcase`; a lexical `abspath` is not enough (measured: a temporary folder
+  that is a symbolic link, `/var` for `/private/var` on macOS).
+- **The file system may not answer** (FM-116): an `OSError` from `exists`,
+  `samefile` or `resolve`, and the `ValueError` that Python 3.10 and 3.11 raise from
+  `resolve` for a path with a NUL (the page's field can hold one), are answered *no*.
+  The document was read a line before and is written a line after, and says so in
+  its own words if the drop lasts.
+- It writes nothing and touches no hardware, but it asks the file system, which
+  `check_ready` never does (its contract is a document object, never a path). It
+  is a function of its own for that reason, and a name in `reuses_from` that is no
+  field of the parameters raises `AttributeError`: a typo would switch the guard off
+  without a word.
+- It is called after `check_ready` by `run_plugin` (before the requirements and
+  before the first write), by `smc run` (before the stand opens, FM-30) and by the
+  plate page's `_prepare` (the click's outcome, FM-169), each with the document the
+  run is into.
+
 `run_plugin`, in this order:
 
 1. `params` not an instance of `plugin.Params`: `TypeError` (a bug).
 2. `doc = RunDocument.load_or_new(run_doc)`; `check_ready(...)` with
    `profile=microscope.profile.microscope.name` and
-   `dry_run=microscope.dry_run`.
+   `dry_run=microscope.dry_run`; then `check_run_doc(plugin, params, run_doc)`
+   (#626).
 3. Requirements: every capability of `requires` for which
    `microscope.has()` is false. When any is missing, `RequirementsError`
    lists them all, with each `CapabilityMissingError` message that
@@ -691,8 +741,9 @@ One command, `@app.command("run")`, with `NAME` an optional argument.
      folder exists and is a directory (exit 2, like `smc snap --out`).
      `Path("")` is `.`, a directory, so an empty value is refused (FM-78).
   3. `Profile.load(profile)`; `RunDocument.load_or_new(run_doc)`;
-     `check_ready(..., profile=<profile>.microscope.name, ...)`. A document
-     that does not load exits 1 and is left as it is.
+     `check_ready(..., profile=<profile>.microscope.name, ...)`; then
+     `check_run_doc(plugin, params, run_doc)` (a `ParamsError`, exit 2, #626). A
+     document that does not load exits 1 and is left as it is.
   4. `with Microscope.open(profile_obj, dry_run=dry_run) as microscope:`
      then `run_plugin(..., on_progress=..., plugin_version=entry.version)`.
      The stand is released before any `✗` line (M1 §9), and the result of
@@ -1677,6 +1728,13 @@ typed and not resolved (FM-50: an absolute path names a user folder),
 from <path>, measured <finished_utc, ISO, seconds>` after the reused
 result's own lines. A result that does not validate is a `PluginRunError`
 that says to run `camera-calibration` again there.
+
+**The other document is never the one the run writes** (#626, F15).
+`reuses_from = ("from_run_doc",)`, so the runner refuses a `from_run_doc` that is
+`--run-doc`, spelt however, as a `ParamsError` before anything is written (§1.8):
+the stage's own `running` record would replace the calibration it was to copy, and
+the document would keep a failed one. The way out the text names is a copy of the
+document, or another one.
 
 **Measurement**, refused in a dry run (`PluginRunError`: "a dry run cannot
 measure the camera; run it without --dry-run"):
