@@ -40,10 +40,12 @@ smc run scan -p <profile> --run-doc run.json --dry-run
 | `max_failed_in_row` | 3 | This many fields failing in a row end the scan (1 to 100). |
 | `max_unlocked_in_row` | 5 | This many fields in a row on which the autofocus would not lock end the scan (1 to 1000). |
 | `landing_tolerance` | 0.05 | How far a field may land from its target, as a fraction of the smaller side of the plan's field of view (above 0, at most 0.5). A field that landed farther is failed, not photographed. 0.05 is 4.8 µm for the demo's 10× (a field of 128 × 96 µm). Read the stand's real agreement at the first hardware session before trusting a fraction. |
-| `cell_focus` | `off` | The focus on the cells ([below](#the-focus-on-the-cells-cell_focus)): `per-field` sweeps Z at every field, `per-well` until one field of the well finds a peak. |
+| `cell_focus` | `off` | The focus on the cells ([below](#the-focus-on-the-cells-cell_focus)): `per-field` sweeps Z at every field, `per-well` until one field of the well finds a peak; `map` takes each field's Z from a 10× scan taken under the lock, plus one offset per well ([below](#the-focus-from-the-10-lock-map-cell_focusmap)). |
 | `focus_range_um` | 10 | The sweep's half-range, in µm (above 0, at most 50, and at most the stand's Z jog limit). Measured at the Ti2-E's 40×, m3 §21.11.6: the cells' focus curve is 9-11 µm wide at half its rise, and ±10 µm at 1 µm finds 17 of 24 cell peaks where ±5 µm finds 3. |
 | `focus_step_um` | 1 | The distance between two planes, in µm (0.1 to 10, at most `focus_range_um`, at least 9 and at most 101 planes: the sweep measures its noise between neighbouring planes). |
 | `focus_score` | `brenner` | `brenner`, `normalized-variance`, `gradient-energy` or `laplacian-variance`. `focus_step_um` and `focus_score` are chosen, not measured. |
+| `focus_map` | none | `cell_focus=map` only, and required by it: a **copy** of the run document whose `scan` was taken with the autofocus locked on this registration of the plate (the 10× scan the fields were planned from). Never the run document this run writes: that one is refused before anything is written. |
+| `map_check_every` | 0 | `cell_focus=map` only: a field whose index in its well is a multiple of this also sweeps around the map's Z, and its frame stays at the map's Z (0 to 100 000; 0 checks none). |
 
 ## What is checked before anything moves
 
@@ -115,7 +117,8 @@ written, and the message says what to do:
    `autofocus=off`, an autofocus that is on is refused, as check 7 says, for every
    `cell_focus`: the sweep's Z moves would switch it off, and nothing would lock it again
    or say so. This is the same refusal and the same text, the one read `autofocus=off`
-   makes of the autofocus.
+   makes of the autofocus. With `cell_focus=map`, the checks of the map follow, in
+   [their own order](#before-anything-moves).
 10. **The plate check's walk** ([below](#the-plate-check)), when the check is made: the
     frame must not hold a whole well, the walk must not be too long, and every frame of
     it must lie inside the stage's soft limits, as for
@@ -355,6 +358,100 @@ run`.
 **A `--resume` of a scan stopped by an older smc** is refused as `the parameters differ`
 (its parameters lack the four `focus_*` keys): run it again without `--resume`.
 
+## The focus from the 10× lock map (`cell_focus=map`)
+
+Until PFS locks at the Ti2-E's 40× (#539), a 40× scan runs with the autofocus off.
+`per-field` centres every field's sweep on the Z the scan starts at, which cannot follow a
+bottom that varies by 9 to 36 µm across a well, and costs 7.5–8.5 s a field. With
+`cell_focus=map`, **each field's Z is the plate's bottom as the 10× scan under the lock
+mapped it, plus one offset per well measured at the 40×** (m3 §21.12). Expected: 0.4–0.75
+s a field plus 26–68 s a well for its anchor, estimated from measured parts; the next
+visit measures it.
+
+**The workflow** (m3 §21.12.7):
+
+1. Scan the wells at the 10× with PFS locked, as usual, and **copy** the run document
+   (`run-10x.json`): the 40× scan replaces the `scan` of the document it writes.
+2. At the 40×, PFS off, focus by eye on cells near the first well's centre, then:
+
+   ```text
+   smc run scan -p nikon-ti2 --run-doc run.json --param cell_focus=map \
+       --param focus_map=run-10x.json --param map_check_every=25 --param autofocus=off
+   ```
+
+**The map** at a field is the Z of the 4 locked frames of the map's scan nearest the
+field's **XY readback**, in the field's own well, weighted by 1/d (a frame within 1 µm
+gives its own Z). Another well's frames are never read (a wall lies between), and a
+frame that was not `locked` names no bottom and is not read either. Measured on session
+6's 10× scan: 1.38 µm median error, leaving each frame out in turn.
+
+**The anchors.** The operator's focus at the start gives the **start anchor**: the Z the
+scan starts at minus the map at the stage's XY. Before each well's first field, the scan
+sweeps (with `focus_range_um`, `focus_step_um` and `focus_score`) at the well's planned
+fields **nearest its centre**, up to 8, each centred on the map there plus the start
+anchor, until 3 find a peak; the well's anchor is the median of `peak - map` over them.
+The centre, not the scan's order: the scan starts at the wall, where the map is least
+sure. Every anchor is centred on the operator's, never on the previous well's, so
+nothing drifts from well to well. A well where no sweep finds a peak keeps the start
+anchor, and a WARNING and `assumed` say so. A try that fails (a landing off target, a
+plane outside the soft limits, a Z readback off its command, a device error) is
+recorded with its error, a WARNING names it, and the next field near the centre is
+tried: it is not a failed field. The anchors' frames are neither written nor shown.
+
+**At each field**, after the stage has landed: the target is the map at the readback plus
+the well's anchor; one Z move there (a target outside the soft limits fails the field
+with nothing moved for it: `MapOutsideLimits: the focus from the map at <field> is <t>
+µm, outside the soft limits [<lo>, <hi>] µm`), then the frame. **The autofocus is not
+touched**: the frame's `focus` is `off`, and [`route`](route.md) takes its Z as recorded.
+With `map_check_every=n`, a field whose index in its well is a multiple of `n` also
+sweeps around the target, then moves back to it: **the check measures the map, it does
+not correct it**, and the frame is still the map's. A check sweep that would leave the
+soft limits or the Z jog limit is not made, and a WARNING and `assumed` say so.
+
+### Before anything moves
+
+After check 9's (a dry run too), in this order:
+
+1. The scan uses the autofocus (on and locked): `cell_focus=map takes each field's Z from
+   the map with the autofocus off, and the autofocus is locked: switch it off, or use
+   per-field or per-well`.
+2. `focus_map` is read as `camera-calibration`'s `from_run_doc` reads a calibration: its
+   `scan` must be usable by this run (done, this profile, not a dry run read by a real
+   run, not stale), and a result this smc reads. Its scan must have read **this run's
+   plate registration**: `the focus map in <path> was scanned on another registration of
+   the plate (<its attempt> against this run's <attempt>)` (`none` when either has none).
+3. Every well left holds 4 locked frames of the map: `the focus map in <path> holds fewer
+   than 4 locked frames in <wells>: scan them with the autofocus locked first`.
+4. On `--resume`, the map is the one the scan being resumed used: `the focus map in <path>
+   is not the one the scan being resumed used: run scan again without --resume`.
+5. The stage's XY lies within the map scan's larger field side of a locked frame: `the
+   stage at (<x>, <y>) µm is <d> µm from the map's nearest locked frame (<name> in
+   <well>): focus by eye on the cells inside a mapped well, then start the scan`.
+6. Every planned field's `map + start anchor ± focus_range_um` lies inside the soft limits
+   and within the Z jog limit of the Z the scan starts at (the moves are absolute, so the
+   layer's jog guard does not reach them): `the focus from the map would reach <z> µm at
+   <field>, outside the soft limits [<lo>, <hi>] µm`, or `…, <d> µm from the Z the scan
+   starts at, beyond the Z jog limit of <j> µm`.
+
+### What it records
+
+Each frame's `cell_focus` has `source` `map`, `dz_um` 0.0, `map_z_um` (the map at its
+readback) and `anchor_um` (its well's): its Z command was their sum. Its `sweep` is the
+check's, or `null`. The result's `focus_map` holds the run document as typed, the map
+scan's attempt and time, this attempt's `start_anchor_um` and each well's anchor with its
+tries (the field, the readback, the map there, the sweep or the error). The checkpoint
+keeps the anchors of the wells done: a `--resume` keeps them and anchors only the others.
+A scan without the map has neither `focus_map` nor the two keys of a frame, so it is
+written as before; one with them is refused by an older smc. `assumed` says where the
+map came from, each well's anchor (`<well>: anchored <a> µm from the map by <p> peaks of
+<t> sweeps near its centre`), the time (`the focus from the map added <x> s per field (<n>
+fields), and the anchors <y> s (<w> wells)`) and the checks (`the map's Z was checked on
+<c> fields: a peak on <p>, within 1 µm of the map's Z on <q1> and within 2 µm on <q2>, the
+median distance <m> µm`, or `the map's Z was not checked against a sweep
+(map_check_every=0)`). A dry run makes every check above, then plans and moves no Z:
+`dry run: the focus from the map was planned for <n> fields, Z <lo>…<hi> µm with the
+operator's anchor <a0> µm, not run`.
+
 ## Resuming
 
 The checkpoint is saved after each well. `--resume` continues with the same folder
@@ -458,6 +555,25 @@ from the checkpoint were written before a frame's offset from its well's centre 
 recorded: they carry no well_dx_um or well_dy_um`.
 
 ## Not verified here
+
+**The focus from the map** (m3 §21.12.7, for the next visit at the Ti2-E, on a plate with
+cells):
+1. the 10× scan of two wells with PFS locked, as in session 6; copy the run document
+   (`run-10x.json`);
+2. at the 40×, PFS off, condenser N2, focus by eye on cells near the first well's centre,
+   then `smc run scan --param cell_focus=map --param focus_map=run-10x.json --param
+   map_check_every=25 --param autofocus=off` over one whole well (1544 fields, about 62
+   checks);
+3. read `assumed`: the time a field and the anchors' (against D16's 0.4–0.75 s and 26–68
+   s), and the check: the fraction of the checked fields whose peak lies within 1 µm and 2
+   µm of the map's Z. The same records give what a fixed Z would have given (each check's
+   peak against the well's anchor plane at its centre), computed offline;
+4. look at the frames of a few checked fields whose peak lay 1, 2 and 3 µm from the map's
+   Z: from which distance a cell is no longer readable at the 40× sets what "sharp" means
+   here;
+5. focus by eye in the second well and compare with its anchor: whether the 10× → 40×
+   difference holds from one well to the next.
+
 
 Nothing in this page was measured on a microscope. For the first hardware session
 (#198): the scan on the Ti2-E; PFS over a 96-well well at 40×; an `engage()` on a
