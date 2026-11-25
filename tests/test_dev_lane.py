@@ -349,11 +349,13 @@ def _pr(
     checks: str = "green",
     texts: tuple = (),
     at: str = "2026-11-11T16:00:00Z",
+    branch: str = "",
 ) -> dict:
     return {
         "number": number,
         "state": state,
         "isDraft": False,
+        "headRefName": branch,
         "createdAt": at,
         "closingIssuesReferences": [{"number": n} for n in closes],
         "statusCheckRollup": _CHECKS[checks],
@@ -541,6 +543,95 @@ def test_a_merged_pr_completes_the_merge() -> None:
     assert _state(seg, merged) == ("done", "PR #12 merged")
     assert _state(seg, _facts([_issue(5)], [_pr(12, (5,))])) == ("wait", "merge #12")
     assert _state(seg, _facts([_issue(5)]))[0] == "owner"
+
+
+# --- a PR is the issue's by its branch too (#658, the lane of 2026-11-25 on #614) ---------
+
+
+def _refs_only(number: int, issue: int, **kw: Any) -> dict:
+    """A PR that says ``Refs #<issue>`` on purpose, so GitHub lists no closing reference."""
+    kw.setdefault("branch", f"feat/{issue}-the-slug")
+    return _pr(number, (), **kw)
+
+
+def test_a_merged_pr_from_the_issues_branch_that_only_says_refs_ends_the_develop_and_the_merge() -> (
+    None
+):
+    # The case of #614: its PR said `Refs #614` (item 2 of the issue stays open), so after the
+    # merge `lane.py` printed `no PR for #614` and `NEXT: session feature 614` again, and the
+    # lane's note said the lane must not be relaunched.
+    merged = _facts([_issue(5)], [_refs_only(12, 5, state="MERGED", at=AFTER)])
+    for kind in ("develop", "feature"):
+        assert _state(_seg(kind), merged) == ("done", "PR #12")
+    assert _state(_seg("merge"), merged) == ("done", "PR #12 merged")
+    assert _state(_seg("review"), merged) == ("done", "PR #12 merged")
+    # ... and the whole lane of that Point reads as done, with nothing left to start
+    lanes = lane.parse_point(
+        "**S2 \N{EM DASH} one issue**\n"
+        "S2.1 `/feature 5` (Sonnet) \N{RIGHTWARDS ARROW} `/review` (Sonnet)"
+        " \N{RIGHTWARDS ARROW} merge\n"
+    )
+    rows = lane.lane_status(lanes, "S2", merged, T0)
+    assert [state for _, _, state, _ in rows] == ["done", "done", "done"]
+    view = lane.render("S2", rows, merged, {"createdAt": T0, "id": "IC_1"}, 51)
+    assert view.lines[-1] == "NEXT: done"
+
+
+def test_an_open_pr_from_the_issues_branch_is_the_merge_to_wait_for_and_the_one_to_review() -> (
+    None
+):
+    facts = _facts([_issue(5)], [_refs_only(12, 5, at=AFTER)])
+    assert _state(_seg("merge"), facts) == ("wait", "merge #12")
+    assert _state(_seg("review"), facts) == ("session", "review 12")
+    assert _state(_seg("develop"), facts) == ("done", "PR #12")
+
+
+def test_a_branch_of_another_issue_or_a_design_branch_is_not_the_issues_pr() -> None:
+    # Only `<type>/<N>-<slug>` for this very number: `feat/55-x` is not #5's (a prefix of the
+    # digits), and neither are a number with no slug of its own, a branch with no number, and the
+    # two branches that close nothing: a plan's design PR is `docs/<N>-<slug>` and would end the
+    # develop before it starts (scripts/ci/check_closing_refs.py reads the branch the same way).
+    for branch in (
+        "feat/6-the-slug",
+        "feat/55-the-slug",
+        "feat/the-slug",
+        "docs/5-the-slug",
+        "adr/5-the-slug",
+        "",
+        "worktree-agent-a25c2fd155f236077",
+    ):
+        facts = _facts([_issue(5)], [_pr(12, (), branch=branch, at=AFTER)])
+        assert _state(_seg("merge"), facts)[0] == "owner", branch
+        assert _state(_seg("feature"), facts) == ("session", "feature 5"), branch
+    for branch in ("feat/5-x", "fix/5-x", "chore/5", "perf/5-x"):
+        facts = _facts([_issue(5)], [_pr(12, (), branch=branch, at=AFTER)])
+        assert _state(_seg("feature"), facts) == ("done", "PR #12"), branch
+    # a PR closed without a merge is no one's, by its branch either
+    closed = _refs_only(12, 5, state="CLOSED", at=AFTER)
+    assert _state(_seg("merge"), _facts([_issue(5)], [closed]))[0] == "owner"
+
+
+def test_a_pr_from_the_issues_branch_older_than_the_point_is_the_last_points_work() -> (
+    None
+):
+    # An issue that an earlier cycle left open (a `Refs` PR merged, the rest waits for the stand)
+    # and that this Point lists again must not read as done: a silent skip. The date guard is
+    # for the branch link only, a PR that closes the issue was never dated.
+    old = _refs_only(12, 5, state="MERGED", at=BEFORE)
+    assert _state(_seg("develop"), _facts([_issue(5, (_plan(AFTER),))], [old])) == (
+        "session",
+        "develop 5",
+    )
+    assert _state(_seg("feature"), _facts([_issue(5)], [old])) == (
+        "session",
+        "feature 5",
+    )
+    assert _state(_seg("merge"), _facts([_issue(5)], [old]))[0] == "owner"
+    closing = _pr(12, (5,), state="MERGED", at=BEFORE, branch="feat/5-x")
+    assert _state(_seg("feature"), _facts([_issue(5)], [closing])) == ("done", "PR #12")
+    # the newest of two wins, by either link
+    both = [_refs_only(13, 5, at=AFTER), _pr(12, (5,), at=BEFORE)]
+    assert _state(_seg("merge"), _facts([_issue(5)], both)) == ("wait", "merge #13")
 
 
 def test_an_owner_segment_is_never_done_by_itself() -> None:
@@ -1415,6 +1506,12 @@ def test_the_facts_are_one_listing_of_prs_the_named_issues_and_the_plans_refs(
     assert "--state" in pr_calls[0]
     assert pr_calls[0][pr_calls[0].index("--state") + 1] == "all"
     fields = pr_calls[0][pr_calls[0].index("--json") + 1].split(",")
-    assert {"closingIssuesReferences", "statusCheckRollup", "reviews"} <= set(fields)
+    # `headRefName` is how a PR that says `Refs #N` is found (#658).
+    assert {
+        "closingIssuesReferences",
+        "headRefName",
+        "statusCheckRollup",
+        "reviews",
+    } <= set(fields)
     # each ref is asked once, though two plans name it
     assert sum(1 for c in calls if c[0] == "api") == 2
