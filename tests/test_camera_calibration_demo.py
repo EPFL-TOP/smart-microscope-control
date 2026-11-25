@@ -122,6 +122,8 @@ class _FlakyStage:
         self.targets: list[tuple[float, float]] = []
         #: What each move returned, in order: the readbacks the plugin was given.
         self.landed: list[XY] = []
+        #: Where the stage really was after each move, whatever it returned.
+        self.really: list[XY] = []
 
     def position_um(self) -> XY:
         if self._faulted and self._unreadable_after_fault:
@@ -142,6 +144,7 @@ class _FlakyStage:
             y_um - self._origin_y_um
         )
         landed = self._real.move_to_um(executed_x_um + dx, executed_y_um + dy)
+        self.really.append(landed)
         if self._lying:
             landed = XY(self._origin_x_um, self._origin_y_um)
         self.landed.append(landed)
@@ -1606,10 +1609,10 @@ def test_a_probe_frame_of_exactly_fifty_counts_has_light_and_49_has_none(
     assert stage.moves == 3
 
 
-def _refusal(microscope: Microscope, tmp_path: Path) -> str:
+def _refusal(microscope: Microscope, tmp_path: Path, **params: object) -> str:
     """The reason the run was refused for, or an empty text when it was not."""
     try:
-        _run(microscope, tmp_path)
+        _run(microscope, tmp_path, **params)
     except PluginRunError as refused:
         return refused.reason
     return ""
@@ -2174,22 +2177,37 @@ def test_a_stage_that_reads_its_start_after_one_probe_names_that_probe_only(
 
 
 @pytest.mark.parametrize(
-    ("fraction", "named", "shown"),
-    [(0.02, False, ""), (0.005, True, "0.5")],
-    ids=["creeps-1.92-um-per-axis", "creeps-0.48-um-per-axis"],
+    ("fraction", "step_um", "named", "shown"),
+    [
+        # The default step of 96 µm: the tolerance is 1.0 µm.
+        (0.02, None, False, ""),
+        (0.005, None, True, "0.5"),
+        # A step of 10 µm: the tolerance is a twentieth of it, 0.5 µm, through the plugin.
+        (0.06, 10.0, False, ""),
+        (0.04, 10.0, True, "0.4"),
+    ],
+    ids=[
+        "creeps-1.92-um-per-axis",
+        "creeps-0.48-um-per-axis",
+        "short-step-creeps-0.6-um",
+        "short-step-creeps-0.4-um",
+    ],
 )
-def test_a_stage_whose_readbacks_are_past_the_tolerance_keeps_the_texture_order_whole(
+def test_a_creeping_stage_is_named_inside_the_tolerance_and_keeps_the_texture_text_past_it(
     demo_microscope: Microscope,
     tmp_path: Path,
     fraction: float,
+    step_um: float | None,
     named: bool,
     shown: str,
 ) -> None:
-    """A readback 1.92 µm from the start is not the start; 0.48 µm is (the tolerance is 1.0 µm).
+    """1.92 µm from the start is not the start, 0.48 µm is (1.0 µm); for a 10 µm step 0.6 is not, 0.4 is (0.5).
 
     The frames are fixed to the sensor (``_DeafCamera``), so the shifts are zero
     whatever the stage did; only the readbacks decide which text the operator reads.
     Past the tolerance the refusal is the texture one, whole, with the stage last.
+    The short step goes through the plugin's own call, so the share is not only a
+    property of ``_stood_still``.
     """
     _start_off_the_origin(demo_microscope)
     camera, _stage, _start = _over_a_still_background(
@@ -2200,7 +2218,9 @@ def test_a_stage_whose_readbacks_are_past_the_tolerance_keeps_the_texture_order_
         y_fraction=fraction,
     )
 
-    reason = _refusal(demo_microscope, tmp_path)
+    reason = _refusal(
+        demo_microscope, tmp_path, **({} if step_um is None else {"step_um": step_um})
+    )
 
     reference, probe_x, probe_y = camera.taken[:3]
     _first_look_reads_zero(reference, probe_x)
@@ -2215,6 +2235,63 @@ def test_a_stage_whose_readbacks_are_past_the_tolerance_keeps_the_texture_order_
         assert reason.startswith(PARALLEL_SHIFTS_NOTE)
         assert reason.endswith(REUSE_SENTENCE)
         assert "the stage read its start" not in reason
+
+
+def test_the_second_look_still_calibrates_a_field_when_the_stage_read_its_start(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """D3: a stage that reads its start while the images followed it is a stale readback, not a refusal.
+
+    F12's two beads over a still background, on a stage that moves for real and reads
+    back the start: the first look reads zero, the second look reads the beads, the
+    calibration is ``done`` and says how it was read. The readbacks are asked of a
+    refusal only, so the second look runs as it did (the review of #614 found that no
+    test would see it stopped).
+    """
+    _start_off_the_origin(demo_microscope)
+    camera, stage, start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330)), lying=True
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    reference, probe_x, probe_y = camera.taken[:3]
+    _first_look_reads_zero(reference, probe_x)
+    _first_look_reads_zero(reference, probe_y)
+    assert stage.moves == 3
+    # The premise: every readback is the start, which a refusal would have named.
+    assert all(_stood_still(XY(*start), landed, STEP_UM) for landed in stage.landed)
+    assert result.pixel_size_um == pytest.approx(1.0, rel=0.02)
+    assert result.assumed[0].startswith("sparse field: the camera's own pattern won")
+    assert result.assumed[-1] == BLIND_RETURN
+    assert _stored(tmp_path).status is StageStatus.done
+
+
+def test_the_readback_is_what_the_move_returned_and_not_a_second_read_of_the_stage(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A stage whose move returns the start while it really moved is named from the return value.
+
+    ``position_um()`` of this stage says where it really is, a quarter field away; only
+    the readback each ``move_to_um`` returned says the start. The refusal quotes that
+    one (FM-167: the move's own word, and no new read of the stage, FM-88).
+    """
+    _start_off_the_origin(demo_microscope)
+    _camera, stage, start = _over_a_still_background(
+        demo_microscope,
+        ((120, 180), (250, 330)),
+        camera_class=_DeafCamera,
+        lying=True,
+    )
+
+    reason = _refusal(demo_microscope, tmp_path)
+
+    assert reason.startswith("the stage read its start after the +X probe (0.0 µm")
+    assert stage.landed[0] == XY(*start)
+    # The premise: the stage really went to the +X probe, 96 µm away, so a second read
+    # of its position would have said so, and the return brought it back.
+    assert stage.really[0].x_um == pytest.approx(start[0] + STEP_UM, abs=0.05)
+    assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
 
 
 @pytest.mark.parametrize(

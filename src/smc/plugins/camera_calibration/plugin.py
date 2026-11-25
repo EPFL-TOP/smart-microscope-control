@@ -575,11 +575,14 @@ def _stood_still_line(still: tuple[tuple[str, float], ...]) -> str:
     """What the stage read after the probes that did not arrive, and where to look.
 
     It names each probe with the distance read from the start, so that a surprise at
-    a stand is a number to report, and says only what was read: the causes are
-    checks, not a diagnosis. One probe is enough for the frames not to be the cause:
-    an axis that goes nowhere gives a zero column and parallel shifts whatever the
-    frames hold. No angle bracket: the plate page puts the text in a pane that a
-    browser parses as HTML (#625).
+    a stand is a number to report. It takes the readback at its word: a stage whose
+    position read is stale over a field the frames cannot show (F12's, say) would
+    send the operator to the stage for a texture problem, the reverse of FM-222's
+    error, and a refusal that the stand shows to be one is the cue to loosen this.
+    The causes it names are checks, not a diagnosis. One probe is enough for the
+    frames not to be the cause: an axis that goes nowhere gives a zero column and
+    parallel shifts whatever the frames hold. No angle bracket: the plate page puts
+    the text in a pane that a browser parses as HTML (#625).
     """
     after = " and ".join(
         f"after the {label} ({distance_um:.1f} µm from it)"
