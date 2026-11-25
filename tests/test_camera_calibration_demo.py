@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+import smc.plugins.camera_calibration.plugin as plugin_module
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XY, Camera, Limits, ObjectiveTurret, XYStage
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError
@@ -1566,6 +1567,11 @@ REUSE_SENTENCE = (
     "; if this camera was calibrated at this objective before, reuse that "
     "calibration with from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)"
 )
+#: The line of a calibration the second look read: its return check is blind, so it says so.
+BLIND_RETURN = (
+    "the return could not be checked: on this field the camera's own pattern "
+    "wins the correlation at zero shift"
+)
 #: The page's card keeps this many characters of a failure's words (``_CARD_TEXT_CHARS``).
 CARD_TEXT_CHARS = _CARD_TEXT_CHARS
 
@@ -1589,6 +1595,7 @@ def _over_a_still_background(
     microscope: Microscope,
     beads_px: tuple[tuple[int, int], ...],
     camera_class: type[_StillBackgroundCamera] = _StillBackgroundCamera,
+    drift_um: dict[int, tuple[float, float]] | None = None,
 ) -> tuple[_StillBackgroundCamera, _FlakyStage, tuple[float, float]]:
     """The stand with a camera that has a still background, a stage that counts, and where it starts.
 
@@ -1604,7 +1611,7 @@ def _over_a_still_background(
         beads_px=beads_px,
     )
     microscope.override(Camera, camera)
-    stage = _FlakyStage(microscope.require(XYStage))
+    stage = _FlakyStage(microscope.require(XYStage), drift_um=drift_um)
     microscope.override(XYStage, stage)
     start = _here(microscope)
     assert carries_signal(camera.snap())
@@ -1669,16 +1676,119 @@ def test_two_beads_over_a_still_background_are_calibrated_by_the_second_look_and
         f"are the strongest peaks away from it ({away_x.peak_ratio:.1f} and "
         f"{away_y.peak_ratio:.1f} times the next, 1.5 asked)"
     )
-    assert result.assumed == (line,)
+    # The sparse-field line, then the return's: its check is blind on this field.
+    assert result.assumed == (line, BLIND_RETURN)
     assert len(line) <= 160  # the strip keeps 160 characters of the first line (FM-205)
+    assert len(BLIND_RETURN) <= 160
     # The return runs before the fit is judged, and the second look asks the
     # camera for nothing: the three moves, then the return's frame, no more (FM-88).
     assert stage.moves == 3
     assert len(camera.taken) == 4
-    assert result.return_error_um is not None
-    assert result.return_error_um < 2.0
+    assert result.return_error_um is None  # unknown, not the 0 the blind check reads
     assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
     assert _stored(tmp_path).status is StageStatus.done
+
+
+def test_a_return_that_landed_far_off_is_not_reported_as_zero_on_a_field_the_second_look_read(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The camera's own pattern wins at zero shift on this field, so the return check cannot see a drift.
+
+    The return move lands 70 µm off in X. On a rich field that is reported (``came back
+    <n> µm off``); here the check would read zero and store it as a measurement, which
+    it is not: the result says it could not be checked and leaves the error unknown.
+    """
+    camera, stage, start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330)), drift_um={3: (-70.0, 0.0)}
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    reference, _probe_x, _probe_y = camera.taken[:3]
+    # The premise: the stage did not come back, and the frame after the return is the
+    # reference's to the first look (the pattern wins), which is what would read zero.
+    assert _here(demo_microscope)[0] == pytest.approx(start[0] - 70.0, abs=0.05)
+    assert stage.moves == 3
+    assert measure_shift(reference, camera.taken[3]).response >= MIN_RESPONSE
+    assert result.return_error_um is None
+    assert result.assumed[-1] == BLIND_RETURN
+    assert not any("came back" in line for line in result.assumed)
+
+
+def test_a_second_look_the_fit_refuses_is_a_refusal_with_the_fits_notes_and_the_ratios(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """D4: a believed second look is judged by ``fit`` like any pair of shifts (FM-120, FM-122).
+
+    Both peaks stand out (4.0 times the next) and are rigid (96 px long, at a right
+    angle), but their response is 0.01: ``fit`` refuses it as a weak response. The
+    run must end ``failed`` with that note and what the second look saw, never ``done``
+    on the strength of the ratio and the shape alone, and the stage must be back.
+    """
+    camera, stage, start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330))
+    )
+    looks = iter(
+        [
+            AwayShift(Shift(-96.0, 0.0, 0.01), 4.0),
+            AwayShift(Shift(0.0, 96.0, 0.01), 4.0),
+        ]
+    )
+    monkeypatch.setattr(
+        plugin_module,
+        "measure_shift_away_from_zero",
+        lambda reference, probe: next(looks),
+    )
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(demo_microscope, tmp_path)
+
+    assert raised.value.reason == (
+        f"{BARELY_CORRELATE_NOTE}; away from the camera's own pattern the best peaks "
+        f"are 4.0 and 4.0 times the next (1.5 asked); step {STEP_UM:g} µm"
+        + REUSE_SENTENCE
+    )
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+    # Two probes and the return; the frame after the return is not taken.
+    assert stage.moves == 3
+    assert len(camera.taken) == 3
+    assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
+
+
+class _NoPixelSizeCamera(_StillBackgroundCamera):
+    """The still-background camera of a stand whose profile has no pixel size: the probe is the 50 µm fallback."""
+
+    def pixel_size_um(self) -> float:
+        return 0.0
+
+
+def test_the_sparse_field_line_follows_the_step_line_and_precedes_the_return_line(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """D5's order with a step line in front: the step's, the sparse field's, the return's.
+
+    The strip keeps the first ``assumed`` line only (FM-205), so what comes first is
+    what the operator reads: the step is a probe distance and not a result, but it
+    stays where the other tools put it.
+    """
+    camera, _stage, _start = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330)), camera_class=_NoPixelSizeCamera
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    reference, probe_x, probe_y = camera.taken[:3]
+    _first_look_reads_zero(reference, probe_x)
+    _first_look_reads_zero(reference, probe_y)
+    assert result.step_um == 50.0
+    assert len(result.assumed) == 3
+    assert result.assumed[0] == "step of 50 µm: no pixel size was known"
+    assert result.assumed[1].startswith("sparse field: the camera's own pattern won")
+    assert result.assumed[2] == BLIND_RETURN
 
 
 def test_the_sparse_field_line_comes_before_the_precision_line(
@@ -1698,11 +1808,12 @@ def test_the_sparse_field_line_comes_before_the_precision_line(
     reference, probe_x, probe_y = camera.taken[:3]
     _first_look_reads_zero(reference, probe_x)
     _first_look_reads_zero(reference, probe_y)
-    assert len(result.assumed) == 2
+    assert len(result.assumed) == 3
     assert result.assumed[0].startswith("sparse field: the camera's own pattern won")
     assert result.assumed[1].startswith(
         "step of 30 µm fits poorly (30 px, under a tenth"
     )
+    assert result.assumed[2] == BLIND_RETURN
 
 
 def test_the_sparse_field_line_is_one_short_line_at_the_largest_ratios() -> None:
@@ -1873,11 +1984,16 @@ def test_a_refusal_that_is_not_for_texture_does_not_offer_the_reuse(
     assert "away from the camera's own pattern" not in reason
 
 
-def test_the_longest_refusal_stays_within_the_cards_600_characters() -> None:
+def test_the_longest_parallel_shifts_refusal_stays_within_the_cards_600_characters() -> (
+    None
+):
     """Five-digit spreads, the 2000 µm step, the wrap hint, the widest ratios: 572 characters.
 
     The page keeps 600 characters of a failure's words, and a cut would take the
-    end of the reuse sentence, the part that says nothing moves.
+    end of the reuse sentence, the part that says nothing moves. This is the
+    longest refusal of the design's measure, with ``parallel shifts`` as its only
+    note: a fit that has both texture notes (a weak response and parallel shifts)
+    is 628 characters in the same case, and the card clips it (FM-269, *Open*).
     """
     parallel = Fit(
         ((0.0, 0.0), (0.0, 0.0)), 0.0, 0.0, False, 0.0, (PARALLEL_SHIFTS_NOTE,)

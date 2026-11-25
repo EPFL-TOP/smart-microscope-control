@@ -2098,7 +2098,13 @@ def test_a_record_that_cannot_be_read_gives_no_failed_line(
 def test_the_failed_line_is_plain_text_and_bounded(
     page: PlatePage, run_doc: Path
 ) -> None:
-    """FM-139, FM-205: markup, a path and 700 characters in a tool's words; the line is one `Str` and one line."""
+    """FM-205: markup, a path and 700 characters in a tool's words; the line is one `Str`, on one line, cut.
+
+    The pane is the page's text pane and the words pass as given. That a browser shows
+    them as text is **not** proved by a pane's type: it parses a `Str` pane as HTML
+    (FM-271, read in Chromium), so a placeholder in angle brackets must not be in a tool's
+    text, and the page-wide escape is a change of its own.
+    """
     words = f"{HOSTILE} in C:\\Users\\lab\\run\nand " + "x" * 700
     _seed_failed_calibration(run_doc, words)
     view = PlatePageView(page)

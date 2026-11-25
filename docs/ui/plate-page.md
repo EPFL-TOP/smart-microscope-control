@@ -339,7 +339,7 @@ disclosure shows the `smc run` line it makes.
   one line under the note, in the warning colour, taking no height while it has nothing to say:
   `The last calibration failed: <the tool's words>`, the same words the Plate screen's block gives
   a document whose record failed (`the last calibration failed: ...`), without the exception's type
-  and the tool's name, on one line and cut at 600 characters, as plain text. It reads the
+  and the tool's name, on one line and cut at 600 characters, in the page's text pane (the same pane kind as every note; see FM-271 for what a browser does with such panes). It reads the
   document the click writes to: **the run document's** latest `camera-calibration` record when the
   click goes into the run document, and **the position's own document** when it goes into
   `calibrations/position-<n>.json` (a problem of that document that is not a failure, no file or

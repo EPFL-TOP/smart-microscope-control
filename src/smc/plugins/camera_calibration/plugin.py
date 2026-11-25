@@ -90,6 +90,13 @@ _RETURN_PIXELS = 4.0
 #: calibration exists to correct: a size 100 times too large would otherwise be
 #: sent as 9.6 mm of absolute moves, which no jog guard covers (FM-121).
 _MAX_STEP_UM = 2000.0
+#: The ``assumed`` line of a calibration the second look read: its return check is blind
+#: (the camera's own pattern wins at zero shift whether or not the stage came back), so
+#: ``return_error_um`` is unknown and not 0. One line, well under the strip's 160 (FM-205).
+_BLIND_RETURN_LINE = (
+    "the return could not be checked: on this field the camera's own pattern "
+    "wins the correlation at zero shift"
+)
 
 
 class CameraCalibrationParams(PluginParams):
@@ -287,8 +294,13 @@ class CameraCalibrationPlugin:
         after_return = measure_shift(reference, camera.snap())
         ctx.progress(3, 3, "return")
         return_error_um: float | None = None
+        if read_away:
+            # The frame after the return is read by the first look, which finds the camera's
+            # own pattern at zero shift on exactly this field, whatever the stage did: a
+            # return error of 0 would be a measurement it is not. Unknown beats guessed.
+            assumed.append(_BLIND_RETURN_LINE)
         # `>=` as the positive test: a response that is nan goes to the else.
-        if after_return.response >= MIN_RESPONSE:
+        elif after_return.response >= MIN_RESPONSE:
             (m00, m01), (m10, m11) = fitted.matrix_um_per_px
             return_error_um = math.hypot(
                 m00 * after_return.d_col_px + m01 * after_return.d_row_px,

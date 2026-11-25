@@ -230,7 +230,7 @@ The slot `camera-calibration` holds a `CameraCalibration`
 | `mirrored` | Whether the image is flipped (`det M > 0`). An upright camera is **not** mirrored. |
 | `residual_um` | How far the frame's edge lies from where a rigid camera of that size and rotation would put it: near 0 for a good camera, large for a stretched or sheared image or a bad measurement. |
 | `response` | The smaller of the two probes' agreement after alignment, 0 to 1. A good field is well above the refusal threshold of 0.05. When the second look read the probes (`assumed` says so), it is the smaller of the two second-look responses, which counts the camera's own pattern too: it is not evidence of the sample's texture. |
-| `return_error_um` | How far the stage came back from where it started, measured on the last frame; `null` (unknown, not zero) when that frame did not correlate or the calibration was reused. |
+| `return_error_um` | How far the stage came back from where it started, measured on the last frame; `null` (unknown, not zero) when that frame did not correlate, when the second look read the probes (the check is blind there, below) or when the calibration was reused. |
 | `step_um` | The probe distance used. |
 | `reused_from` | The run document this was copied from, as typed but written with forward slashes (`as_posix()`), and never resolved; `null` for a measurement. |
 | `assumed` | What it rests on that was not measured: see below. |
@@ -243,7 +243,9 @@ lines and before the next one; at most 160 characters, the length the page's str
 keeps of the first line); `step of 50 µm fits poorly (18 px,
 under a tenth of the 1412 px frame; residual 10.7 µm, 21 % of the step): run again
 with step_um=970` (the next paragraph); `the return could not be checked:
-the frame after it did not correlate (<r>)`; `the stage came back <n> µm off: its
+the frame after it did not correlate (<r>)`, and `the return could not be checked: on
+this field the camera's own pattern wins the correlation at zero shift` (after a second
+look: the check cannot see a drift there); `the stage came back <n> µm off: its
 repeatability limits the scan's stitching` (reported, not refused: above the
 larger of 2 µm and four pixels); `camera calibration reused from <path>, measured
 <time>`.
@@ -292,9 +294,12 @@ plan as measured. Read the numbers before you trust them:
   pattern, so a response that looks fine says nothing about the sample; its
   pixel size, rotation and mirror are what to read, against what you expect (the
   Ti2-E's 10x measured 1.12432 µm per pixel and 178.33° on a plate of beads). And
-  the return check reads the camera's own pattern as well: on such a field
-  `return_error_um` reads about 0 whether or not the stage came back, because the
-  first look finds the pattern at zero shift. The result is as good as the specks are.
+  the return check would read the camera's own pattern as well: on such a field the
+  frame after the return reads a shift of zero whether or not the stage came back
+  (a return 70 µm off read 0.0 in the review of #625), so the result leaves
+  `return_error_um` **unknown** (`null`) and says so in `assumed` (`the return could
+  not be checked: on this field the camera's own pattern wins the correlation at zero
+  shift`). Check where the stage is after the run. The result is as good as the specks are.
 
 These checks are not made for you yet: whether a uniform scale error or a
 periodic target should be refused, and against what, waits for the data of the

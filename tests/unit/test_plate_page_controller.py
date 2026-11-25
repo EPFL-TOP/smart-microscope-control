@@ -7006,7 +7006,12 @@ def test_a_record_that_cannot_be_read_gives_no_failed_line(
 def test_the_failed_words_are_one_line_plain_and_cut_at_the_cards_bound(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
-    """FM-139, FM-205, FM-50: markup, a path and 700 characters in a tool's words, through the bound."""
+    """FM-205: markup, a path and 700 characters in a tool's words, through the bound.
+
+    This pins the model's text (one line, cut at the bound, the words as given). Whether
+    a browser shows a `Str` pane's text as text is not proved here (FM-271: it parses it
+    as HTML), and no test of the model can prove it.
+    """
     words = "the frame is <b>dark</b>\nin C:\\Users\\lab\\run\n" + "x" * 700
     _seed_calibration_record(
         run_doc,
@@ -7021,7 +7026,7 @@ def test_the_failed_words_are_one_line_plain_and_cut_at_the_cards_bound(
 
     assert shown is not None
     assert "\n" not in shown
-    # The text is kept as it is (the pane draws it as plain text); it is cut, not rewritten.
+    # The words are kept as given and cut, not rewritten (what a browser makes of `<b>` is FM-271's).
     assert shown.startswith("the frame is <b>dark</b> in C:\\Users\\lab\\run xxx")
     assert len(shown) == 601
     assert shown.endswith("…")
