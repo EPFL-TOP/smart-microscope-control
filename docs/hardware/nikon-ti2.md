@@ -1079,10 +1079,13 @@ near the wall (three runs of 2.5–2.7 s); `mirrored` false in both.
 - **On the plate with cells the 10× calibration refused at every field
   tried** (F14, #625), in phase contrast (Ph1): "the two moves gave
   parallel shifts", the probe frames spanning 6674 and 6574 counts. It
-  passed at once on beads in the morning. The page did not show the
-  refusal; the morning's calibration was reused with `from_run_doc`. A
-  reuse from the run document that is itself `--run-doc` refuses as "still
-  running or interrupted" and leaves its calibration `failed` (F15, #626).
+  passed at once on beads in the morning. Not Ph1 and not cells as such:
+  the fields held almost nothing and the camera's own pattern won the
+  correlation (measured offline on that afternoon's scan, m3 §4.4). The
+  page did not show the refusal; the morning's calibration was reused
+  with `from_run_doc`. A reuse from the run document that is itself
+  `--run-doc` refuses as "still running or interrupted" and leaves its
+  calibration `failed` (F15, #626).
 
 ### Scans and the page
 

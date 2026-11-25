@@ -1595,7 +1595,8 @@ def fit(
   structure, then the light path, then the stage", which names the frames
   before the stage as F12 at the 40x showed, #545; the plugin adds "the
   probe frames span <a> and <b> counts (1st to 99th percentile)" to the
-  reason), with a zero matrix and no division; and `max|M − ideal| >= pixel_size_um` ("the shifts do not fit
+  reason), with a zero matrix and no division (§4.4: a probe that read zero is read a
+  second time, away from zero shift); and `max|M − ideal| >= pixel_size_um` ("the shifts do not fit
   a rigid camera: did each axis move its full command?"), which refuses
   an axis that moves a fraction of its command, or none plus noise
   (review of #211).
@@ -1777,6 +1778,189 @@ with a textured `PlateSample`:
 **Failure modes**: FM-88, FM-64, FM-73, FM-75 (casts), FM-104 (finite
 pixel size), FM-85 (wait before the start is read; readbacks after the
 facade's move only), FM-50 (`reused_from` as typed).
+
+### 4.4 A sparse field: the camera's own pattern wins the correlation (#625)
+
+Fixed by #625's plan (2026-11-25). At the Ti2-E (session 6, F14, #620) *Calibrate the camera* at the
+10× in phase contrast (condenser module Ph1), on a plate with cells, was refused at every field the
+owner tried: `the two moves gave parallel shifts: ... the probe frames span 6674 and 6574 counts`.
+The morning's calibration, on a plate of beads, had passed at once. §4.1 says that the fit cannot
+tell a still background from a stage that did not move (F12, FM-222); this section measures what the
+correlation surface can tell, and adds a second look at the probes the first one read as zero.
+**Merging this section decides it.**
+
+#### 4.4.1 What was measured (2026-11-25, planning #625)
+
+Throwaway scripts, not committed, on the stand's own 10× scan of that afternoon
+(`local/scans/2026-11-24/scan/f48173057fed`: 436 frames of 1412 x 1412 in B3, B4, C3 and C4, PFS
+locked), scikit-image 0.26.0, numpy 2.5.5, scipy 1.18.1, Python 3.13:
+
+- **The fields the owner tried hold almost nothing.** The six frames nearest C3's centre, where the
+  owner drove (`C3_0060` is at 0 µm from it), span 6340 to 7026 counts from the 1st to the 99th
+  percentile: the refused probes' 6674 and 6574. After a high-pass such a frame is a smooth vignette,
+  the sensor's vertical column stripes, a few dust specks and a handful of dark specks (debris, a few
+  pixels across): no cell is visible, and the selection the cells stage drew over C3 marks few
+  detections in the whole well. The contrast the refusal quoted is the vignette's, not the sample's.
+- **The camera's own pattern wins at zero shift.** The refused probes cannot be had again (only the
+  last attempt is kept, and not its frames), so they are emulated from the scan. The camera's fixed
+  pattern `F` is the pixelwise median of 24 frames of the well (1230 counts of standard deviation); a
+  frame's *content* is the frame minus `F`, without its smooth part (Gaussian, 15 px) and without the
+  bins of its spectrum that do not exceed three noise sigmas (so that nothing that moves with the
+  content is the frame's own noise: a lower bound of what the sample shows); a probe is `F`, over the
+  window the two probes share (1049 x 1049 px), plus the content moved by the morning's matrix at its
+  step of 396.938 µm (+X: 10 rows up and 353 columns right; +Y: 353 rows up and 10 columns left),
+  plus noise of the frame's own sigma (128 counts, a robust estimate from the Laplacian), independent
+  in each probe. On the six frames nearest C3's centre `measure_shift` reads `(0, 0)` for both probes
+  six times in six, and `fit` refuses with the field's own words: parallel shifts, and no "barely
+  correlate" (the response at zero shift is 0.1 to 0.5). With the content smoothed by one pixel
+  instead (a cruder variant, which keeps part of the frame's noise as content) the phase correlation's
+  zero-shift peak stood at 0.24 to 0.27 and the sample's true peak at 0.04 to 0.08. Over 148 fields
+  spread over the four wells (every third frame of each) `measure_shift` reads `(0, 0)` twice in 148.
+- **It is not the cells and not Ph1.** The same emulation on the morning's plate of beads
+  (`local/scans/2026-11-24-train`, C3 and C2, 74 fields spread over the wells) gives
+  `(0, 0)` twice in 74: the morning's field had been chosen with beads in it (*focus by eye
+  on beads in B2*). F12's field of two beads in water was the same case (FM-222), and was calibrated
+  once the field held more.
+- **Removing the camera's pattern first does not help.** On 26 fields (every ninth frame of C3 and
+  B4): the plain estimate, a high-pass before the correlation, the pixelwise median of the three probe
+  frames subtracted from each, and both together, read the shift right and pass the fit on none; the
+  second look below does on 22. (The median of three frames is mostly the sample's, and a high-pass
+  leaves the dust, which is sharp.)
+- **The correlation surface tells them apart.** `measure_shift` keeps the highest peak, which is
+  the camera's. Taking the highest peak outside a square of 12 px around zero shift gives the shift of
+  the emulation (within 1 px, the sub-pixel step reading it to 0.1 px) on 124 of the 148 fields of the
+  cells and 67 of the 74 of the beads, with the best peak 7.7 to 9.6 times the next one on the six frames
+  nearest C3's centre. The ratio of the best peak to the highest one more than 10 px from it is the
+  measure of "stands out": the fields it reads right have a tenth percentile of 2.4 (cells) and 1.4
+  (beads), and the ones it reads wrong 1.0 to 1.5, except one of the cells' at 1.94 that is the right
+  peak, 1 px off. At 1.5 it accepts 123 of the 148 and 60 of the 74, none at another peak. **Not a camera's
+  peak**: a stage that did not move (the content where it was) gives at most 1.20 (20 emulated pairs) and a
+  field with no sample at all at most 1.19 (28 pairs, with 12 px excluded; with 3 px excluded the empty
+  field gave 1.7, the skirt of the zero peak). A camera aligned with the stage (the X probe on the row
+  axis, the Y probe on the column stripes' ridge) is read exactly, at 2.1 to 3.9. The sub-pixel step
+  written below equals `measure_shift` to 0.05 px on four synthetic shifts.
+- **F12's field changes its answer.** The suite's own field of two beads over a still background
+  (`_StillBackgroundCamera`, 384 x 512, 96 µm at 1 µm per pixel): both probes read `(0, 0)`, the second
+  look reads `(0, -96.3)` and `(96.3, 0)` at 4.7 and 4.9 times, one bead at 19 and 24, no bead at
+  1.01 and 1.06. `test_parallel_shifts_on_two_beads_over_a_still_background_name_the_frames_before_the_stage`
+  asserts a refusal for it, and will assert a calibration (§4.4.4).
+
+#### 4.4.2 Decisions
+
+- **D1 A peak at zero shift is the camera's.** When the stage moved a probe of tens of pixels, a
+  peak at zero shift is what did not move: dust, shading and the column pattern fixed to the sensor.
+  `measure_shift` is not changed: it is the answer for every field that calibrates today (§4.1) and
+  the return check's. A **second look** runs only where the first gave nothing.
+- **D2 The second look** is `measure_shift_away_from_zero(reference, moved, *, exclude_px=12)`, in
+  `algorithm.py`. It takes the frames `measure_shift` takes (float64, mean-subtracted, divided by the
+  standard deviation, the same `ValueError`s), forms the cross-power spectrum with its magnitude
+  normalised to 1 (floored at 100 machine epsilons, as scikit-image's `normalization="phase"` does),
+  and takes the absolute value of its inverse FFT. The cells with `|row| <= exclude_px` and
+  `|col| <= exclude_px` of zero shift (wrapped) are set to 0; the highest remaining cell is the integer
+  peak; `peak_ratio` is its value over the highest cell outside a square of `PEAK_SEPARATION_PX` (10)
+  around it. The sub-pixel shift is the matrix-product DFT around the integer peak at `UPSAMPLE`, in a
+  window of `ceil(1.5 * UPSAMPLE)` samples, as scikit-image does (`//` and `int`, never `np.fix`,
+  which numpy 2.5 deprecates). The shift is negated as `measure_shift`'s, and `response` is
+  `_response`'s at that shift. A flat frame is `AwayShift(Shift(0.0, 0.0, 0.0), 1.0)` without a
+  correlation; a frame with a side of `4 * exclude_px` or less is a `ValueError`. 12 px is the
+  zero peak's skirt, which reaches 4 to 5 px and put an empty field's best "other" peak at 1.7 with
+  3 px excluded.
+- **D3 When.** `PARALLEL_SHIFTS_NOTE` is in the first fit's notes **and** at least one probe's first
+  shift is within `FIXED_SHIFT_PX` (2.0) of zero on both axes (`reads_the_fixed_pattern`). Nothing else
+  triggers it: a fit whose only note is "barely correlate", a rigid-camera refusal, a trustworthy fit
+  and a dark probe keep their paths. When it runs, it runs for **both** probes, and a refusal that
+  follows it says what it saw (D5).
+- **D4 Accepted** when both probes' `peak_ratio` is at least `MIN_PEAK_RATIO` (1.5) **and** the two
+  shifts are a rigid camera's (`shifts_of_a_rigid_camera`: lengths within `RIGID_MAGNITUDE_TOLERANCE`,
+  10 %, and the angle between them within `RIGID_ANGLE_TOLERANCE_DEG`, 10°, of a right angle, for a
+  mirrored camera as for the others). `fit` is then run again on the second look's shifts and judged
+  as ever (its notes, the rigidity, the response, `precision_reasons`): a second look that is
+  accepted and a fit that is not is a refusal with the fit's own notes. The second test guards
+  independently of the first: on the 148 and the 74 emulated fields it rejected none that the ratio
+  had accepted, so it costs nothing there.
+- **D5 What it says.** *Accepted*: one line of `assumed`, after the step lines and before
+  `precision_line`'s, at most 160 characters (FM-205): `sparse field: the camera's own pattern won at
+  zero shift, so both shifts are the strongest peaks away from it (<a> and <b> times the next, 1.5
+  asked)`, the ratios to one decimal. `response` is the smaller of the two second-look responses; it
+  counts the camera's pattern too, so it is not evidence of the sample's texture, and the line says why
+  the result was read this way. *Refused*: the reason is `<notes>; the probe frames span <a> and <b>
+  counts (1st to 99th percentile); away from the camera's own pattern the best peaks are <a> and <b>
+  times the next (1.5 asked); step <s> µm`, then the wrap hint when it applies.
+- **D6 The reuse is offered where it can work.** A refusal for texture (`PARALLEL_SHIFTS_NOTE` or
+  `the frames barely correlate`) ends with `; if this camera was calibrated at this objective before,
+  reuse that calibration with from_run_doc=<its run document> (nothing moves)`. The tool cannot know
+  what the stand holds (it reads no other document), so the sentence is conditional and the page does
+  not add a path it does not hold. The reason stays within 600 characters (the page's card bound,
+  `_CARD_TEXT_CHARS`): 566 at the longest (five-digit spreads, a 2000 µm step and the wrap hint).
+- **D7 What does not change.** `measure_shift`, `fit`, `precision_reasons`, the dark and saturated
+  refusals, the return check, the loop's moves and its FM-88 returns, the slot's fields, and the
+  rule that nothing fills the slot on a refusal. A calibration the second look accepted is a
+  `CameraCalibration` like any other, and says so in `assumed`.
+
+#### 4.4.3 Interface
+
+```python
+# camera_calibration/algorithm.py
+FIXED_PATTERN_EXCLUDE_PX = 12
+PEAK_SEPARATION_PX = 10
+MIN_PEAK_RATIO = 1.5
+FIXED_SHIFT_PX = 2.0
+RIGID_MAGNITUDE_TOLERANCE = 0.10
+RIGID_ANGLE_TOLERANCE_DEG = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class AwayShift:
+    shift: Shift
+    peak_ratio: float
+
+
+def measure_shift_away_from_zero(
+    reference: npt.NDArray[Any],
+    moved: npt.NDArray[Any],
+    *,
+    exclude_px: int = FIXED_PATTERN_EXCLUDE_PX,
+) -> AwayShift: ...
+def reads_the_fixed_pattern(shift: Shift) -> bool: ...
+def shifts_of_a_rigid_camera(shift_x: Shift, shift_y: Shift) -> bool: ...
+```
+
+`plugin.py` keeps the three frames (12 MB in all at 1412 x 1412 and 16 bits), asks the second look
+only on D3's condition, after the dark-probe judgement and before the error is raised, and builds
+D5's two texts.
+
+#### 4.4.4 Tests
+
+`tests/unit/test_camera_calibration_away.py` (new: no other module has that name) on a seeded
+synthetic sparse field, 384 x 512, a step of 96 px, built from what §4.4.1 saw: the camera's pattern
+is a vignette `30000 - 3000 r^2` (`r^2 = ((y - H/2) / (H/2))^2 + ((x - W/2) / (W/2))^2`), a stripe of
+`N(0, 150)` counts per column, and 60 discs of radius 2 at `-1500 * U(0.6, 1.4)` (a Gaussian of
+1 px over them); the sample is a canvas 120 px larger on each side with 45 discs of radius 3 at
+`-2000 * U(0.6, 1.4)` (the same softening); a probe is the pattern plus the canvas window moved
+by `(d_row, d_col)` = `(0, 96)` for +X and `(-96, 0)` for +Y, plus `N(0, 128)` noise drawn for each
+probe; `np.random.default_rng(seed)` draws the pattern, the canvas and the noise in that order.
+Measured over seeds 0 to 29 (numpy 2.5.5): `measure_shift` reads `(0, 0)` on both probes for 29,
+the second look reads the shifts to 1.2 px or better (0.2 to 1.2, median 0.5) with the lowest ratio
+at 1.82 and the median at 2.5; a stage that did not move reads 1.00 to 1.06 and a field with no
+sample 1.00 to 1.02 (seeds 0 to 4). The tests **assert this premise** (`measure_shift` reads
+`(0, 0)`: FM-222's test asserts its three moves and two shifts of zero the same way), so that a
+generator that drifts fails where it is, and use seeds for which it holds. And: the known shifts
+recovered away from zero and agreeing with `measure_shift` to 0.05 px on a rich pair; a stage that
+did not move and an empty field give no ratio of 1.5; a camera aligned with the stage is read on the
+axes; a flat frame and a frame under the exclusion; the rigid check at its tolerances (both senses,
+mirrored); `reads_the_fixed_pattern` on each side of 2.0 (at 1.5 and at 3.0).
+`tests/test_camera_calibration_demo.py`: the F12 test becomes a calibration with D5's line whole
+(and the pixel size within 2 %), a bead-free still background keeps D5's refusal whole, a stage that
+did not move over the camera's pattern keeps it too, the texture refusals end with D6's sentence,
+and the reason's length is bounded.
+
+#### 4.4.5 Not verified (for the owner)
+
+The second look at the stand: no probe frame of a refused calibration was ever saved, and the
+emulation moves a real frame's content over a median of the scan's frames. A calibration at the 10× in
+Ph1 on the plate with cells (or any sparse field), reading the pixel size and rotation the morning gave
+(1.12432 µm per pixel, 178.33°), is the check; so is one on a field the tool must still refuse (an empty
+well).
 
 ## 5. Plate registration and going to a well (#19)
 
