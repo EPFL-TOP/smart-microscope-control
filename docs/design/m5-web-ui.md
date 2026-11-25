@@ -6739,6 +6739,12 @@ document against the position of its file, **D22** says a folder the page cannot
 **D23** gives `/ui-check`'s summary a line for the block. D12, D15, D16, D17 and D18 each end with a
 pointer to the decision that amends them.
 
+Amended by #617's plan (2026-11-25), the follow-up D19 left open (the Wells and Scan screens at
+another objective): **D24** has the page give `scan-plan` the held document of the plan's objective,
+decided at the click, **D25** is what that click reads and the one refusal it makes, **D26** says it
+before the click (the Wells screen's note and the command under *Lay out the fields*), and **D27** is
+what stays as it was. D19 ends with a pointer to D24.
+
 #### 18.6.1 What was measured (2026-11-17, planning #501)
 
 Throwaway scripts that are not committed, on `main` at `405590c`, pymmcore-plus 0.18.1, Python
@@ -6819,6 +6825,53 @@ Chromium 1255 (the project asks 1.64), `demo-sample` turned as above and registe
   without the right to list a folder (NTFS can bypass traverse checking, so a file's `stat` may
   succeed where the folder's listing would not), Panel 1.9.4, Python 3.10, the turn at the handset
   between the click's read and the tool's (the stub that turns the turret in its run stands for it).
+
+**Measured again for #617 (2026-11-25, planning #617)**: throwaway scripts that are not committed, on
+`main` at `1068d25`, pymmcore-plus 0.18.1, Python 3.13.0, `demo-sample` turned as above and registered
+under the 10X, the 40X calibrated by the Stand screen's button (`calibrate_camera`, into
+`position-1.json`), the page's own `PlatePage.run`.
+
+- **What the click makes today.** `run("scan-plan", ["wells=A1"])` at the 40X: `done`,
+  `matrix_um_per_px ((0.25, 0.0), (0.0, -0.25))` for a camera turned 29.97° and mirrored,
+  `matrix_source` `profile`, `calibration_from` `None`; its `assumed` lines are the objectives'
+  offset, `camera calibration not used: it is of Nikon 10X S Fluor, the plan is for Nikon 40X Plan
+  Fluor ELWD; give calibration, ...` and `no camera calibration for Nikon 40X Plan Fluor ELWD:
+  rotation 0 and no mirror assumed`. The strip says `Field layout done in 0.0 s; assumed: the offset
+  between ... (+2 more, on the card)`: the first line it shows is the offset's, and the two that say
+  the camera was not used are on the card. That is the quiet failure.
+- **The same click with the document.** `calibration=<position-1.json, absolute>`: matrix
+  `((-0.2164, 0.1248), (-0.1246, -0.2164))` (turned and mirrored, as the document's),
+  `matrix_source` `camera-calibration`, `calibration_from` the path as given, `calibration_measured`
+  the record's time to the second, and `assumed` only the offset's line and the gaps' one (`the camera
+  is turned 29.9° from the stage axes: ...`).
+- **What the tool refuses, and what a refusal costs.** Typed `objective=<the 10X>` beside the 40X's
+  document: `Field layout failed: scan-plan: the calibration in <path> is of Nikon 40X Plan Fluor
+  ELWD, the plan is for Nikon 10X S Fluor: ...`, and the `scan-plan` record is `failed`: a document
+  the tool refuses replaces the usable plan (§11.4, FM-206). A document whose `image_shape_px` was
+  edited to `[1024, 1024]` (the camera gives `(512, 512)`) is **read as usable by the page's own
+  `_read_calibration`** (`problem` `None`, the objective right: `CalibrationRead` holds no frame), and
+  the tool then fails with `the calibration in <path> is of a frame of (1024, 1024), the camera gives
+  (512, 512) (binning or the region changed): ...`. With `pixel_size_um=0.3` beside `calibration`:
+  `scan-plan: ParamsError: ... give pixel_size_um or calibration, not both`, nothing written; with
+  `calibration` twice: `'calibration' given twice`. A pair the page adds is therefore added only when
+  neither is typed.
+- **What `parse_params` reads.** `objective=null` is `None`, `objective=` (blank) is `''` (the tool
+  refuses it: `objective '' is not on the turret`), `calibration=null` is `None`.
+- **The camera's frame.** `Camera.image_shape()` is `(512, 512)` on the demo, 4.6 µs a call (1000
+  calls), a tuple of ints equal to the `image_shape_px` of a document the same camera made, and it
+  reads on a halted stand (`state().halted` was `True`): a read is not a move. `FakeCore.image_shape`
+  is `(512, 512)` and a plain attribute; the unit module's `_calibration` helper writes `(384, 512)`,
+  so a document made with it is of another frame than the fake camera's until one of the two is set.
+  `Microscope.override(Camera, <a class that delegates by __getattr__>)` is refused (`TypeError: ...
+  does not implement Camera: it lacks one of its methods`): a test that wants another frame changes
+  the document's or the fake core's.
+- **The test seam.** A stub tool named `scan-plan` with `Params = ScanPlanParams`, loaded from its own
+  entry-point value, is parsed by `_prepare("scan-plan", ["wells=A1"])` into a `ScanPlanParams`, and
+  `run` hands the stub that same object (`seen[0].calibration` `None`).
+- **Session 6's hand-typed form.** The report of Ti2-E session 6 (#620) shows `scan-plan ...
+  calibration=<position-3.json>` typed by the owner in step 9b, so the form works on that stand.
+- **Not measured**: the frame at the Ti2-E's camera (its binning), a Windows path in `calibration=`
+  and in the command shown, the page at the Ti2-E.
 
 #### 18.6.2 Decisions
 
@@ -7010,7 +7063,7 @@ Chromium 1255 (the project asks 1.64), `demo-sample` turned as above and registe
     (`camera calibration not used: ...; give calibration, a run document whose camera-calibration was
     made with <objective> in place`) and plans with rotation 0 and no mirror, as it already did for
     every objective but the calibration's. Before this decision the same click put the plate out of
-    date, which was loud; the page does not yet give `scan-plan` the pair (§18.6.5, #617).
+    date, which was loud; the page did not yet give `scan-plan` the pair: D24 (#617) does.
 - **D20 The light in `calibrate_wait`** (the deferred finding of #501's review; FM-206). A calibration
   that the tool refuses for a dark frame is a `failed` record, and it replaces the position's usable
   document (§18.6.1). `calibrate_wait` takes `light_on: bool | None`, keyword-only and **required** so
@@ -7068,6 +7121,119 @@ Chromium 1255 (the project asks 1.64), `demo-sample` turned as above and registe
   states still show the block hidden or off the screen. Not done: a way for the page to say that the
   block is long at 1280 x 800 (the lead, the list, then the button), which is the owner's walk with a
   newcomer, not a test.
+
+- **D24 The page gives `scan-plan` the held document of the plan's objective, decided at the click**
+  (#617; the second half of FM-216, left by D19). After a registration under the 10X, *Lay out the
+  fields* at the 40X planned with the profile's size, rotation 0 and no mirror (§18.6.1: the strip
+  shows the offset's `assumed` line, the two that say the camera was not used are on the card), where
+  the 40X's calibration is in `calibrations/position-<n>.json` and the tool has a parameter for it.
+  - **Where.** `PlatePage._prepare`, for `plugin == "scan-plan"` run into the page's own document
+    (`doc_path is None`) when the parsed parameters are a `ScanPlanParams`, between
+    `RunDocument.load_or_new` and `check_ready`. Every way to run the tool goes through it: *Lay out
+    the fields*, the expert view's *Run* of the tool, the next step's *Run* (`on_next`) and the
+    `scan-plan` of the chain *Measure the time* (on the worker, after `timing`). `_prepare` parses the
+    pairs as given and, when the decision below gives a document, parses again with
+    `calibration=<path>` added, so the record's `params` and the run are a typed pair's. **`page_params
+    ("scan-plan")` and the next step's pairs are unchanged**: they are read at a view (FM-145: no read
+    of the stand) and `on_next` runs the pairs as drawn, so a pair carried in them would be a copy that
+    a turn or a new calibration has made old (FM-177, FM-151).
+  - **The plan's objective** is `parsed.objective` when it is set (the expert view's field: the tool
+    reads it so), else the label the turret reads at the click. A blank one is no objective.
+  - **The decision** is one pure function, `plan_calibration` (§18.6.3), that the click, the Wells
+    screen's note and the command read (FM-169). The first that holds:
+    1. no offer (`plate_objective` is `None`: the plate was not registered from its walls, D2):
+       nothing, no note. The calibration is `run.json`'s, where the Stand screen's button writes it
+       for such a plate (D19), and `scan-plan` reads it there;
+    2. the parameters already hold `calibration` or `pixel_size_um` (`given`): nothing, no note. The
+       operator chose; the tool's rules (`given twice`, `not both`, §18.6.1) stay the tool's, and a
+       pair the page makes never causes them;
+    3. no objective, or a blank one: nothing, no note (the tool says `no objective is in place`);
+    4. not `calibration_goes_to_a_document(plate_objective, objective)`, the plan being for the
+       plate's own objective: nothing, no note (D19's condition; the plate's calibration is
+       `run.json`'s);
+    5. no turret position for the objective (`turret_position(labels, objective)` is `None`: the
+       labels were not read, two positions carry it, or it is past position 12): nothing, and the note
+       says it (`calibrate_position_unknown`);
+    6. the held document at that position: **no file**: nothing, the note says `none has been made`;
+       **a `problem`** (a failed record, a file that cannot be read, a document of another stand, a
+       document made in a dry run for a real plan: `_read_calibration` reads as the tool does):
+       nothing, the note says the problem; **no document read because the folder was denied** (D22):
+       nothing, the note says the `denied` line;
+    7. the document's objective is not the plan's (`calibration_at_its_position`, D21: a turn during
+       a run, a relabelled turret): nothing, the note names the objective the file holds;
+    8. at the click only, the camera's frame is known and is not the document's `image_shape_px`
+       (`CalibrationRead` holds it since #617): **refused** (D25);
+    9. else the document, as `Path(read.path).absolute()` (never `resolve()`: FM-24, FM-50), given as
+       `calibration=<path>`. Absolute so that the command the page shows runs from any folder, as
+       its `--run-doc` does (`command_for`).
+  - **Rejected**: `page_params` filling it (a copy, and a read of the stand at every redraw); a mode
+    of the tool that takes the document "if it fits" (a change of a tool: m3 §23 keeps a document
+    that was asked for refused, and the page is the one that can know what fits before the click);
+    copying the document into `run.json` (FM-216: it replaces the registration's calibration);
+    sending `objective=` beside the pair so that the tool cannot read another label than the page
+    did (a pair nobody typed, closing only the milliseconds between the click's read and the tool's:
+    a turn at the handset in that window is a `failed` record that says `the calibration in <path>
+    is of <X>, the plan is for <Y>`, loud, **not covered**).
+- **D25 What the click reads, and its one refusal.**
+  - **Reads**, never the tick's copies (FM-177, FM-151): `_plan_reading` gives the turret's label,
+    every position's label and `Camera.image_shape()` in one read a Disconnect waits for, and
+    `_held_calibrations()` (D15: twelve `stat`s and at most three reads, 0.1 to 0.2 ms warm,
+    §18.6.1) the documents. They are read only when the offer exists, the parameters hold neither
+    `calibration` nor `pixel_size_um` and the plan's objective is not the plate's (items 1 to 4,
+    asked first), so a layout at the plate's own objective reads no document. A frame that cannot be
+    read (no camera, a read that raised, a side under 1) is `None`: nothing is added and nothing is
+    refused (unknown beats guessed; the tool then decides, as it did), and a read that raised is one
+    WARNING line with the error's class and one line, never kept (FM-98). Nothing here moves or turns
+    anything (FM-14, FM-88).
+  - **The one refusal** is item 8. The document exists, the Wells screen has said that the plan uses
+    it, and the camera's frame is the one thing the tick does not read; the tool would refuse it with
+    a `failed` record that replaces the usable plan (measured; FM-206). So `_prepare` returns
+    `Field layout: <plan_calibration_frame(...)>` as the outcome, **nothing written and nothing
+    started**, before `check_ready`. Every other case the page can see before the click adds nothing
+    and **says so before the click** (D26): the tool's own `assumed` lines stay. The frames are
+    compared as the tool compares them, `(height, width)` with `==`: a transposed frame is another
+    frame (FM-73). The way out is to calibrate again at the objective (the Stand screen's button,
+    whose run replaces the document).
+  - A dry-run page reads a real document without complaint, and a document made in a dry run is, for
+    a real plan, a `problem` (the tool's own rule, through `_read_calibration(dry_run=...)`): nothing
+    added, said in the note (FM-182). A chain's `scan-plan` is prepared by the worker after `timing`,
+    reads the same, and a refusal ends the chain as any `_prepare` refusal does.
+- **D26 The Wells screen says it before the click, and the command says what the click makes.**
+  - **A note under *Lay out the fields*** (`layout_calibration_text`, a text pane under `layout_wait`
+    that takes no height while it says nothing, `_say`): the line `plan_calibration` gives for the
+    objective of the last tick, drawn **by the tick** and by every redraw (a turn at the handset is
+    followed at the next tick), from the status's objective and connection, the offer, the view's
+    `calibrations` and `calibrations_denied`, the page's copy of the labels and the typed
+    `objective`, `calibration` and `pixel_size_um` of the `scan-plan` fields (`null` reads as unset,
+    as `parse_params` does). **No stand and no file is read** (FM-145), and the frame is not compared
+    (`frame_px=None`: only the click reads the camera). Nothing is drawn with the stand closed or
+    without a view. It is a note and never a wait: the button is not disabled by it, since the
+    operator may want rotation 0 and the tool's `assumed` lines say it after the plan. It says
+    either `Lay out the fields uses the camera calibration of <O> made on <date>
+    (calibrations/position-<n>.json): the camera's turn and mirror are measured, not assumed.` or
+    `No camera calibration of <O> can be used (<why>): Lay out the fields assumes the profile's pixel
+    size, rotation 0 and no mirror, and the positions of cells in the fields will be wrong if the
+    camera is turned or mirrored. To get one: Stand screen, Calibrate the camera, with <O> in place.`
+  - **The command** under *Lay out the fields* gets `calibration=<the path>` appended to the pairs it
+    is given when the same decision gives a path (`_draw_layout_command`: the page's pairs, the typed
+    fields, this one), so that the line is the call the click makes (ADR-0006, principle 5) and a
+    terminal's run of it plans the same. The tick draws it again **when the path changed** since the
+    last drawing, from the pairs of the last redraw (no new read of the run document). It is the
+    tick's copy, one tick old after a turn or a new calibration, which the click's own read makes
+    harmless.
+  - What is designed is what the line must say (what is used or assumed, and where to get it); the
+    final words are the owner's walk with a newcomer to confirm (the issue's note).
+- **D27 What stays.** The expert view's `calibration` field still works and wins: typed, it is the
+  only one in the pairs, the note is silent and the command is the typed one; so does a typed
+  `pixel_size_um`, and a typed `objective` is the plan's objective for the decision. The Stand
+  screen's routed note (D19) says what uses the document now: `calibrate_stand_routed` ends `Lay out
+  the fields (Wells screen) and Measure the offsets between objectives (Plate screen) use it.` (it
+  said only the second). The next step's command (the expert view) is the pairs of its last view and
+  is **not** changed: its *Run* does give the document at the click, and the *Command* under *Lay out
+  the fields* shows the whole call. A plate registered by eye has no offer, and nothing is added for
+  it (item 1). The Scan screen has nothing to add: the plan's matrix goes with the plan, which `cells`
+  and `route` read (m3 §23). No new button and no new handler (FM-171 is not touched), no tool
+  change, no `ui_snap.py` change.
 
 #### 18.6.3 Interface
 
@@ -7237,8 +7403,8 @@ def calibration_denied(folder: str, reason: str) -> str: ...
   position past the labels, an objective that is `None` or blank, another label).
 - `calibrate_stand_routed(P, X, f)` (D19): `The plate was registered with <P>: a calibration at <X> here
   is kept in its own document, calibrations/<f>, and the plate's calibration stays as it is.
-  Measure the offsets between objectives (Plate screen) uses it.` (`<f>` is `calibration_file(n)`).
-  `calibrate_command_folder_note(F)`: `The folder <F> must exist first: the page makes it, a terminal
+  Measure the offsets between objectives (Plate screen) uses it.` (`<f>` is `calibration_file(n)`;
+  *its last sentence is D27's since #617*). `calibrate_command_folder_note(F)`: `The folder <F> must exist first: the page makes it, a terminal
   does not.`
 - `calibrate_measured_other(e, m, f)` (D21): `it measured <m>, not <e> as the button said (the turret
   was turned during the run): <f> holds a calibration of <m> and <e> has none; put <e> in place and
@@ -7296,6 +7462,101 @@ view (FM-145); `_calibrations_held_lines` passes `at_position`, draws `calibrati
 heading and lists no `no calibration yet` while it is set. `scripts/dev/ui_snap.py`: `OFFSETS_MEASURE`
 and `_offsets_block_line(page)`, which `_on_screen` appends (D23).
 
+**Added by #617's plan (2026-11-25)**, texts character for character, in `smc/ui/guide.py`:
+
+```python
+PLAN_CALIBRATION_NONE_MADE = "none has been made"
+```
+
+```python
+def plan_calibration_used(objective: str, file: str, measured: str) -> str: ...
+def plan_calibration_missing(objective: str, why: str) -> str: ...
+def plan_calibration_other_objective(file: str, found: str | None) -> str: ...
+def plan_calibration_frame(
+    objective: str, file: str, held_px: tuple[int, int], camera_px: tuple[int, int]
+) -> str: ...
+```
+
+- `plan_calibration_used(O, f, m)` (D26): `Lay out the fields uses the camera calibration of <O> made
+  <when> (calibrations/<f>): the camera's turn and mirror are measured, not assumed.` `<when>` is `on
+  <the first ten characters of m>` when `m` is an ISO time and `at an unknown time` otherwise, as
+  `calibration_held_line` says a date; `<f>` is `calibration_file(position)`.
+- `plan_calibration_missing(O, w)` (D26): `No camera calibration of <O> can be used (<w>): Lay out the
+  fields assumes the profile's pixel size, rotation 0 and no mirror, and the positions of cells in
+  the fields will be wrong if the camera is turned or mirrored. To get one: Stand screen, Calibrate
+  the camera, with <O> in place.` `<w>` is, by D24's items, `calibrate_position_unknown(O)`,
+  `PLAN_CALIBRATION_NONE_MADE`, the held document's `problem` as it is, the `denied` line as it is,
+  or `plan_calibration_other_objective(f, n)`.
+- `plan_calibration_other_objective(f, n)` (D24 item 7): `calibrations/<f> holds a calibration of
+  <n>`, `<n>` being `an unknown objective` for `None`.
+- `plan_calibration_frame(O, f, h, c)` (D25): `the camera calibration of <O> in calibrations/<f> is
+  of a frame of <h0> by <h1> px, the camera gives <c0> by <c1> (binning or the region changed):
+  calibrate the camera at <O> again (Stand screen, Calibrate the camera)`; the outcome is that text
+  after `tool_title("scan-plan")` (`Field layout`), a colon and a space. Every text is one line
+  (`_flat`), plain (FM-139: a label and a path come from outside).
+- Changed, text for text (D27): `calibrate_stand_routed` ends `... and the plate's calibration stays
+  as it is. Lay out the fields (Wells screen) and Measure the offsets between objectives (Plate
+  screen) use it.`
+
+`smc/ui/controller.py`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class PlanCalibration:
+    path: Path | None = None
+    note: str = ""
+    refusal: str | None = None
+```
+
+```python
+def plan_calibration(
+    *,
+    plate_objective: str | None,
+    objective: str | None,
+    given: bool,
+    labels: Sequence[str],
+    documents: Sequence[HeldCalibration],
+    denied: str | None,
+    frame_px: tuple[int, int] | None,
+) -> PlanCalibration: ...
+```
+
+```python
+CalibrationRead.image_shape_px: tuple[int, int] | None = None  # new, with a default
+
+
+def _plan_reading(
+    self,
+) -> tuple[str | None, tuple[str, ...], tuple[int, int] | None]: ...
+def _plan_calibration_for(
+    self, doc: RunDocument, parsed: ScanPlanParams
+) -> PlanCalibration: ...
+```
+
+- `plan_calibration` is D24's list, in its order, and nothing else decides: `path` is the document
+  (item 9), `note` the line of items 5 to 7 and of item 9 (`plan_calibration_used`, from the held
+  read's objective and time), `""` for items 1 to 4, and `refusal` the text of item 8, with `path`
+  `None`. `frame_px` is `None` when the caller does not read the camera (the tick) or could not
+  (the click): the frames are then not compared. A `documents` entry is the one whose `position` is
+  `turret_position(labels, objective)`.
+- `_read_calibration` fills `image_shape_px` from `found.image_shape_px`; nothing else of §18.3
+  changes. `_plan_reading` is `_turret_reading` without the light and with the frame: one
+  `_reading()`, `(None, (), None)` with the stand closed.
+- `_plan_calibration_for` is D25's reads and the two cheap conditions asked first; it returns a
+  `PlanCalibration()` (nothing) for a page with no offer. `_prepare` calls it for `scan-plan` only (`doc_path`
+  `None`, the parsed parameters a `ScanPlanParams`), and returns `f"{tool_title(plugin)}: {refusal}"`
+  for a refusal, or parses again with the pair for a path.
+
+`smc/ui/plate_page.py` (`PlatePageView`): `layout_calibration_text` under `layout_wait` in
+`_wells_region` (a `_wrapped_text()`, hidden while empty); `_plan_calibration_drawn()`, which calls
+`plan_calibration` with the status's objective (the typed `objective` if there is one), the view's
+offer, labels, `calibrations` and `calibrations_denied`, `given` from the typed `calibration` and
+`pixel_size_um`, and `frame_px=None`; `_draw_wells_screen` draws the note from it at every tick;
+`_draw_layout_command` appends `calibration=<path>` to its pairs, and the tick calls it again when
+the drawn path changed (`_layout_path_drawn`, per tab: FM-151). `_on_field_changed` already calls
+`_draw_layout_command`; it draws the note too, since a typed field changes what the decision says.
+All from the status and the last view (FM-145).
+
 #### 18.6.4 Tests and failure modes
 
 - `tests/unit/test_ui_guide.py` gains the pure tests of §18.6.3 (names in the plan);
@@ -7333,6 +7594,31 @@ and `_offsets_block_line(page)`, which `_on_screen` appends (D23).
   Stand screen's button (§18.6.1, D17): the develop session of #557 edits its last *Check* to say
   that the button now routes, and FM-206's and FM-177's *Check* with the light and the record; a new
   entry only if a review confirms a kind the tests miss.
+- **#617 adds** the tests of D24 to D27 in three new modules (`tests/unit/test_plate_page_plan_calibration.py`,
+  the controller's part on a stub `scan-plan` whose `Params` is `ScanPlanParams`;
+  `tests/unit/test_plate_page_plan_calibration_view.py`, Panel; `tests/test_plate_page_plan_calibration_demo.py`,
+  `@pytest.mark.demo`, the whole chain on `demo-sample` with the camera turned and mirrored) and edits
+  `tests/unit/test_ui_guide.py`, the two modules of §18.6.4's first bullet that pin the Stand screen's
+  routed note, and `tests/unit/test_plate_page_calibrations.py` for `CalibrationRead.image_shape_px`.
+  **Failure modes**: FM-216 (the third instance: a per-objective value that the page's own
+  `scan-plan` call did not take from the document the page itself keeps; the page gives it, from the
+  document of the objective's turret position, and never copies it into `run.json`), FM-206 (a row
+  of the tool's refusals that depends on the stand, the camera's frame, read **at the click** and
+  refused before anything is written, where every other row is the note's; a document the tool would
+  refuse is never sent), FM-177 and FM-151 (the click reads the turret, the documents and the frame
+  again and never sends the tick's copy; a turn at the handset between the tick and the click sends
+  the new objective's document or none), FM-169 (one pure function for the note, the command and the
+  click), FM-145 (the note and the command are drawn from the status and the last view; the reads are
+  the click's), FM-125 and FM-98 (a held document is data; a read that raised is text, nothing kept),
+  FM-24 and FM-50 (an absolute path, never resolved; compared with `samefile` or `as_posix`), FM-73
+  (a transposed frame is another frame), FM-139 (plain text), FM-175 (the command with a
+  `calibration=` path on a Windows page keeps the quoting note), FM-182 (a dry-run page walked), FM-238
+  (the held documents are read at a click that `run` has already checked for a busy page, or on the
+  worker), FM-45 (every text is asserted whole), FM-14 and FM-88 (nothing here moves or turns
+  anything: asserted by the turret's label and the stage's position after the click). **FM-216 and
+  FM-206 already have lines**: the develop session of #617 edits FM-216's last *Check* to say that the
+  page's `scan-plan` takes the position's document, and FM-206's to name the camera's frame as the
+  row read at the click; a new entry only if a review confirms a kind the tests miss.
 
 #### 18.6.5 What this does not do
 
@@ -7341,10 +7627,11 @@ and `_offsets_block_line(page)`, which `_on_screen` appends (D23).
   Stand screen), delete or move a document, or keep a document per stand: a folder shared by two
   stands holds one position's document of whichever ran last, and the other's reads as `camera-
   calibration was run on <stand>, this is <stand>`.
-- It does not give `scan-plan` the document of the scan's objective (its `calibration` parameter,
-  M3 §23, is the expert's; a pair the page fills from the held document is #617, which D19 makes
-  more pressing: the Wells screen at another objective plans with run.json's calibration set aside) or
-  write the position's calibration anywhere but its own file.
+- It does not write the position's calibration anywhere but its own file. *(It did not give
+  `scan-plan` the document of the plan's objective either, M3 §23's parameter being the expert's;
+  D24 to D27, #617, do, at the click, for a plate registered from its walls under another
+  objective.)* It still gives nothing to a plate registered by eye, whose calibration is
+  `run.json`'s, nor to the next step's command (D27), and it does not change `scan-plan`.
 - It does not hide or refuse the Stand screen's *Calibrate the camera* (D19 routes it, only for a
   plate registered from its walls under another objective), and does not guard the expert view's
   *Run camera-calibration*, which still writes `run.json`.
@@ -7357,7 +7644,11 @@ at the 10× and the 40× at the plate's height, the run's time, the stage's retu
 10× and 4× → 40× measured with them, a Windows PC's `calibrations\position-<n>.json` and the
 block read by a newcomer. For #557: the Stand screen's button routed at the Ti2-E (the note, the
 folder made, the document read back, `run.json` untouched), the light read there (`LightSource.is_on()`
-of its lamp) and the refusal it gives, and `Path` denials on a Windows account.
+of its lamp) and the refusal it gives, and `Path` denials on a Windows account. For #617: the Wells
+screen's note and *Lay out the fields* at the 40× at the Ti2-E (the plan's matrix the document's, the
+camera's frame as `Camera.image_shape()` reads it there, the cells' positions of a route landing on the
+cells), the command's `calibration=` path pasted in a Windows shell (FM-175), and the note's wording read
+by a newcomer (the owner's walk).
 
 ## 19. The Plate screen suggests wells the stand can reach (#512)
 
