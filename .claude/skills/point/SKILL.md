@@ -132,6 +132,15 @@ The session ends when the list is posted.
    naming no step, a later step of its own lane, or a cycle of lanes that
    wait for each other).
 
+   **A Point posted while lanes run ends them** (2026-11-25, morning: `/lane S1` and
+   `/lane S2` stopped on the new Point's comment id, and `lane.py` dates a plan against
+   the newest Point, so a lane copied as it was would have asked for finished plans
+   again). When `point.py` shows a lane whose newest note is not `lane done`, tell the
+   owner **before posting** that those lanes will stop and must be relaunched, and
+   write each of them from its **first unfinished segment**: `/develop n` for an issue
+   whose plan is posted, never a finished `/plan n`; the step is `lane.py <S>`'s
+   first line that is not `done`.
+
    No history and no explanations unless the owner asks.
 
 ## Never

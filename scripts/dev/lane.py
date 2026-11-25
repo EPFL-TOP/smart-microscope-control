@@ -49,16 +49,11 @@ PR_FIELDS = (
 )
 
 
-def _load_point() -> Any:
-    """``point.py`` loaded from this folder: its readers of a PR are not copied.
-
-    One reading of "ready to merge", "running" or "changes requested" in the
-    project: a second copy would drift from the one the owner's point shows.
-    """
-    name = "smc_dev_point"
+def _load_script(name: str, path: Path) -> Any:
+    """The module at ``path`` loaded under ``name`` (once): a script's readers are not copied."""
     if name in sys.modules:
         return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, HERE / "point.py")
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -67,7 +62,23 @@ def _load_point() -> Any:
     return module
 
 
+def _load_point() -> Any:
+    """``point.py`` loaded from this folder: its readers of a PR are not copied.
+
+    One reading of "ready to merge", "running" or "changes requested" in the
+    project: a second copy would drift from the one the owner's point shows.
+    """
+    return _load_script("smc_dev_point", HERE / "point.py")
+
+
 point = _load_point()
+
+# The CI's own reader of a branch name (``<type>/<N>-<slug>``, ``docs/`` and ``adr/`` close
+# nothing): a PR is the issue's by its branch under the same grammar that the closing
+# references check enforces, and never under a second copy of it (#658).
+closing_refs = _load_script(
+    "smc_ci_check_closing_refs", HERE.parent / "ci" / "check_closing_refs.py"
+)
 
 
 # -- the grammar of a lane (pure) ----------------------------------------------
@@ -338,14 +349,33 @@ def _pr_state(pr: dict[str, Any]) -> str:
     return str(pr.get("state", "")).upper()
 
 
-def issue_pr(facts: Facts, number: int) -> dict[str, Any] | None:
-    """The newest PR that closes the issue and was not closed without a merge."""
-    hits = [
-        p
-        for p in facts.prs
-        if _pr_state(p) != "CLOSED"
-        and number in {int(r["number"]) for r in p.get("closingIssuesReferences") or []}
-    ]
+def issue_pr(facts: Facts, number: int, since: str = "") -> dict[str, Any] | None:
+    """The newest PR of the issue that was not closed without a merge.
+
+    A PR is the issue's when GitHub lists the issue among the ones it closes, or when its
+    branch is ``<type>/<number>-<slug>`` (CLAUDE.md, workflow step 3). The second link is for
+    a PR that says ``Refs #N`` on purpose, because an item of the issue stays open (#614's
+    PR of 2026-11-25): GitHub then lists nothing, the lane saw no PR and started the step
+    again. ``docs/`` and ``adr/`` branches close nothing and are never a develop's PR: a
+    plan's design PR is ``docs/<N>-<slug>``.
+
+    ``since`` is the Point's time: a PR linked **by its branch only** counts when it was created
+    at or after it, so that an issue an earlier cycle left open does not read as done when this
+    Point lists it again (a silent skip). A PR that closes the issue is never dated: the issue
+    is closed with it. ISO strings compare as strings.
+    """
+    hits = []
+    for p in facts.prs:
+        if _pr_state(p) == "CLOSED":
+            continue
+        closes = number in {
+            int(r["number"]) for r in p.get("closingIssuesReferences") or []
+        }
+        by_branch = number in closing_refs.allowed(
+            str(p.get("headRefName") or "")
+        ) and str(p.get("createdAt", "")) >= str(since)
+        if closes or by_branch:
+            hits.append(p)
     return max(
         hits,
         key=lambda p: (str(p.get("createdAt", "")), int(p["number"])),
@@ -377,13 +407,13 @@ def _blocked(plan: str, facts: Facts) -> tuple[str, str] | None:
     return None
 
 
-def _review_state(seg: Segment, facts: Facts) -> tuple[str, str]:
+def _review_state(seg: Segment, facts: Facts, t0: str) -> tuple[str, str]:
     n = seg.issue
     pr = None
     if seg.pr is not None:
         pr = next((p for p in facts.prs if int(p["number"]) == seg.pr), None)
     elif n is not None:
-        pr = issue_pr(facts, n)
+        pr = issue_pr(facts, n, t0)
     if pr is None:
         if seg.pr is not None:
             return ("owner", f"PR #{seg.pr} is not among the last 100 pull requests")
@@ -452,7 +482,7 @@ def segment_state(seg: Segment, facts: Facts, t0: str) -> tuple[str, str]:
             return ("owner", f"no plan on #{n} since the point: no design PR to read")
         return _blocked(str(plan["body"]), facts) or ("done", "design PR merged")
     if seg.kind in ("develop", "feature"):
-        pr = issue_pr(facts, n)
+        pr = issue_pr(facts, n, t0)
         if pr is not None:
             return ("done", f"PR #{pr['number']}")
         labels = {str(x.get("name")) for x in issue.get("labels") or []}
@@ -470,8 +500,8 @@ def segment_state(seg: Segment, facts: Facts, t0: str) -> tuple[str, str]:
             return ("owner", f"no plan on #{n}")
         return _blocked(str(plan["body"]), facts) or ("session", f"develop {n}")
     if seg.kind == "review":
-        return _review_state(seg, facts)
-    pr = issue_pr(facts, n)  # merge
+        return _review_state(seg, facts, t0)
+    pr = issue_pr(facts, n, t0)  # merge
     if pr is None:
         return ("owner", f"no PR for #{n}")
     if _pr_state(pr) == "MERGED":

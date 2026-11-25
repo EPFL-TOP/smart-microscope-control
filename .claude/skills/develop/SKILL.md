@@ -75,6 +75,12 @@ them if it is not the one you run on.
    created by a command on its own, and run them with `.venv/bin/python
    <file>`. Read `gh` output with `--json <fields>` and no filter.
    Three recipes, each met by several sessions (#224, #248, #260, #263):
+   - **A file of text** (a comment's body, a plan, a throwaway script) is written with
+     the Write tool and passed by its path: `gh ... --body-file <file>`,
+     `.venv/bin/python <script.py>`. Never a heredoc: three Reports met the refusal
+     (#614, #625, #627), and a plan edit made with `Edit` took seven calls. To correct a
+     posted comment, Write its whole text to a file and `gh api -X PATCH
+     repos/{owner}/{repo}/issues/comments/<id> -F body=@<file>`.
    - **Save a GitHub comment to a file**: run `gh issue view N --comments`
      (no redirection, no `--jq`), then Write what you read into the file.
    - **Append to a test file**: Read it, then Edit with the last lines as the
@@ -165,7 +171,10 @@ them if it is not the one you run on.
     first `gh pr view --json mergeable`, then wait for the run **in the
     background**, never with `gh pr checks --watch` or `gh run watch` (each
     refresh reprints the whole job tree, about 60 KB for one wait, #353):
-    `gh pr checks N` once to get the run id, then one Bash call with
+    `gh pr checks N` once to get the run id (it answers `no checks reported` for a
+    few seconds after `gh pr create`, #617 and #626: ask again after about 30 s, and
+    only a second empty answer is "no checks yet" in the Report; a PR that
+    conflicts with `main`, below, stays empty), then one Bash call with
     `run_in_background`: `python scripts/dev/wait_for_run.py <id>` (it polls
     every 60 s and prints one line with the conclusion; the sandbox refuses
     an `until` loop with `$(...)`, #342, #380), and read `gh pr checks N`
@@ -248,7 +257,10 @@ stop and say what you need.
 - **CI** (step 13): do not rely on a background wait, a subagent is not woken
   by one. Open the PR, read `gh pr checks N` once, and say in the Report that
   the checks were running; the lane waits for them itself and stops for the
-  owner when they are red.
+  owner when they are red. `gh pr checks` is empty for a few seconds after
+  `gh pr create` (#617, #626): write the Report's text first, then read it a
+  second time (about 30 s later), and say "no checks yet" only when that one is
+  empty too.
 - **Step 15**: no `ExitWorktree`; the harness keeps a worktree that holds
   commits.
 - **Addressing a review**: the first develop's worktree holds the PR's

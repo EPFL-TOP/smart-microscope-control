@@ -15,6 +15,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -243,6 +244,22 @@ def _fake_page(
     return page
 
 
+#: What a seed that was to fail says when it did (``Stand.run_failing``'s return).
+FAILING_SEED = "camera-calibration exited 1: the frames barely correlate"
+
+
+def _fake_stand(run_chain=lambda steps: None, **kw: object) -> SimpleNamespace:
+    """A stand that runs nothing: its chain is ``run_chain``, its failing seed fails as the tool does, its camera images a sample."""
+    fields: dict[str, object] = {
+        "run_chain": run_chain,
+        "run_failing": lambda step: FAILING_SEED,
+        "images_sample": True,
+        "viewport": (1280, 800),
+    }
+    fields.update(kw)
+    return SimpleNamespace(**fields)
+
+
 def _drive(snap, tmp_path: Path, page: MagicMock, run_chain):
     """``drive`` on a fake page, with the chain replaced by ``run_chain``."""
     context = MagicMock()
@@ -254,7 +271,7 @@ def _drive(snap, tmp_path: Path, page: MagicMock, run_chain):
         plans=snap.plan_states("demo-sample", results=True),
         stand_name="demo-sample",
         results=True,
-        stand=SimpleNamespace(run_chain=run_chain, viewport=(1280, 800)),
+        stand=_fake_stand(run_chain),
         out=tmp_path,
     )
 
@@ -427,9 +444,13 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         "wells-laid-out",
         "wells-timed",
         "scanned",
+        # The Stand screen after a calibration that failed (m5 §22.2, #625, #658): the last of
+        # all, since its failed record replaces the calibration `stand-620` seeded.
+        "stand-failed-620",
     ]
     assert list(snap.STATE_NAMES) == names
     assert snap.GUIDED_STATES == ("wells-laid-out", "wells-timed", "scanned")
+    assert snap.FAILED_STATES == ("stand-failed-620",)
     assert snap.CHAIN_STATES == ("after-density", "with-route", "results-all", "turned")
     # `expert` is the fourth, so that both stands reach it (m5 §17.8).
     alone = [True, True, True, True]
@@ -439,6 +460,9 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     # (`wells-timed` runs its own `timing`, and no result of the chain).
     guided = [True, True, True]
     no_sample = [False, False, False]
+    # The failed calibration is seeded by a step that fails on both stands and reads no result
+    # of the chain: reached on both, with the chain, without it and after one that failed.
+    failed_seed = [True]
 
     full = snap.plan_states("demo-sample", results=True)
     assert [p.name for p in full] == names
@@ -448,28 +472,47 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     assert [p.name for p in demo] == names
     # `turned` needs the chain's registered plate (m5 §16.4): with the results. The two
     # short-page states need none: both stands reach them. The guided ones need a sample.
-    assert [p.reachable for p in demo] == [*alone, *chained, *short, *no_sample]
+    assert [p.reachable for p in demo] == [
+        *alone,
+        *chained,
+        *short,
+        *no_sample,
+        *failed_seed,
+    ]
     for plan in demo[4:8]:
         assert plan.reason == (
             "the demo camera images no sample: no cells, no density; "
             "use --stand demo-sample"
         )
-    assert [p.reason for p in demo[10:]] == [
+    assert [p.reason for p in demo[10:13]] == [
         "the demo has no sample to register from"
     ] * 3
+    assert demo[13].reason is None
     assert snap.NO_SAMPLE_TO_REGISTER == "the demo has no sample to register from"
 
     # With no chain, or after a chain that failed, the guided states are still reached:
     # they do not read the chain's results.
     skipped = snap.plan_states("demo-sample", results=False)
-    assert [p.reachable for p in skipped] == [*alone, *chained, *short, *guided]
+    assert [p.reachable for p in skipped] == [
+        *alone,
+        *chained,
+        *short,
+        *guided,
+        *failed_seed,
+    ]
     assert {p.reason for p in skipped[4:8]} == {"skipped by --no-results"}
-    assert [p.reason for p in skipped[10:]] == [None, None, None]
+    assert [p.reason for p in skipped[10:]] == [None, None, None, None]
 
     failed = snap.plan_states(
         "demo-sample", results=True, chain_failure="cells exited 1: no detector"
     )
-    assert [p.reachable for p in failed] == [*alone, *chained, *short, *guided]
+    assert [p.reachable for p in failed] == [
+        *alone,
+        *chained,
+        *short,
+        *guided,
+        *failed_seed,
+    ]
     assert [p.name for p in failed[4:8]] == [
         "after-density",
         "with-route",
@@ -1002,7 +1045,10 @@ def test_a_file_that_cannot_be_removed_is_a_note_and_the_rest_are_removed(
 
 def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
     def run_chain(steps) -> None:
-        raise snap.ChainFailedError("cells exited 1: x")
+        # The calibration `stand-620` seeds is its own run and passes: only the chain's steps
+        # and the `timing` fail, as in the sentence of the issue (a real `cells` that exits 1).
+        if steps[0].plugin != "camera-calibration":
+            raise snap.ChainFailedError("cells exited 1: x")
 
     records, errors, warnings = _drive(snap, tmp_path, _fake_page(), run_chain)
     assert [(r.name, r.reached) for r in records] == [
@@ -1022,6 +1068,8 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         ("wells-laid-out", True),
         ("wells-timed", False),
         ("scanned", True),
+        # The failed calibration is seeded by its own step, which fails on purpose.
+        ("stand-failed-620", True),
     ]
     assert records[4].reason == "cells exited 1: x"
     assert records[5].reason == "needs the chain: cells exited 1: x"
@@ -1045,6 +1093,7 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
         False,
         True,
         False,
+        True,
         True,
         True,
         True,
@@ -1077,6 +1126,7 @@ def test_a_step_button_that_times_out_names_the_state_and_the_next_one_runs(
         False,
         True,
         True,
+        True,
     ]
     assert records[1].reason == "Locator.click: Timeout 10000ms exceeded."
     assert records[10].reason == records[1].reason
@@ -1098,6 +1148,7 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
         False,
         False,
         True,
+        True,
     ]
     assert records[1].reason == "Locator.fill: Timeout 10000ms exceeded."
     assert records[10].reason == records[1].reason
@@ -1105,7 +1156,7 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
 
 
 def _no_chain() -> SimpleNamespace:
-    return SimpleNamespace(run_chain=lambda steps: None)
+    return _fake_stand()
 
 
 def test_the_turned_state_picks_the_selects_turned_label_and_waits_for_the_outcome(
@@ -1271,6 +1322,7 @@ def test_expert_waits_for_the_pressed_class_and_the_switch_goes_off_after_the_ph
         "expert": snap._after_expert,
         "stand-620": snap._after_short,
         "plate-620": snap._after_short,
+        "stand-failed-620": snap._after_short,
     } == snap.AFTER_ACTIONS
 
     # In the driver: the photograph is taken before the switch goes off.
@@ -1416,7 +1468,15 @@ def test_on_screen_ends_with_the_offsets_block_line_and_a_page_without_a_viewpor
     monkeypatch.setattr(snap, "_short_parts", lambda page, state: parts)
     monkeypatch.setattr(snap, "_guided_parts", lambda page, state: parts)
     monkeypatch.setattr(snap, "_results_parts", lambda page: parts)
-    for state in (None, "snap", "stand-620", "plate-620", "scanned", "results-all"):
+    for state in (
+        None,
+        "snap",
+        "stand-620",
+        "plate-620",
+        "stand-failed-620",
+        "scanned",
+        "results-all",
+    ):
         for count, visible, line in (
             (0, False, "offsets block: not on this screen"),
             (1, False, "offsets block: hidden"),
@@ -1472,6 +1532,8 @@ def test_the_short_page_states_name_the_screens_titles_the_guide_draws(snap) -> 
     # screen's, which names the two wells the state types, in plate order.
     assert {
         "stand-620": SCREEN_TITLES["stand"],
+        # The Stand screen again, after a calibration that failed (#658).
+        "stand-failed-620": SCREEN_TITLES["stand"],
         "plate-620": SCREEN_TITLES["plate"],
         "wells-laid-out": SCREEN_TITLES["wells"],
         # `wells-timed` stays on the Wells screen (m5 §17.12.12 D42).
@@ -1484,14 +1546,29 @@ def test_the_short_page_states_name_the_screens_titles_the_guide_draws(snap) -> 
 
 
 @pytest.mark.parametrize(
-    ("action", "number", "title", "heading"),
+    ("action", "number", "title", "heading", "then_waits_for"),
     [
-        ("_act_stand_620", 1, "Stand", "Which stand, and which preset?"),
-        ("_act_plate_620", 2, "Plate", "Where is the plate?"),
+        # The Stand screen after a seeded calibration waits for its numbers' first line.
+        (
+            "_act_stand_620",
+            1,
+            "Stand",
+            "Which stand, and which preset?",
+            "wait:^Camera calibration (at |\\()",
+        ),
+        ("_act_plate_620", 2, "Plate", "Where is the plate?", None),
+        # ... and after one that failed, for the failed line.
+        (
+            "_act_stand_failed_620",
+            1,
+            "Stand",
+            "Which stand, and which preset?",
+            "wait:^The last calibration failed",
+        ),
     ],
 )
 def test_a_short_page_state_connects_forgets_the_outcome_shrinks_then_opens_its_screen(
-    snap, action: str, number: int, title: str, heading: str
+    snap, action: str, number: int, title: str, heading: str, then_waits_for: str | None
 ) -> None:
     page = MagicMock()
     page.viewport_size = {"width": 1280, "height": 800}
@@ -1508,9 +1585,16 @@ def test_a_short_page_state_connects_forgets_the_outcome_shrinks_then_opens_its_
         return found
 
     page.get_by_role.side_effect = role
-    page.locator.return_value.filter.return_value.first.wait_for.side_effect = lambda: (
-        order.append("wait:title")
-    )
+
+    def filtered(*, has_text: object) -> MagicMock:
+        label = getattr(has_text, "pattern", None)
+        found = MagicMock()
+        found.first.wait_for.side_effect = lambda: order.append(
+            "wait:title" if label is None else f"wait:{label}"
+        )
+        return found
+
+    page.locator.return_value.filter.side_effect = filtered
     getattr(snap, action)(page, _no_chain())
     # The outcome the earlier states left is forgotten with *Refresh* (D12 measures the
     # header with its outcome lines empty); the page shrinks before the screen opens, so
@@ -1521,6 +1605,7 @@ def test_a_short_page_state_connects_forgets_the_outcome_shrinks_then_opens_its_
         "resize:{'width': 1280, 'height': 620}",
         f"click:^{number}\\. {title}",
         "wait:title",
+        *([then_waits_for] if then_waits_for else []),
     ]
     page.locator.return_value.filter.assert_any_call(has_text=heading)
     page.wait_for_timeout.assert_not_called()
@@ -1593,11 +1678,30 @@ def test_the_short_parts_are_the_strip_the_step_bar_the_title_and_the_first_acti
 ) -> None:
     page = MagicMock()
     stand = {n: c for n, c in snap._short_parts(page, "stand-620")}
-    assert list(stand) == ["STOP", "step bar", "title", "first action"]
+    # The Stand states add the calibration pane they are about, read by its first line (#658).
+    assert list(stand) == [
+        "STOP",
+        "step bar",
+        "title",
+        "first action",
+        "calibration numbers, first line",
+    ]
     page.get_by_role.assert_any_call("button", name="Load", exact=True)
     page.locator.return_value.filter.assert_any_call(
         has_text="Which stand, and which preset?"
     )
+    page.locator.return_value.filter.assert_any_call(has_text=snap.CALIBRATION_NUMBERS)
+    failed = MagicMock()
+    parts = [n for n, _ in snap._short_parts(failed, "stand-failed-620")]
+    assert parts == [
+        "STOP",
+        "step bar",
+        "title",
+        "first action",
+        "calibration failed, first line",
+    ]
+    failed.get_by_role.assert_any_call("button", name="Load", exact=True)
+    failed.locator.return_value.filter.assert_any_call(has_text=snap.CALIBRATION_FAILED)
     page = MagicMock()
     snap._short_parts(page, "plate-620")
     names = [
@@ -1609,6 +1713,343 @@ def test_the_short_parts_are_the_strip_the_step_bar_the_title_and_the_first_acti
     assert r"^Go to " in names
     assert r"^1\. Stand" in names
     page.locator.return_value.filter.assert_any_call(has_text="Where is the plate?")
+    # The Plate screen has no calibration pane to read.
+    assert [n for n, _ in snap._short_parts(MagicMock(), "plate-620")] == [
+        "STOP",
+        "step bar",
+        "title",
+        "first action",
+    ]
+
+
+# --- the Stand screen after a seeded and a failed calibration (m5 §23.2, §22.2, #658) ---------
+
+
+def test_the_calibration_words_are_the_guides(snap) -> None:
+    from smc.ui.guide import (
+        CalibrationNote,
+        CalibrationNumbers,
+        calibration_numbers_text,
+        stand_calibration_failed,
+    )
+
+    # The script imports nothing of smc at import, so its copies of what the two panes start
+    # with are pinned (FM-45): a reworded pane would make both states wait ten seconds for a
+    # text that never comes and say `not reached`.
+    numbers = CalibrationNumbers(1.0, 0.0, False, 0.0, 128.0)
+    for objective in ("Nikon 10X S Fluor", None):
+        note = CalibrationNote(
+            objective, "2026-11-25 16:35:00", "2026-11-25 16:35", numbers
+        )
+        first = calibration_numbers_text(note).splitlines()[0]
+        assert snap.CALIBRATION_NUMBERS.search(first), first
+    assert snap.CALIBRATION_FAILED.search(stand_calibration_failed("the frames barely"))
+    # Not the known block's `Camera: calibrated at ...` line, nor the tool's command line.
+    assert not snap.CALIBRATION_NUMBERS.search(
+        "Camera: calibrated at Nikon 10X S Fluor on 2026-11-25 16:35"
+    )
+    assert not snap.CALIBRATION_NUMBERS.search("smc run camera-calibration -p x")
+    assert not snap.CALIBRATION_FAILED.search("Camera: not calibrated (the arrows ...)")
+
+
+def test_the_calibration_seeds_are_real_runs_that_the_plugins_params_accept(
+    snap,
+) -> None:
+    from smc.plugins.params import parse_params
+    from smc.plugins.registry import load
+
+    profile = snap.stand_profile("demo-sample")
+    params = load("camera-calibration").plugin.Params
+    for step in (snap.CALIBRATION_STEP, snap.FAILING_CALIBRATION_STEP):
+        assert step.plugin == "camera-calibration"
+        parse_params(params, [f"{key}={value}" for key, value in step.params])
+        # Real runs beside the page: the tool refuses a dry run, which is what the page is in.
+        command = snap.run_command("py", step, profile, Path("/work/run.json"))
+        assert "--dry-run" not in command
+    assert snap.CALIBRATION_STEP.params == ()
+    # The failing seed's probe is the tool's own largest, which no frame of the demo follows.
+    assert dict(snap.FAILING_CALIBRATION_STEP.params) == {"step_um": "2000"}
+
+
+def test_stand_620_seeds_a_calibration_beside_the_page_before_it_opens_the_screen(
+    snap,
+) -> None:
+    page, order = _recording_page()
+    seeded: list[object] = []
+    stand = _fake_stand(
+        lambda steps: (seeded.append(list(steps)), order.append("seed"))[1]
+    )
+    readings = snap._act_stand_620(page, stand)
+    # The good calibration, and not the failing one (same plugin, other parameters).
+    assert seeded == [[snap.CALIBRATION_STEP]]
+    # The run comes first (the page reads the run document again at the *Refresh* that
+    # `_open_screen` clicks), and the state ends on the numbers' first line, never a delay.
+    assert order[0] == "seed"
+    assert order[1] == r"wait-detached:\| not connected\b"
+    assert order[2] == "click:Refresh"
+    assert order[-2:] == [
+        "wait:Which stand, and which preset?",
+        r"wait:^Camera calibration (at |\()",
+    ]
+    assert readings == [
+        (
+            "calibration seed",
+            "seeded by a real camera-calibration on the simulated stage",
+        )
+    ]
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_stand_620_seeds_nothing_on_a_stand_whose_camera_images_no_sample(snap) -> None:
+    # On the plain demo the same run fails (`the two moves gave parallel shifts`): nothing is
+    # seeded, nothing is waited for, and the summary says so with the pane `not on the page`.
+    page, order = _recording_page()
+    stand = _fake_stand(
+        lambda steps: order.append("seed"),
+        images_sample=False,
+    )
+    readings = snap._act_stand_620(page, stand)
+    assert "seed" not in order
+    assert not any("Camera calibration" in line for line in order)
+    assert readings == [("calibration seed", snap.NOT_SEEDED)]
+    assert snap.state_facts("stand-620", [], readings) == [
+        f"calibration seed: {snap.NOT_SEEDED}"
+    ]
+    assert "demo camera images no sample" in snap.NOT_SEEDED
+
+
+def test_a_seed_that_fails_on_a_stand_with_a_sample_is_a_state_not_reached(
+    snap, tmp_path
+) -> None:
+    # A regression of `camera-calibration` on `demo-sample` must be a finding (exit 3), not a
+    # state that is reached with a quiet `not seeded`.
+    def chain(steps) -> None:
+        raise snap.ChainFailedError("camera-calibration exited 1: no texture")
+
+    records, _, _ = _drive(snap, tmp_path, _fake_page(), chain)
+    by_name = {r.name: r for r in records}
+    assert by_name["stand-620"].reached is False
+    assert by_name["stand-620"].reason == "camera-calibration exited 1: no texture"
+
+
+def test_stand_failed_620_runs_a_calibration_that_must_fail_then_waits_for_the_failed_line(
+    snap,
+) -> None:
+    page, order = _recording_page()
+    stand = _fake_stand(
+        lambda steps: order.append("chain"),
+        run_failing=lambda step: (
+            order.append(f"failing:{dict(step.params)}") or FAILING_SEED
+        ),
+    )
+    readings = snap._act_stand_failed_620(page, stand)
+    assert snap.ACTIONS["stand-failed-620"] is snap._act_stand_failed_620
+    assert order[0] == "failing:{'step_um': '2000'}"
+    assert (
+        "chain" not in order
+    )  # the passing seed is not run: the record must be the failure's
+    assert order[-1] == "wait:^The last calibration failed"
+    assert readings == [("failing calibration seed", FAILING_SEED)]
+    assert snap.state_facts("stand-failed-620", [], readings) == [
+        f"failing calibration seed: {FAILING_SEED}"
+    ]
+    page.wait_for_timeout.assert_not_called()
+
+
+def _stand_with_outcome(snap, monkeypatch, outcome) -> Any:
+    """A real ``Stand`` whose one ``smc run`` ends as ``outcome`` says (no child is started)."""
+    monkeypatch.setattr(snap, "run_step", lambda command, **kw: outcome)
+    return snap.Stand("py", Path("/p.toml"), Path("/work/run.json"), Path("/c.log"), {})
+
+
+@pytest.mark.parametrize(
+    ("outcome", "wanted"),
+    [
+        pytest.param(
+            ("camera-calibration", 0, 0.2, "done", False, 120.0),
+            "was to fail and passed",
+            id="the tool passed",
+        ),
+        pytest.param(
+            ("camera-calibration", None, 120.0, "", True, 120.0),
+            "did not end within 120 s",
+            id="the tool hung",
+        ),
+        pytest.param(
+            ("camera-calibration", 2, 0.1, "no such parameter", False, 120.0),
+            "exited 2: no such parameter (wanted a failed record, exit 1)",
+            id="a usage error is no failed record",
+        ),
+        # Exit 1 is also the code of a run document that cannot be read or written (a lock
+        # that Windows held for the five tries of `retry_on_permission_error`): its line starts
+        # with the path where a tool's own starts with its name, and no failed record is written.
+        pytest.param(
+            (
+                "camera-calibration",
+                1,
+                0.1,
+                "\N{BALLOT X} /work/run.json: is not valid JSON",
+                False,
+                120.0,
+            ),
+            "not camera-calibration's own failure",
+            id="a run document that cannot be written is no failed record",
+        ),
+    ],
+)
+def test_a_seed_that_was_to_fail_and_did_not_is_a_state_not_reached(
+    snap, monkeypatch, outcome, wanted: str
+) -> None:
+    stand = _stand_with_outcome(snap, monkeypatch, snap.StepOutcome(*outcome))
+    with pytest.raises(snap.ChainFailedError, match=re.escape(wanted)):
+        stand.run_failing(snap.FAILING_CALIBRATION_STEP)
+
+
+def test_a_seed_that_fails_as_a_tool_does_gives_the_sentence_the_summary_says(
+    snap, monkeypatch
+) -> None:
+    # The line `smc run` prints for a tool that failed: a mark, the tool's name, its words.
+    words = "\N{BALLOT X} camera-calibration: the frames barely correlate"
+    done = snap.StepOutcome("camera-calibration", 1, 0.3, words)
+    stand = _stand_with_outcome(snap, monkeypatch, done)
+    assert (
+        stand.run_failing(snap.FAILING_CALIBRATION_STEP)
+        == f"camera-calibration exited 1: {words}"
+    )
+    # `run_chain` still raises on any failure, as it did.
+    with pytest.raises(snap.ChainFailedError, match="exited 1"):
+        stand.run_chain([snap.CALIBRATION_STEP])
+
+
+@pytest.mark.parametrize("state", ["stand-620", "stand-failed-620", "plate-620"])
+def test_a_short_page_state_that_fails_after_the_shrink_puts_the_viewport_back(
+    snap, tmp_path, state: str
+) -> None:
+    # The wait for the state's own text times out after `_open_screen` shrank the page: the
+    # state is named, and the states after it (the guided ones follow `stand-620` and
+    # `plate-620`) must not be photographed at 620 px.
+    page = _fake_page()
+    sizes: list[int] = []
+    page.set_viewport_size.side_effect = lambda size: sizes.append(size["height"])
+    shots: list[str] = []
+    page.screenshot.side_effect = lambda **kw: shots.append(Path(kw["path"]).name)
+
+    def filtered(*, has_text: object) -> MagicMock:
+        found = MagicMock()
+        if has_text in (snap.CALIBRATION_NUMBERS, snap.CALIBRATION_FAILED) or (
+            state == "plate-620" and has_text == snap.SCREEN_TITLE_OF["plate-620"]
+        ):
+            found.first.wait_for.side_effect = _FakeError(
+                "Locator.wait_for: Timeout 10000ms exceeded."
+            )
+        return found
+
+    page.locator.return_value.filter.side_effect = filtered
+    context = MagicMock()
+    context.new_page.return_value = page
+    records, _, _ = snap.drive(
+        SimpleNamespace(Error=_FakeError),
+        context,
+        port=1,
+        plans=[snap.StatePlan(state, True)],
+        stand_name="demo-sample",
+        results=True,
+        stand=_fake_stand(),
+        out=tmp_path,
+    )
+    assert [(r.name, r.reached) for r in records] == [(state, False)]
+    assert records[0].reason == "Locator.wait_for: Timeout 10000ms exceeded."
+    assert f"{state}-FAILED.png" in shots
+    # Shrunk by the state's own screen, and put back to the run's height by the driver.
+    assert sizes == [620, 800]
+
+
+def test_the_stand_knows_whether_its_camera_images_a_sample(
+    snap, monkeypatch, tmp_path
+) -> None:
+    seen: dict[str, bool] = {}
+
+    def drive(pw, context, **kw: Any) -> tuple[list, list, int]:
+        seen[kw["stand_name"]] = kw["stand"].images_sample
+        return [], [], 0
+
+    monkeypatch.setattr(snap, "drive", drive)
+    monkeypatch.setattr(snap, "free_port", lambda: 1)
+    monkeypatch.setattr(snap, "wait_for_serving", lambda server, log: None)
+    monkeypatch.setattr(snap.subprocess, "Popen", lambda *a, **kw: MagicMock())
+    outcome = snap.StopOutcome("sigint", 0, 0.1, "stopped by SIGINT, exit 0", True)
+    monkeypatch.setattr(snap, "stop_server", lambda server: outcome)
+    monkeypatch.setattr(snap, "_say", lambda text="": None)
+    for name in ("demo-sample", "demo"):
+        out = tmp_path / name
+        out.mkdir()
+        args = snap.build_parser().parse_args(["--stand", name, "--out", str(out)])
+        snap._serve_and_drive(
+            args, SimpleNamespace(), MagicMock(), Path("/p"), out, out
+        )
+    # The sample stand's camera images one; the plain demo's does not, so a seed there is a
+    # run that fails and the Stand screen has nothing to say about it.
+    assert seen == {"demo-sample": True, "demo": False}
+
+
+def _evaluating(answer: object) -> MagicMock:
+    element = MagicMock()
+    if isinstance(answer, Exception):
+        element.evaluate.side_effect = answer
+    else:
+        element.evaluate.return_value = answer
+    return element
+
+
+def test_on_screen_measures_the_first_line_of_a_pane_and_never_guesses(
+    snap, monkeypatch
+) -> None:
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 620}
+    page.get_by_role.return_value.count.return_value = 0
+
+    def part(name: str, element: MagicMock) -> tuple[str, MagicMock]:
+        found = MagicMock()
+        found.count.return_value = 1
+        found.first = element
+        element.bounding_box.return_value = _box(10, 500, 380, 300)  # the whole pane
+        return name, found
+
+    parts = [
+        # Three lines under the fold, the first one inside: the whole pane's box would say NO.
+        part(snap.NUMBERS_PART, _evaluating(_box(10, 559, 7, 14))),
+        # The first line below the fold: NO, with where.
+        part(snap.FAILED_PART, _evaluating(_box(10, 640, 7, 14))),
+    ]
+    monkeypatch.setattr(snap, "_short_parts", lambda page, state: parts)
+    for state in ("stand-620", "stand-failed-620"):
+        # The new state's parts are the short page's too, not the frame's (#658).
+        lines = snap._on_screen(page, state)
+        assert lines[:2] == [
+            "calibration numbers, first line: yes (y 559 to 573 of 620, x 10 to 17 of 1280)",
+            "calibration failed, first line: NO (y 640 to 654 of 620, x 10 to 17 of 1280)",
+        ], state
+    # The browser's answer is read from the element's first text, through its shadow roots.
+    assert "NodeFilter.SHOW_TEXT" in snap._FIRST_LINE_JS
+    parts[0][1].first.evaluate.assert_called_with(snap._FIRST_LINE_JS)
+    # A pane with no text drawn, one the browser refuses, and an answer that is no box: `not
+    # drawn` for the first and `?` for the others, never the box of the whole pane.
+    for answer, line in (
+        (None, "not drawn"),
+        (_FakeError("the page is closed"), "?"),
+        ("tall", "?"),
+        ({"x": 1, "y": 2}, "?"),
+        (_box(10, True, 7, 14), "?"),
+    ):
+        parts[:] = [part(snap.NUMBERS_PART, _evaluating(answer))]
+        assert snap._on_screen(page, "stand-620")[0] == (
+            f"calibration numbers, first line: {line}"
+        )
+    # The other parts keep their own box: only the two panes are read by their first line.
+    assert snap.FIRST_LINE_PARTS == (
+        "calibration numbers, first line",
+        "calibration failed, first line",
+    )
 
 
 # --- the guided states of the Wells and Scan screens (m5 §17.10.4, #445) ----------------
@@ -2046,10 +2487,19 @@ def test_only_the_scanned_wells_timed_and_results_all_states_carry_facts(
         "time (autofocus off): not on the page",
         "time (autofocus required): not on the page",
     ]
+    # The two Stand states say their seed, and no other state says anything.
+    assert by_name["stand-620"].facts == [
+        "calibration seed: seeded by a real camera-calibration on the simulated stage"
+    ]
+    assert by_name["stand-failed-620"].facts == [
+        f"failing calibration seed: {FAILING_SEED}"
+    ]
     assert [n for n, r in by_name.items() if r.facts] == [
         "results-all",
+        "stand-620",
         "wells-timed",
         "scanned",
+        "stand-failed-620",
     ]
 
 
