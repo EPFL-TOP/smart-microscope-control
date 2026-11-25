@@ -1,9 +1,9 @@
-"""The files that set a collaborator up work (algorithms design §7, #554): the label, the template, CODEOWNERS and the skill's templates.
+"""The files that set a collaborator up work (algorithms design §7, #554): the label, the template and the skill's templates.
 
 None of them is code that a test of the kit reaches, and each fails quietly: GitHub
-drops a label an issue form names but the repository lacks, a CODEOWNERS line for a
-path that was renamed protects nothing, and a skill whose template stopped being
-valid gives the collaborator a first file that does not load.
+drops a label an issue form names but the repository lacks, and a skill whose
+template stopped being valid gives the collaborator a first file that does not load.
+CODEOWNERS has moved to ``test_two_tracks_repository.py`` (ADR-0010).
 """
 
 from __future__ import annotations
@@ -61,19 +61,6 @@ def test_the_algorithm_template_asks_what_the_design_says_it_asks() -> None:
         assert block, f"{label} is not a required field"
     assert "label: The wiring issue" in text
     assert "dropdown" not in text, "an algorithm never needs a stand"
-
-
-def test_every_codeowners_path_exists() -> None:
-    lines = (ROOT / ".github" / "CODEOWNERS").read_text(encoding="utf-8").splitlines()
-    rules = [
-        line.split() for line in lines if line.strip() and not line.startswith("#")
-    ]
-    assert {rule[0] for rule in rules} >= {"/src/smc/hardware/", "/profiles/"}
-    for pattern, *owners in rules:
-        assert owners, f"{pattern} has no owner"
-        assert (ROOT / pattern.lstrip("/")).exists(), (
-            f"{pattern} is not in the repository"
-        )
 
 
 def _skill_blocks(language: str) -> list[str]:
