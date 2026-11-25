@@ -105,6 +105,8 @@ settle_tolerance_um = 0.5
 # binning 1, each at the step named (a quarter of the field, as the plugin's default will be now that
 # a size is known; its 50 µm fallback gave a residual of 10.7 µm at the 4x). The camera is turned
 # 2.56 deg from the stage's axes (rotation 177.44 deg) at all three objectives.
+# Since 2026-11-24 (session 6, #620) the rotation reads 178.33 deg at the 10x and 178.32 deg at the 40x
+# (the camera turned on its port, inferred), and the 40x read 0.277555 um that day.
 "1-Plan Fluor 4x" = 2.73909          # step 900 µm, residual 0.894 µm (nominal 2.75)
 "2-Plan Fluor 10x" = 1.12447         # step 350 µm, residual 0.642 µm (nominal 1.1)
 "3-Plan Apo LmbdD0.25 40x" = 0.276136    # step 100 µm, residual 0.535 µm (nominal 0.275)

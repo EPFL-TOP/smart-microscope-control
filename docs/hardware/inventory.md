@@ -65,12 +65,19 @@ New findings arrive as *Hardware session report* issues and land here.
   on a new plate (session 2, #334; #331). The first lock from the floor
   works at the 10× in a well with water (6.3 units/µm, Z about 1240 µm
   away from the sample), and did **not** lock at the 40× in water:
-  `in range: no` for 5 s (session 5, #550; #539).
+  `in range: no` for 5 s (session 5, #550; #539). It worked again at the
+  10× in session 6 (6.31 units/µm, 436 of 436 fields of a 10× scan
+  locked). **At the 40× the Ti2-E reads PFSOffset back the write + 1 at 0
+  and at 1** (0 → 1, 1 → 2), and as written from 1000 to 17794; at the 10×
+  the same day 0 read back 0. `in range` was yes at 17794, the stand's own
+  offset, and no at 14000 down to 1000, so no first lock from the floor
+  can be tried at the 40× (session 6, #620; #621).
 - **The stand keeps a PFS offset per objective and restores it on a turn**
   (inferred from session 3's reads): 9370 for the 10×, also at power-on,
   and 17794 for the 40×; the 4× leaves it as it was. An offset written
   before a turn is gone after it (#407). Session 5 saw it on all 21 turns,
-  whatever offset was locked before (#550).
+  whatever offset was locked before (#550); session 6 saw 17794 and 9370
+  again, after offsets of 7987 and 2.
 - **XY and Z moves return only once they have ended**, and neither reads
   busy: 10 mm of XY in about 0.6 s, 50 µm of Z in 0.2–0.35 s (#221). A read
   takes under 0.05 ms (a cache in the adapter, inferred).
@@ -79,8 +86,9 @@ New findings arrive as *Hardware session report* issues and land here.
   itself: down to a 500 µm escape height and back **inside the call**
   (the 500 µm read at the return is stale), then +8.7 µm with the 4× and
   −47.5 µm with the 40× against the 10× (session 3, #405; −47.32 to
-  −47.52 µm over 10 turns in session 5). The 40×'s focus lies about 60 µm
-  under the 10×'s, so a turn from the 10×'s focus lands the 40× about
+  −47.52 µm over 10 turns in session 5; −47.58 µm and +47.14 µm back in
+  session 6). The 40×'s focus lies about 60 µm under the 10×'s, so a turn
+  from the 10×'s focus lands the 40× about
   12 µm short of its focus (session 5, #550). A turret left
   between positions fails `getStateLabel` ("Cannot get current position
   label"), and seating it from the stand finishes the restore: Z rose
@@ -108,19 +116,32 @@ New findings arrive as *Hardware session report* issues and land here.
   Hamamatsu's. Measured by `camera-calibration` in session 3 (lever 1.0×):
   **2.73909 µm at 4×, 1.12447 µm at 10×, 0.276136 µm at 40×**, and the
   camera sits **2.56° off the stage's axes** (rotation 177.44° at all
-  three). Session 5: 1.12494 µm at 10×, 0.275748 µm at 40× (#550). The Prime 95B is on the left port (`LightPath` `L100`); a
-  frame with the light path elsewhere is dark (#408).
+  three). Session 5: 1.12494 µm at 10×, 0.275748 µm at 40× (#550).
+  **Session 6: 1.12432 µm at 10×, 0.277555 µm at 40×, and the rotation
+  reads 178.33° and 178.32°**: the camera turned by about +0.9° since
+  session 5, the turret unchanged (**inferred:** the camera was turned on
+  its port, after work on the microscope; a calibration older than
+  2026-11-24 is suspect for rotation; #620). The Prime 95B is on the left
+  port (`LightPath` `L100`); a frame with the light path elsewhere is dark
+  (#408). Cells at the 40× in a 24-well plate fill about 2 % of the
+  camera's range at 10 ms (session 6).
 - A load fails now and then (`Ti2-E__0` (-10), or PVCAM
   `PL_ERR_DDI_DEVICE_OPEN_FAILED`) when commands follow each other, and the
   next command loads; nothing is sent (session 3, #411). Session 5 saw
   two `Ti2-E__0` (-10) in a row at the page's *Connect*, right after a
-  console command; the third loaded.
+  console command; the third loaded. Session 6 saw six in the day, at
+  console commands and once at the *Connect*; the next command loaded each
+  time (#620).
 - **The stage frame is turned 180° from useq's for a plate with A1 at the
   back left**: the back of the stand is −Y and the operator's right −X
-  (session 5, #540).
+  (session 5, #540); a drive to B2 landed under B2 in session 6.
+- **The condenser module follows the objective**: `2-Ph1` for the 10×,
+  `7-N2` (dry DIC) for the 40× (session 6, #628). No role takes a condenser
+  turret, so smc cannot switch it.
 - **PVCAM and the hub load from an SSH session** (OpenSSH Server, key
   login): `smc doctor` exits 0 there; prefix it with `set PYTHONUTF8=1&&`
-  (session 5, #550).
+  (session 5, #550). It needs `SMC_PROFILE` set, or `-p` after the command
+  (session 6).
 - The lab's `MMConfig.cfg` (nikon-control, 2026-09-16) has no Startup
   preset and no `Core,TimeoutMs`. Its state labels are its own, and
   FilterTurret2's are truncated fragments, unusable as channel names.
