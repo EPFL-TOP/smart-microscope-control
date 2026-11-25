@@ -4,7 +4,9 @@
   #564 (§3), #565 (§2), #566 (§4), #567 (§5), #568 (§6) and #554 itself (§7);
   the first task is #570, its wiring #569.
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per
-  issue, the collaborator's included.
+  issue, the collaborator's included. §7 was rewritten for two tracks
+  (ADR-0010, #654, 2026-11-25); the analysis track's own package is designed
+  in [`analysis.md`](analysis.md).
 - **Rule**: as in M1 to M5, this document is the contract between issues built
   in parallel. Names, module paths and signatures below are fixed; an executor
   who needs to change one stops and comments on its issue (`## Plan
@@ -26,10 +28,13 @@ an arrangement between two people:
 
 - **The collaborator** owns the *pure algorithm*: data in, a decision out,
   unit-tested on synthetic data and checked on a real dataset. Their issues
-  carry `area: algorithms` and touch nothing of `smc.hardware`, `profiles/`
-  or `smc.ui` (§7).
+  carry `track: analysis` (and `area: algorithms` for an algorithm) and touch
+  nothing of `smc.hardware`, `profiles/` or `smc.ui` (§7).
 - **The owner** owns the *hardware loop*, the page and the stand: a second
   issue connects each result and carries the check at a stand (§7.2).
+
+Since ADR-0010 the two are the leads of two tracks, each planning, reviewing
+and merging on its own paths (§7).
 
 The kit is: a dataset exported from a run folder (§2), a loader with no
 hardware (§3), the plugins that never drive the stand run offline (§4), the
@@ -39,7 +44,8 @@ the way two people work in one repository (§7).
 **Decided with the owner (2026-11-18)**: the collaborator has write access
 to the repository and works with Claude Code and this repository's skills;
 datasets travel as a zip on the lab's share; `main` asks for the code
-owner's review on the paths of §7.4 only; tools run offline through `smc
+owner's review on the stand's paths only (§7.4, as ADR-0010 has it since
+2026-11-25); tools run offline through `smc
 run NAME --offline` rather than a second set of commands; the contract is
 two halves, a selector and an orderer, chosen by name; the algorithms live
 in this repository under `src/smc/selection/`; the first task (#570) uses
@@ -795,26 +801,60 @@ it.
 - `pillow>=10.1` becomes a declared dependency (`ImageFont.load_default(size=…)`
   needs 10.1).
 
-## 7. Two people in one repository (#554)
+## 7. Two tracks in one repository (#554, ADR-0010)
+
+[ADR-0010](../adr/0010-two-tracks.md) decides how the two people work: two
+tracks, the **stand track** led by the owner and the **analysis track** led
+by the collaborator, each with its paths, its issues, its Point, its lanes
+and its merges. This section says what that means for the kit; where it and
+the ADR differ, the ADR holds.
 
 ### 7.1 Where things go
 
+**`.github/CODEOWNERS` is the map**, and the stand is its default: a path
+belongs to the analysis track only when a line with no owner names it. The
+analysis track's paths are:
+
+- `src/smc/selection/`, except `api.py` and `registry.py` (the selection
+  contract and how `route` finds a name, §5: interfaces between the tracks);
+- `src/smc/analysis/`, the analysis track's package for its new modules,
+  its interface included ([`analysis.md`](analysis.md));
+- `docs/algorithms/`, the guide and a page per algorithm or module;
+- their tests: `tests/**/test_selector_*.py` and `tests/analysis/`.
+
 An `area: algorithms` change lives in `src/smc/selection/` (its module),
-`tests/` (its tests), `docs/algorithms/` (its page) and `pyproject.toml`
-(its entry point; a dependency if it needs one). It does not touch
-`src/smc/hardware/`, `profiles/` or `src/smc/ui/`; `/review` checks the
-paths.
+`tests/test_selector_<module>.py` (its tests), `docs/algorithms/` (its page)
+and `pyproject.toml` (its entry point; a dependency if it needs one). A
+change of the analysis interface lives in `src/smc/analysis/`,
+`tests/analysis/` and `docs/algorithms/`. Neither touches
+`src/smc/hardware/`, `profiles/` or `src/smc/ui/`.
+`python scripts/dev/tracks.py <path>…` prints the track of each path, and
+`/plan` and `/review` check every path of an issue against its track.
+
+Everything else is a stand path, the interfaces between the tracks included:
+the run folder and the dataset (§2), the loader `smc.data` (§3), the
+selection contract and the registry (§5), the plugin API, and the design
+documents that fix them. A change from the analysis side on one of them
+starts as an issue that both leads agree on before any code (ADR-0010).
+`pyproject.toml`, `docs/design/failure-modes.md` and
+`scripts/github/labels.json` are shared files, edited by small appends; they
+are stand paths, so such an append asks for one approval of the owner.
 
 ### 7.2 Two issues per result
 
-- **The algorithm issue** (`area: algorithms`, the collaborator's, from the
-  *Algorithm* template, §7.3) is done when the algorithm passes its tests
-  in CI and has been looked at on a dataset with the owner.
-- **The wiring issue** (`area: plugins` or `area: ui`, the owner's) names
-  the first on its plan's `**Depends on**` line, connects the result to the
-  tool that drives the microscope, and carries the check at a stand.
+- **The analysis issue** (`track: analysis`, the collaborator's; from the
+  *Algorithm* template, §7.3, for an algorithm) is done when its code passes
+  its tests in CI and has been looked at on a dataset by its lead.
+- **The wiring issue** (the stand track's, `area: plugins` or `area: ui`)
+  names the first on its plan's `**Depends on**` line, connects the result to
+  the tool that drives the microscope, and carries the check at a stand.
 
-### 7.3 The issue template
+The pair runs both ways (ADR-0010, rule 2): a need of the analysis track on a
+stand path (a field the page should expose, a change of `smc.data`) is an
+issue of the stand track, named on the analysis issue's **Depends on** line,
+and never an edit; the analysis issue then uses it.
+
+### 7.3 The issue templates
 
 `.github/ISSUE_TEMPLATE/algorithm.yml`, labels `type: feature` and `area:
 algorithms`, fields: **Goal**; **Data in** (the dataset on the share, the
@@ -824,41 +864,56 @@ the dataset's drawings looked at with the owner, the numbers to report);
 **The wiring issue** (the owner's, filled when it exists).
 `scripts/github/labels.json` gains `area: algorithms` (colour `5319E7`,
 "Pure algorithm on acquired data — no microscope, no smc.hardware (ADR-0004's
-algorithm half)"), as it already is on GitHub.
+algorithm half)"), as it already is on GitHub, and `track: analysis`
+(ADR-0010). An idea for the interface, from either person's use, starts from
+`.github/ISSUE_TEMPLATE/interface-idea.yml` (the task, what is wrong or
+missing, a sketch; no code); the lead of the track it lands in plans it.
 
 ### 7.4 Reviews and `main`
 
-`.github/CODEOWNERS`:
+As [ADR-0010](../adr/0010-two-tracks.md) has it (*How it is enforced*); the
+paths are `.github/CODEOWNERS`'s, not repeated here.
 
-```text
-/src/smc/hardware/  @clementhelsens
-/profiles/          @clementhelsens
-/docs/adr/          @clementhelsens
-/docs/design/       @clementhelsens
-/.github/           @clementhelsens
-/.claude/           @clementhelsens
-/CLAUDE.md          @clementhelsens
-```
-
-Branch protection of `main`, set by the owner in the repository's settings
-(not by a PR): a pull request is required; the light set and *closing
-references* are required checks; **review from code owners is required**,
-with no general approval count, so a PR on the paths above needs the
-owner's approval and any other needs CI only. The owner remains the only
-one who merges (CLAUDE.md applies to people too); the owner, as an
-administrator, may bypass the rule for their own PRs on those paths, since
-an author cannot approve their own PR.
+- **The lead of a track merges on that track's paths**, on a green light set
+  and a `ready to merge` review (`/review`, on that track). Nobody else
+  merges there; agents never merge (ADR-0008).
+- **A pull request that touches a stand path needs the owner's approval**,
+  whoever wrote it: the *Code owners* ruleset on `main` asks for a
+  code owner's review, with no general approval count. One that touches only
+  analysis paths needs the light set only, and its lead merges it.
+- The classic protection of `main` stays: a pull request, the light set's
+  checks and *closing references* required, linear history,
+  `enforce_admins: true`, so nobody merges past a red light set.
+- The owner's own pull requests, which no author can approve, go through the
+  ruleset's bypass for the administrator role, which skips the code-owner
+  rule only. The collaborator has write access, not admin.
+- **A red `main`**: the lead whose merge turned it red chooses between a
+  revert and a fix forward, the same day; until then neither track merges
+  code that the failing tests name (ADR-0010, amending ADR-0009).
 
 ### 7.5 Sessions
 
-The collaborator has write access and runs this repository's skills in
-Claude Code: `/develop <issue>` on an `area: algorithms` issue labelled
-`status: ready`, `/feature` for a small one, `/adversarial-review` inside
-`/develop` as for anyone. `/point`, `/lane`, `/plan`, `/review`, `/adr` and
-`/hardware-session` stay the owner's. Their comments carry the same headers
-(`## Report (develop session, <date>)`), which `point.py` reads as an
-agent's. Their own notes start with no header, as the owner's do; `/point`
-tells them apart by author.
+Each lead runs this repository's skills on their own track, with the track
+as an argument where the skill takes one:
+
+| | Stand track (the owner) | Analysis track (the collaborator) |
+|---|---|---|
+| Piloting | `/point` on #51 | `/point --track analysis` on their own pinned issue |
+| Lanes | `/lane S1` to `S3` | `/lane A1`, `A2` |
+| Design and review | `/plan`, `/review` on stand issues and PRs | `/plan`, `/review` on `track: analysis` issues and PRs |
+| Execution | `/develop`, `/feature` | `/develop`, `/feature`, `/new-selector` |
+
+- `/adversarial-review` runs inside `/develop` for both, as for anyone.
+- `/adr` may be run by either; **ADRs are decided by the owner**, and so is
+  everything under `docs/adr/` and `docs/design/`, whichever track asks for
+  the change. `/hardware-session` stays the owner's.
+- Comments carry the same headers on both tracks (`## Plan (design session,
+  <date>)`, `## Report (develop session, <date>)`), and a lane note names its
+  lane (`## Lane (A1, <date>)`). Each lead's own notes start with no header;
+  `point.py` names the author of each.
+- **Each Point ends with *Asks to the other track***, as issue numbers, and
+  lists no issue of the other track anywhere else; the two leads read both
+  Points together once a week.
 
 ### 7.6 Set-up on a laptop, and the guide
 
