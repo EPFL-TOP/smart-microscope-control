@@ -15,6 +15,7 @@ putting either back would move Z after a stop (FM-88).
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -37,7 +38,15 @@ from smc.plugins.errors import PluginRunError
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
 
+_log = logging.getLogger(__name__)
+
+#: How long ``move_checked`` waits before it reads Z again after a readback off
+#: its command (m3 §21.11 D10, FM-188). Chosen: one read in 504 at the Ti2-E
+#: returned the plane before (session 6, F17); the lag was not measured.
+REREAD_WAIT_S = 0.3
+
 __all__ = [
+    "REREAD_WAIT_S",
     "AutofocusStillOn",
     "FocusDriveOffTarget",
     "SweepBounds",
@@ -145,23 +154,55 @@ def switch_off_for_sweep(af: Autofocus) -> None:
         )
 
 
-def move_checked(z: ZStage, target_um: float, tolerance_um: float) -> float:
+def move_checked(
+    z: ZStage,
+    target_um: float,
+    tolerance_um: float,
+    *,
+    wait_s: Callable[[float], None],
+) -> float:
     """Move Z to ``target_um`` with the autofocus left off; the readback, checked (FM-167).
 
     A move that returned is not a move that arrived: the readback must lie
     within ``tolerance_um`` of the command, and a NaN readback is off target
-    (FM-104).
+    (FM-104). A readback off its command is read **once** again after
+    ``REREAD_WAIT_S``: the Ti2-E returned the plane before on one move in 504
+    (session 6, F17, FM-188) and a sweep that fails a field on a stale read
+    gives the cells' plane up for nothing. The second read is what is
+    returned, never the first. A drive that did not arrive is still a failed
+    field, 0.3 s later, and the error names both reads.
+
+    The second read is a read of where Z is **now**, outside the move's own
+    lock (FM-63): acceptable because the run owns Z, nothing else moves it
+    during the wait. ``wait_s`` is the caller's ``ctx.wait_s`` and never
+    ``time.sleep`` (FM-83), so a stop during the wait raises ``StopRequested``
+    (FM-64). A dry run's readback is its command, so it is never read again.
 
     Raises:
-        FocusDriveOffTarget: The readback is farther than ``tolerance_um``.
+        FocusDriveOffTarget: Both readbacks are farther than ``tolerance_um``.
+        StopRequested: The wait was stopped; no read follows it.
     """
     readback = z.move_to_um(target_um, keep_autofocus=False)
-    if not abs(readback - target_um) <= tolerance_um:
-        raise FocusDriveOffTarget(
-            f"Z read {readback:.2f} µm after a move to {target_um:.2f} µm, more "
-            f"than {tolerance_um:.2f} µm away"
+    if abs(readback - target_um) <= tolerance_um:
+        return readback
+    # Read at the call, so that a test (or a later measured value) can change it.
+    wait_s(REREAD_WAIT_S)
+    again = z.position_um()
+    if abs(again - target_um) <= tolerance_um:
+        _log.info(
+            "Z read %.2f µm after a move to %.2f µm, and %.2f µm %g s later: "
+            "the first read was stale (FM-188)",
+            readback,
+            target_um,
+            again,
+            REREAD_WAIT_S,
         )
-    return readback
+        return again
+    raise FocusDriveOffTarget(
+        f"Z read {readback:.2f} µm after a move to {target_um:.2f} µm and "
+        f"{again:.2f} µm {REREAD_WAIT_S:g} s later, more than {tolerance_um:.2f} "
+        "µm away"
+    )
 
 
 def sweep(
@@ -172,6 +213,7 @@ def sweep(
     score: ScoreName,
     *,
     raise_if_stopped: Callable[[], None],
+    wait_s: Callable[[float], None],
     on_plane: Callable[[int, float, npt.NDArray[Any]], None] | None = None,
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:
     """Move to each plane, snap and score; the readbacks and the scores, in the planes' order.
@@ -179,10 +221,12 @@ def sweep(
     ``on_plane(k, readback, frame)`` runs after each plane's score: the tool
     writes the frame there, so a failure at a later plane keeps the frames
     already taken. The autofocus must already be off (``switch_off_for_sweep``).
+    ``wait_s`` is the caller's ``ctx.wait_s``, passed to every ``move_checked``
+    (no default: a default of ``time.sleep`` would break FM-83).
 
     Raises:
-        FocusDriveOffTarget: A readback was farther than ``LANDING_FRACTION``
-            of the step from its plane.
+        FocusDriveOffTarget: A readback, read again once, was still farther
+            than ``LANDING_FRACTION`` of the step from its plane.
         HardwareError, MicroscopeHaltedError, MotionStoppedError, StopRequested:
             Passed as they are; nothing is restored.
     """
@@ -191,7 +235,7 @@ def sweep(
     scores: list[float] = []
     for k, plane in enumerate(planes_um):
         raise_if_stopped()
-        readback = move_checked(z, plane, tolerance_um)
+        readback = move_checked(z, plane, tolerance_um, wait_s=wait_s)
         frame = np.asarray(camera.snap())
         readbacks.append(readback)
         scores.append(score_frame(frame, score))

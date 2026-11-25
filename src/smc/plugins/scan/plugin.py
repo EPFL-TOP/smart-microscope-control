@@ -459,7 +459,7 @@ def _focus_before_snap(
         focus.switched = True
     tolerance_um = LANDING_FRACTION * params.focus_step_um
     if known is not None:
-        move_checked(z, centre + known, tolerance_um)
+        move_checked(z, centre + known, tolerance_um, wait_s=ctx.wait_s)
         return _Prepared(started, "well", None, known)
 
     readbacks, scores = sweep(
@@ -469,6 +469,7 @@ def _focus_before_snap(
         params.focus_step_um,
         params.focus_score,
         raise_if_stopped=ctx.raise_if_stopped,
+        wait_s=ctx.wait_s,
     )
     peak = find_peak(readbacks, scores)
     focus.outcomes[peak.outcome] += 1
@@ -476,7 +477,7 @@ def _focus_before_snap(
     dz_um = target - centre
     if peak.z_um is not None and params.cell_focus == "per-well":
         focus.well_dz_um.setdefault(well, dz_um)
-    move_checked(z, target, tolerance_um)
+    move_checked(z, target, tolerance_um, wait_s=ctx.wait_s)
     return _Prepared(
         started,
         "swept",

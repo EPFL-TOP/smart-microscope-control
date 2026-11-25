@@ -3,8 +3,11 @@
 Each folder is one stack: the TIFFs in it whose JSON metadata has ``z_um``
 (the tool's ``<k>.tif`` frames; ``best.tif`` is left out). For each stack it
 prints one row per plane (Z and the four scores) and, per score, the outcome
-and the refined Z of ``find_peak``, so that the default score and the sweep's
-range and step are chosen on real 40x stacks before the scan uses the step::
+and the refined Z of ``find_peak`` with its prominence (the rise over the noise
+between neighbouring planes; a peak needs more than ``NOISE_FACTOR``, #622), so
+that the default score and the sweep's range and step are chosen on real 40x
+stacks before the scan uses the step. A stack of fewer than ``MIN_PLANES`` (9)
+frames is reported and skipped::
 
     python scripts/dev/focus_scores.py local/cell-focus/* --csv scores.csv --plot plots
 
@@ -41,7 +44,13 @@ import numpy as np
 import numpy.typing as npt
 import tifffile
 
-from smc.plugins.cell_focus.algorithm import ScoreName, find_peak, score_frame
+from smc.plugins.cell_focus.algorithm import (
+    MIN_PLANES,
+    NOISE_FACTOR,
+    ScoreName,
+    find_peak,
+    score_frame,
+)
 from smc.run.files import retry_on_permission_error
 
 SCORES: tuple[ScoreName, ...] = get_args(ScoreName)
@@ -96,10 +105,12 @@ def read_stack(folder: Path) -> tuple[list[Plane], str]:
     note = (
         f"{left_out} TIFFs without z_um in their metadata left out" if left_out else ""
     )
-    if len(planes) < 3:
+    if len(planes) < MIN_PLANES:
+        # find_peak measures the noise between neighbouring planes and refuses
+        # fewer than MIN_PLANES (#622): a stack of fewer is not scored.
         return [], (
             f"{folder}: {len(planes)} frames with z_um in their metadata, a stack "
-            f"needs 3: skipped" + (f" ({note})" if note else "")
+            f"needs {MIN_PLANES}: skipped" + (f" ({note})" if note else "")
         )
     planes.sort(key=lambda plane: plane.z_um)
     if len({plane.z_um for plane in planes}) != len(planes):
@@ -144,7 +155,9 @@ def report(folder: Path, planes: Sequence[Plane], out: Any) -> None:
         at = f"{peak.z_um:.2f} um" if peak.z_um is not None else "kept the centre"
         best = z[peak.best_index]
         out.write(
-            f"  {name}: {peak.outcome}, best plane {best:.2f} um, refined: {at}\n"
+            f"  {name}: {peak.outcome}, best plane {best:.2f} um, refined: {at}, "
+            f"prominence {peak.prominence:.1f} (a peak needs more than "
+            f"{NOISE_FACTOR:g})\n"
         )
 
 

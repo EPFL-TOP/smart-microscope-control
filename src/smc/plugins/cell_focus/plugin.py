@@ -212,7 +212,7 @@ class FocusOnCellsPlugin:
             walked: list[float] = []
             for plane in planes:
                 ctx.raise_if_stopped()
-                walked.append(move_checked(z, plane, tolerance_um))
+                walked.append(move_checked(z, plane, tolerance_um, wait_s=ctx.wait_s))
             assumed.append(f"dry run: {n} planes walked, no frame taken")
             return CellFocusResult(
                 folder=folder,
@@ -275,13 +275,14 @@ class FocusOnCellsPlugin:
                 params.step_um,
                 params.score,
                 raise_if_stopped=raise_if_stopped,
+                wait_s=ctx.wait_s,
                 on_plane=on_plane,
             )
             peak = find_peak(readbacks, scores)
             best_file: str | None = None
             if peak.z_um is not None:
                 step = "the move to the best plane"
-                landed = move_checked(z, peak.z_um, tolerance_um)
+                landed = move_checked(z, peak.z_um, tolerance_um, wait_s=ctx.wait_s)
                 step = "the snap at the best plane"
                 frame = np.asarray(camera.snap())
                 _write(
@@ -298,7 +299,7 @@ class FocusOnCellsPlugin:
                 best_file = f"{folder}/{_BEST}"
             else:
                 step = "the move back to the centre"
-                move_checked(z, centre, tolerance_um)
+                move_checked(z, centre, tolerance_um, wait_s=ctx.wait_s)
         except (MicroscopeHaltedError, MotionStoppedError, StopRequested):
             # A halt or a stop is not a failure (FM-64), and nothing is put
             # back after it (FM-88): what was left is said, then it passes.
