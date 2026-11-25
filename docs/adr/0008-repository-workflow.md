@@ -1,6 +1,6 @@
 # 0008 — Repository workflow: issues, branches, PRs, CI
 
-- **Status**: accepted (amended in part by 0009)
+- **Status**: accepted (amended in part by 0009, 0010)
 - **Date**: 2026-09-22
 
 ## Context
