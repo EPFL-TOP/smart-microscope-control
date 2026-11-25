@@ -12,9 +12,12 @@ pin what the map is meant to say.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
+import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -41,52 +44,30 @@ ANALYSIS = {
 NOT_YET = {"/src/smc/analysis/", "/tests/analysis/"}
 
 
+def _tracks() -> Any:
+    """``scripts/dev/tracks.py``, the one reader of CODEOWNERS (``point.py`` and ``lane.py`` share it)."""
+    name = "smc_dev_tracks"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, ROOT / "scripts" / "dev" / "tracks.py"
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _rules() -> list[tuple[str, list[str]]]:
     """The lines of CODEOWNERS as (pattern, owners), in file order."""
-    rules: list[tuple[str, list[str]]] = []
-    for raw in CODEOWNERS.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        pattern, *owners = line.split()
-        rules.append((pattern, owners))
-    return rules
+    return _tracks().codeowners_rules(CODEOWNERS.read_text(encoding="utf-8"))
 
 
-def _regex(pattern: str) -> re.Pattern[str]:
-    """A CODEOWNERS pattern as gitignore reads it, for the forms ADR-0010 uses.
-
-    A leading ``/`` anchors the pattern at the root, ``**/`` is zero or more
-    directories, ``*`` does not cross a ``/``, and a pattern owns what is under it.
-    A form this reading does not model is refused, so that a future line is never
-    approved by a matcher that would read it differently from GitHub: a trailing
-    ``*`` is one level on GitHub (``docs/*`` leaves ``docs/x/y.md`` out) and
-    recursive here, and a pattern with no leading ``/`` floats under any directory
-    here and not always there.
-    """
-    floating = pattern != "*" and not pattern.startswith("/")
-    trailing_star = pattern != "*" and pattern.endswith("*")
-    bare_double_star = "**" in pattern.replace("**/", "")
-    if floating or trailing_star or bare_double_star:
-        raise ValueError(
-            f"{pattern!r} is a form this matcher does not model: write the line as"
-            " ADR-0010 does, or teach the matcher the form and test it first"
-        )
-    body = pattern.strip("/")
-    parts: list[str] = []
-    i = 0
-    while i < len(body):
-        if body.startswith("**/", i):
-            parts.append("(?:.*/)?")
-            i += 3
-        elif body[i] == "*":
-            parts.append("[^/]*")
-            i += 1
-        else:
-            parts.append(re.escape(body[i]))
-            i += 1
-    prefix = "" if pattern.startswith("/") else "(?:.*/)?"
-    return re.compile(f"^{prefix}{''.join(parts)}(?:/.*)?$")
+def _regex(pattern: str) -> Any:
+    """A CODEOWNERS pattern as gitignore reads it: ``tracks.py``'s matcher, whose table this is."""
+    return _tracks().pattern_regex(pattern)
 
 
 def _owners_of(path: str) -> list[str]:

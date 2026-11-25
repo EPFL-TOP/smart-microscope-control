@@ -24,6 +24,17 @@ _BRANCH = re.compile(r"(?P<type>[a-z]+)/(?P<number>\d+)(?:-|$)")
 _CLOSES_NOTHING = {"docs", "adr"}
 
 
+def branch_issue(branch: str) -> int | None:
+    """The issue a branch is named for, whatever its type; ``None`` for a branch with no number.
+
+    A ``docs/<N>-<slug>`` branch closes nothing (``allowed``) and is still the work of
+    issue N: the tooling that finds the issue of a pull request reads the number here,
+    under the one grammar of a branch name, and never in a copy of the pattern.
+    """
+    m = _BRANCH.match(branch)
+    return None if m is None else int(m["number"])
+
+
 def allowed(branch: str) -> set[int]:
     """The issues a PR from ``branch`` may close."""
     m = _BRANCH.match(branch)
