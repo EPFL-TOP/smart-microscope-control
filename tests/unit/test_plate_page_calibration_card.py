@@ -8,6 +8,8 @@ given. Every expected text is the design's, written out whole and not built by t
 
 from __future__ import annotations
 
+import time
+from collections.abc import Iterator
 from datetime import datetime, timezone
 
 import pytest
@@ -207,6 +209,31 @@ def test_the_fixed_text_is_never_cut_at_the_widest_value_the_model_allows() -> N
     assert len(second) < CALIBRATION_LINE_CHARS
 
 
+@pytest.mark.parametrize(
+    ("length", "cut"),
+    [
+        pytest.param(CALIBRATION_LINE_CHARS - 1, False, id="one under the bound"),
+        pytest.param(CALIBRATION_LINE_CHARS, False, id="at the bound"),
+        pytest.param(CALIBRATION_LINE_CHARS + 1, True, id="one over the bound"),
+        pytest.param(CALIBRATION_LINE_CHARS + 2, True, id="two over the bound"),
+    ],
+)
+def test_a_line_of_the_bound_is_kept_whole_and_one_character_more_is_cut(
+    length: int, cut: bool
+) -> None:
+    # The edge itself (FM-43): `assumed: ` is 9 characters, the note is the rest.
+    prefix = "assumed: "
+    note = "n" * (length - len(prefix))
+
+    line = calibration_numbers_text(_note(notes=(note,))).split("\n")[-1]
+
+    if cut:
+        assert line == (prefix + note)[:CALIBRATION_LINE_CHARS] + "…"
+    else:
+        assert line == prefix + note
+        assert len(line) == length
+
+
 def test_the_line_bound_is_the_cards_sentence_bound() -> None:
     assert CALIBRATION_LINE_CHARS == controller._CARD_TEXT_CHARS == 600
 
@@ -302,6 +329,32 @@ def test_at_the_plates_objective_or_with_no_offer_the_run_documents_calibration_
     )
 
     assert found == (run if shown else None)
+
+
+def test_at_the_plates_own_objective_a_document_held_at_its_position_is_not_the_run_documents() -> (
+    None
+):
+    # The click at the plate's own objective writes into the run document (D19), so a file left at
+    # that objective's position by an earlier session is not the calibration in use: the pane says
+    # the run document's, with its own numbers and path (FM-216; the case D1 item 2 is for).
+    stale = _read(
+        TEN,
+        path="run/calibrations/position-2.json",
+        numbers=DEMO,
+        notes=("a stale file",),
+    )
+
+    found = _stand(
+        objective=TEN,
+        plate_objective=TEN,
+        # The 10X is the second label of LABELS: position 2.
+        documents=(controller.HeldCalibration(2, stale),),
+    )
+
+    assert found is RUN
+    assert found is not None
+    assert found.where == "run/run.json"
+    assert found.numbers == RUN_NUMBERS
 
 
 def test_at_another_objective_the_positions_document_is_shown() -> None:
@@ -424,6 +477,25 @@ def test_the_time_of_a_document_is_the_tools_own_iso_text_and_an_unknown_time_is
     assert controller._measured_times("") == ("????-??-?? ??:??:??", "")
 
 
+@pytest.fixture
+def pc_zone(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """The PC set to UTC+14, where no clock reading of a UTC time can be mistaken for the PC's.
+
+    On a runner in UTC a naive time read as the PC's and the same time read as UTC are one text,
+    so the rule "a time with no zone is UTC" is only seen from another zone (FM-43). ``tzset`` is
+    the platform's: Windows reads the zone from the system and the test is skipped there.
+    """
+    if not hasattr(time, "tzset"):
+        pytest.skip("this platform sets no zone from TZ")
+    monkeypatch.setenv("TZ", "Pacific/Kiritimati")
+    time.tzset()
+    try:
+        yield "Pacific/Kiritimati"
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
 def test_a_time_in_another_zone_or_with_none_is_put_in_utc() -> None:
     plus_two = "2026-11-25T12:20:30+02:00"
     naive = "2026-11-25T10:20:30"  # a run document's times are UTC: never the PC's zone
@@ -437,6 +509,17 @@ def test_a_time_in_another_zone_or_with_none_is_put_in_utc() -> None:
         "2026-11-25 10:20:30",
         local_time(instant),
     )
+
+
+def test_a_time_with_no_zone_is_utc_whatever_zone_the_pc_is_in(pc_zone: str) -> None:
+    naive = "2026-11-25T10:20:30"
+    instant = datetime(2026, 11, 25, 10, 20, 30, tzinfo=timezone.utc)
+
+    utc, local = controller._measured_times(naive)
+
+    # The PC is 14 hours ahead of UTC: the local form is the next morning, the UTC form is as written.
+    assert utc == "2026-11-25 10:20:30"
+    assert local == local_time(instant) == "2026-11-26 00:20"
 
 
 def test_a_time_utc_cannot_hold_is_the_unknown_time_and_raises_nothing() -> None:

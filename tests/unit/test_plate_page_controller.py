@@ -4506,6 +4506,19 @@ GOTO_UNDER_LIVE = (
 )
 
 
+def _run_threads() -> list[str]:
+    """The names of the live threads that are the page's activities, never its background stand read.
+
+    ``status()`` starts ``smc-stand-read`` while an activity goes and it ends when the read does:
+    a count of all threads across a ``status()`` call is raced by it (FM-44).
+    """
+    return sorted(
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name != "smc-stand-read"
+    )
+
+
 def test_a_goto_while_live_goes_says_why_and_what_to_press(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
@@ -4517,7 +4530,9 @@ def test_a_goto_while_live_goes_says_why_and_what_to_press(
         before = stage.position_um()
         page.live(True)
         assert page.is_live
-        threads = threading.active_count()
+        # The threads by name, without the stand read that `status()` may start and end
+        # on its own (a count across a `status()` call raced it: 3 failures in 15 runs).
+        threads = _run_threads()
         shown = (page.current, page.status().goto, page.status().goto_answer)
         with _refuses(RuntimeError, GOTO_UNDER_LIVE):
             page.goto("B2")
@@ -4528,7 +4543,7 @@ def test_a_goto_while_live_goes_says_why_and_what_to_press(
         # text and the row's answer as they were (#444).
         assert page.is_live
         assert page.status().running == "live"
-        assert threading.active_count() == threads
+        assert _run_threads() == threads
         assert StubGoto.ran == []
         assert stage.position_um() == before
         assert (page.current, page.status().goto, page.status().goto_answer) == shown
@@ -4581,6 +4596,30 @@ def test_a_goto_after_live_ended_goes(
         assert StubGoto.ran == [("B2", "centre")]
     finally:
         page.close()
+
+
+def test_a_goto_on_a_closed_page_whose_live_has_not_ended_says_the_page_is_closed(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `close()` gives up on an activity that does not end within `_CLOSE_WAIT_S`: a Live worker
+    # held in a snap keeps `is_live` true on a closed page, and its text (press End live) would be
+    # the wrong one for a page that no longer answers a press.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    camera = FrameCamera(_ramp_frame(), block=True)
+    fake_microscope.override(Camera, camera)
+    monkeypatch.setattr(controller_module, "_CLOSE_WAIT_S", 0.05)
+    page = _page(fake_microscope, run_doc)
+    page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        page.close()
+        assert page.is_live
+        with _refuses(RuntimeError, "the page is closed"):
+            page.goto("B2")
+    finally:
+        camera.release.set()
+        assert page.join(10.0)
+    assert StubGoto.ran == []
 
 
 def test_end_live_stops_only_the_live_it_started(

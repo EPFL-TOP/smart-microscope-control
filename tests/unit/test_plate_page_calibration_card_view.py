@@ -363,6 +363,26 @@ def test_at_another_objective_the_stand_screen_says_the_numbers_of_its_document_
     assert view.calibration_numbers.object.split("\n")[2] == f"Written to {run_doc}."
 
 
+def test_at_the_plates_own_objective_a_stale_file_at_its_position_is_not_what_the_pane_says(
+    make_view: Callable[..., PlatePageView], run_doc: Path
+) -> None:
+    # A position-2 file left by an earlier session, with the demo's numbers, next to a plate
+    # registered under the 10X: the click at the 10X writes into the run document (D19), so the
+    # pane says the run document's calibration, its numbers and its path (FM-216).
+    _seed_plate(run_doc, TEN)
+    _seed_run_calibration(run_doc, TEN)
+    stale = _hold(run_doc, TEN)
+
+    view = make_view()
+
+    assert view.calibration_numbers.object.split("\n")[:3] == [
+        f"Camera calibration at {TEN}, measured {LOCAL}.",
+        RUN_LINE,
+        f"Written to {run_doc}.",
+    ]
+    assert str(stale) not in view.calibration_numbers.object
+
+
 def test_a_document_that_is_not_its_positions_says_nothing_on_the_screen(
     make_view: Callable[..., PlatePageView],
     fake_microscope: Microscope,
