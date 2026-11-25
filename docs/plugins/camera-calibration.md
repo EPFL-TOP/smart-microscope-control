@@ -80,7 +80,7 @@ refusal has no sentence about it.
 
 A stage that ran and could not produce a usable result ends the record `failed`
 with the reason, and **fills no slot**: a reader never finds a matrix it should
-not trust. The reason says which of five things went wrong (six texts: the first
+not trust. The reason says which of six things went wrong (seven texts: the first
 is told two ways). The first ones are about the light and come before any
 judgement of the shifts:
 
@@ -130,7 +130,8 @@ The other three are what the shifts of frames with light say:
   5, F12, #545); the same field with more beads calibrated, and so does that field
   now, by the second look below. The next suspects are
   the light path and then the stage (a stage that ignored the command, the wrong
-  camera). When a probe read zero, the second look ran and the reason says what it
+  camera; when the stage's own readback says it did not move, the refusal says so
+  first, below). When a probe read zero, the second look ran and the reason says what it
   saw: `away from the camera's own pattern the best peaks are <a> and <b> times the
   next (1.5 asked)`, after the two figures and before the step. The two figures are the contrast of the two probe frames, as the
   dark-frame refusal above quotes it: a dark frame spans a few tens of counts, and a
@@ -145,7 +146,37 @@ The other three are what the shifts of frames with light say:
   little noise (a limit that clamped it, a stage that stopped short). Check the
   stage's travel on that axis, then run it again.
 
-Each of these three is followed by `step <n> µm`, and by `a step over 40 % of the field may
+**The stage's own readback comes first when it says a move did not arrive** (#614).
+`move_to_um` returns where the stage read it was once the move was done, and the plugin
+keeps it for each probe move. A stage that accepts a command and goes nowhere gives two
+shifts of zero, which the fit can only call a texture problem. When the fit refuses and
+a probe's readback is within **1 µm** of the start (over both axes; 5 % of the step for a
+step under 20 µm), the reason leads with that and the texture advice goes:
+
+```text
+the stage read its start after the +X probe (0.0 µm from it) and after the +Y probe (0.0 µm from it): the moves did not arrive, so the frames are not the cause; check the stage (its controller on, nothing else holding it); step 96 µm
+```
+
+With one probe it names that probe (`the stage read its start after the +Y probe (0.0 µm
+from it): that move did not arrive, ...`): an axis that goes nowhere makes one column of the
+shifts zero, so the shifts are parallel whatever the frames hold. The figure is the distance
+the stage read from the start, to a tenth of a µm, so that a surprise at the stand is a
+number to bring back. What goes with the texture advice: `PARALLEL_SHIFTS_NOTE` (it ranks
+the frames first), the probe frames' spread, the second look's ratios, the wrap hint and
+the reuse sentence (a reuse is no way out of a stage that did not obey). The fit's other
+notes stay after the line (a weak response is a fact of the field), then `step <n> µm`. The
+line says what was read, and its checks are suggestions, not a diagnosis.
+
+Readbacks that left the start change **nothing**: the refusal is the texture one above,
+byte for byte (the reason has no room to quote them: 572 of the card's 600 characters
+at the longest). A fit that is trustworthy is never refused or relabelled for the
+readbacks: a stage that moves and reads back its start (a stale readback) calibrates
+from the images, which followed it. The tolerance is **assumed**: the demo stage lands
+within 0.005 µm of a command and the fake exactly (measured 2026-11-25), and a stage that
+goes nowhere reads its start with the same read; a real stage's idle readback was not
+measured.
+
+Each of the three texts above is followed by `step <n> µm`, and by `a step over 40 % of the field may
 wrap: give a smaller step_um` when the step was the 50 µm fallback or more than
 40 % of the smaller side. Phase correlation reports each axis's shift in
 `[-N/2, N/2)`, so content moved by 200 rows of a 384-row frame reads -184: a step
@@ -159,7 +190,8 @@ from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)`. The tool reads no other
 document, so it cannot name the file: `PATH_TO_ITS_RUN_DOCUMENT` stands for the run document of
 an earlier calibration at this objective (the plate page keeps one per turret
 position, below). A refusal for another reason (a dark frame, the rigid-camera
-note) does not carry it: a reuse is no way out of a stage that did not obey. The
+note, the stage's own readback) does not carry it: a reuse is no way out of a stage
+that did not obey. The
 whole reason stays within the 600 characters the plate page's card keeps of a
 failure (572 at the longest: five-digit spreads, a 2000 µm step and the wrap hint).
 
@@ -446,3 +478,9 @@ sparse field, which should read the morning's 1.12432 µm per pixel and 178.33°
 one on a field the tool must still refuse (an empty well). The two thresholds, 1.5
 times the next peak and 12 px around zero shift, are the emulation's. A ratio or a
 shift that surprises is a number to bring back.
+
+The stage's own line (#614) was built on a stage double that goes nowhere and on the demo
+stage. **Not run at a stand**: a calibration with the stage disabled or held by the vendor
+software, which should read the start after each probe (the distance read then is the
+number to bring back, against the 1 µm tolerance, which is assumed), and a calibration on
+a field the stage can move but the frames cannot show (it should keep the texture text).
