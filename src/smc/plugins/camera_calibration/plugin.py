@@ -26,6 +26,13 @@ harm.
   gives is believed only when it stands out and is a rigid camera's, the fit
   then judges it as ever, and the result says it was read this way. No move, no
   snap: the second look runs after the return, on arithmetic.
+* **A refusal says first what the stage's own readback says** (#614, FM-167). A stage
+  that accepts a probe move and goes nowhere gives two shifts of zero, which the fit
+  can only call a texture problem; ``move_to_um`` had returned where the stage read it
+  was, and the plugin discarded it. When a probe's readback is within a micrometre of
+  the start, the refusal says the move did not arrive and that the frames are not the
+  cause. Only a refusal reads the readbacks: a fit that is trustworthy is the
+  measurement, and readbacks that left the start change no word.
 * **A reuse never names the document the run writes** (F15, #626). The runner
   marks the stage ``running`` in its own document before ``run``, which replaces
   the calibration a ``from_run_doc`` of that same document would copy: the refusal
@@ -95,6 +102,14 @@ _RETURN_PIXELS = 4.0
 #: calibration exists to correct: a size 100 times too large would otherwise be
 #: sent as 9.6 mm of absolute moves, which no jog guard covers (FM-121).
 _MAX_STEP_UM = 2000.0
+#: A probe move whose readback is within ``min(_STILL_UM, _STILL_SHARE * step)`` of the
+#: start did not arrive (#614). **Assumed**, not measured at a stand: the demo stage lands
+#: within 0.005 µm of a command and ``FakeCore`` exactly, and a stage that goes nowhere
+#: reads its start with the very same read, so 1 µm is two hundred times the demo's
+#: rounding and far under any step the tool sends (a quarter of the field, 50 µm at the
+#: least by default). The share keeps the claim true for a step under 20 µm.
+_STILL_UM = 1.0
+_STILL_SHARE = 0.05
 #: The ``assumed`` line of a calibration the second look read: its return check is blind
 #: (the camera's own pattern wins at zero shift whether or not the stage came back), so
 #: ``return_error_um`` is unknown and not 0. One line, well under the strip's 160 (FM-205).
@@ -210,6 +225,9 @@ class CameraCalibrationPlugin:
         # 1412 and 16 bits): the second look needs them after the return, and
         # asks the camera for nothing (FM-88).
         probe_frames: list[npt.NDArray[Any]] = []
+        # Where the stage read it was once each probe move returned: a refusal
+        # compares them with the start (#614). Nothing is read for them.
+        landed: list[XY] = []
         # Per probe frame: whether it carries light, and the spread the message quotes.
         signals: list[tuple[bool, float]] = []
         settle_s = params.settle_ms / 1000.0
@@ -221,7 +239,7 @@ class CameraCalibrationPlugin:
             for done, (label, dx_um, dy_um) in enumerate(probes, start=1):
                 ctx.raise_if_stopped()
                 away = True
-                xy.move_to_um(start.x_um + dx_um, start.y_um + dy_um)
+                landed.append(xy.move_to_um(start.x_um + dx_um, start.y_um + dy_um))
                 ctx.wait_s(settle_s)
                 probe_frame = camera.snap()
                 probe_frames.append(probe_frame)
@@ -277,6 +295,13 @@ class CameraCalibrationPlugin:
                 shift_x, shift_y = looked[0].shift, looked[1].shift
                 fitted = fit(shift_x, shift_y, step_um=step_um, image_shape_px=shape)
         if not fitted.trustworthy:
+            # Only a refusal reads the readbacks: a fit that is trustworthy is the
+            # measurement, whatever a stale readback says (#614).
+            still = tuple(
+                (label, _distance_um(start, there))
+                for (label, _dx_um, _dy_um), there in zip(probes, landed, strict=True)
+                if _stood_still(start, there, step_um)
+            )
             raise PluginRunError(
                 self.name,
                 _unusable_reason(
@@ -287,6 +312,7 @@ class CameraCalibrationPlugin:
                     used_fallback,
                     tuple(spread for _lit, spread in signals),
                     ratios,
+                    still,
                 ),
             )
         if ratios is not None and read_away:
@@ -525,6 +551,47 @@ def _warn_left(ctx: RunContext, xy: XYStage, start: XY) -> None:
     )
 
 
+def _distance_um(start: XY, there: XY) -> float:
+    """How far ``there`` is from ``start`` over both axes, in µm."""
+    return math.hypot(there.x_um - start.x_um, there.y_um - start.y_um)
+
+
+def _stood_still(start: XY, landed: XY, step_um: float) -> bool:
+    """Whether a probe move's readback is the start: the move did not arrive (#614, FM-167).
+
+    ``move_to_um`` returns where the stage read it was once the move was done, and
+    a move that returns is not a move that arrived: a stage that accepts the
+    command and goes nowhere reads its start. Within ``min(_STILL_UM, _STILL_SHARE
+    * step_um)`` of it, over both axes. ``<=`` as the positive test, so that a
+    readback that is not a number (``nan``; ``inf`` is further than anything) is
+    not taken for the start, and the claim is never made on a value that is not one
+    (FM-104).
+    """
+    tolerance_um = min(_STILL_UM, _STILL_SHARE * step_um)
+    return _distance_um(start, landed) <= tolerance_um
+
+
+def _stood_still_line(still: tuple[tuple[str, float], ...]) -> str:
+    """What the stage read after the probes that did not arrive, and where to look.
+
+    It names each probe with the distance read from the start, so that a surprise at
+    a stand is a number to report, and says only what was read: the causes are
+    checks, not a diagnosis. One probe is enough for the frames not to be the cause:
+    an axis that goes nowhere gives a zero column and parallel shifts whatever the
+    frames hold. No angle bracket: the plate page puts the text in a pane that a
+    browser parses as HTML (#625).
+    """
+    after = " and ".join(
+        f"after the {label} ({distance_um:.1f} µm from it)"
+        for label, distance_um in still
+    )
+    moves = "the moves did" if len(still) > 1 else "that move did"
+    return (
+        f"the stage read its start {after}: {moves} not arrive, so the frames are "
+        "not the cause; check the stage (its controller on, nothing else holding it)"
+    )
+
+
 def _unusable_reason(
     fitted: Fit,
     step_um: float,
@@ -533,8 +600,17 @@ def _unusable_reason(
     used_fallback: bool,
     probe_spreads: tuple[float, ...] = (),
     away_ratios: tuple[float, float] | None = None,
+    stood_still: tuple[tuple[str, float], ...] = (),
 ) -> str:
     """Why the fit is no good, the step that was tried, and a hint when it may have wrapped.
+
+    When the stage's own readback stayed at the start after a probe (``stood_still``:
+    the probe's label and the distance read, #614), the reason leads with that and the
+    texture advice goes: ``PARALLEL_SHIFTS_NOTE`` ranks the frames above the stage, and
+    the probe frames' spread, the second look's ratios, the wrap hint and the reuse
+    sentence are all about the frames or the step. The fit's other notes stay after the
+    stage's line (a featureless field is a fact of its own), then the step. Readbacks
+    that left the start change nothing: the reason is what it was.
 
     Parallel shifts name the frames first (``PARALLEL_SHIFTS_NOTE``), and the
     message gives the contrast of the probe frames, the 1st to 99th percentile
@@ -553,6 +629,11 @@ def _unusable_reason(
     parses as HTML, and ``<its run document>`` vanished there as a tag (#625,
     read in Chromium, Panel 1.11.0).
     """
+    if stood_still:
+        others = tuple(note for note in fitted.notes if note != PARALLEL_SHIFTS_NOTE)
+        return "; ".join(
+            (_stood_still_line(stood_still), *others, f"step {step_um:g} µm")
+        )
     reason = "; ".join(fitted.notes)
     if PARALLEL_SHIFTS_NOTE in fitted.notes and probe_spreads:
         shown = " and ".join(f"{spread:.0f}" for spread in probe_spreads)

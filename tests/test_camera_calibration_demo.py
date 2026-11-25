@@ -57,6 +57,7 @@ from smc.plugins.camera_calibration.plugin import (
     CameraCalibrationParams,
     CameraCalibrationPlugin,
     _second_look_holds,
+    _stood_still,
     _unusable_reason,
     _wants_a_second_look,
     precision_line,
@@ -88,6 +89,9 @@ class _FlakyStage:
     moves it was asked for and ``targets`` keeps them, so a test can say that no
     return was sent and how far a move was asked to go. With
     ``unreadable_after_fault`` the position cannot be read once a move failed.
+    An axis with a fraction of 0.0 is dead: it accepts every command and goes
+    nowhere, and the readback of a move says where it really is. ``lying`` moves
+    for real and reads back the start, the stage of a readback that is stale.
     """
 
     def __init__(
@@ -98,18 +102,26 @@ class _FlakyStage:
         drift_um: dict[int, tuple[float, float]] | None = None,
         unreadable_after_fault: bool = False,
         x_fraction: float = 1.0,
+        y_fraction: float = 1.0,
+        lying: bool = False,
     ) -> None:
         self._real = real
         self._fail_on_move = fail_on_move
         self._drift_um = drift_um or {}
         self._unreadable_after_fault = unreadable_after_fault
-        # An X axis that executes this fraction of every command, counted from
+        # An axis that executes this fraction of every command, counted from
         # where the stage was when the wrapper was made (the start).
         self._x_fraction = x_fraction
-        self._origin_x_um = real.position_um().x_um
+        self._y_fraction = y_fraction
+        self._lying = lying
+        start = real.position_um()
+        self._origin_x_um = start.x_um
+        self._origin_y_um = start.y_um
         self._faulted = False
         self.moves = 0
         self.targets: list[tuple[float, float]] = []
+        #: What each move returned, in order: the readbacks the plugin was given.
+        self.landed: list[XY] = []
 
     def position_um(self) -> XY:
         if self._faulted and self._unreadable_after_fault:
@@ -126,7 +138,14 @@ class _FlakyStage:
         executed_x_um = self._origin_x_um + self._x_fraction * (
             x_um - self._origin_x_um
         )
-        return self._real.move_to_um(executed_x_um + dx, y_um + dy)
+        executed_y_um = self._origin_y_um + self._y_fraction * (
+            y_um - self._origin_y_um
+        )
+        landed = self._real.move_to_um(executed_x_um + dx, executed_y_um + dy)
+        if self._lying:
+            landed = XY(self._origin_x_um, self._origin_y_um)
+        self.landed.append(landed)
+        return landed
 
     def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
         return self._real.move_by_um(dx_um, dy_um, force=force)
@@ -1656,6 +1675,9 @@ def _over_a_still_background(
     beads_px: tuple[tuple[int, int], ...],
     camera_class: type[_StillBackgroundCamera] = _StillBackgroundCamera,
     drift_um: dict[int, tuple[float, float]] | None = None,
+    x_fraction: float = 1.0,
+    y_fraction: float = 1.0,
+    lying: bool = False,
 ) -> tuple[_StillBackgroundCamera, _FlakyStage, tuple[float, float]]:
     """The stand with a camera that has a still background, a stage that counts, and where it starts.
 
@@ -1671,7 +1693,13 @@ def _over_a_still_background(
         beads_px=beads_px,
     )
     microscope.override(Camera, camera)
-    stage = _FlakyStage(microscope.require(XYStage), drift_um=drift_um)
+    stage = _FlakyStage(
+        microscope.require(XYStage),
+        drift_um=drift_um,
+        x_fraction=x_fraction,
+        y_fraction=y_fraction,
+        lying=lying,
+    )
     microscope.override(XYStage, stage)
     start = _here(microscope)
     assert carries_signal(camera.snap())
@@ -2044,6 +2072,277 @@ def test_a_refusal_that_is_not_for_texture_does_not_offer_the_reuse(
     assert "away from the camera's own pattern" not in reason
 
 
+# -- a stage that read its start after a probe: its own words come first (#614, m3 §4.5)
+
+#: What the stage's line ends with, character for character: the checks, not a diagnosis.
+STAGE_CHECK = "check the stage (its controller on, nothing else holding it)"
+#: The line when the stage read its start after both probes (0.0 µm from it each).
+STILL_BOTH = (
+    "the stage read its start after the +X probe (0.0 µm from it) and after the +Y "
+    "probe (0.0 µm from it): the moves did not arrive, so the frames are not the "
+    f"cause; {STAGE_CHECK}"
+)
+#: The sentences of the texture refusal that a stage's line must not be read beside.
+TEXTURE_WORDS = (
+    "parallel shifts",
+    "too little texture",
+    "probe frames span",
+    "away from the camera's own pattern",
+    "may wrap",
+    "from_run_doc",
+)
+
+
+def test_a_stage_that_reads_its_start_after_both_probes_is_named_first_and_the_frames_are_not_blamed(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A stage that accepts the move and goes nowhere gave the texture refusal (F12, #545).
+
+    Both axes are dead: every readback is the start, and the frames, which follow
+    the real stage, do not change (the premise: two shifts of exactly zero, so the
+    fit says ``parallel shifts``). The refusal says what the stage read, and none
+    of the advice that ranks the frames first.
+    """
+    start = _start_off_the_origin(demo_microscope)
+    camera, stage, _ = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330)), x_fraction=0.0, y_fraction=0.0
+    )
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(demo_microscope, tmp_path)
+
+    reference, probe_x, probe_y = camera.taken[:3]
+    _first_look_reads_zero(reference, probe_x)
+    _first_look_reads_zero(reference, probe_y)
+    assert measure_shift_away_from_zero(reference, probe_x).peak_ratio < 1.5
+    assert stage.moves == 3
+    assert stage.targets[0] == (start[0] + STEP_UM, start[1])
+    assert stage.targets[1] == (start[0], start[1] + STEP_UM)
+    assert raised.value.reason == f"{STILL_BOTH}; step {STEP_UM:g} µm"
+    for words in TEXTURE_WORDS:
+        assert words not in raised.value.reason
+    # The return was sent (FM-88: the measurement ran to its end), no frame after it.
+    assert len(camera.taken) == 3
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+    assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
+
+
+@pytest.mark.parametrize(
+    ("fractions", "label", "still_um"),
+    [
+        ({"x_fraction": 0.0}, "+X probe", "0.0"),
+        ({"y_fraction": 0.0}, "+Y probe", "0.0"),
+    ],
+    ids=["dead-x-axis", "dead-y-axis"],
+)
+def test_a_stage_that_reads_its_start_after_one_probe_names_that_probe_only(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    fractions: dict[str, float],
+    label: str,
+    still_um: str,
+) -> None:
+    """One axis that goes nowhere makes the determinant zero whatever the frames hold.
+
+    A dead X axis leaves the +X probe at the start and moves the +Y one; a dead Y
+    axis lets the +X probe move and puts X back at the start for the +Y probe, which
+    reads it. Only the probe that read the start is named, and the other is not.
+    """
+    start = _start_off_the_origin(demo_microscope)
+    camera, stage, _ = _over_a_still_background(
+        demo_microscope, ((120, 180), (250, 330)), **fractions
+    )
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(demo_microscope, tmp_path)
+
+    assert stage.moves == 3
+    other = "+Y probe" if label == "+X probe" else "+X probe"
+    assert raised.value.reason == (
+        f"the stage read its start after the {label} ({still_um} µm from it): "
+        f"that move did not arrive, so the frames are not the cause; {STAGE_CHECK}; "
+        f"step {STEP_UM:g} µm"
+    )
+    assert other not in raised.value.reason
+    for words in TEXTURE_WORDS:
+        assert words not in raised.value.reason
+    assert len(camera.taken) == 3
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
+
+
+@pytest.mark.parametrize(
+    ("fraction", "named", "shown"),
+    [(0.02, False, ""), (0.005, True, "0.5")],
+    ids=["creeps-1.92-um-per-axis", "creeps-0.48-um-per-axis"],
+)
+def test_a_stage_whose_readbacks_are_past_the_tolerance_keeps_the_texture_order_whole(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    fraction: float,
+    named: bool,
+    shown: str,
+) -> None:
+    """A readback 1.92 µm from the start is not the start; 0.48 µm is (the tolerance is 1.0 µm).
+
+    The frames are fixed to the sensor (``_DeafCamera``), so the shifts are zero
+    whatever the stage did; only the readbacks decide which text the operator reads.
+    Past the tolerance the refusal is the texture one, whole, with the stage last.
+    """
+    _start_off_the_origin(demo_microscope)
+    camera, _stage, _start = _over_a_still_background(
+        demo_microscope,
+        ((120, 180), (250, 330)),
+        camera_class=_DeafCamera,
+        x_fraction=fraction,
+        y_fraction=fraction,
+    )
+
+    reason = _refusal(demo_microscope, tmp_path)
+
+    reference, probe_x, probe_y = camera.taken[:3]
+    _first_look_reads_zero(reference, probe_x)
+    _first_look_reads_zero(reference, probe_y)
+    if named:
+        assert reason.startswith(
+            f"the stage read its start after the +X probe ({shown} µm"
+        )
+        assert f"and after the +Y probe ({shown} µm from it)" in reason
+        assert PARALLEL_SHIFTS_NOTE not in reason
+    else:
+        assert reason.startswith(PARALLEL_SHIFTS_NOTE)
+        assert reason.endswith(REUSE_SENTENCE)
+        assert "the stage read its start" not in reason
+
+
+@pytest.mark.parametrize(
+    ("landed_um", "step_um", "still"),
+    [
+        # Over both axes: 0.6 and 0.6 are 0.85 µm from the start, 0.8 and 0.8 are 1.13.
+        ((0.0, 0.0), 96.0, True),
+        ((0.6, -0.6), 96.0, True),
+        ((0.8, 0.8), 96.0, False),
+        # The tolerance itself is still: `<=`, not `<`.
+        ((1.0, 0.0), 96.0, True),
+        ((0.0, -1.0), 96.0, True),
+        ((1.1, 0.0), 96.0, False),
+        ((0.0, 2.0), 96.0, False),
+        # A step under 20 µm shrinks it to a twentieth of the step.
+        ((0.4, 0.0), 10.0, True),
+        ((0.6, 0.0), 10.0, False),
+        ((0.9, 0.0), 19.0, True),
+        ((1.0, 0.0), 19.0, False),
+        # A readback that is not a number is not the start (FM-104).
+        ((math.nan, 0.0), 96.0, False),
+        ((0.0, math.nan), 96.0, False),
+        ((math.inf, 0.0), 96.0, False),
+        ((math.nan, math.inf), 96.0, False),
+    ],
+)
+def test_a_readback_is_still_at_the_tolerance_and_not_past_it(
+    landed_um: tuple[float, float], step_um: float, still: bool
+) -> None:
+    """The decision is a positive test on a distance over both axes, from a start off the origin."""
+    start = XY(300.0, 200.0)
+    landed = XY(start.x_um + landed_um[0], start.y_um + landed_um[1])
+
+    assert _stood_still(start, landed, step_um) is still
+
+
+def test_a_calibration_that_the_fit_accepts_is_never_refused_for_the_readbacks(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """A stage that moves for real and reads back its start is a stale readback, not a field to refuse.
+
+    The images followed the stage by a quarter field on each axis, a rigid camera's
+    shifts: the measurement stands, and the result is a calibration like any other,
+    with no line about the readbacks. The readbacks speak only when the fit refuses.
+    """
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    start = _start_off_the_origin(microscope)
+    stage = _FlakyStage(microscope.require(XYStage), lying=True)
+    microscope.override(XYStage, stage)
+
+    result = _result(_run(microscope, tmp_path))
+
+    # The premise: every readback is the start, so a refusal would have named the stage.
+    assert stage.moves == 3
+    assert all(_stood_still(XY(*start), landed, STEP_UM) for landed in stage.landed)
+    assert result.pixel_size_um == pytest.approx(1.0, rel=0.02)
+    assert result.assumed == ()
+    assert _here(microscope) == pytest.approx(start, abs=0.05)
+
+
+def test_a_stage_line_leaves_the_other_notes_of_the_fit_after_it() -> None:
+    """A featureless field and a dead stage: the stage first, the weak response kept, nothing for the frames' order.
+
+    The weak-response note is a fact about the field and stays; ``PARALLEL_SHIFTS_NOTE``
+    ranks the frames above the stage, which the readbacks contradict, and goes, with
+    the spreads, the second look's ratios, the wrap hint and the reuse sentence that
+    belong to it.
+    """
+    both = Fit(
+        ((0.0, 0.0), (0.0, 0.0)),
+        0.0,
+        0.0,
+        False,
+        0.0,
+        (BARELY_CORRELATE_NOTE, PARALLEL_SHIFTS_NOTE),
+    )
+
+    reason = _unusable_reason(
+        both,
+        2000.0,
+        (1412, 1412),
+        1.0,
+        True,
+        (12345.0, 12345.0),
+        (99.9, 99.9),
+        (("+X probe", 0.0), ("+Y probe", 0.3)),
+    )
+
+    assert reason == (
+        "the stage read its start after the +X probe (0.0 µm from it) and after the "
+        "+Y probe (0.3 µm from it): the moves did not arrive, so the frames are not "
+        f"the cause; {STAGE_CHECK}; {BARELY_CORRELATE_NOTE}; step 2000 µm"
+    )
+
+
+def test_the_longest_stage_refusal_stays_within_the_cards_600_characters() -> None:
+    """Both probes named at the tolerance, the weak-response note kept and the widest step: 400 characters or fewer.
+
+    The page keeps 600 of a failure's words (``_CARD_TEXT_CHARS``, FM-205); the stage's
+    line is the one that must not be cut, so it is measured at its longest and the
+    texture refusal's 572 is not what bounds it.
+    """
+    both = Fit(
+        ((0.0, 0.0), (0.0, 0.0)),
+        0.0,
+        0.0,
+        False,
+        0.0,
+        (BARELY_CORRELATE_NOTE, PARALLEL_SHIFTS_NOTE),
+    )
+
+    reason = _unusable_reason(
+        both,
+        2000.0,
+        (1412, 1412),
+        1.0,
+        False,
+        (12345.0, 12345.0),
+        (99.9, 99.9),
+        (("+X probe", 1.0), ("+Y probe", 1.0)),
+    )
+
+    assert reason.startswith("the stage read its start after the +X probe (1.0 µm")
+    assert reason.endswith("step 2000 µm")
+    assert len(reason) <= 400
+    assert len(reason) <= CARD_TEXT_CHARS
+
+
 def test_the_longest_parallel_shifts_refusal_stays_within_the_cards_600_characters() -> (
     None
 ):
@@ -2087,6 +2386,20 @@ def test_what_a_refusal_and_the_assumed_line_say_has_no_angle_bracket() -> None:
         reason = _unusable_reason(
             fitted, 96.0, SHAPE, 1.0, True, (5138.0, 5138.0), (1.2, 1.1)
         )
+        assert "<" not in reason
+        assert ">" not in reason
+        # The stage's line, whole, over the same notes: no tag in it either (#614).
+        reason = _unusable_reason(
+            fitted,
+            96.0,
+            SHAPE,
+            1.0,
+            True,
+            (5138.0, 5138.0),
+            (1.2, 1.1),
+            (("+X probe", 0.0), ("+Y probe", 0.0)),
+        )
+        assert reason.startswith("the stage read its start")
         assert "<" not in reason
         assert ">" not in reason
     line = sparse_field_line((4.7, 4.9))
