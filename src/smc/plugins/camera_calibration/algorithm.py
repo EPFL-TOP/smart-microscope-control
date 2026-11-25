@@ -18,6 +18,14 @@ Two failures look like success, and each is refused here instead of returned:
   The response measured at the wrapped shift is that of unrelated content, so
   the same weak response refuses it (FM-120).
 
+A third looks like a failure and is not always one: **a sparse field over the
+camera's own pattern** (m3 §4.4). The sensor's fixed pattern (vignette, column
+stripes, dust) does not move with the stage, so on a field that holds almost
+nothing of the sample it wins the phase correlation at zero shift, and a stage
+that moved a quarter field reads as one that did not (F14, Ti2-E session 6,
+#625). ``measure_shift_away_from_zero`` is the second look at the probes the
+first one read as zero; ``measure_shift`` is not changed.
+
 This is the port of ``nikon-control``'s ``camera_cal.py`` without its hardware
 loop (that is ``plugin.py``'s): it imports nothing of ``smc.hardware``.
 """
@@ -49,21 +57,32 @@ from smc.plugins.frame_signal import signal_spread as signal_spread
 from smc.plugins.geometry import Matrix2
 
 __all__ = [
+    "BARELY_CORRELATE_NOTE",
     "DEFAULT_STEP_FRACTION",
     "FALLBACK_STEP_UM",
+    "FIXED_PATTERN_EXCLUDE_PX",
+    "FIXED_SHIFT_PX",
     "MAX_RESIDUAL_SHARE",
     "MIN_FEATURE_FRACTION",
+    "MIN_PEAK_RATIO",
     "MIN_RESPONSE",
     "MIN_SIGNAL_SPREAD_COUNTS",
     "PARALLEL_SHIFTS_NOTE",
+    "PEAK_SEPARATION_PX",
+    "RIGID_ANGLE_TOLERANCE_DEG",
+    "RIGID_MAGNITUDE_TOLERANCE",
     "SMALL_STEP_FRACTION",
     "UPSAMPLE",
+    "AwayShift",
     "Fit",
     "Shift",
     "carries_signal",
     "fit",
     "measure_shift",
+    "measure_shift_away_from_zero",
     "precision_reasons",
+    "reads_the_fixed_pattern",
+    "shifts_of_a_rigid_camera",
     "signal_floor_counts",
     "signal_spread",
 ]
@@ -97,6 +116,31 @@ PARALLEL_SHIFTS_NOTE = (
     "texture (a sparse field, a dark or flat frame): try a field with more "
     "structure, then the light path, then the stage"
 )
+
+#: What the fit says when a probe's frames share nothing once aligned. A name for
+#: the text ``fit`` has always written, so that the plugin can tell a refusal for
+#: texture (this and ``PARALLEL_SHIFTS_NOTE``) from the others by the note itself.
+BARELY_CORRELATE_NOTE = "the frames barely correlate: find a field with texture"
+
+#: The second look sets to zero the correlation surface this far (rows and
+#: columns, both ways) from zero shift (m3 §4.4.2 D2). 12 px is the zero peak's
+#: skirt, which reaches 4 to 5 px: with 3 px excluded an empty field's best
+#: "other" peak stood at 1.7 times the next, a peak that is only the skirt.
+FIXED_PATTERN_EXCLUDE_PX = 12
+#: A peak's "next peak" is the highest cell further than this from it.
+PEAK_SEPARATION_PX = 10
+#: The second look is believed when its best peak is this many times the next
+#: one. A stage that did not move gave at most 1.20 and an empty field 1.19 on
+#: emulated pairs of the stand's frames; the fields it reads right have a tenth
+#: percentile of 2.4 (cells) and 1.4 (beads), and none read at 1.5 was another peak.
+MIN_PEAK_RATIO = 1.5
+#: A first shift within this many pixels of zero, on both axes, is the camera's
+#: own pattern: the stage moved tens of pixels.
+FIXED_SHIFT_PX = 2.0
+#: The two probes of a rigid camera are as long as each other, to this share...
+RIGID_MAGNITUDE_TOLERANCE = 0.10
+#: ... and at a right angle, to this many degrees (a mirrored camera as well).
+RIGID_ANGLE_TOLERANCE_DEG = 10.0
 
 #: Fewer overlapping pixels than this on an axis say nothing about agreement.
 _MIN_OVERLAP_PX = 8
@@ -153,6 +197,19 @@ class Fit:
         return not self.notes
 
 
+@dataclass(frozen=True, slots=True)
+class AwayShift:
+    """The strongest correlation peak away from zero shift, and how far it stands out.
+
+    ``peak_ratio`` is that peak over the highest one more than
+    ``PEAK_SEPARATION_PX`` from it: a peak that is the best of a crowd of equals
+    is noise, and one several times the next is a shift (m3 §4.4.2 D2).
+    """
+
+    shift: Shift
+    peak_ratio: float
+
+
 def measure_shift(reference: npt.NDArray[Any], moved: npt.NDArray[Any]) -> Shift:
     """The displacement of the content from ``reference`` to ``moved``, with its response.
 
@@ -181,6 +238,141 @@ def measure_shift(reference: npt.NDArray[Any], moved: npt.NDArray[Any]) -> Shift
     d_row = -float(shift[0]) + 0.0
     d_col = -float(shift[1]) + 0.0
     return Shift(d_col, d_row, _response(a, b, d_row, d_col))
+
+
+def measure_shift_away_from_zero(
+    reference: npt.NDArray[Any],
+    moved: npt.NDArray[Any],
+    *,
+    exclude_px: int = FIXED_PATTERN_EXCLUDE_PX,
+) -> AwayShift:
+    """The shift of the strongest correlation peak that is not at zero shift (m3 §4.4).
+
+    The camera's own pattern (vignette, column stripes, dust) does not move with
+    the stage, so on a field that holds almost nothing of the sample it is the
+    highest peak of ``measure_shift`` and the stage reads as one that did not
+    move (F14, #625). When the stage moved a probe of tens of pixels, a peak at
+    zero shift is what did not move. This looks at the same correlation surface
+    with the cells within ``exclude_px`` of zero shift (the zero peak's skirt
+    reaches 4 to 5 px) set to 0, and says how far the best remaining peak stands
+    out from the next one: the camera's pattern is not a peak that stands out
+    away from zero, and a sample's shift is. It is a second look, asked only of
+    a probe the first one read as zero; ``measure_shift`` stays the answer for
+    every field that calibrates without it.
+
+    The correlation is ``measure_shift``'s (normalised frames, the cross-power
+    spectrum at unit magnitude), and so is the sub-pixel step (the matrix-product
+    DFT around the integer peak at ``UPSAMPLE``), and the response, measured at
+    the shift found. A flat frame has no shift to find: ``Shift(0.0, 0.0, 0.0)``
+    at a ratio of 1.0, without a correlation.
+
+    Raises:
+        ValueError: A frame is not 2-D, holds a value that is not finite, the two
+            frames differ in shape, or a side is ``4 * exclude_px`` or less (the
+            exclusion and the separation would then leave no peak to compare).
+    """
+    a = _as_frame(reference, "reference")
+    b = _as_frame(moved, "moved")
+    if a.shape != b.shape:
+        raise ValueError(
+            f"the two frames must have the same shape, got {a.shape} and {b.shape}"
+        )
+    if min(a.shape) <= 4 * exclude_px:
+        raise ValueError(
+            f"a frame of {a.shape} is too small to exclude {exclude_px} px around "
+            "zero shift: each side must be more than four times that"
+        )
+    if _is_flat(a) or _is_flat(b):
+        return AwayShift(Shift(0.0, 0.0, 0.0), 1.0)
+    a = (a - a.mean()) / a.std()
+    b = (b - b.mean()) / b.std()
+
+    # The cross-power spectrum at unit magnitude, floored as scikit-image does.
+    product = np.fft.fft2(a) * np.fft.fft2(b).conj()
+    product /= np.maximum(np.abs(product), 100.0 * np.finfo(np.float64).eps)
+    surface = np.abs(np.fft.ifft2(product))
+    height, width = surface.shape
+    surface[
+        np.ix_(_cells_near(height, 0, exclude_px), _cells_near(width, 0, exclude_px))
+    ] = 0.0
+
+    row, col = (
+        int(index) for index in np.unravel_index(np.argmax(surface), surface.shape)
+    )
+    best = float(surface[row, col])
+    rest = surface.copy()
+    rest[
+        np.ix_(
+            _cells_near(height, row, PEAK_SEPARATION_PX),
+            _cells_near(width, col, PEAK_SEPARATION_PX),
+        )
+    ] = 0.0
+    next_best = float(rest.max())
+    if next_best > 0.0:
+        peak_ratio = best / next_best
+    else:
+        peak_ratio = math.inf if best > 0.0 else 1.0
+
+    # The integer peak as a signed shift, then refined at 1 / UPSAMPLE of a pixel
+    # in a window of a pixel and a half, exactly as `phase_cross_correlation` does.
+    # `//` and `int`, never `np.fix`, which numpy 2.5 deprecates.
+    shift_row = float(row - height if row > height // 2 else row)
+    shift_col = float(col - width if col > width // 2 else col)
+    region = math.ceil(UPSAMPLE * 1.5)
+    centre = region // 2
+    refined = np.abs(
+        _upsampled_dft(
+            product.conj(),
+            region,
+            (centre - shift_row * UPSAMPLE, centre - shift_col * UPSAMPLE),
+        )
+    )
+    fine_row, fine_col = (
+        int(index) for index in np.unravel_index(np.argmax(refined), refined.shape)
+    )
+    shift_row += (fine_row - centre) / UPSAMPLE
+    shift_col += (fine_col - centre) / UPSAMPLE
+    # Negated, as `measure_shift`'s; `+ 0.0` turns a -0.0 into 0.0.
+    d_row, d_col = -shift_row + 0.0, -shift_col + 0.0
+    return AwayShift(Shift(d_col, d_row, _response(a, b, d_row, d_col)), peak_ratio)
+
+
+def reads_the_fixed_pattern(shift: Shift) -> bool:
+    """Whether a probe's first shift is the camera's own pattern, not the stage's.
+
+    The stage moved a probe of tens of pixels, so a shift within
+    ``FIXED_SHIFT_PX`` of zero on both axes is what did not move with it (m3
+    §4.4.2 D3). A positive test, so that a shift that is not a number is not read
+    as the pattern: nothing then asks for the second look.
+    """
+    return (
+        abs(shift.d_col_px) <= FIXED_SHIFT_PX and abs(shift.d_row_px) <= FIXED_SHIFT_PX
+    )
+
+
+def shifts_of_a_rigid_camera(shift_x: Shift, shift_y: Shift) -> bool:
+    """Whether a +X and a +Y probe look like one camera's: as long, and at a right angle.
+
+    A camera, mirrored or not, turns the two stage axes into two image vectors of
+    one length that stand at a right angle (the sign of the angle is the mirror).
+    Two peaks that are not, are two peaks of the sample's own periodicity or of
+    noise. This guards the second look independently of its peak ratio, and
+    ``fit`` then judges the matrix as ever (m3 §4.4.2 D4). A shift without
+    length, or that is not a number, is not a camera's.
+    """
+    length_x = math.hypot(shift_x.d_col_px, shift_x.d_row_px)
+    length_y = math.hypot(shift_y.d_col_px, shift_y.d_row_px)
+    if not (length_x > 0.0 and length_y > 0.0):
+        return False
+    if not abs(length_x - length_y) <= RIGID_MAGNITUDE_TOLERANCE * max(
+        length_x, length_y
+    ):
+        return False
+    cosine = (
+        shift_x.d_col_px * shift_y.d_col_px + shift_x.d_row_px * shift_y.d_row_px
+    ) / (length_x * length_y)
+    angle_deg = math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
+    return abs(angle_deg - 90.0) <= RIGID_ANGLE_TOLERANCE_DEG
 
 
 def fit(
@@ -213,7 +405,7 @@ def fit(
     # `not >=`, not `<`, and each probe on its own: a response that is nan must
     # fail the check, and `min(0.9, nan)` is 0.9.
     if not (shift_x.response >= MIN_RESPONSE and shift_y.response >= MIN_RESPONSE):
-        notes.append("the frames barely correlate: find a field with texture")
+        notes.append(BARELY_CORRELATE_NOTE)
     a, b = shift_x.d_col_px / step_um, shift_y.d_col_px / step_um
     c, d = shift_x.d_row_px / step_um, shift_y.d_row_px / step_um
     determinant = a * d - b * c
@@ -289,6 +481,34 @@ def precision_reasons(
             f"residual {fitted.residual_um:.1f} µm, {share:.0f} % of the step"
         )
     return tuple(reasons)
+
+
+def _cells_near(size: int, centre: int, radius: int) -> npt.NDArray[np.bool_]:
+    """The indices of an axis of ``size`` cells within ``radius`` of ``centre``, wrapped.
+
+    A correlation surface is periodic: a peak at -3 is at ``size - 3``.
+    """
+    distance = np.abs(np.arange(size) - centre)
+    return np.asarray(np.minimum(distance, size - distance) <= radius)
+
+
+def _upsampled_dft(
+    data: npt.NDArray[np.complex128], region: int, offsets: tuple[float, float]
+) -> npt.NDArray[np.complex128]:
+    """The DFT of ``data`` sampled at 1 / UPSAMPLE of a pixel in a ``region`` square, by matrix products.
+
+    ``phase_cross_correlation``'s own refinement (Guizar-Sicairos 2008), written
+    here because scikit-image keeps it private: it is the same arithmetic, so the
+    second look and ``measure_shift`` agree on a rich pair to a hundredth of a
+    pixel. ``offsets`` is where, in samples, the window starts on each axis.
+    """
+    out = data
+    for n_items, offset in zip(data.shape[::-1], offsets[::-1], strict=True):
+        kernel = (np.arange(region) - offset)[:, None] * np.fft.fftfreq(
+            n_items, UPSAMPLE
+        )
+        out = np.tensordot(np.exp(-2j * np.pi * kernel), out, axes=(1, -1))
+    return out
 
 
 def _is_flat(frame: npt.NDArray[np.float64]) -> bool:
