@@ -24,7 +24,11 @@ where each is a run that moves nothing, and so does ``results-all``, which press
 screen's *Run all that are left* over the chain's results (the report and the export, which
 move nothing); ``wells-timed`` runs one real ``timing`` beside the page, as the chain's steps
 are, and reads the Wells screen's ``Time`` line under the scan's three autofocus modes; the
-script never presses a tool's own *Run*.
+script never presses a tool's own *Run*. The two Stand states seed the calibration they are about
+with a real ``camera-calibration`` beside the page, as the chain's steps are (the dry-run page
+"cannot measure the camera"): ``stand-620`` a good one, on ``demo-sample`` only, and
+``stand-failed-620`` one that fails (a 2000 µm probe), last; each says where the first line of its
+pane sits in the 620 px page (#658).
 
 Exit codes: 0 every state reached, the server logged no error and stopped by
 Ctrl-C; 1 the job could not be done (no playwright, no browser, the server never
@@ -88,13 +92,25 @@ KILL_GRACE_S = 5.0
 #: last three walk the Wells and Scan screens by their own buttons (m5 §17.10.4, #445), the
 #: middle one reading the Wells screen's ``Time`` line under the scan's three autofocus modes
 #: (§17.12.12 D42, #592): they need a sample to register the plate from, so ``demo-sample``
-#: only, and nothing of the chain.
+#: only, and nothing of the chain. ``stand-failed-620`` is the last: the Stand screen after a
+#: calibration that failed (m5 §22.2, #625), at the short height, reached alone on both stands;
+#: its failed record replaces the calibration ``stand-620`` seeded, so nothing may come after it
+#: (#658).
 ALONE_STATES = ("empty", "wells-selected", "snap", "expert")
 CHAIN_STATES = ("after-density", "with-route", "results-all", "turned")
 SHORT_STATES = ("stand-620", "plate-620")
 GUIDED_STATES = ("wells-laid-out", "wells-timed", "scanned")
-STATE_NAMES = (*ALONE_STATES, *CHAIN_STATES, *SHORT_STATES, *GUIDED_STATES)
+FAILED_STATES = ("stand-failed-620",)
+STATE_NAMES = (
+    *ALONE_STATES,
+    *CHAIN_STATES,
+    *SHORT_STATES,
+    *GUIDED_STATES,
+    *FAILED_STATES,
+)
 REACHABLE_ALONE = len(ALONE_STATES)
+#: The states photographed at ``SHORT_VIEWPORT_HEIGHT_PX``: the viewport goes back after each.
+SHORT_PAGE_STATES = (*SHORT_STATES, *FAILED_STATES)
 
 #: Why the guided states are not reached on the plain demo (m5 §17.10.4): its plate has no
 #: references to register from, and a registration from three centres by eye is a hand's work.
@@ -114,6 +130,7 @@ SHORT_VIEWPORT_HEIGHT_PX = 620
 #: this to: this script imports nothing of smc at import).
 SCREEN_TITLE_OF = {
     "stand-620": "Which stand, and which preset?",
+    "stand-failed-620": "Which stand, and which preset?",
     "plate-620": "Where is the plate?",
     # The Scan screen's title names the plan's wells (``guide.scan_title``): the two wells
     # ``wells-laid-out`` types, in plate order.
@@ -124,6 +141,23 @@ SCREEN_TITLE_OF = {
     # The Results screen's title is the screen's own name (``guide.SCREEN_TITLES``).
     "results-all": "Results",
 }
+
+#: What the Stand screen's two calibration panes start with (m5 §23.2 D3, §22.2 D1), as the page
+#: draws them and a test pins to ``guide`` (this script imports nothing of smc at import): the
+#: numbers pane's first line ``Camera calibration at <objective>, measured <when>.`` (or
+#: ``Camera calibration (objective not recorded), ...``) and the failed line ``The last
+#: calibration failed: <the tool's words>``. The states wait for these texts, never a delay, and
+#: read each pane's first line (``FIRST_LINE_PARTS``).
+CALIBRATION_NUMBERS = re.compile(r"^Camera calibration (at |\()")
+CALIBRATION_FAILED = re.compile(r"^The last calibration failed")
+NUMBERS_PART = "calibration numbers, first line"
+FAILED_PART = "calibration failed, first line"
+#: The parts that are read by their first line: the numbers pane is three lines and the failed
+#: line wraps, and a box of the whole pane says ``NO`` for a pane whose first line is in view.
+FIRST_LINE_PARTS = (NUMBERS_PART, FAILED_PART)
+#: What the demo stand says when it is not seeded: its camera images no sample, and the same
+#: ``camera-calibration`` run fails there (``the two moves gave parallel shifts``).
+NOT_SEEDED = "not seeded (the demo camera images no sample: it cannot be measured)"
 
 #: What the Results screen says (m5 §17.4.5, §17.11), as the page draws it and a test pins to
 #: ``guide`` (this script imports nothing of smc at import): the five rows' plain names in the
@@ -197,6 +231,22 @@ ROUTE_STEP = Step("route", (("labels", json.dumps(["single", "doublet"])),))
 #: demo's simulated stage like the chain's steps, since ``timing`` refuses a dry run (its calls
 #: take no time to measure) and so cannot be a click of the page.
 TIMING_STEP = Step("timing", (("repeats", "1"),))
+#: The calibration ``stand-620`` seeds (#658): a real run beside the page, on the simulated stage,
+#: since the dry-run page "cannot measure the camera" (the tool refuses a dry run). 0.2 s on
+#: ``demo-sample``: pixel size 1.0, rotation 0.0, not mirrored, the 10X.
+CALIBRATION_STEP = Step("camera-calibration")
+#: The calibration ``stand-failed-620`` seeds, which must fail: a probe step of 2000 µm (the
+#: tool's own largest) is further than the frames correlate on ``demo-sample`` (``the frames
+#: barely correlate ... a step over 40 % of the field may wrap``) and on the plain demo it ends as
+#: its default does (``the two moves gave parallel shifts``): exit 1 on both stands (measured,
+#: #658). Its record ends ``failed`` with the tool's words, which the Stand screen's line says.
+FAILING_CALIBRATION_STEP = Step("camera-calibration", (("step_um", "2000"),))
+#: The exit code of ``smc run`` for a tool that failed. Another one (2, a renamed parameter) is
+#: not the failure a seed wants.
+FAILED_EXIT_CODE = 1
+#: How the summary names a seed (``seed_facts``).
+SEED_LABEL = "calibration seed"
+FAILING_SEED_LABEL = "failing calibration seed"
 
 #: The label of the ``scan`` tool's ``autofocus`` field on the Wells screen (``plate_page``'s
 #: ``_AUTOFOCUS_FIELD``, which a test pins this to: this script imports nothing of smc at import).
@@ -363,10 +413,11 @@ def plan_states(
     The four of ``CHAIN_STATES`` need the results of a real run of the workflow: the demo
     camera images no sample, ``--no-results`` skips the chain, and a chain step that failed
     leaves them without their input. The two short-page states of D12 need none, and are
-    reached on both stands, last.
+    reached on both stands, and so is the failed-calibration state, which comes last.
     """
     plans = [StatePlan(name, True) for name in ALONE_STATES]
     short = [StatePlan(name, True) for name in SHORT_STATES]
+    failed = [StatePlan(name, True) for name in FAILED_STATES]
     # The guided states register the plate from the sample themselves and run no chain, so
     # they are reached with ``--no-results`` and after a chain that failed: ``demo-sample``
     # only, since the plain demo has nothing to register from.
@@ -393,6 +444,7 @@ def plan_states(
             *(StatePlan(n, False, reason) for n in CHAIN_STATES),
             *short,
             *guided,
+            *failed,
         ]
     if chain_failure is not None:
         return [
@@ -404,8 +456,10 @@ def plan_states(
             ),
             *short,
             *guided,
+            *failed,
         ]
-    return [*plans, *(StatePlan(n, True) for n in CHAIN_STATES), *short, *guided]
+    chain = [StatePlan(n, True) for n in CHAIN_STATES]
+    return [*plans, *chain, *short, *guided, *failed]
 
 
 # --- what is read back -----------------------------------------------------
@@ -696,19 +750,40 @@ class Stand:
     env: dict[str, str]
     #: The viewport of the run, which a short-page state puts back after its photograph.
     viewport: tuple[int, int] = (VIEWPORT_WIDTH_PX, VIEWPORT_HEIGHT_PX)
+    #: Whether the stand's camera images a sample: the calibration ``stand-620`` seeds can be
+    #: measured only on ``demo-sample`` (the plain demo's frames hold no texture, #658).
+    images_sample: bool = True
+
+    def _run(self, step: Step) -> StepOutcome:
+        return run_step(
+            run_command(self.python, step, self.profile, self.run_doc),
+            label=step.plugin,
+            log=self.chain_log,
+            cwd=ROOT,
+            env=self.env,
+        )
 
     def run_chain(self, steps: Sequence[Step]) -> None:
         for step in steps:
-            outcome = run_step(
-                run_command(self.python, step, self.profile, self.run_doc),
-                label=step.plugin,
-                log=self.chain_log,
-                cwd=ROOT,
-                env=self.env,
-            )
-            failure = outcome.failure()
+            failure = self._run(step).failure()
             if failure is not None:
                 raise ChainFailedError(failure)
+
+    def run_failing(self, step: Step) -> str:
+        """Run ``step``, which must fail as a tool does (exit 1), and say how it failed.
+
+        A seed that is meant to leave a ``failed`` record: a step that passed, hung or ended
+        with another code (2, a renamed parameter) is no such record, so the state is *not
+        reached* with that sentence and a regression of the tool is never a quiet pass.
+        """
+        outcome = self._run(step)
+        if outcome.ok:
+            raise ChainFailedError(f"{step.plugin} was to fail and passed")
+        if outcome.timed_out or outcome.exit_code != FAILED_EXIT_CODE:
+            raise ChainFailedError(
+                f"{outcome.failure()} (wanted a failed record, exit {FAILED_EXIT_CODE})"
+            )
+        return outcome.failure() or ""
 
 
 def _act_empty(page: Any, stand: Stand) -> None:
@@ -869,9 +944,46 @@ def _open_screen(page: Any, number: int, title: str, heading: str) -> None:
     page.locator("pre").filter(has_text=heading).first.wait_for()
 
 
-def _act_stand_620(page: Any, stand: Stand) -> None:
-    """*1. Stand* after Connect, at 1280 x 620 (m5 §17.8): its title and *Load* are inside the page."""
+def _seed_calibration(stand: Stand) -> list[tuple[str, str]]:
+    """A real ``camera-calibration`` beside the page, so that the Stand screen has numbers to say (#658).
+
+    The page is in dry run and cannot measure, so the run is the chain's kind: on the
+    simulated stage, into the run document, which the *Refresh* of ``_open_screen`` makes the
+    page read again. Only where the camera images a sample: on the plain demo the same run
+    fails, so nothing is seeded and the summary says so, with the numbers pane ``not on the
+    page``. Returns the one reading the summary says (``seed_facts``).
+    """
+    if not stand.images_sample:
+        return [(SEED_LABEL, NOT_SEEDED)]
+    stand.run_chain([CALIBRATION_STEP])
+    return [(SEED_LABEL, "seeded by a real camera-calibration on the simulated stage")]
+
+
+def _act_stand_620(page: Any, stand: Stand) -> list[tuple[str, str]]:
+    """*1. Stand* after a seeded calibration and Connect, at 1280 x 620 (m5 §17.8, §23.2): its title and *Load* are inside the page, and the numbers pane is drawn.
+
+    The wait for the pane's first line is for the text the server draws once it has read the
+    run document again (FM-162), and only when a calibration was seeded.
+    """
+    seeds = _seed_calibration(stand)
     _open_screen(page, 1, "Stand", SCREEN_TITLE_OF["stand-620"])
+    if stand.images_sample:
+        page.locator("pre").filter(has_text=CALIBRATION_NUMBERS).first.wait_for()
+    return seeds
+
+
+def _act_stand_failed_620(page: Any, stand: Stand) -> list[tuple[str, str]]:
+    """*1. Stand* after a calibration that failed, at 1280 x 620 (m5 §22.2 D1, #625): the line of what it said is drawn.
+
+    The seed is a ``camera-calibration`` that must fail (``FAILING_CALIBRATION_STEP``): its
+    record ends ``failed`` with the tool's words, and the line under *Calibrate the camera*
+    says them. The state waits for that text (FM-162). Returns the tool's own sentence, which the
+    summary says beside the page's.
+    """
+    failure = stand.run_failing(FAILING_CALIBRATION_STEP)
+    _open_screen(page, 1, "Stand", SCREEN_TITLE_OF["stand-failed-620"])
+    page.locator("pre").filter(has_text=CALIBRATION_FAILED).first.wait_for()
+    return [(FAILING_SEED_LABEL, failure)]
 
 
 def _act_plate_620(page: Any, stand: Stand) -> None:
@@ -1010,14 +1122,16 @@ ACTIONS = {
     "wells-laid-out": _act_wells_laid_out,
     "wells-timed": _act_wells_timed,
     "scanned": _act_scanned,
+    "stand-failed-620": _act_stand_failed_620,
 }
 
-#: What a state does after its photograph: ``expert`` puts its switch off, and the two
-#: short-page states put the viewport back.
+#: What a state does after its photograph: ``expert`` puts its switch off, and the short-page
+#: states put the viewport back.
 AFTER_ACTIONS = {
     "expert": _after_expert,
     "stand-620": _after_short,
     "plate-620": _after_short,
+    "stand-failed-620": _after_short,
 }
 
 
@@ -1042,19 +1156,30 @@ def _short_parts(page: Any, state: str) -> list[tuple[str, Any]]:
 
     Not the figures and the drive bar: at 620 px they are below the fold by design, and
     the screen's own fields are read by eye in the PNG. The first action of *Stand* is
-    the preset's *Load*, and of *Plate* the first row's *Go to*.
+    the preset's *Load*, and of *Plate* the first row's *Go to*. The two Stand states add
+    the calibration pane they are about, by its first line (``FIRST_LINE_PARTS``).
     """
+    on_stand = state != "plate-620"
     first = (
         page.get_by_role("button", name="Load", exact=True)
-        if state == "stand-620"
+        if on_stand
         else page.get_by_role("button", name=re.compile(r"^Go to "))
     )
-    return [
+    parts = [
         ("STOP", page.get_by_role("button", name="STOP")),
         ("step bar", _step_button(page, 1, "Stand")),
         ("title", page.locator("pre").filter(has_text=SCREEN_TITLE_OF[state])),
         ("first action", first),
     ]
+    # The Stand screen's calibration panes (#658): the numbers after a seeded calibration, the
+    # failed line after a failed one, each read by its first line.
+    if state == "stand-620":
+        pane = page.locator("pre").filter(has_text=CALIBRATION_NUMBERS)
+        parts.append((NUMBERS_PART, pane))
+    elif state == "stand-failed-620":
+        pane = page.locator("pre").filter(has_text=CALIBRATION_FAILED)
+        parts.append((FAILED_PART, pane))
+    return parts
 
 
 def _guided_parts(page: Any, state: str) -> list[tuple[str, Any]]:
@@ -1118,6 +1243,50 @@ def _header_height_px(page: Any) -> float | None:
     return float(height)
 
 
+#: Finds the first character that is not a space in an element's text and says where it is
+#: drawn: the first line of a pane that wraps, which the box of the whole pane cannot say.
+_FIRST_LINE_JS = """el => {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const at = node.data.search(/\\S/);
+    if (at < 0) continue;
+    const range = document.createRange();
+    range.setStart(node, at);
+    range.setEnd(node, at + 1);
+    const rect = range.getClientRects()[0];
+    if (rect) return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+  }
+  return null;
+}"""
+
+
+class _UnreadError(Exception):
+    """The browser did not answer a read: the line says ``?`` and nothing is guessed."""
+
+
+def _first_line_box(element: Any) -> dict[str, float] | None:
+    """Where the first line of ``element``'s text is drawn, or ``None`` when no text is.
+
+    One ``evaluate`` on the element (a Range over its first visible character), so that it
+    pierces the shadow roots the pane is in. A browser that refuses, or an answer that is
+    not a box, is ``_UnreadError``: the summary says ``?``, never the box of the whole pane in
+    its place (#658).
+    """
+    try:
+        box = element.evaluate(_FIRST_LINE_JS)
+    except Exception as exc:
+        raise _UnreadError from exc
+    if box is None:
+        return None
+    keys = ("x", "y", "width", "height")
+    if not isinstance(box, dict) or not all(
+        isinstance(box.get(k), int | float) and not isinstance(box.get(k), bool)
+        for k in keys
+    ):
+        raise _UnreadError
+    return {k: float(box[k]) for k in keys}
+
+
 def _offsets_block_line(page: Any) -> str:
     """Whether the offsets block is shown: ``offsets block: shown``, ``hidden``, ``not on this screen`` or ``?`` (m5 §18.6 D23).
 
@@ -1156,7 +1325,7 @@ def _on_screen(page: Any, state: str | None = None) -> list[str]:
     if not isinstance(viewport, dict):
         return []
     lines: list[str] = []
-    if state in SHORT_STATES:
+    if state in SHORT_PAGE_STATES:
         parts = _short_parts(page, state)
     elif state in GUIDED_STATES:
         parts = _guided_parts(page, state)
@@ -1168,7 +1337,15 @@ def _on_screen(page: Any, state: str | None = None) -> list[str]:
         if locator.count() == 0:
             lines.append(f"{name}: not on the page")
             continue
-        box = locator.first.bounding_box()
+        try:
+            box = (
+                _first_line_box(locator.first)
+                if name in FIRST_LINE_PARTS
+                else locator.first.bounding_box()
+            )
+        except _UnreadError:
+            lines.append(f"{name}: ?")
+            continue
         if box is None:
             lines.append(f"{name}: not drawn")
             continue
@@ -1269,12 +1446,19 @@ def time_facts(readings: Sequence[tuple[str, str]]) -> list[str]:
     return [f"time (autofocus {mode}): {line}" for mode, line in readings]
 
 
+def seed_facts(readings: Sequence[tuple[str, str]]) -> list[str]:
+    """What a Stand state's seed was, as ``<label>: <what>``: the calibration ``stand-620`` made (or why it made none) and the sentence the failing one ended with (#658)."""
+    return [f"{label}: {text}" for label, text in readings]
+
+
 def state_facts(
     name: str,
     texts: Sequence[str],
     readings: Sequence[tuple[str, str]] = (),
 ) -> list[str]:
-    """The facts a state is about, by name: ``scanned`` the scan's, ``results-all`` the chain's, ``wells-timed`` the three ``Time`` lines its action read (``readings``); none for the others."""
+    """The facts a state is about, by name: ``scanned`` the scan's, ``results-all`` the chain's, ``wells-timed`` the three ``Time`` lines its action read (``readings``), the two Stand states their seed (``readings``); none for the others."""
+    if name in ("stand-620", "stand-failed-620"):
+        return seed_facts(readings)
     if name == "scanned":
         return scan_facts(texts)
     if name == "results-all":
@@ -1369,6 +1553,11 @@ def drive(
             # A page that is gone has no picture: the reason is what there is to say.
             with contextlib.suppress(pw.Error):
                 page.screenshot(path=str(out / f"{plan.name}-FAILED.png"))
+            # A short-page state that failed after it shrank the page (a wait that timed out)
+            # must not leave the next states, the guided ones among them, at 620 px (#658).
+            if plan.name in SHORT_PAGE_STATES:
+                with contextlib.suppress(pw.Error):
+                    _after_short(page, stand)
             records.append(StateRecord(plan.name, False, reason))
             if isinstance(exc, ChainFailedError) and plan.name == "after-density":
                 later = plan_states(stand_name, results=results, chain_failure=reason)
@@ -1502,6 +1691,7 @@ def _serve_and_drive(
         out / "chain.log",
         env,
         (args.width, args.height),
+        images_sample=args.stand == "demo-sample",
     )
     plans = plan_states(args.stand, results=not args.no_results)
     log = out / "server.log"
