@@ -103,20 +103,25 @@ class FocusOnCellsParams(PluginParams):
     """How far and how finely to sweep, which score, and whether to lock the autofocus again."""
 
     range_um: float = Field(
-        5.0,
+        10.0,
         gt=0.0,
         le=MAX_RANGE_UM,
         description=(
             "The sweep's half-range in µm, around the Z where the stage is (or "
-            "the plane the autofocus holds). Chosen, not measured: session 3 "
-            "measures it on cells."
+            "the plane the autofocus holds). Measured at the Ti2-E's 40x "
+            "(session 6, m3 §21.11.6): the cells' focus curve is 9-11 µm wide "
+            "at half its rise, and ±10 µm at 1 µm finds 17 of 24 cell peaks "
+            "where ±5 µm finds 3."
         ),
     )
     step_um: float = Field(
         1.0,
         ge=MIN_STEP_UM,
         le=MAX_STEP_UM,
-        description="The distance between two planes, in µm. Chosen, not measured.",
+        description=(
+            "The distance between two planes of the sweep, in µm. Chosen; the "
+            "rule against the noise was measured at 1 µm."
+        ),
     )
     score: ScoreName = Field(
         DEFAULT_SCORE,

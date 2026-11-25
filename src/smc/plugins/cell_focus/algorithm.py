@@ -66,7 +66,8 @@ MAX_STEP_UM = 10.0
 MAX_PLANES = 101
 #: A sweep measures its own noise between neighbouring planes, so it needs
 #: this many (m3 §21.11 D9). Measured on synthetic peaks (planning #622): with
-#: fewer, a clean peak's own curvature reads as noise.
+#: fewer, a clean peak's own curvature reads as noise. The rule's floor, not a
+#: sweep for cells: the defaults are 21 planes (m3 §21.11.6 D11).
 MIN_PLANES = 9
 #: A sweep whose smoothed rise is not above this many noises of a smoothed
 #: score is flat (m3 §21.11 D7). Measured on session 6's 49 sweeps at the
@@ -90,6 +91,9 @@ _WHOLE_STEPS_SLACK = 1e-9
 #: 1 / Phi^-1(3/4): turns a median absolute value of a normal law into its
 #: standard deviation (the noise of ``find_peak`` is robust, a median).
 _MAD_TO_SIGMA = 1.4826
+#: sqrt(pi / 2): turns the mean absolute value of a normal law into its standard
+#: deviation (the fallback of ``find_peak`` when the median is 0, D13).
+_MEAN_TO_SIGMA = math.sqrt(math.pi / 2.0)
 
 
 @dataclass(frozen=True)
@@ -244,6 +248,12 @@ def find_peak(z_um: Sequence[float], scores: Sequence[float]) -> Peak:
     unequal spacing is allowed), clamped between the neighbouring planes: a
     sweep never claims a plane it did not bracket.
 
+    A tie at the top of the smoothed scores takes the middle of its run (the
+    lower middle when the run is even): a peak narrower than a step makes three
+    equal values, and the first of them put Z half a step low. When the
+    median second difference is 0 the noise is read from their mean, so that a
+    bare blip on a sweep of exact zeros is not a peak of prominence ``inf``.
+
     Raises:
         ValueError: The lists differ in length, hold fewer than ``MIN_PLANES``
             values, a value is not finite, or ``z_um`` is not strictly
@@ -271,10 +281,20 @@ def find_peak(z_um: Sequence[float], scores: Sequence[float]) -> Peak:
     # The second difference of white noise of sigma has a standard deviation
     # of sigma * sqrt(6), and a mean of three planes has sigma / sqrt(3).
     second = [abs(s[k] - 2.0 * s[k + 1] + s[k + 2]) for k in range(n - 2)]
-    noise = _MAD_TO_SIGMA * statistics.median(second) / math.sqrt(18.0)
+    median = statistics.median(second)
+    if median > 0.0:
+        noise = _MAD_TO_SIGMA * median / math.sqrt(18.0)
+    else:
+        # More than half the second differences exactly 0 (D13): their mean.
+        noise = _MEAN_TO_SIGMA * statistics.fmean(second) / math.sqrt(18.0)
     top = max(m)
     bottom = min(m)
-    k_star = m.index(top)
+    first = m.index(top)
+    last = first
+    while last + 1 < len(m) and m[last + 1] == top:
+        last += 1
+    # A tie at the top takes its middle (D12): the first put Z half a step low.
+    k_star = first + (last - first) // 2
     best_index = k_star + 1
     rise = top - bottom
     if noise > 0.0:
