@@ -4483,8 +4483,7 @@ def test_live_and_every_other_activity_refuse_each_other(
             page.live(True)
         with _refuses(RuntimeError, "live is running"):
             page.resume()
-        with _refuses(RuntimeError, "live is running"):
-            page.goto("A1")
+        # `goto` refuses with a text of its own: it says what to press (#627, D6).
     finally:
         page.live(False)
     assert page.join(10.0)
@@ -4498,6 +4497,90 @@ def test_live_and_every_other_activity_refuse_each_other(
         Slow.release.set()
     assert page.join(10.0)
     assert not page.is_live
+
+
+#: What a drive click says while Live runs (m5 §23.2 D6), written out whole (FM-45).
+GOTO_UNDER_LIVE = (
+    "live is running, so the stage did not move: press End live, switch Drive on and "
+    "click the well again. The arrows work during Live."
+)
+
+
+def test_a_goto_while_live_goes_says_why_and_what_to_press(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page = _page(fake_microscope, run_doc)
+    try:
+        stage = fake_microscope.require(XYStage)
+        before = stage.position_um()
+        page.live(True)
+        assert page.is_live
+        threads = threading.active_count()
+        shown = (page.current, page.status().goto, page.status().goto_answer)
+        with _refuses(RuntimeError, GOTO_UNDER_LIVE):
+            page.goto("B2")
+        with _refuses(RuntimeError, GOTO_UNDER_LIVE):
+            page.goto("B2", "left")
+        # Live goes on: the click never ends it (m5 §5.2); no thread was started; the stage
+        # did not move; and a refusal that is not an answer to a drive leaves the drive's
+        # text and the row's answer as they were (#444).
+        assert page.is_live
+        assert page.status().running == "live"
+        assert threading.active_count() == threads
+        assert StubGoto.ran == []
+        assert stage.position_um() == before
+        assert (page.current, page.status().goto, page.status().goto_answer) == shown
+        assert shown == (None, "", None)
+    finally:
+        page.live(False)
+        assert page.join(10.0)
+        page.close()
+
+
+def test_a_goto_while_another_activity_goes_keeps_its_own_refusal(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # Only Live has the text that says what to press: the mutant that gives it for any
+    # activity says `press End live` to a page that is running a tool.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.run("slow", [])
+        try:
+            assert Slow.started.wait(5)
+            assert not page.is_live
+            with _refuses(RuntimeError, "slow is running"):
+                page.goto("B2")
+        finally:
+            Slow.release.set()
+        assert page.join(10.0)
+    finally:
+        page.close()
+    assert StubGoto.ran == []
+
+
+def test_a_goto_after_live_ended_goes(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `is_live` is read at the call, never from a label a tab drew (FM-177): a Live that
+    # ended meanwhile lets the click go, and the text's own instruction works.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.live(True)
+        with _refuses(RuntimeError, GOTO_UNDER_LIVE):
+            page.goto("B2")
+        page.live(False)
+        assert page.join(10.0)
+        assert not page.is_live
+        page.goto("B2")
+        assert page.join(10.0)
+        assert StubGoto.ran == [("B2", "centre")]
+    finally:
+        page.close()
 
 
 def test_end_live_stops_only_the_live_it_started(

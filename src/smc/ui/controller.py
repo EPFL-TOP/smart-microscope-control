@@ -143,6 +143,7 @@ from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     GOTO_ESTIMATED,
+    GOTO_REFUSED_DURING_LIVE,
     GOTO_UNPLACED,
     GOTO_WALL_NEEDS_REGISTRATION,
     MAP_FIELDS_UP_TO,
@@ -2636,8 +2637,14 @@ class PlatePage:
                 side of the image; an image side with no usable calibration
                 (``NO_CALIBRATION_FOR_SIDES``), or one whose camera is off a quarter
                 turn (``frames``' own text).
-            RuntimeError: A run is going, or the page is closed.
+            RuntimeError: A run is going (while Live runs, ``GOTO_REFUSED_DURING_LIVE``:
+                why the stage did not move and what to press), or the page is closed.
         """
+        # Live is the one activity whose refusal says what to press (m5 §23.2 D6): ``is_live``
+        # is read here, at the call, never from the label a tab drew (FM-177), and Live is
+        # never ended for the click (§5.2). A closed page says it is closed, below.
+        if not self._closed and self.is_live:
+            raise RuntimeError(GOTO_REFUSED_DURING_LIVE)
         # A click refused because an activity runs leaves the page's drive text as it was
         # (the running drive's own, #444's Report): it is not an answer to this click.
         self._refuse_if_busy()
