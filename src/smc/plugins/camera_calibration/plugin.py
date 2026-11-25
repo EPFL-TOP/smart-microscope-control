@@ -526,7 +526,10 @@ def _unusable_reason(
     A refusal for texture ends with the way out that needs none: the calibration
     of an earlier run at this objective can be reused, and nothing moves (D6).
     The tool reads no other document, so the sentence is conditional and names a
-    placeholder, not a path it does not hold.
+    placeholder, not a path it does not hold. The placeholder has no angle
+    brackets: the plate page puts this text in a ``Str`` pane, which a browser
+    parses as HTML, and ``<its run document>`` vanished there as a tag (#625,
+    read in Chromium, Panel 1.11.0).
     """
     reason = "; ".join(fitted.notes)
     if PARALLEL_SHIFTS_NOTE in fitted.notes and probe_spreads:
@@ -544,7 +547,7 @@ def _unusable_reason(
     if PARALLEL_SHIFTS_NOTE in fitted.notes or BARELY_CORRELATE_NOTE in fitted.notes:
         reason += (
             "; if this camera was calibrated at this objective before, reuse "
-            "that calibration with from_run_doc=<its run document> (nothing moves)"
+            "that calibration with from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)"
         )
     return reason
 

@@ -1564,7 +1564,7 @@ def test_a_field_of_a_few_beads_on_a_dark_background_is_calibrated(
 #: D6's last sentence, character for character: the conditional way out of a refusal for texture.
 REUSE_SENTENCE = (
     "; if this camera was calibrated at this objective before, reuse that "
-    "calibration with from_run_doc=<its run document> (nothing moves)"
+    "calibration with from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)"
 )
 #: The page's card keeps this many characters of a failure's words (``_CARD_TEXT_CHARS``).
 CARD_TEXT_CHARS = _CARD_TEXT_CHARS
@@ -1874,7 +1874,7 @@ def test_a_refusal_that_is_not_for_texture_does_not_offer_the_reuse(
 
 
 def test_the_longest_refusal_stays_within_the_cards_600_characters() -> None:
-    """Five-digit spreads, the 2000 µm step, the wrap hint, the widest ratios: 566 characters.
+    """Five-digit spreads, the 2000 µm step, the wrap hint, the widest ratios: 572 characters.
 
     The page keeps 600 characters of a failure's words, and a cut would take the
     end of the reuse sentence, the part that says nothing moves.
@@ -1892,8 +1892,30 @@ def test_the_longest_refusal_stays_within_the_cards_600_characters() -> None:
     assert "step 2000 µm" in reason
     assert "may wrap" in reason
     assert reason.endswith(REUSE_SENTENCE)
-    assert len(reason) == 566
+    assert len(reason) == 572
     assert len(reason) <= CARD_TEXT_CHARS
+
+
+def test_what_a_refusal_and_the_assumed_line_say_has_no_angle_bracket() -> None:
+    """The plate page shows these texts in a pane that a browser parses as HTML (#625).
+
+    ``from_run_doc=<its run document>`` read ``from_run_doc= (nothing moves)`` on the
+    Stand screen: words between angle brackets are a tag there. No text of the tool
+    that the page can carry has one, whatever the note.
+    """
+    parallel = Fit(
+        ((0.0, 0.0), (0.0, 0.0)), 0.0, 0.0, False, 0.0, (PARALLEL_SHIFTS_NOTE,)
+    )
+    weak = Fit(((0.0, 0.0), (0.0, 0.0)), 0.0, 0.0, False, 0.0, (BARELY_CORRELATE_NOTE,))
+    for fitted in (parallel, weak):
+        reason = _unusable_reason(
+            fitted, 96.0, SHAPE, 1.0, True, (5138.0, 5138.0), (1.2, 1.1)
+        )
+        assert "<" not in reason
+        assert ">" not in reason
+    line = sparse_field_line((4.7, 4.9))
+    assert "<" not in line
+    assert ">" not in line
 
 
 @pytest.mark.parametrize(

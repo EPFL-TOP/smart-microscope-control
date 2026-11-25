@@ -66,7 +66,7 @@ the synthetic plate of `smc.testing.synthetic`, whose frames follow the stage):
 ```text
 $ smc run camera-calibration -p demo --run-doc run.json
 camera-calibration: 1/3 +X probe
-✗ camera-calibration: the two moves gave parallel shifts: the frames probably hold too little texture (a sparse field, a dark or flat frame): try a field with more structure, then the light path, then the stage; the probe frames span 5138 and 5138 counts (1st to 99th percentile); step 128 µm; if this camera was calibrated at this objective before, reuse that calibration with from_run_doc=<its run document> (nothing moves)
+✗ camera-calibration: the two moves gave parallel shifts: the frames probably hold too little texture (a sparse field, a dark or flat frame): try a field with more structure, then the light path, then the stage; the probe frames span 5138 and 5138 counts (1st to 99th percentile); step 128 µm; if this camera was calibrated at this objective before, reuse that calibration with from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)
 ```
 
 The demo's frames carry plenty of contrast (5138 counts), which tells a stand's
@@ -155,13 +155,13 @@ refuses it.
 **A refusal for texture offers a way out that needs none.** `parallel shifts` and
 `barely correlate` both end, after the step and the wrap hint, with `; if this
 camera was calibrated at this objective before, reuse that calibration with
-from_run_doc=<its run document> (nothing moves)`. The tool reads no other
-document, so it cannot name the file: `<its run document>` is the run document of
+from_run_doc=PATH_TO_ITS_RUN_DOCUMENT (nothing moves)`. The tool reads no other
+document, so it cannot name the file: `PATH_TO_ITS_RUN_DOCUMENT` stands for the run document of
 an earlier calibration at this objective (the plate page keeps one per turret
 position, below). A refusal for another reason (a dark frame, the rigid-camera
 note) does not carry it: a reuse is no way out of a stage that did not obey. The
 whole reason stays within the 600 characters the plate page's card keeps of a
-failure (566 at the longest: five-digit spreads, a 2000 µm step and the wrap hint).
+failure (572 at the longest: five-digit spreads, a 2000 µm step and the wrap hint).
 
 ### A sparse field: the second look
 
