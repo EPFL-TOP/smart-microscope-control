@@ -1385,6 +1385,35 @@ def test_an_ask_is_an_open_issue_of_the_other_track_only(point) -> None:
     assert point.asks("stand", issues[:3], [], rules) == ["- none"]
 
 
+def test_the_asks_are_in_number_order_and_name_a_waiting_issue_once(point) -> None:
+    rules = point.tracks.read_rules()
+    issues = [
+        # listed in the order that would give the wrong answer if nothing sorted them
+        _work(12, "c", [], "**Depends on**: #20, #20"),
+        _work(10, "a", [], "**Depends on**: #21, #20"),
+        _work(21, "d", ["track: analysis", "status: ready"]),
+        _work(20, "e", ["track: analysis", "status: blocked"]),
+    ]
+    assert point.asks("stand", issues, [], rules) == [
+        "- #20 (analysis track, blocked): awaited by #10, #12",
+        "- #21 (analysis track, ready): awaited by #10",
+    ]
+    crossings = [
+        _pr_of(9, ["pyproject.toml"], (21,)),
+        _pr_of(7, ["pyproject.toml"], (21,)),
+    ]
+    lines = point.asks("analysis", [issues[2]], crossings, rules)
+    assert [ln.split(" of ")[0] for ln in lines] == ["- PR #7", "- PR #9"]
+
+
+def test_the_first_issue_of_a_pr_is_the_one_github_says_it_closes(point) -> None:
+    # closing #5 on a branch named for #9: both are open issues, #5 is the first
+    pr = _pr_of(8, ["pyproject.toml"], (5,), branch="feat/9-x")
+    by_number = {5: _work(5, "a", ["track: analysis"]), 9: _work(9, "b", [])}
+    assert point.pr_open_issue(pr, by_number)["number"] == 5
+    assert point.pr_open_issue(_pr_of(8, [], branch="feat/7-x"), by_number) is None
+
+
 def test_an_ask_takes_a_plans_depends_on_line_before_the_body(point) -> None:
     rules = point.tracks.read_rules()
     planned = {
@@ -1430,6 +1459,8 @@ def test_a_pr_is_listed_in_the_report_of_the_track_of_its_paths(
         _pr_of(702, [ANALYSIS_PATH, "pyproject.toml"], (636,)),
         # two files listed of three: a cut listing is read as the stand's (FM-256)
         _pr_of(703, [ANALYSIS_PATH, "docs/algorithms/README.md"], changed=3),
+        # a plain PR of the stand's own issue and paths: nobody is asked anything
+        _pr_of(707, ["pyproject.toml"], branch="feat/653-x"),
     ]
     stand = _report(point, monkeypatch, capsys, tmp_path, TODAY, prs=prs)
     analysis = _report(
@@ -1444,11 +1475,17 @@ def test_a_pr_is_listed_in_the_report_of_the_track_of_its_paths(
     assert crossing.endswith("| crossing: its issue is the analysis track's")
     (cut,) = (ln for ln in stand_prs.splitlines() if ln.startswith("- #703"))
     assert "crossing" not in cut
-    # the analysis lead is asked for the crossing, by its stand paths
-    assert _section(analysis, "Asks to the other track").strip().splitlines()[-1] == (
-        "- PR #702 of #636 is on the stand track's paths: pyproject.toml"
+    # the analysis lead is asked for the crossing, by its stand paths, and for nothing else:
+    # #701 and #707 are each track's own, #703 has no issue (the whole section, both ways)
+    assert (
+        _section(analysis, "Asks to the other track").strip().splitlines()
+        == [
+            "- #599 (stand track, needs-decision): awaited by #600",  # TODAY's, before the PRs
+            "- PR #702 of #636 is on the stand track's paths: pyproject.toml",
+        ]
     )
     assert not _mentions(analysis_prs, 702)
+    assert _section(stand, "Asks to the other track").strip().splitlines() == ["- none"]
 
 
 def test_a_pr_of_a_stand_issue_on_analysis_paths_is_the_analysis_leads_and_an_ask(

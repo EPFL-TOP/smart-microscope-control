@@ -87,6 +87,33 @@ def test_a_path_written_with_backslashes_or_a_leading_slash_is_read_as_posix(
     assert tracks.path_track("src\\smc\\selection\\api.py", rules) == "stand"
 
 
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "./src/smc/selection/builtin.py",
+        ".\\src\\smc\\selection\\builtin.py",
+        "src//smc/selection/builtin.py",
+        "src/smc/../smc/selection/builtin.py",
+        "/./src/smc/selection/builtin.py",
+    ],
+)
+def test_one_file_is_one_path_whatever_the_shell_wrote_in_front_of_it(
+    tracks: Any, rules: Any, spelling: str
+) -> None:
+    # PowerShell completes with `.\`: the file fell to the stand without a word (FM-24).
+    assert tracks.path_track(spelling, rules) == "analysis"
+    assert tracks.path_track(spelling.replace("builtin", "api"), rules) == "stand"
+
+
+def test_a_star_of_a_pattern_does_not_cross_a_slash(tracks: Any) -> None:
+    # `/tests/**/test_selector_*.py` owns files, and a directory that merely looks like one
+    # is not matched on GitHub: a `.*` here would hand it to the analysis track.
+    regex = tracks.pattern_regex("/tests/**/test_selector_*.py")
+    assert regex.match("tests/test_selector_x.py")
+    assert regex.match("tests/unit/test_selector_x.py")
+    assert not regex.match("tests/unit/test_selector_x/y.py")
+
+
 def test_a_pr_is_the_analysis_tracks_only_when_every_path_is(
     tracks: Any, rules: Any
 ) -> None:
@@ -157,6 +184,30 @@ def test_a_missing_codeowners_or_a_form_the_reader_does_not_model_ends_with_the_
     assert str(missing) in str(unmodelled.value)
 
 
+def test_a_codeowners_that_is_not_plain_utf8_ends_with_the_file_named_and_what_to_do(
+    tracks: Any, tmp_path: Path
+) -> None:
+    # A Windows editor saves a BOM, UTF-16 or cp1252: the BOM made the first comment line a
+    # pattern of a form "the matcher does not model", the others a raw UnicodeDecodeError.
+    text = tracks.CODEOWNERS.read_text(encoding="utf-8")
+    for name, data in {
+        "bom": b"\xef\xbb\xbf" + text.encode("utf-8"),
+        "utf16": text.encode("utf-16"),
+        "cp1252": ("# caf\N{LATIN SMALL LETTER E WITH ACUTE}\n" + text).encode(
+            "cp1252"
+        ),
+    }.items():
+        path = tmp_path / f"CODEOWNERS-{name}"
+        path.write_bytes(data)
+        with pytest.raises(SystemExit) as stop:
+            tracks.read_rules(path)
+        assert str(path) in str(stop.value), name
+        assert "UTF-8" in str(stop.value), name
+    clean = tmp_path / "CODEOWNERS"
+    clean.write_bytes(text.encode("utf-8"))
+    assert tracks.read_rules(clean)
+
+
 def test_the_reader_keeps_whether_a_line_names_an_owner(
     tracks: Any, tmp_path: Path
 ) -> None:
@@ -219,6 +270,25 @@ def test_the_command_line_takes_paths_or_a_pr_and_not_both_or_neither(
     with pytest.raises(SystemExit) as stop:
         tracks.main(argv)
     assert stop.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "wild",
+    [
+        "src/smc/selection/*.py",
+        "tests/test_selector_?.py",
+        "tests/test_selector_[ab].py",
+    ],
+)
+def test_a_wildcard_is_refused_for_it_stands_for_several_tracks(
+    tracks: Any, capsys: pytest.CaptureFixture[str], wild: str
+) -> None:
+    # `src/smc/selection/*.py` holds api.py and registry.py, which are the stand's, and a
+    # shell that does not expand it (cmd.exe, PowerShell) would have it read as analysis.
+    with pytest.raises(SystemExit) as stop:
+        tracks.main(["pyproject.toml", wild])
+    assert stop.value.code == 2
+    assert wild in capsys.readouterr().err
 
 
 def _fake_gh(
@@ -289,6 +359,32 @@ def test_the_pr_mode_says_none_when_every_path_is_on_the_issues_track(
         "PR #5 | issue #7, stand track | 2 paths: 0 analysis, 2 stand",
         "other track: none",
     ]
+
+
+def test_the_pr_mode_takes_the_first_issue_of_a_pr_that_names_two(
+    tracks: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # GitHub says it closes #5 and the branch is named for #9: the issue GitHub lists is
+    # the first, and the paths are checked against its track.
+    seen = _fake_gh(
+        monkeypatch,
+        tracks,
+        {
+            "number": 8,
+            "headRefName": "feat/9-x",
+            "closingIssuesReferences": [{"number": 5}],
+        },
+        {"number": 5, "labels": [{"name": "track: analysis"}]},
+        "src/smc/selection/builtin.py\n",
+    )
+    assert tracks.main(["--pr", "8"]) == 0
+    assert (
+        capsys.readouterr()
+        .out.splitlines()[0]
+        .startswith("PR #8 | issue #5, analysis track |")
+    )
+    assert ("issue", "view", "5", "--json", "number,labels") in seen
+    assert not any(a[:3] == ("issue", "view", "9") for a in seen)
 
 
 def test_the_pr_mode_without_an_issue_takes_the_track_of_its_paths(

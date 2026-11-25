@@ -1562,6 +1562,15 @@ def test_an_after_of_one_lane_can_name_a_step_of_another_of_the_same_point() -> 
     assert lane.check_point(body) == []
     assert lane.parse_point(body)["A2"][0].after == ("A1.1",)
     # a step of the other track's Point is no step of this one
+    several = (
+        "**A1 \N{EM DASH} x**\nA1.1 `/feature 5`\nA1.2 `/feature 6`\n"
+        "**A2 \N{EM DASH} y**\nA2.1 after A1.1, A1.2: `/feature 7`\n"
+        "A2.2 after A1.1 and A2.1: `/feature 8`\n"
+    )
+    assert lane.check_point(several) == []
+    steps = lane.parse_point(several)["A2"]
+    assert [s.after for s in steps] == [("A1.1", "A1.2"), ("A1.1", "A2.1")]
+    assert steps[0].segments[0].kind == "feature"
     other = "**A1 \N{EM DASH} x**\nA1.1 after S1.1: `/feature 5`\n"
     assert lane.check_point(other) == ["A1.1: after S1.1 names no step"]
 

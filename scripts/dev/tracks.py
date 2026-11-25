@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import posixpath
 import re
 import sys
 from collections.abc import Callable
@@ -127,6 +128,16 @@ def read_rules(path: Path = CODEOWNERS) -> Rules:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise SystemExit(f"cannot read {path}: {exc}") from None
+    except UnicodeDecodeError as exc:
+        # An editor on Windows may save UTF-16 or cp1252: say which file and what to do (FM-80).
+        raise SystemExit(
+            f"cannot read {path}: not UTF-8 ({exc.reason}); save it as UTF-8"
+        ) from None
+    if text.startswith("\N{ZERO WIDTH NO-BREAK SPACE}"):
+        # A byte order mark would make the first comment line read as a pattern.
+        raise SystemExit(
+            f"{path} starts with a byte order mark; save it as UTF-8 without one"
+        )
     rules: Rules = []
     for pattern, owners in codeowners_rules(text):
         try:
@@ -137,14 +148,16 @@ def read_rules(path: Path = CODEOWNERS) -> Rules:
 
 
 def path_track(path: str, rules: Rules) -> str:
-    """The track of a path: the last matching line wins, a line with no owner is the analysis'.
+    r"""The track of a path: the last matching line wins, a line with no owner is the analysis'.
 
     A path no line matches is the stand's, and so is one whose last line names an owner:
     the default errs on the side that protects the microscopes. A Windows path (a
     backslash) and a path written from the root (a leading ``/``) are read as POSIX: the
     patterns are, and a path that missed them would fall to the stand without a word (FM-24).
+    The same file written ``./src/...`` (PowerShell completes with ``.\``), ``src//...`` or with
+    a ``..`` segment is one path, so the path is normalised before the lines are tried.
     """
-    posix = path.replace("\\", "/").lstrip("/")
+    posix = posixpath.normpath(path.replace("\\", "/").lstrip("/"))
     analysis = False
     for regex, has_owner in rules:
         if regex.match(posix):
@@ -260,6 +273,12 @@ def main(argv: list[str] | None = None) -> int:
     ns = ap.parse_args(argv)
     if bool(ns.paths) == (ns.pr is not None):
         ap.error("give paths, or --pr N, and not both")
+    # cmd.exe and PowerShell pass a wildcard on as it is, and bash does when it matches nothing:
+    # `src/smc/selection/*.py` would read as one path of the analysis track, with api.py and
+    # registry.py, which are the stand's, among the files it stands for.
+    wild = [p for p in ns.paths if any(c in p for c in "*?[")]
+    if wild:
+        ap.error(f"name the files, a wildcard stands for several tracks: {wild[0]}")
     # point.py imports this module, so the reverse import waits for a run (no cycle at import).
     point = load_script("smc_dev_point", HERE / "point.py")
     rules = read_rules()
