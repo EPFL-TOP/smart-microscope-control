@@ -38,6 +38,8 @@ from smc.hardware.errors import (
 )
 from smc.hardware.profile import Profile
 from smc.plugins import PluginRunError, load, run_plugin
+from smc.plugins.api import RunContext, StopRequested
+from smc.plugins.cell_focus.loop import REREAD_WAIT_S
 from smc.plugins.cell_focus.plugin import FocusOnCellsParams, FocusOnCellsPlugin
 from smc.plugins.slots import CellFocusResult
 from smc.run import RunDocument, StageRecord, StageStatus
@@ -223,6 +225,25 @@ def _meta(path: Path) -> dict[str, Any]:
 @pytest.fixture
 def run_doc(tmp_path: Path) -> Path:
     return tmp_path / "run.json"
+
+
+@pytest.fixture
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The seconds the tool asked its context to wait, recorded (the wait still happens).
+
+    The reread's wait must be the context's ``wait_s``, never ``time.sleep``
+    (FM-83) and never nothing, so that a stop ends it (FM-64) and a slow drive
+    has the time (FM-188): only the context is watched here.
+    """
+    asked: list[float] = []
+    real = RunContext.wait_s
+
+    def record(self: RunContext, seconds: float) -> None:
+        asked.append(seconds)
+        real(self, seconds)
+
+    monkeypatch.setattr(RunContext, "wait_s", record)
+    return asked
 
 
 # ---------------------------------------------------------------- the tool
@@ -482,7 +503,7 @@ def test_a_readback_off_its_command_fails_the_sweep(
 
 
 def test_a_readback_off_once_is_read_again_and_the_sweep_goes_on(
-    open_stand: Callable[..., Microscope], run_doc: Path
+    open_stand: Callable[..., Microscope], run_doc: Path, waits: list[float]
 ) -> None:
     # F17 (#622): the drive reported the plane before once; the drive itself is
     # where it was told, and a second read says so.
@@ -499,6 +520,83 @@ def test_a_readback_off_once_is_read_again_and_the_sweep_goes_on(
     # not the first read, which was 0.3 µm off.
     assert result.sweep.z_um[3] == pytest.approx(z.moves[3], abs=0.05)
     assert result.sweep.z_um[3] != pytest.approx(z.moves[3] + 0.3, abs=0.05)
+    # The wait before it was the context's, asked once, for the one read again.
+    assert waits == [REREAD_WAIT_S]
+
+
+@pytest.mark.parametrize(
+    ("start_um", "outcome", "step"),
+    [
+        pytest.param(0.0, "peak", "the move to the best plane", id="best-plane"),
+        pytest.param(20.0, "at-edge", "the move back to the centre", id="centre"),
+    ],
+)
+def test_the_moves_after_the_sweep_read_again_through_the_contexts_wait(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    waits: list[float],
+    start_um: float,
+    outcome: str,
+    step: str,
+) -> None:
+    # The sweep's 11 moves are 1 to 11; the 12th is the move to the best plane,
+    # or, from 20 µm where the sweep is at-edge (D8), the move back to the centre.
+    stand = open_stand()
+    stand.require(ZStage).move_to_um(start_um)
+    z = _Z(stand.require(ZStage))
+    z.off_um[12] = 0.3
+    stand.override(ZStage, z)
+
+    result = _result(_run(stand, run_doc))
+
+    assert result.sweep.outcome == outcome, step
+    assert len(z.moves) == 12
+    assert waits == [REREAD_WAIT_S]
+
+
+def test_a_stop_during_the_reread_wait_ends_the_run_stopped_with_no_read_after_it(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-64: the wait is the context's, so a stop in it is a StopRequested, an
+    # outcome and not a failure; and nothing reads Z after it, which would
+    # have called the stop a drive that did not arrive.
+    stand = open_stand()
+    z = _Z(stand.require(ZStage))
+    z.off_um[4] = 0.3
+    stand.override(ZStage, z)
+
+    def stopped(self: RunContext, seconds: float) -> None:
+        raise StopRequested
+
+    monkeypatch.setattr(RunContext, "wait_s", stopped)
+
+    record = _run(stand, run_doc)
+
+    assert record.status is StageStatus.stopped
+    assert len(z.moves) == 4
+    assert len(_tiffs(run_doc)) == 3
+
+
+def test_a_dry_run_walk_reads_a_readback_off_its_command_again_through_the_contexts_wait(
+    open_stand: Callable[..., Microscope], run_doc: Path, waits: list[float]
+) -> None:
+    # The layer's dry run answers a move with its command, so the walk never asks
+    # for a wait on its own: the double misreports the second plane's, and
+    # reads where the command was (the stage stays at the start in a dry run).
+    stand = open_stand(dry_run=True)
+    inner = stand.require(ZStage)
+    start = inner.position_um()
+    z = _Z(inner)
+    z.off_um[2] = 0.3
+    z.reread_off_um[2] = -1.5  # the walk's second plane: start - 1.5 µm
+    stand.override(ZStage, z)
+
+    result = _result(_run(stand, run_doc, range_um=2.0, step_um=0.5))
+
+    assert waits == [REREAD_WAIT_S]
+    assert result.sweep.z_um[1] == pytest.approx(start - 1.5)
 
 
 def test_a_readback_within_a_quarter_step_passes(

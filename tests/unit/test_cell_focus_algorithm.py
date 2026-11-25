@@ -280,6 +280,35 @@ def test_a_best_at_the_end_is_at_edge() -> None:
     assert (first.outcome, first.best_index, first.z_um) == ("at-edge", 1, None)
 
 
+def test_a_best_one_plane_inside_the_edge_is_a_peak() -> None:
+    # The zone's other side (FM-73): a smoothed best on the third plane, or the
+    # third-to-last, is bracketed by a smoothed score on each side, and a field
+    # whose focus lies that close to the sweep's end must still move Z to it.
+    tent = [0.0, 1.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    near_first = find_peak(_Z9, tent)
+    assert (near_first.outcome, near_first.best_index) == ("peak", 2)
+    assert near_first.z_um == pytest.approx(2.0)
+    near_last = find_peak(_Z9, tent[::-1])
+    assert (near_last.outcome, near_last.best_index) == ("peak", 6)
+    assert near_last.z_um == pytest.approx(6.0)
+
+
+def test_a_falling_shoulder_at_the_start_is_not_a_second_peak() -> None:
+    # A second maximum is an interior one of the smoothed scores: an object
+    # focused below the sweep leaves a shoulder that falls from its first
+    # plane, which is no maximum and must not turn a clear peak into two.
+    shoulder = [
+        1.0
+        + 0.04 * math.exp(-((k - 12) ** 2) / 4.5)
+        + 0.03 * math.exp(-k / 2)
+        + 0.0005 * (-1) ** k
+        for k in range(21)
+    ]
+    peak = find_peak(_Z21, shoulder)
+    assert (peak.outcome, peak.best_index) == ("peak", 12)
+    assert peak.z_um == pytest.approx(12.0, abs=0.05)
+
+
 def _two(second: float) -> list[float]:
     """A best at plane 6 and a second bump at plane 14 of ``second`` times its height, on 21 planes."""
     return [

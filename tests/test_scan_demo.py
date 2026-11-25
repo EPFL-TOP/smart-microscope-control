@@ -61,7 +61,8 @@ from smc.hardware.errors import (
     SafetyRefusedError,
 )
 from smc.plugins import PluginRunError, Progress, load, run_plugin
-from smc.plugins.api import ShownFrame
+from smc.plugins.api import RunContext, ShownFrame
+from smc.plugins.cell_focus.loop import REREAD_WAIT_S
 from smc.plugins.errors import ResumeError
 from smc.plugins.geometry import pixel_matrix
 from smc.plugins.scan.plugin import ScanCheckpoint, ScanParams, ScanPlugin
@@ -2837,6 +2838,97 @@ class _LimitedZ:
 
     def limits_um(self) -> Limits | None:
         return self.limits
+
+
+class _OffAtMoves:
+    """The demo's focus drive that misreports the readback of the moves numbered in ``off_at`` (from 1).
+
+    A later ``position_um()`` is true: the drive is where it was told, as when
+    one read in 504 returned the plane before (F17, #622). Every method is
+    written out, because ``Microscope.override`` refuses a delegate.
+    """
+
+    def __init__(self, inner: ZStage, off_at: set[int], off_um: float) -> None:
+        self._inner = inner
+        self.off_at = off_at
+        self.off_um = off_um
+        self.moves = 0
+
+    def position_um(self) -> float:
+        return self._inner.position_um()
+
+    def move_to_um(self, z_um: float, *, keep_autofocus: bool = True) -> float:
+        self.moves += 1
+        readback = self._inner.move_to_um(z_um, keep_autofocus=keep_autofocus)
+        return readback + self.off_um if self.moves in self.off_at else readback
+
+    def move_by_um(
+        self, dz_um: float, *, force: bool = False, keep_autofocus: bool = True
+    ) -> float:
+        raise AssertionError("the focus step makes no relative move")
+
+    def wait(self, timeout_s: float | None = None) -> None:
+        self._inner.wait(timeout_s)
+
+    def is_busy(self) -> bool:
+        return self._inner.is_busy()
+
+    def stop(self) -> None:
+        self._inner.stop()
+
+    def limits_um(self) -> Limits | None:
+        return self._inner.limits_um()
+
+
+@pytest.fixture
+def waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The seconds the scan asked its context to wait, recorded (the wait still happens).
+
+    The reread's wait must be the context's ``wait_s``, never ``time.sleep``
+    (FM-83) and never nothing, so that a stop ends it (FM-64) and a slow drive
+    has the time (FM-188).
+    """
+    asked: list[float] = []
+    real = RunContext.wait_s
+
+    def record(self: RunContext, seconds: float) -> None:
+        asked.append(seconds)
+        real(self, seconds)
+
+    monkeypatch.setattr(RunContext, "wait_s", record)
+    return asked
+
+
+@pytest.mark.parametrize(
+    ("cell_focus", "off_at", "what"),
+    [
+        # A field's sweep is moves 1 to 11 (FOCUS: ±10 µm in steps of 2), the
+        # move to its best plane the 12th; per-well, the well's next field has
+        # no sweep and one move, the 13th.
+        pytest.param("per-field", {4}, "a plane of the sweep", id="sweep"),
+        pytest.param("per-field", {12}, "the move to the best plane", id="best"),
+        pytest.param("per-well", {13}, "the move to the well's known plane", id="well"),
+    ],
+)
+def test_a_focus_readback_off_once_is_read_again_through_the_contexts_wait(
+    rig: _Rig,
+    waits: list[float],
+    cell_focus: str,
+    off_at: set[int],
+    what: str,
+) -> None:
+    # No autofocus: every sweep is centred on the Z read before anything moved,
+    # 3 µm from the sample's sharp plane. A step is 2 µm: a quarter is 0.5 µm.
+    z = _OffAtMoves(rig.microscope.require(ZStage), off_at, 0.7)
+    z.move_to_um(PFS_PLANE_UM)
+    z.moves = 0
+    rig.microscope.override(ZStage, z)
+
+    result = _result(_scan(rig, cell_focus=cell_focus, **FOCUS))
+
+    assert result.failed == (), what
+    assert len(result.frames) == 12
+    assert waits == [REREAD_WAIT_S], what
 
 
 def _locked_on_the_plate(rig: _Rig) -> _Autofocus:
