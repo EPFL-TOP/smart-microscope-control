@@ -8949,8 +8949,8 @@ no cells, and a scanned field's frame comes with #680.
 
 **The notebook** (`docs/ui/views-in-a-notebook.md`, new): `pn.extension()`, `load_scan(RUN_DOC)`, the
 first frame of the first well, its cells as boxes in `smc.data.draw.CLASS_COLOURS` with
-`f"{cell.label} {cell.score:.2f}"`, `ImageView().panel()`. Its first code block is exactly one line,
-`RUN_DOC = Path("runs/2026-11-24/run.json")  # your run document`, which the test replaces.
+`f"{cell.label} {cell.score:.2f}"`, `ImageView().panel()`. Its first code block is `from pathlib import Path` and
+`RUN_DOC = Path("runs/2026-11-24/run.json")  # your run document`, whose `RUN_DOC` line the test replaces.
 
 ### 24.4 Smoothing (#679)
 
