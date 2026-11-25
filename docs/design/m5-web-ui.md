@@ -26,7 +26,9 @@
   plan (§21, 2026-11-23); the leftovers of the session-5 fixes (a stop's call names on
   the page, the strip's STOP line, the lock notes while the stand is halted, the card's
   cap on assumed lines, a `/ui-check` state for the time line) fixed by #592's plan
-  (§17.12.12, 2026-11-23).
+  (§17.12.12, 2026-11-23); the image and the plate at working size (the image view as a
+  component, enlarged over the page, smoothing in Live, the plate map as a component that
+  zooms to a well) fixed by #631's plan with the owner (§24, 2026-11-25).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -8754,3 +8756,289 @@ a new one named by its text: *a result the page says only as its status*.
 **Not verified (for the owner)**: the pane in a real browser at 1280 x 620 with the stand PC's font
 size and the Ti2-E's long Windows paths; a calibration at the stand after the build, read on the
 screen against `calibrations/position-<n>.json`; the refusal under Live at the stand.
+
+## 24. The image and the plate at working size (#631, #679, #680)
+
+Fixed by #631's plan with the owner (2026-11-25). The owner, after the Ti2-E session 6: "Actuellement
+l'image des cellules est minuscule, la fenêtre live/snap est très peu adaptée. Il faudrait pouvoir
+simplement zoomer sur la plate pour voir les FOV et matérialiser le chemin et les puits sélectionnés.
+Peut-on avoir un smoothing quand on fait le live pour éviter de voir des pixels de bruit changer sans
+cesse ?" (2026-11-24), and the design requirement of the same day: the image and the plate are
+**components of their own**, which the page embeds and a notebook shows as they are (#632 decides
+whether a notebook becomes a front of smc; this section keeps that door open and decides nothing of it).
+
+Three issues, one per part, each its own PR: **#631 the image view** (§24.3), which #677 of the analysis
+track waits for (`analysis.md` §2.8); **#679 smoothing in Live** (§24.4); **#680 the plate map as a
+component** (§24.5), whose interface its own plan fixes here. The mock-up the owner decided on is
+[`mockups/m5-working-views.html`](mockups/m5-working-views.html) (static; nothing in it talks to a stand).
+
+### 24.1 What was measured (2026-11-25, planning #631)
+
+Throwaway scripts, not committed; the page's code at `1559560`; Panel 1.11.1 / Bokeh 3.10.2 and
+headless Chromium (Playwright 1.65.2) for the browser, Panel 1.10.0 / Bokeh 3.10.1 for the server-side
+costs.
+
+- **The size today.** `FIGURE_HEIGHT_PX = 360` (§17.12 D15's floor), the map and the image side by side
+  in the centre, about 440 px each at a 1280 px width. The cameras' frames are square (the Prime 95B's
+  1200 x 1200, an ORCA's 2048 x 2048), so a frame is never shown larger than its figure is high, axes
+  and title taken out: about 300 px today. At 1280 x 800 the page is 623 px high (§17.2 D12), so
+  **no layout inside the page shows a square frame at half the page's width** (640 px): the frame
+  has to cover the page to be larger than the figure's height.
+- **An enlarged view by a CSS class, the figure never moved.** A `pn.Column` holding the figure,
+  whose `css_classes` gains a class whose stylesheet makes it `position: fixed` over the whole window
+  (`top: 0; left: 0; right: 0; height: 100vh !important; width: auto !important; z-index: 1000`), with
+  the figure's own box `flex: 1 1 auto; height: auto !important; min-height: 0` under that class, and
+  the figure `sizing_mode="stretch_both"`: the canvas goes from 440 x 360 to **1280 x 540** at
+  1280 x 623 (a bar of buttons above it and a drive bar of twelve buttons under it) and to **1920 x 867**
+  at 1920 x 950; the class taken away gives back exactly 440 x 360; no console error. The figure is
+  never re-parented, so FM-174 (a view destroyed and rebuilt) does not arise. A height left `auto`
+  without the flex rule collapsed the canvas to 35 px; a fixed `top` below the header cannot be
+  written in CSS, because the header's height changes with its outcome lines.
+- **Row 0 on top without flipping the array.** `figure.y_range.flipped = True` and the `image` glyph at
+  `x=0, y=0, dw=W, dh=H`: a frame whose first 40 rows are white shows them at the top, and a box from
+  `(row0, col0) = (100, 200)` to `(150, 260)` falls on those pixels (read on the PNG).
+- **The scale bar.** Bokeh's `ScaleBar(range=figure.x_range, unit="µm", dimensional=MetricLength(),
+  location="bottom_right", bar_length=0.2)` over a figure whose coordinates are micrometres reads
+  `50 µm` at 440 px, `150 µm` and `100 µm` enlarged, and follows the zoom. It needs the coordinates in
+  µm: it has no factor of its own from pixels.
+- **Zoom under new frames.** A wheel zoom (x from −202…402 to 60…139) is kept through 20 frames that
+  the server pushes into the image's source, 100 ms apart.
+- **Boxes and their text.** A `quad` glyph with `fill_alpha=0` and a `LabelSet` at each box's top left,
+  over the same source, follow the zoom and the enlarged view.
+- **Costs** (`display_image`, uint16, the main venv): 1200² to 1024 px 4.6 ms, 1200² at full size
+  11.0 ms, 2048² to 1024 px 9.2 ms, 2048² at full size 41.6 ms; the mean of 8 frames 5.8 ms at 1200²
+  and 16.6 ms at 2048². Nothing here limits Live's 5.9 frames a second at the Ti2-E (session 2).
+- **The interface prototype** (§24.3) builds `get_root()` with no server, as a notebook does, and is
+  clean under `mypy --strict` and `ruff` (bar the prototype's missing docstrings).
+- **Not measured**: a notebook (no Jupyter in the venv); the enlarged view on the stand PC's screen and
+  over RDP; Panel 1.9.4 / Bokeh 3.9 in a browser (`ScaleBar` and `flipped` exist since Bokeh 3.4).
+
+### 24.2 Decisions
+
+- **D1 Components, not regions of the page** (owner). `smc/ui/image_view.py` holds `ImageView`, the
+  frame with its zoom, scale bar and boxes; #680's `smc/ui/plate_map.py` holds the map. Each imports, of
+  smc, nothing but `smc.ui.frames` (numpy only) and its own pure model, so `smc.analysis` may import
+  it (`analysis.md` §1.1): no `smc.hardware`, no `smc.ui.controller`, no `smc.ui.plate_page`, no
+  `smc.ui.guide` (which loads the plugin registry), no `smc.data`. `plate_page.py` builds one of each
+  and feeds it from the controller; a notebook feeds it from a run folder.
+- **D2 The image in the page** (owner). The image's figure loses its axes and grid, so the frame takes
+  the whole figure; its toolbar stays (pan, wheel zoom, box zoom, reset, save). The map and the image
+  keep their place and `FIGURE_HEIGHT_PX` (§17.3, §17.12 D15).
+- **D3 Enlarge** (owner). A toggle *Enlarge* on the image's bar puts the image column over the whole
+  window: its bar (a **second instance of STOP**, *Snap*, *Live*, then *Reduce*), the figure and the
+  drive bar under it, so that the arrows, Z and the light work while enlarged. *Reduce* (the same
+  toggle, relabelled) gives the page back as it was. The second STOP is a button like the strip's,
+  through the same `_handler` and the same controller call (§17.2 D5 allows several instances of a
+  button); it is visible only while the view is enlarged, because the strip is under the overlay. The
+  enlarged state belongs to the browser tab (§17.2 D6); a Snap, a run's end or a tick never changes it.
+  No key closes it (Panel has no key event for a button; Escape is not promised).
+- **D4 Micrometres when the pixel size is known.** The view's coordinates are µm (`dw = width ×
+  pixel_size_um`), so the scale bar reads the zoom; boxes are given in the frame's pixels and scaled by
+  the view. A pixel size of 0 or not finite (unknown, as a plugin's frame says, m3 §25.5) gives pixel
+  coordinates and **no scale bar**, and the title says so (`; no scale bar: pixel size unknown`):
+  unknown beats guessed.
+- **D5 How many pixels reach the browser.** A frame of Live is strided to `LIVE_MAX_SIDE_PX = 1024`, as
+  today (§5.3); a still frame (a snap, a plugin's frame, a scanned field) to `STILL_MAX_SIDE_PX = 2048`,
+  so that a zoom into a snap shows the camera's pixels on every camera smc drives. The stride never
+  changes the coordinates (FM-136): `dw` and `dh` are the frame's own.
+- **D6 Boxes.** A box is `(row0, col0, row1, col1)` in the frame's pixels, as `Cell.box_px` is: the
+  edges, a pixel `(r, c)` covering `[c, c + 1) × [r, r + 1)`. It has a colour (a CSS colour) and a text,
+  drawn at its top left in its colour, cut at `BOX_TEXT_CHARS = 60`. Text is drawn on the canvas, never
+  as markup (FM-139). A box with a corner that is not finite, or with `row1 <= row0` or `col1 <= col0`,
+  is not drawn, and the title says how many were not (`; <n> boxes not drawn`): a cells file is data
+  (FM-125), and one bad cell must not hide a field.
+- **D7 Smoothing** (owner, #679). A select *Smoothing* on the image's bar, per tab: `Off`, `2 frames`,
+  `4 frames`, `8 frames`, **Off by default**. On, the view shows the mean of the last N frames of
+  Live's **series** (§24.4): a series starts with each Live and after every drive action the live
+  worker runs (an arrow, Z, the objective, the light), so a move is shown sharp at once. A snap and a
+  plugin's frame are shown alone. The title says it (`<summary>; mean of <k> frames`, k the frames in
+  the mean, up to N). It never changes `PlatePage.frame()`, a snap, a scan or what a tool reads: the
+  mean is the view's, per tab. A focus turned by hand at the stand is not seen by the page: the
+  operator turns smoothing off to focus by hand (the page's docs say it).
+- **D8 The plate at a well** (owner, #680). A double-click on a well frames that well; a *Whole plate*
+  button frames the plate again (the frame of §17.12 D16 otherwise); the wheel zoom stays. At any zoom
+  the scanned fields are drawn at their real footprint (the camera's matrix, `footprint`), the chosen
+  fields (the route's stops) with their order, the route as a line in its order, the selected wells
+  outlined. A click on a field with Drive off shows that field's frame, with its cells' boxes, in the
+  image view; with Drive armed a click drives as today (§6).
+- **D9 A notebook shows the same objects.** `pn.extension()`, then `ImageView(...).panel()` (and #680's
+  map) in a cell, fed from `smc.data.load_scan` with no stand. The example is a page of `docs/ui/`
+  whose code a test runs on a seeded scan, so that it cannot rot.
+
+### 24.3 The image view (#631)
+
+```python
+# smc/ui/frames.py (numpy only, unchanged otherwise)
+@dataclass(frozen=True, slots=True)
+class Box:
+    """A box over a frame, in its pixels' edges (D6)."""
+
+    row0: float
+    col0: float
+    row1: float
+    col1: float
+    colour: str
+    text: str = ""
+```
+
+```python
+# smc/ui/image_view.py (new; Panel and Bokeh; of smc, imports smc.ui.frames only)
+__all__ = [
+    "BOX_TEXT_CHARS",
+    "LIVE_MAX_SIDE_PX",
+    "STILL_MAX_SIDE_PX",
+    "Box",
+    "ImageView",
+]
+
+LIVE_MAX_SIDE_PX = 1024
+STILL_MAX_SIDE_PX = 2048
+BOX_TEXT_CHARS = 60
+ENLARGE_LABEL = "Enlarge"
+REDUCE_LABEL = "Reduce"
+NO_SCALE_TEXT = "no scale bar: pixel size unknown"
+
+
+class ImageView:
+    figure: Any  # bokeh figure: y flipped, no axes, ScaleBar bottom right
+    source: Any  # ColumnDataSource {"image", "dw", "dh"}
+    boxes_source: Any  # {"left", "right", "top", "bottom", "colour", "text"}
+    scale_bar: Any
+    enlarge_toggle: pn.widgets.Toggle  # visible only when enlargeable
+
+    def __init__(
+        self, *, height_px: int = 360, enlargeable: bool = False, title: str = ""
+    ) -> None: ...
+    def show(
+        self,
+        image: npt.NDArray[np.uint8] | npt.NDArray[np.uint16],
+        *,
+        bit_depth: int,
+        pixel_size_um: float,
+        boxes: Sequence[Box] = (),
+        title: str = "",
+        max_side_px: int = STILL_MAX_SIDE_PX,
+    ) -> None: ...
+    def clear(self, title: str) -> None: ...
+    def on_enlarge(self, callback: Callable[[bool], None]) -> None: ...
+    def panel(
+        self, *, toolbar: Sequence[Viewable] = (), below: Sequence[Viewable] = ()
+    ) -> pn.viewable.Viewable: ...
+```
+
+- `show` draws through `display_image` (unchanged) with the given `max_side_px`; it raises its
+  `ValueError` for a frame that is not 2-D `uint8` or `uint16`. `bit_depth` 0 is "unknown", as `Frame`
+  says. The title is the figure's own (`figure.title.text`), canvas text.
+- `panel` is built once and returned again on later calls (one root per view: a second call with other
+  widgets is a programming error the docstring names). It is `pn.Column(pn.Row(*toolbar,
+  enlarge_toggle), <the figure's box, height=height_px, css_classes=["smc-image-box"]>, *below,
+  stylesheets=[<D3's CSS>])`.
+- `on_enlarge` callbacks run on the toggle's change, after the class is set; the page shows its second
+  STOP from one.
+- `smc.ui.image_view` re-exports `Box`, so that a caller imports one module.
+
+**The page** (`plate_page.py`): `PlatePageView.image_view = ImageView(height_px=FIGURE_HEIGHT_PX,
+enlargeable=True, title=NO_FRAME_TEXT)`; `image_figure` and `image_source` stay as the view's
+`figure` and `source` (the tests and `/ui-check` read them); `_draw_image(frame)` calls `show(frame.image,
+bit_depth=frame.bit_depth, pixel_size_um=frame.pixel_size_um, title=frame.summary, max_side_px=LIVE_MAX_SIDE_PX
+if self.page.is_live else STILL_MAX_SIDE_PX)`, with no flip; the image column is `image_view.panel(toolbar=[
+self.image_stop_button, self.snap_button, self.live_button, self.snap_note], below=[self._drive_bar()])`.
+`image_stop_button` (new, label `STOP`, `color="danger"`) goes through `_handler(self.on_stop)`, as
+`stop_button` does, and is visible only while enlarged. No box is drawn on the page in #631: a snap has
+no cells, and a scanned field's frame comes with #680.
+
+**The notebook** (`docs/ui/views-in-a-notebook.md`, new): `pn.extension()`, `load_scan(RUN_DOC)`, the
+first frame of the first well, its cells as boxes in `smc.data.draw.CLASS_COLOURS` with
+`f"{cell.label} {cell.score:.2f}"`, `ImageView().panel()`. Its first code block is exactly one line,
+`RUN_DOC = Path("runs/2026-11-24/run.json")  # your run document`, which the test replaces.
+
+### 24.4 Smoothing (#679)
+
+```python
+# smc/ui/frames.py
+@dataclass(frozen=True, slots=True)
+class Frame:
+    ...
+    series: int | None = None  # new, the last field
+
+
+SMOOTHING_FRAMES = (2, 4, 8)
+
+
+class FrameMean:
+    """The mean of the last frames of one series, for the screen only (D7)."""
+
+    def __init__(self, frames: int) -> None: ...
+    @property
+    def count(self) -> int: ...
+    def add(self, frame: Frame) -> npt.NDArray[np.uint8] | npt.NDArray[np.uint16]: ...
+```
+
+- `series` is `None` for a snap and for a plugin's frame; Live's frames carry the controller's series
+  number. `PlatePage` keeps `_series: int` (from 0) and takes the next number when `_live_frames`
+  starts and after every `_run_handed` in its loop; `_take_frame(series=...)` puts it in the `Frame`.
+- `FrameMean.add` keeps up to `frames` images of one series, shape and dtype; a frame of another
+  series, shape or dtype, or with `series=None`, starts again from that frame. It returns the mean
+  rounded to the frame's dtype (`np.rint`), so that `display_image` takes it as it is; `count` is the
+  number of frames in it.
+- The view (`plate_page.py`): `smoothing_select` (`pn.widgets.Select`, name `Smoothing`, options
+  `Off` and `<n> frames` for each of `SMOOTHING_FRAMES`, value `Off`), on the image's bar after *Live*;
+  a change makes a new `FrameMean` (or none) for this tab. `_draw_image` shows `mean.add(frame)` when
+  smoothing is on, and the title is `frame.summary` then `; mean of <count> frames` when `count > 1`.
+  `frame_hint` (the saturation note) reads the camera's frame, as before.
+- The enlarged bar carries the select too (it is in the image's toolbar).
+
+### 24.5 The plate map as a component (#680)
+
+Decided here (D8); #680's plan fixes the interface in this subsection, with what it measures, before
+any code. The constraints:
+
+- `smc/ui/plate_map.py` holds `PlateMap`, built from a pure drawing model (wells with their outline and
+  value, the scanned fields as footprints, the route's stops in order, the selected wells, the stage's
+  cross) in a module that imports neither the controller nor the hardware; `plate_page.py` builds it
+  from `PlatePage.view()`, and a function builds it from a `Scan` (`smc.data`), for the notebook.
+- The frame of §17.12 D16 (the invisible glyph the ranges follow) stays the one way the map is framed;
+  a double-click sets it to the well under the click, *Whole plate* sets it back.
+- A click on a field asks for the field's frame through a callback the page gives; the page reads it
+  from the run folder (`load_frame`), never from the camera, and shows it with `STILL_MAX_SIDE_PX` and
+  its cells' boxes.
+- Every map-drawing behaviour of §14 to §21 is kept (the density, the cross, the sides, the names, the
+  hover); FM-145 (no O(wells) rebuild at a tick) and FM-174 hold.
+
+### 24.6 `/ui-check`
+
+#631 adds the state **`enlarged`** after `snap` (both stands): the *Enlarge* toggle, a wait for its
+`bk-active` class, the photograph at 1280 x 800, then *Reduce*. `summary.txt` says the canvas's box,
+whether it spans the page's width, whether the second STOP is inside the page, and the canvas's box
+after *Reduce* against the one before. #680 adds a state for a well framed after the chain.
+
+### 24.7 Tests and failure modes
+
+#631: `tests/unit/test_image_view.py` (the component with no server: coordinates in µm and in pixels,
+boxes scaled and skipped, the scale bar's visibility, the stride per `max_side_px`, the enlarged class
+and its callback, `get_root()` with no document); `tests/unit/test_plate_page.py` (the page's use: no
+flip, the second STOP's handler and visibility); `tests/unit/test_image_view_notebook_example.py` (the
+docs page's code on a seeded scan). `test_kit_imports.py`'s list forbids all of `smc.ui`, so the
+component's guard is its own, in `test_image_view.py`: an AST walk finds no import of smc in
+`image_view.py` but `smc.ui.frames`, and a subprocess that imports `smc.ui.image_view` finds none of
+`smc.hardware`, `smc.plugins`, `smc.data`, `smc.ui.controller`, `smc.ui.guide`, `smc.ui.plate_page`,
+`pymmcore_plus` in `sys.modules` (measured: `smc.ui.frames` with Panel and Bokeh loads `smc`,
+`smc.plates`, `smc.ui` and itself). #679: `tests/unit/test_frame_mean.py` and the controller's series. Failure modes: FM-136 (the
+frame's own size), FM-139 (canvas text), FM-125 (a cells file is data), FM-145 and FM-151 (the frame
+tick draws what the controller holds, nothing else), FM-174 (the figure never moved), FM-177 (the
+second STOP reads nothing from the label), and a new one named by its text: *a display transform that
+reaches what a tool reads* (#679).
+
+### 24.8 What this does not do
+
+- It does not change the map in #631, nor the image's place beside it, nor `FIGURE_HEIGHT_PX`.
+- It does not draw cells on a snap (no detector runs on it), nor run a detector from the page.
+- It does not decide #632 (a notebook as a front of smc): it only makes the views display there.
+- It does not make the view a second live client: a notebook shows a run folder; a live stand is the
+  page's (one process holds a stand, #632).
+- It promises no key to close the enlarged view, and no browser full screen (the strip's STOP would be
+  hidden).
+
+**Not verified (for the owner)**: the enlarged view and the smoothing on the stand PC's screen and over
+RDP, Live at full frame on the Ti2-E with smoothing at 8 frames, and the notebook example opened in
+Jupyter by the collaborator.
