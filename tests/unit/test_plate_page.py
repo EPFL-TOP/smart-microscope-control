@@ -1540,6 +1540,77 @@ def test_a_drive_tap_on_another_plates_map_is_refused_before_anything_moves(
     assert "goto-well" not in RunDocument.load(run_doc).stages
 
 
+#: What a drive click says while Live runs (m5 §23.2 D6, #627), written out whole (FM-45).
+GOTO_UNDER_LIVE = (
+    "live is running, so the stage did not move: press End live, switch Drive on and "
+    "click the well again. The arrows work during Live."
+)
+
+
+def test_a_drive_tap_under_live_says_why_spends_drive_and_leaves_live_going(
+    run_doc: Path, page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # F1 (Ti2-E session 6): a click on a well while Live ran left `live is running` in the
+    # message, the toggle spent and the stage where it was, with nothing to say what to press.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    stage = fake_microscope.require(XYStage)
+    before = stage.position_um()
+    view.on_live()
+    try:
+        assert page.is_live
+        view.drive_toggle.value = True
+        _tap(view, *_centre("C5"))
+
+        assert view.message.object == GOTO_UNDER_LIVE
+        # The click spent Drive, as it does for every click (#514): the text says to arm it again.
+        assert not view.drive_toggle.value
+        assert view.drive_text.object == ""
+        # Live was not ended for the click, the stage did not move and no run was recorded.
+        assert page.is_live
+        assert page.status().running == "live"
+        assert stage.position_um() == before
+        assert page.status().goto == ""
+        assert "goto-well" not in RunDocument.load(run_doc).stages
+        # A tap in select mode afterwards selects, and the refusal is the last click's: gone.
+        _tap(view, *_centre("A1"))
+        assert view.message.object == ""
+        assert page.selection == ("A1",)
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+
+
+def test_the_press_the_refusal_names_makes_the_click_work(
+    run_doc: Path, page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The refusal's three instructions, followed in its order: End live, switch Drive on, click
+    # the well again. This proves *what to press*: the click then goes (F1).
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    stage = fake_microscope.require(XYStage)
+    view.on_live()
+    assert page.is_live
+    view.drive_toggle.value = True
+    _tap(view, *_centre("C5"))
+    assert view.message.object == GOTO_UNDER_LIVE
+    assert view.live_button.label == "End live"
+
+    view.on_live()  # the button the text names
+    assert page.join(10.0)
+    assert not page.is_live
+    view.drive_toggle.value = True
+    _tap(view, *_centre("C5"))
+    assert page.join(10.0)
+
+    assert view.message.object == ""
+    assert stage.position_um().x_um == pytest.approx(_centre("C5")[0], abs=1e-6)
+    assert stage.position_um().y_um == pytest.approx(_centre("C5")[1], abs=1e-6)
+    assert "goto-well" in RunDocument.load(run_doc).stages
+
+
 def test_density_colours_the_wells_and_unknown_is_grey(
     run_doc: Path, page: PlatePage
 ) -> None:

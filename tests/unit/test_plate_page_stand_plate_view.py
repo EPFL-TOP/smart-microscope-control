@@ -385,18 +385,21 @@ def test_the_stand_screen_shows_the_preset_before_anything_else(
 ) -> None:
     view = PlatePageView(page)
     view.show_step("stand")
-    title, lead, stand_region, preset_region, known, calibrate, cont = list(
+    title, lead, stand_region, preset_region, known, numbers, calibrate, cont = list(
         view.step_panel.objects
     )
     assert lead.object == SCREEN_LEADS["stand"]
-    # D12: the stand line and the preset with its *Load* come first, then what is known,
-    # then the calibration; the next step is not here, and each action's command is under
+    # D12: the stand line and the preset with its *Load* come first, then what is known and
+    # the numbers of its calibration, then the calibration; the next step is not here, and each action's command is under
     # its own *Command* disclosure.
     assert title.object == "Which stand, and which preset?"
     assert view.stand_text in stand_region
     assert view.preset_select in _objects([preset_region])
     assert view.preset_load_button in _objects([preset_region])
     assert known is view.known_block
+    # The numbers of the calibration in place, under what is known and outside the box that
+    # hides when the objective needs no calibration (m5 §23.2 D2, #627).
+    assert numbers is view.calibration_numbers
     assert calibrate is view.calibrate_box
     assert cont is view.continue_button
     assert view.next_text not in _objects(list(view.step_panel.objects))
@@ -978,6 +981,54 @@ def test_go_to_is_disabled_during_live_and_says_why(
     assert not any(slot.goto_button.disabled for slot in view.centre_slots)
     assert GOTO_NOT_DURING_LIVE not in view.rows_note.object
     assert not view.rows_note.visible
+
+
+def test_a_stale_go_to_row_click_under_live_says_the_same(
+    page: PlatePage,
+    run_doc: Path,
+    fake_microscope: Microscope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # m5 §23.2 D6: every caller of `goto` gets the refusal of the Live text, the rows' too. The
+    # row's own screen says it once above the rows (`GOTO_NOT_DURING_LIVE`), so the click that
+    # still arrives leaves the message alone, as it always did: the controller's text is what
+    # the call raised, and nothing moved.
+    _seed_plate(run_doc)
+    fake_microscope.override(Camera, LiveCamera())
+    view = PlatePageView(page)
+    view.show_step("plate")
+    view.refresh()
+    raised: list[str] = []
+    real_goto = page.goto
+
+    def spy(well: str, side: str = "centre") -> None:
+        try:
+            real_goto(well, side)
+        except RuntimeError as exc:
+            raised.append(str(exc))
+            raise
+
+    monkeypatch.setattr(page, "goto", spy)
+    stage = fake_microscope.require(XYStage)
+    before = stage.position_um()
+    view.on_live()
+    try:
+        assert page.is_live
+        view.tick()
+        _click(view.centre_slots[0].goto_button)
+
+        assert raised == [
+            "live is running, so the stage did not move: press End live, switch Drive "
+            "on and click the well again. The arrows work during Live."
+        ]
+        assert view.rows_note.object.split("\n") == [GOTO_NOT_DURING_LIVE]
+        assert view.message.object == ""
+        assert page.is_live
+        assert stage.position_um() == before
+        assert StubGoto.ran == []
+    finally:
+        page.live(False)
+    assert page.join(10.0)
 
 
 def test_capture_stays_enabled_during_live(
