@@ -170,8 +170,10 @@ move, and only one program holds the stand at a time, so the page's
   holds.
 - **Open.** The rest of the kit: the offline runs (#566), the dataset's export
   (#565), the contract of a selector (#567), the drawing of what it chose
-  (#568), then the guide (#554). The data: the 40× scan of the stand
-  session of 2026-11-19 as a dataset (#595; the session itself is on #198).
+  (#568), then the guide (#554). The data: the scans of the stand session of
+  2026-11-24 as three datasets, the 10× scan of four wells and the whole-well
+  40× tilings of C4 and C3 (#595; [the list](algorithms/datasets.md)), on the
+  share once the owner has copied them.
   The first task, the algorithm itself (#570). One question is the owner's:
   whether the selection reads the 10× scan and the 40× scan only judges it
   (as #570 says), or reads the 40× scan itself.
