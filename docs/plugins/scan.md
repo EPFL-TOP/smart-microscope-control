@@ -41,9 +41,9 @@ smc run scan -p <profile> --run-doc run.json --dry-run
 | `max_unlocked_in_row` | 5 | This many fields in a row on which the autofocus would not lock end the scan (1 to 1000). |
 | `landing_tolerance` | 0.05 | How far a field may land from its target, as a fraction of the smaller side of the plan's field of view (above 0, at most 0.5). A field that landed farther is failed, not photographed. 0.05 is 4.8 µm for the demo's 10× (a field of 128 × 96 µm). Read the stand's real agreement at the first hardware session before trusting a fraction. |
 | `cell_focus` | `off` | The focus on the cells ([below](#the-focus-on-the-cells-cell_focus)): `per-field` sweeps Z at every field, `per-well` until one field of the well finds a peak. |
-| `focus_range_um` | 5 | The sweep's half-range, in µm (above 0, at most 50, and at most the stand's Z jog limit). |
+| `focus_range_um` | 10 | The sweep's half-range, in µm (above 0, at most 50, and at most the stand's Z jog limit). Measured at the Ti2-E's 40×, m3 §21.11.6: the cells' focus curve is 9-11 µm wide at half its rise, and ±10 µm at 1 µm finds 17 of 24 cell peaks where ±5 µm finds 3. |
 | `focus_step_um` | 1 | The distance between two planes, in µm (0.1 to 10, at most `focus_range_um`, at least 9 and at most 101 planes: the sweep measures its noise between neighbouring planes). |
-| `focus_score` | `brenner` | `brenner`, `normalized-variance`, `gradient-energy` or `laplacian-variance`. The four `focus_*` defaults are chosen, not measured. |
+| `focus_score` | `brenner` | `brenner`, `normalized-variance`, `gradient-energy` or `laplacian-variance`. `focus_step_um` and `focus_score` are chosen, not measured. |
 
 ## What is checked before anything moves
 

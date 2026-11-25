@@ -29,14 +29,14 @@ It never moves XY: it sweeps where the stage is.
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `range_um` | 5 | The sweep's half-range, in µm (above 0, at most 50, and at most the stand's Z jog limit). |
+| `range_um` | 10 | The sweep's half-range, in µm (above 0, at most 50, and at most the stand's Z jog limit). Measured at the Ti2-E's 40×, m3 §21.11.6: the cells' focus curve is 9-11 µm wide at half its rise, and ±10 µm at 1 µm finds 17 of 24 cell peaks where ±5 µm finds 3. |
 | `step_um` | 1 | The distance between two planes, in µm (0.1 to 10, and at most `range_um`). At least 9 planes and at most 101: the sweep measures its noise between neighbouring planes. |
 | `score` | `brenner` | `brenner`, `normalized-variance`, `gradient-energy` or `laplacian-variance`. |
 | `relock` | true | Lock PFS again after the sweep, when it was locked at the start. |
 
-**Every default is chosen, not measured.** `brenner` is chosen from the literature; the
-range and the step are a guess at a 40×'s depth of field. Session 3's stacks decide them
-(m3 §21.10).
+**`range_um` is measured; the other defaults are chosen.** `brenner` is chosen from the
+literature and the step is chosen (the rule against the noise was measured at 1 µm);
+the range is the sweep session 6 measured (m3 §21.11.6).
 
 ## What it does
 

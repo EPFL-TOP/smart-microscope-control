@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from typing import get_args
 
@@ -20,6 +21,8 @@ from smc.plugins.cell_focus.algorithm import (
     score_frame,
     sweep_size_problem,
 )
+from smc.plugins.cell_focus.plugin import FocusOnCellsParams
+from smc.plugins.scan.plugin import ScanParams
 from smc.testing.synthetic import PlateSample
 
 #: Inside well A1 of a plate whose A1 centre is the origin: the texture of the
@@ -254,6 +257,98 @@ def test_the_noise_factor_lies_between_an_empty_field_and_a_cell() -> None:
     assert cell.prominence == pytest.approx(10.74, abs=0.01)
 
 
+def test_the_default_sweep_finds_the_weakest_recorded_cell_peak() -> None:
+    # The two defaults (D11): the scan and the tool sweep the same 21 planes, the
+    # sweep the rule was fitted to. B4_0014 is the weakest of session 6's 17 cell
+    # peaks (B4_0004 is a peak at 11 planes too, so it could not fail on the old
+    # defaults): cut to the default planes it is a peak at 10.74, and cut to the
+    # old +-5 um it is flat at 6.32.
+    tool = FocusOnCellsParams()
+    scan = ScanParams()
+    assert (tool.range_um, tool.step_um) == (scan.focus_range_um, scan.focus_step_um)
+    planes = plan_planes(0.0, tool.range_um, tool.step_um)
+    assert len(planes) == 21
+    assert all(b - a == pytest.approx(1.0) for a, b in itertools.pairwise(planes))
+    k = len(planes) // 2
+    z = _B4_0014_Z_UM[10 - k : 11 + k]
+    scores = _B4_0014_SCORES[10 - k : 11 + k]
+    default = find_peak(z, scores)
+    assert (default.outcome, default.best_index) == ("peak", 8)
+    assert default.z_um == pytest.approx(4191.52, abs=0.01)
+    assert default.prominence == pytest.approx(10.74, abs=0.01)
+    old = find_peak(_B4_0014_Z_UM[5:16], _B4_0014_SCORES[5:16])
+    assert (old.outcome, old.z_um) == ("flat", None)
+    assert old.prominence == pytest.approx(6.32, abs=0.01)
+
+
+def test_a_peak_narrower_than_a_step_refines_to_its_own_plane() -> None:
+    # One plane far above neighbours that do not move: the smoothed scores of
+    # planes 3, 4 and 5 are equal, and the first of them put Z half a step low (D12).
+    narrow = find_peak(_Z9, [0.0, 1.0, 0.0, 1.0, 40.0, 0.0, 1.0, 0.0, 1.0])
+    assert (narrow.outcome, narrow.best_index) == ("peak", 4)
+    assert narrow.z_um == pytest.approx(4.0)
+    assert narrow.prominence == pytest.approx(19.08, abs=0.01)
+    # A peak symmetric about the middle of two planes ties two smoothed values:
+    # the lower middle is the best plane, and the vertex is halfway between.
+    even = find_peak(
+        _Z21,
+        [0, 0, 0, 1, 2, 5, 12, 25, 40, 40, 25, 12, 5, 2, 1, 0, 0, 0, 0, 0, 0],
+    )
+    assert (even.outcome, even.best_index) == ("peak", 8)
+    assert even.z_um == pytest.approx(8.5)
+
+
+def test_a_plateau_that_reaches_an_end_of_the_sweep_is_at_edge() -> None:
+    # A run of equal top values takes its middle (D12), but the sweep did not
+    # bracket a run that reaches the first or the last smoothed plane: the
+    # middle is not what the edge rule reads, the run is. Each case was an
+    # at-edge before D12, or moved Z to a plane in the middle of a plateau.
+    for scores in (
+        [10.0, 10.0, 10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+    ):
+        plateau = find_peak(_Z9, scores)
+        assert (plateau.outcome, plateau.z_um) == ("at-edge", None)
+    # A rise into a plateau at the far end of 21 planes, and the same plateau
+    # at the start, whose middle is well inside the sweep.
+    rising = [0.0, 1.0, 3.0, 5.0, 8.0, 13.0, 21.0] + [30.0] * 9 + [30.0] * 5
+    assert find_peak(_Z21, rising).outcome == "at-edge"
+    falling = [30.0] * 9 + [
+        21.0,
+        13.0,
+        8.0,
+        5.0,
+        3.0,
+        2.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+    assert find_peak(_Z21, falling).outcome == "at-edge"
+
+
+def test_a_sweep_whose_second_differences_are_mostly_zero_is_flat() -> None:
+    # More than half the second differences are exactly 0, so their median is 0
+    # and no robust noise is left (D13): the noise is read from their mean, and
+    # the rise of a bare blip is not 10 of them. Without the guard each of these
+    # was a peak of prominence inf. 1.97 and not 2.47 pins the sqrt(pi / 2).
+    for scores in (
+        [5.0, 5.0, 5.0, 5.0, 5.0001, 5.0, 5.0, 5.0, 5.0],
+        [0.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0],
+    ):
+        blip = find_peak(_Z9, scores)
+        assert (blip.outcome, blip.z_um) == ("flat", None)
+        assert blip.prominence == pytest.approx(1.97, abs=0.01)
+    # A straight line has every second difference 0: no noise at all, and the
+    # rise stays unbounded.
+    line = find_peak(_Z9, [float(k) for k in range(9)])
+    assert (line.outcome, line.z_um) == ("at-edge", None)
+    assert line.prominence == math.inf
+
+
 def test_a_noise_only_sweep_is_flat() -> None:
     noise = find_peak(_Z21, _NOISE_ONLY)
     assert (noise.outcome, noise.z_um) == ("flat", None)
@@ -337,8 +432,9 @@ def test_unequal_spacing_is_refined_through_the_readbacks() -> None:
     peak = find_peak([0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0, 9.0], tent)
     assert peak.outcome == "peak"
     assert peak.z_um == pytest.approx(4.5)
-    # A tent has no noise between its planes: its prominence is unbounded.
-    assert peak.prominence == math.inf
+    # A tent's median second difference is 0, so its noise is read from their
+    # mean instead (D13): the prominence is finite, not unbounded.
+    assert peak.prominence == pytest.approx(27.65, abs=0.01)
     # The same scores on an even spacing put the vertex on the best plane.
     assert find_peak(_Z9, tent).z_um == pytest.approx(4.0)
     # A parabola whose top lies just short of 4.5, halfway between two planes:

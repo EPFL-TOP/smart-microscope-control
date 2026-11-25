@@ -192,6 +192,8 @@ def open_stand(mm_available: bool) -> Iterator[Callable[..., Microscope]]:
 
 
 def _run(stand: Microscope, run_doc: Path, **params: Any) -> StageRecord:
+    # The tool's default sweep is 21 planes (m3 §21.11.6 D11); a test that counts
+    # the planes of a sweep, or the 12th move, passes ``range_um=5.0`` (11 planes).
     return run_plugin(
         FocusOnCellsPlugin(), stand, FocusOnCellsParams(**params), run_doc
     )
@@ -354,7 +356,7 @@ def test_a_guard_trip_ends_the_sweep_and_keeps_the_frames(
     z.fail[3] = SafetyRefusedError("Z 3.0 µm is outside the soft limits")
     stand.override(ZStage, z)
 
-    reason = _refused(stand, run_doc)
+    reason = _refused(stand, run_doc, range_um=5.0)
 
     assert re.fullmatch(
         r"the focus sweep ended at plane 3 of 11 \(SafetyRefusedError: Z 3\.0 µm is "
@@ -489,7 +491,7 @@ def test_a_readback_off_its_command_fails_the_sweep(
     z.reread_off_um[4] = 0.3
     stand.override(ZStage, z)
 
-    reason = _refused(stand, run_doc)
+    reason = _refused(stand, run_doc, range_um=5.0)
 
     assert re.fullmatch(
         r"the focus sweep ended at plane 4 of 11 \(FocusDriveOffTarget: Z read "
@@ -512,7 +514,7 @@ def test_a_readback_off_once_is_read_again_and_the_sweep_goes_on(
     z.off_um[4] = 0.3
     stand.override(ZStage, z)
 
-    result = _result(_run(stand, run_doc))
+    result = _result(_run(stand, run_doc, range_um=5.0))
 
     assert len(result.files) == 11
     assert len(_tiffs(run_doc)) == 12
@@ -547,7 +549,7 @@ def test_the_moves_after_the_sweep_read_again_through_the_contexts_wait(
     z.off_um[12] = 0.3
     stand.override(ZStage, z)
 
-    result = _result(_run(stand, run_doc))
+    result = _result(_run(stand, run_doc, range_um=5.0))
 
     assert result.sweep.outcome == outcome, step
     assert len(z.moves) == 12
@@ -607,7 +609,7 @@ def test_a_readback_within_a_quarter_step_passes(
     z.off_um[4] = 0.2
     stand.override(ZStage, z)
 
-    result = _result(_run(stand, run_doc))
+    result = _result(_run(stand, run_doc, range_um=5.0))
 
     assert len(result.files) == 11
 
@@ -722,7 +724,7 @@ def test_a_sweep_without_a_peak_moves_back_to_the_centre(
     stand = open_stand()
     start = stand.require(ZStage).move_to_um(20.0)
 
-    result = _result(_run(stand, run_doc))
+    result = _result(_run(stand, run_doc, range_um=5.0))
 
     assert result.sweep.outcome == "at-edge"
     assert result.sweep.best_z_um is None
@@ -772,7 +774,7 @@ def test_a_frame_path_one_character_under_the_limit_is_written(
     monkeypatch.setattr(focus_plugin, "ON_WINDOWS", True)
     monkeypatch.setattr(focus_plugin, "MAX_PATH", _longest_write_chars(run_doc) + 1)
 
-    assert len(_result(_run(stand, run_doc)).files) == 11
+    assert len(_result(_run(stand, run_doc, range_um=5.0)).files) == 11
 
 
 def test_a_dry_run_moves_nothing_and_writes_nothing(

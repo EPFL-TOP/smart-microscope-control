@@ -51,7 +51,9 @@ def stack(mm_available: bool, tmp_path_factory: pytest.TempPathFactory) -> Path:
     stand = Microscope.open(Profile.load(DEMO_SAMPLE))
     try:
         stand.require(ZStage).move_to_um(2.0)
-        record = run_plugin(FocusOnCellsPlugin(), stand, FocusOnCellsParams(), run_doc)
+        record = run_plugin(
+            FocusOnCellsPlugin(), stand, FocusOnCellsParams(range_um=5.0), run_doc
+        )
     finally:
         stand.close()
     assert record.status is StageStatus.done, record.error
