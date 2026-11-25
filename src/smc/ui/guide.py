@@ -122,6 +122,7 @@ __all__ = [
     "OFFSETS_TURRET_UNREAD",
     "ORIENTATION_IN_STAGE_TERMS",
     "OTHER_WAYS_TO_REGISTER",
+    "PLAN_CALIBRATION_NONE_MADE",
     "PLATE_NOT_CHOSEN",
     "REGISTER_ACROSS_A_TURN",
     "REGISTER_FIRST",
@@ -244,6 +245,10 @@ __all__ = [
     "orientation_label",
     "page_words",
     "plain_default",
+    "plan_calibration_frame",
+    "plan_calibration_missing",
+    "plan_calibration_other_objective",
+    "plan_calibration_used",
     "plan_selection_note",
     "plan_title",
     "plate_from_line",
@@ -3344,6 +3349,10 @@ CALIBRATE_LIGHT_OFF = "the light reads off, so the camera's frame would be dark 
 #: it would replace the plate's, so it is the expert view's.
 CALIBRATE_REUSE_ROUTED = "the form's from_run_doc reuses a calibration into the run document, where it would replace the plate's: clear it to calibrate into the objective's own document, or use Run camera-calibration in the expert view"
 
+#: The reason ``plan_calibration_missing`` gives when the position's file does not exist (m5
+#: §18.6 D24 item 6): no calibration of that objective has been made on this page.
+PLAN_CALIBRATION_NONE_MADE = "none has been made"
+
 
 def calibration_file(position: int) -> str:
     """The file name of a turret position's calibration document: ``position-<n>.json`` (D11).
@@ -3535,7 +3544,8 @@ def calibrate_stand_routed(plate_objective: str, objective: str, file: str) -> s
     return _flat(
         f"The plate was registered with {plate_objective}: a calibration at {objective} "
         f"here is kept in its own document, {CALIBRATIONS_FOLDER}/{file}, and the "
-        f"plate's calibration stays as it is. {OFFSETS_TITLE} (Plate screen) uses it."
+        "plate's calibration stays as it is. Lay out the fields (Wells screen) and "
+        f"{OFFSETS_TITLE} (Plate screen) use it."
     )
 
 
@@ -3647,3 +3657,64 @@ def calibration_failed(words: str) -> str:
     operator acts on, and the strip's outcome is gone at the next activity.
     """
     return _flat(f"the last calibration failed: {words}")
+
+
+def plan_calibration_used(objective: str, file: str, measured: str) -> str:
+    """The Wells screen's note when *Lay out the fields* will use the objective's own calibration document (m5 §18.6 D26, FM-216).
+
+    ``file`` is ``calibration_file(position)`` and ``measured`` what ``calibration_from`` returns
+    for the document: its date is the first ten characters when it is an ISO time and
+    ``at an unknown time`` otherwise, as ``calibration_held_line`` says one. Plain text on one
+    line (FM-139): an objective's label comes from outside.
+    """
+    when = f"on {measured[:10]}" if _ISO_DATE.match(measured) else "at an unknown time"
+    return _flat(
+        f"Lay out the fields uses the camera calibration of {objective} made {when} "
+        f"({CALIBRATIONS_FOLDER}/{file}): the camera's turn and mirror are measured, "
+        "not assumed."
+    )
+
+
+def plan_calibration_missing(objective: str, why: str) -> str:
+    """The Wells screen's note when no document of the objective can be used: the plan then assumes rotation 0 and no mirror, and how to get one (m5 §18.6 D26, FM-216).
+
+    It is said **before** the click, because the tool's own ``assumed`` lines are on the card
+    after the plan, and a camera turned 177 degrees plans a route about 270 um off at the 40X
+    without the strip saying so (§18.6.1). It is a note and never a wait: the operator may want
+    rotation 0. ``why`` is one of D24's reasons (``calibrate_position_unknown``,
+    ``PLAN_CALIBRATION_NONE_MADE``, a held document's ``problem``, a ``denied`` line or
+    ``plan_calibration_other_objective``).
+    """
+    return _flat(
+        f"No camera calibration of {objective} can be used ({why}): Lay out the fields "
+        "assumes the profile's pixel size, rotation 0 and no mirror, and the positions "
+        "of cells in the fields will be wrong if the camera is turned or mirrored. To "
+        f"get one: Stand screen, Calibrate the camera, with {objective} in place."
+    )
+
+
+def plan_calibration_other_objective(file: str, found: str | None) -> str:
+    """Why a position's document is not the plan's objective's: it holds another objective's calibration (m5 §18.6 D24 item 7, D21).
+
+    A turn at the handset during a calibration, or a relabelled turret, leaves a file holding
+    another objective's calibration; ``found`` is ``None`` for a record that names none.
+    """
+    named = "an unknown objective" if found is None else found
+    return _flat(f"{CALIBRATIONS_FOLDER}/{file} holds a calibration of {named}")
+
+
+def plan_calibration_frame(
+    objective: str, file: str, held_px: tuple[int, int], camera_px: tuple[int, int]
+) -> str:
+    """The one refusal of the click: the document's frame is not the camera's, so the tool would refuse it with a ``failed`` record that replaces the usable plan (m5 §18.6 D25, FM-206, FM-73).
+
+    The frames are ``(height, width)`` as the tool compares them, so that a transposed frame
+    is another frame. The way out is to calibrate again at the objective: the run replaces
+    the document.
+    """
+    return _flat(
+        f"the camera calibration of {objective} in {CALIBRATIONS_FOLDER}/{file} is of a "
+        f"frame of {held_px[0]} by {held_px[1]} px, the camera gives {camera_px[0]} by "
+        f"{camera_px[1]} px (binning or the region changed): calibrate the camera at "
+        f"{objective} again (Stand screen, Calibrate the camera)"
+    )

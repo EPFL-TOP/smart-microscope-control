@@ -106,6 +106,7 @@ from smc.ui.guide import (
     OFFSETS_TOO_MANY,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
+    PLAN_CALIBRATION_NONE_MADE,
     PLATE_NOT_CHOSEN,
     REGISTER_ACROSS_A_TURN,
     REGISTER_FIRST,
@@ -220,6 +221,10 @@ from smc.ui.guide import (
     orientation_label,
     page_words,
     plain_default,
+    plan_calibration_frame,
+    plan_calibration_missing,
+    plan_calibration_other_objective,
+    plan_calibration_used,
     plan_selection_note,
     plan_title,
     plate_from_line,
@@ -4914,8 +4919,8 @@ def test_the_stand_routed_note_the_folder_note_and_the_measured_other_text_are_t
     assert calibrate_stand_routed(_TEN_X, _FORTY_X, "position-1.json") == (
         f"The plate was registered with {_TEN_X}: a calibration at {_FORTY_X} here is "
         "kept in its own document, calibrations/position-1.json, and the plate's "
-        "calibration stays as it is. Measure the offsets between objectives (Plate "
-        "screen) uses it."
+        "calibration stays as it is. Lay out the fields (Wells screen) and Measure "
+        "the offsets between objectives (Plate screen) use it."
     )
     assert calibrate_command_folder_note("run/calibrations") == (
         "The folder run/calibrations must exist first: the page makes it, a "
@@ -4933,6 +4938,72 @@ def test_the_stand_routed_note_the_folder_note_and_the_measured_other_text_are_t
         "position-1.json holds a calibration of an unknown objective and "
         f"{_FORTY_X} has none; put {_FORTY_X} in place and press the button again"
     )
+
+
+def test_the_plan_calibration_texts_are_the_designs_whole() -> None:
+    """Whole texts of m5 §18.6.3 "Added by #617's plan", written out here (FM-45)."""
+    assert PLAN_CALIBRATION_NONE_MADE == "none has been made"
+    assert plan_calibration_used(
+        _FORTY_X, "position-1.json", "2026-11-25T10:20:30+00:00"
+    ) == (
+        f"Lay out the fields uses the camera calibration of {_FORTY_X} made on "
+        "2026-11-25 (calibrations/position-1.json): the camera's turn and mirror are "
+        "measured, not assumed."
+    )
+    # A time that is not an ISO one is an unknown time, as the held list says it.
+    assert plan_calibration_used(_FORTY_X, "position-1.json", "at an unknown time") == (
+        f"Lay out the fields uses the camera calibration of {_FORTY_X} made at an "
+        "unknown time (calibrations/position-1.json): the camera's turn and mirror "
+        "are measured, not assumed."
+    )
+    assert plan_calibration_used(_FORTY_X, "position-1.json", "") == (
+        f"Lay out the fields uses the camera calibration of {_FORTY_X} made at an "
+        "unknown time (calibrations/position-1.json): the camera's turn and mirror "
+        "are measured, not assumed."
+    )
+    assert plan_calibration_missing(_FORTY_X, PLAN_CALIBRATION_NONE_MADE) == (
+        f"No camera calibration of {_FORTY_X} can be used (none has been made): Lay "
+        "out the fields assumes the profile's pixel size, rotation 0 and no mirror, "
+        "and the positions of cells in the fields will be wrong if the camera is "
+        "turned or mirrored. To get one: Stand screen, Calibrate the camera, with "
+        f"{_FORTY_X} in place."
+    )
+    assert plan_calibration_other_objective("position-1.json", _TEN_X) == (
+        f"calibrations/position-1.json holds a calibration of {_TEN_X}"
+    )
+    assert plan_calibration_other_objective("position-1.json", None) == (
+        "calibrations/position-1.json holds a calibration of an unknown objective"
+    )
+    assert plan_calibration_frame(
+        _FORTY_X, "position-1.json", (1024, 1024), (384, 512)
+    ) == (
+        f"the camera calibration of {_FORTY_X} in calibrations/position-1.json is of "
+        "a frame of 1024 by 1024 px, the camera gives 384 by 512 px (binning or the "
+        f"region changed): calibrate the camera at {_FORTY_X} again (Stand screen, "
+        "Calibrate the camera)"
+    )
+    # The transposed frame is another frame, and the words keep the order they were given.
+    assert "512 by 384 px, the camera gives 384 by 512 px" in plan_calibration_frame(
+        _FORTY_X, "position-1.json", (512, 384), (384, 512)
+    )
+
+
+def test_the_plan_calibration_texts_are_one_line_for_a_label_with_a_line_break() -> (
+    None
+):
+    label = "40X lens\nwith a break\r\nand [markup] *stars*"
+    texts = (
+        plan_calibration_used(label, "position-1.json", "2026-11-25T10:20:30+00:00"),
+        plan_calibration_missing(label, "why\nnot"),
+        plan_calibration_other_objective("position-1.json", label),
+        plan_calibration_frame(label, "position-1.json", (1, 2), (3, 4)),
+    )
+
+    for text in texts:
+        assert "\n" not in text
+        assert "\r" not in text
+    # Plain text for the view (FM-139): the markup characters are kept as typed.
+    assert "[markup] *stars*" in texts[0]
 
 
 def test_calibration_denied_names_the_folder_and_the_reason_and_never_a_file() -> None:

@@ -1402,8 +1402,8 @@ def _routed(plate: str, objective: str, position: int) -> str:
     return (
         f"The plate was registered with {plate}: a calibration at {objective} here is "
         f"kept in its own document, calibrations/position-{position}.json, and the "
-        "plate's calibration stays as it is. Measure the offsets between objectives "
-        "(Plate screen) uses it."
+        "plate's calibration stays as it is. Lay out the fields (Wells screen) and "
+        "Measure the offsets between objectives (Plate screen) use it."
     )
 
 

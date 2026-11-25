@@ -313,7 +313,8 @@ disclosure shows the `smc run` line it makes.
   put the plate out of date (FM-216; this button did that until #557). A note under the button
   says it before the click: `The plate was registered with <O>: a calibration at <X> here is
   kept in its own document, calibrations/position-<n>.json, and the plate's calibration stays
-  as it is. Measure the offsets between objectives (Plate screen) uses it.`, and, when that
+  as it is. Lay out the fields (Wells screen) and Measure the offsets between objectives (Plate
+  screen) use it.`, and, when that
   position already holds a usable calibration of `<X>`, what a new one replaces. The *Command*
   disclosure shows the call the click makes (`smc run camera-calibration ... --run-doc
   <the position's file> ...`) and says that the page makes the folder and a terminal does not.
@@ -324,10 +325,12 @@ disclosure shows the `smc run` line it makes.
   `settle_ms` only, and refuses a typed `from_run_doc` (that field reuses a calibration into the
   run document: it is the expert view's *Run camera-calibration*, which still writes the run
   document and is not routed). To register the plate afresh at another objective, reuse the
-  position's document into the run document with that field in the expert view. **Not yet done**
-  (#617): the Wells and Scan screens read the run document's calibration, so at another objective
-  `scan-plan` sets it aside and plans with rotation 0 and no mirror, with its own words; give it
-  the `calibration` field of the expert view. A plate registered from its walls **before the
+  position's document into the run document with that field in the expert view. **The Wells
+  screen's *Lay out the fields* uses that document** (since #617): at an objective other than the
+  plate's, `scan-plan` is given `calibration=<the position's document>` by the page, at the click,
+  so the plan has the camera's measured turn and mirror and not the profile's size, rotation 0 and
+  no mirror (the second half of FM-216); the Wells screen says so before the click (below). A plate
+  registered from its walls **before the
   objective was recorded** has no block, so this button still writes the run document and puts that
   plate out of date.
 
@@ -598,6 +601,32 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   first field.` The button stays enabled: laying the fields out again is the way to change a
   plan after a STOP, and it is your choice (`Start again` would run the scan with the plan you
   want to change);
+- **which camera calibration the plan will use**, a note under the button, **only when the plate
+  was registered from its walls under another objective than the one in place** (the plate's own
+  objective, and a plate registered by eye, have their calibration in the run document and the
+  note is not drawn). The page gives `scan-plan` the calibration document of the objective in
+  place, `calibrations/position-<n>.json` (the one the Stand screen's *Calibrate the camera*
+  made), and says it before the click: `Lay out the fields uses the camera calibration of <O>
+  made on <date> (calibrations/position-<n>.json): the camera's turn and mirror are measured,
+  not assumed.` With **no document it can use** (none made, a failed one, one of another
+  objective, a position the page cannot name, a folder it cannot look into) nothing is given, and
+  the note says why and what the plan will assume: `No camera calibration of <O> can be used
+  (<why>): Lay out the fields assumes the profile's pixel size, rotation 0 and no mirror, and the
+  positions of cells in the fields will be wrong if the camera is turned or mirrored. To get one:
+  Stand screen, Calibrate the camera, with <O> in place.` It is a note and never a wait: the
+  button stays enabled, since you may want rotation 0, and the plan's card says what it assumed
+  after the plan. **The click reads again**: the turret, the documents and the camera's frame
+  now, not the note's copy (a turn at the handset since the last second is followed). A
+  document **of another frame than the camera gives** (binning or the region changed) is refused
+  with the two frames named, **before anything is written**, so the plan you had is not replaced
+  by a failure; calibrate the camera again at that objective to replace it. A typed
+  `calibration`, `pixel_size_um` or `objective` in the expert view's form wins (typed
+  `calibration` or `pixel_size_um`: nothing is added and no note; typed `objective`: the
+  plan's objective for this decision). The *Command* disclosure under the button shows the whole
+  call, `--param calibration=<the document's absolute path>` included, so a terminal plans the
+  same (a Windows page keeps its note that the line is quoted for a POSIX shell). The same holds
+  for the expert view's *Run* of `scan-plan`, the next step's *Run* and the `scan-plan` of
+  *Measure the time*, which all go through the one place that gives it;
 - **what is known**, under the button: `Objective: <label>, in place`; `Fields: 72 in 2 wells`
   (or `Fields: not laid out yet`, or `Fields: out of date (<why>)` when the plate or the timings
   were produced again since, so the plan is stale); the `Time` line, which **says which

@@ -38,6 +38,7 @@ import threading
 import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -75,12 +76,14 @@ from smc.ui.controller import (
     OffsetsStep,
     PageServerError,
     PageStatus,
+    PlanCalibration,
     PlatePage,
     PlateView,
     ResultCard,
     ScanEnd,
     ToolView,
     WellView,
+    plan_calibration,
 )
 from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
@@ -848,6 +851,12 @@ class PlatePageView:
         # objective, written by ``_draw_stand`` and sent by the click, because the destination of
         # the calibration is chosen for the label the button showed (FM-151, FM-177).
         self._stand_calibrate_for: str | None = None
+        # *Lay out the fields*' command (m5 §18.6 D26): the pairs the controller gave at the last
+        # redraw (``None`` when it refused them) and the calibration document the command was drawn
+        # with, so that the tick draws it again from these when the document the Wells screen's
+        # note names has changed, and reads neither the run document nor the stand (FM-145, FM-151).
+        self._layout_pairs: list[str] | None = None
+        self._layout_path_drawn: Path | None = None
         # The documents the page held at the last redraw of the block, and the line for a folder
         # it could not look into: the wait beside *Measure the offsets* was read for them, and
         # says nothing true once either changes (FM-247, m5 §18.6 D22).
@@ -1716,6 +1725,11 @@ class PlatePageView:
         )
         self.layout_wait = _wrapped_text()
         self.layout_wait.visible = False
+        # Before the click, which camera calibration the plan will use or assume (m5 §18.6 D26):
+        # a note and never a wait, so no button is disabled by it, and it takes no height while
+        # it says nothing.
+        self.layout_calibration_text = _wrapped_text()
+        self.layout_calibration_text.visible = False
         self.wells_known_block = _wrapped_text()
         # *Measure the time* (m5 §17.12 D18), under the known block while the plan has no
         # time: the chain of ``timing`` and ``scan-plan``, whose line is drawn under it.
@@ -2416,8 +2430,9 @@ class PlatePageView:
         """The Wells screen's own widgets, in the order of m5 §17.4.3 (the action is above what is known).
 
         The *Wells* box, then the two tool fields with the line that says where each value
-        comes from, the action, its wait, what is known about the plan, the note that the
-        selection is not the plan's, and the *Command* disclosure. The two fields are the
+        comes from, the action, its wait, the note on the camera calibration the plan will
+        use (m5 §18.6 D26), what is known about the plan, the note that the selection is not
+        the plan's, and the *Command* disclosure. The two fields are the
         tools' own instances (D5, ``tool_fields``), the ones the accordion holds too: a tool
         that did not load has no field, and its line is left out with it.
         """
@@ -2433,6 +2448,7 @@ class PlatePageView:
             *listed,
             self.layout_button,
             self.layout_wait,
+            self.layout_calibration_text,
             self.wells_known_block,
             self.measure_time_button,
             self.measure_time_wait,
@@ -4843,10 +4859,16 @@ class PlatePageView:
         card of the tool carried them before this screen replaced its section: FM-226). The
         plan card's ``assumed`` lines go under it, plain text (FM-139). The button and its
         wait are ``_draw_wells_scan_buttons``'s. A text pane that says nothing takes no height.
+
+        The note under *Lay out the fields* says which camera calibration the plan will use or
+        assume (m5 §18.6 D26): drawn at every tick, so that a turn at the handset is followed, from
+        the status and the last view alone. When the document it names has changed the *Command*
+        line is drawn again from the pairs of the last redraw.
         """
         view = self._view
         plan = None if view is None else view.plan
         self._draw_field_lines()
+        self._draw_layout_calibration()
         self._draw_wells_known(status)
         self._say(
             self.wells_note,
@@ -4854,6 +4876,19 @@ class PlatePageView:
                 () if plan is None else plan.well_names, self.page.selection
             ),
         )
+
+    def _draw_layout_calibration(self) -> None:
+        """The note under *Lay out the fields* and, when the document it names changed, the command drawn again (m5 §18.6 D26).
+
+        A note and never a wait: *Lay out the fields* stays enabled, since the operator may want
+        rotation 0 and the tool's ``assumed`` lines say it after the plan. It takes no height while
+        it says nothing (``_say``). The command is the tick's copy of the call (the click reads
+        again), drawn from the pairs of the last redraw and never by ``page_params``.
+        """
+        chosen = self._plan_calibration_drawn()
+        self._say(self.layout_calibration_text, chosen.note)
+        if chosen.path != self._layout_path_drawn:
+            self._show_layout_command(chosen)
 
     def _draw_wells_known(self, status: PageStatus | None) -> None:
         """The Wells screen's "known" block: objective, fields, time, the plan's assumptions (m5 §17.10.3).
@@ -5177,19 +5212,82 @@ class PlatePageView:
         self._say(self.measure_time_wait, reason or busy or "")
 
     def _draw_layout_command(self) -> None:
-        """The command of *Lay out the fields*: ``scan-plan`` with the page's wells and the form's typed fields (m5 §17.2 D8).
+        """The command of *Lay out the fields*: ``scan-plan`` with the page's wells and the form's typed fields, and the camera calibration the click will give it (m5 §17.2 D8, §18.6 D26).
 
         Read at a redraw and at a field's change, never by the tick (it reads the run
         document). A selection the controller refuses for (none, or on another plate) draws
-        no command, as ``_draw_calibrate_command`` does, and the card is hidden with it.
+        no command, as ``_draw_calibrate_command`` does, and the card is hidden with it. The
+        pairs it was given are kept (``_layout_pairs``, ``None`` when refused) so that the tick
+        can draw the line again when the calibration document changes, with no new read. The
+        Wells screen's note follows the same decision, since a typed ``calibration``,
+        ``pixel_size_um`` or ``objective`` changes what it says (``_on_field_changed``).
         """
         try:
-            pairs = [*self.page.page_params("scan-plan"), *self._typed("scan-plan")]
+            self._layout_pairs = [
+                *self.page.page_params("scan-plan"),
+                *self._typed("scan-plan"),
+            ]
         except ValueError:
+            self._layout_pairs = None
+        chosen = self._plan_calibration_drawn()
+        self._say(self.layout_calibration_text, chosen.note)
+        self._show_layout_command(chosen)
+
+    def _show_layout_command(self, chosen: PlanCalibration) -> None:
+        """The *Command* line from the pairs of the last redraw and the document ``chosen`` names: the call the click makes (ADR-0006, principle 5, m5 §18.6 D26).
+
+        ``calibration=<path>`` is appended exactly when the click would give it
+        (``plan_calibration``), so a terminal's run of the line plans what the page plans. A typed
+        ``calibration=null`` is replaced as the click does (the parser reads it as none, and a
+        second ``calibration`` would be ``given twice``). The path is the tick's copy: one tick old
+        after a turn or a new calibration, which the click's own read makes harmless. Reads
+        nothing: no stand, no run document (FM-145).
+        """
+        self._layout_path_drawn = chosen.path
+        pairs = self._layout_pairs
+        if pairs is None:
             self.layout_command.object = ""
         else:
+            if chosen.path is not None:
+                pairs = [
+                    *(pair for pair in pairs if pair != "calibration=null"),
+                    f"calibration={chosen.path}",
+                ]
             self.layout_command.object = self.page.command_for("scan-plan", pairs)
         self.layout_card.visible = bool(self.layout_command.object)
+
+    def _plan_calibration_drawn(self) -> PlanCalibration:
+        """What the Wells screen says about the camera calibration of the plan, from the last status and the last view (m5 §18.6 D24, D26, FM-169, FM-145).
+
+        The decision is the controller's ``plan_calibration``, the one the click reads again with
+        the turret, the documents and the camera's frame read **now**; this is the tick's copy of
+        it: the status's objective (the typed ``objective`` of the ``scan-plan`` form wins, ``null``
+        reading as unset as the parser does), the view's offer, documents and denied folder, the
+        page's copy of the turret's labels, and ``given`` from the typed ``calibration`` and
+        ``pixel_size_um``. ``frame_px`` is ``None``: only the click reads the camera. Nothing is
+        said with the stand closed, no status or no view. No stand and no file is read.
+        """
+        status = self._status
+        view = self._view
+        offer = None if view is None else view.offsets
+        if status is None or view is None or offer is None or not status.connected:
+            return PlanCalibration()
+        fields = self.tool_fields.get("scan-plan", {})
+
+        def typed(key: str) -> str:
+            widget = fields.get(key)
+            text = "" if widget is None else str(widget.value).strip()
+            return "" if text == "null" else text
+
+        return plan_calibration(
+            plate_objective=offer.plate_objective,
+            objective=typed("objective") or status.objective or None,
+            given=bool(typed("calibration") or typed("pixel_size_um")),
+            labels=self._objective_labels,
+            documents=view.calibrations,
+            denied=view.calibrations_denied,
+            frame_px=None,
+        )
 
     def _draw_scan_command(self) -> None:
         """The command of *Start the scan*, or of *Continue the scan* (``--resume``) over a checkpoint it continues (m5 §17.2 D8, §17.12 D17).

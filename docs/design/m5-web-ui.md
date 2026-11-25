@@ -7541,7 +7541,11 @@ def _plan_calibration_for(
   `turret_position(labels, objective)`.
 - `_read_calibration` fills `image_shape_px` from `found.image_shape_px`; nothing else of §18.3
   changes. `_plan_reading` is `_turret_reading` without the light and with the frame: one
-  `_reading()`, `(None, (), None)` with the stand closed.
+  `_reading()`, `(None, (), None)` with the stand closed. *(Pinned by #617's develop session: a
+  frame that could not be read never reaches `plan_calibration` at the click, since D25 says
+  nothing is added and nothing is refused for it: `_plan_calibration_for` returns
+  `PlanCalibration()` before it reads the documents, and `frame_px` is `None` only for the tick.
+  A held read with no `image_shape_px` compares no frame either.)*
 - `_plan_calibration_for` is D25's reads and the two cheap conditions asked first; it returns a
   `PlanCalibration()` (nothing) for a page with no offer. `_prepare` calls it for `scan-plan` only (`doc_path`
   `None`, the parsed parameters a `ScanPlanParams`), and returns `f"{tool_title(plugin)}: {refusal}"`

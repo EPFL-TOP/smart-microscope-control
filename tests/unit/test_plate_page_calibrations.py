@@ -1717,6 +1717,7 @@ def test_the_held_calibrations_are_read_for_positions_1_to_12_in_order_and_for_n
         "Objective-2",
         "2026-11-17T09:00:00+00:00",
         None,
+        image_shape_px=(384, 512),
     )
     assert by_position[12].problem is None
     # A page's path, as the page was given the run document, never resolved.
@@ -1735,6 +1736,34 @@ def test_the_held_calibrations_are_read_for_positions_1_to_12_in_order_and_for_n
         "lightsheet, this is demo; run camera-calibration again on this profile"
     )
     assert all(h.read.objective is None for h in held if h.read.problem is not None)
+
+
+def test_a_held_document_carries_the_frame_it_was_made_in(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The scan plan refuses a document of another frame (m5 §18.6 D25, #617): the read holds it,
+    # ``(height, width)`` as the tool keeps it, so that the click can compare it with the camera's.
+    # A read with a problem has no frame.
+    _seed_plate(run_doc)
+    folder = _folder(run_doc)
+    _seed_calibration(folder / "position-1.json", FORTY)
+    _seed_calibration(
+        folder / "position-4.json",
+        TWENTY,
+        status=StageStatus.failed,
+        error="the frame is dark",
+    )
+    page = _page(fake_microscope, run_doc)
+    try:
+        held = {h.position: h.read for h in page.view().calibrations}
+    finally:
+        page.close()
+
+    assert held[1].image_shape_px == (384, 512)
+    assert held[4].problem is not None
+    assert held[4].image_shape_px is None
+    # A read built without a frame (every construction before #617) has none.
+    assert CalibrationRead("p.json", FORTY, "", None).image_shape_px is None
 
 
 def test_one_position_that_cannot_be_read_leaves_the_others(

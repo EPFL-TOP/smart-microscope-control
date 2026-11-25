@@ -105,6 +105,7 @@ from smc.plugins.presets import (
 from smc.plugins.presets import load_preset as read_preset
 from smc.plugins.presets import save_preset as write_preset
 from smc.plugins.runner import reachable_checkpoint
+from smc.plugins.scan_plan.plugin import ScanPlanParams
 from smc.plugins.scan_plan.wells import parse_wells
 from smc.plugins.slots import (
     IMAGE_SIDES,
@@ -157,6 +158,7 @@ from smc.ui.guide import (
     OFFSETS_RESTART_FIRST,
     OFFSETS_TOO_MANY,
     OFFSETS_TURRET_UNREAD,
+    PLAN_CALIBRATION_NONE_MADE,
     PLATE_NOT_CHOSEN,
     RUN_ALL_LABEL,
     SCAN_CHECKPOINT_KEPT,
@@ -196,6 +198,10 @@ from smc.ui.guide import (
     offsets_not_on_turret,
     offsets_plate_refusal,
     page_words,
+    plan_calibration_frame,
+    plan_calibration_missing,
+    plan_calibration_other_objective,
+    plan_calibration_used,
     register_objective_refusal,
     replace_note,
     scan_plan_card_lines,
@@ -236,6 +242,7 @@ __all__ = [
     "OffsetsStep",
     "PageServerError",
     "PageStatus",
+    "PlanCalibration",
     "PlanLayer",
     "PlatePage",
     "PlateView",
@@ -247,6 +254,7 @@ __all__ = [
     "ToolView",
     "WellView",
     "jog_crossing",
+    "plan_calibration",
 ]
 
 log = logging.getLogger("smc.ui")
@@ -658,7 +666,10 @@ class CalibrationRead:
     document cannot be used, in the tool's words, and then ``objective`` is ``None`` and
     ``measured`` is empty. ``notes`` are the calibration's own ``assumed`` lines, each on one
     line and cut at the card's bound, at most the card's count (m5 §18.6 D15); a read that
-    has a ``problem`` has none.
+    has a ``problem`` has none. ``image_shape_px`` is the frame the calibration was measured in,
+    ``(height, width)`` as the tool keeps it (m5 §18.6 D24, #617): ``scan-plan`` refuses a
+    document of another frame, and the click compares it with the camera's. ``None`` for a read
+    that has a ``problem`` and for one built without it.
     """
 
     path: str
@@ -666,6 +677,7 @@ class CalibrationRead:
     measured: str
     problem: str | None
     notes: tuple[str, ...] = ()
+    image_shape_px: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1416,7 +1428,9 @@ def _read_calibration(path: str, *, profile: str, dry_run: bool) -> CalibrationR
     notes = tuple(
         _cut(_flat(line), _CARD_TEXT_CHARS) for line in found.assumed[:_CARD_LINES]
     )
-    return CalibrationRead(path, found.objective, measured, None, notes)
+    return CalibrationRead(
+        path, found.objective, measured, None, notes, found.image_shape_px
+    )
 
 
 def _failed_calibration_words(path: Path) -> str | None:
@@ -1450,6 +1464,96 @@ def _offsets_offer_of(registered: PlateResult | None) -> OffsetsOffer | None:
     if registered is None or registered.walls is None or not registered.objective:
         return None
     return OffsetsOffer(registered.objective)
+
+
+@dataclass(frozen=True, slots=True)
+class PlanCalibration:
+    """What *Lay out the fields* gives ``scan-plan`` as its camera calibration, and what the Wells screen says about it (m5 §18.6 D24).
+
+    ``path`` is the document to give as ``calibration=<path>`` (absolute, never resolved:
+    FM-24, FM-50), ``None`` for nothing. ``note`` is the line the Wells screen shows before the
+    click, ``""`` when there is nothing to say. ``refusal`` is the one text that stops the
+    click (a document of another frame, D25) and then ``path`` is ``None``: the page refuses
+    before anything is written, since the tool would refuse it with a ``failed`` record that
+    replaces the usable plan (FM-206).
+    """
+
+    path: Path | None = None
+    note: str = ""
+    refusal: str | None = None
+
+
+def plan_calibration(
+    *,
+    plate_objective: str | None,
+    objective: str | None,
+    given: bool,
+    labels: Sequence[str],
+    documents: Sequence[HeldCalibration],
+    denied: str | None,
+    frame_px: tuple[int, int] | None,
+) -> PlanCalibration:
+    """The camera calibration the page gives ``scan-plan`` for a plan at ``objective``, decided in one place: the click, the Wells screen's note and the command read it (m5 §18.6 D24, FM-169, FM-216).
+
+    After a registration under the 10X, a plan at the 40X used the profile's size, rotation 0 and
+    no mirror, where the 40X's own calibration sat in ``calibrations/position-<n>.json``. The
+    first of D24's items that holds decides: no offer (``plate_objective`` is ``None``), a
+    calibration or pixel size typed (``given``), no objective, the plate's own objective (its
+    calibration is the run document's): nothing, no note. Then the position of ``objective`` on
+    the turret, and the document held there: each way it cannot be used is nothing and a note
+    that says why (the tool's own ``assumed`` lines stay, after the plan). A document of another
+    frame than ``frame_px`` is the one **refusal**, which only the click can make because only the
+    click reads the camera (``frame_px`` is ``None`` for the tick, or when the camera could not
+    be read: unknown beats guessed, and the tool decides). The frames are compared as the tool
+    compares them, ``(height, width)`` with ``==`` (FM-73). Else the document, as an absolute
+    path.
+
+    No hardware, no file and no widget: ``documents`` and ``denied`` are what ``_held_calibrations``
+    read, ``labels`` what the turret reads.
+    """
+    if plate_objective is None or given:
+        return PlanCalibration()
+    if objective is None or not objective.strip():
+        return PlanCalibration()
+    if not calibration_goes_to_a_document(plate_objective, objective):
+        return PlanCalibration()
+    position = turret_position(labels, objective)
+    if position is None:
+        return PlanCalibration(
+            note=plan_calibration_missing(
+                objective, calibrate_position_unknown(objective)
+            )
+        )
+    held = next((doc for doc in documents if doc.position == position), None)
+    if held is None:
+        # A folder that could not be looked into says so for every position it did not
+        # reach (D22): what is not known is not "none has been made".
+        why = PLAN_CALIBRATION_NONE_MADE if denied is None else denied
+        return PlanCalibration(note=plan_calibration_missing(objective, why))
+    read = held.read
+    if read.problem is not None:
+        return PlanCalibration(note=plan_calibration_missing(objective, read.problem))
+    file = calibration_file(position)
+    if calibration_at_its_position(labels, position, read.objective) is not True:
+        return PlanCalibration(
+            note=plan_calibration_missing(
+                objective, plan_calibration_other_objective(file, read.objective)
+            )
+        )
+    if (
+        frame_px is not None
+        and read.image_shape_px is not None
+        and read.image_shape_px != frame_px
+    ):
+        return PlanCalibration(
+            refusal=plan_calibration_frame(
+                objective, file, read.image_shape_px, frame_px
+            )
+        )
+    return PlanCalibration(
+        path=Path(read.path).absolute(),
+        note=plan_calibration_used(objective, file, read.measured),
+    )
 
 
 def _plan_layer(
@@ -3084,6 +3188,27 @@ class PlatePage:
                 # that ends with no word (FM-113).
                 return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
             doc = RunDocument.load_or_new(doc_path or self._run_doc)
+            if (
+                plugin == "scan-plan"
+                and doc_path is None
+                and isinstance(parsed, ScanPlanParams)
+            ):
+                # The one place the page's own ``scan-plan`` gets the document of the plan's
+                # objective (m5 §18.6 D24): every way to run the tool comes here, and the
+                # decision is read at the click, never a copy a view made (FM-177, FM-151).
+                chosen = self._plan_calibration_for(doc, parsed)
+                if chosen.refusal is not None:
+                    return f"{tool_title(plugin)}: {chosen.refusal}"
+                if chosen.path is not None:
+                    # A typed ``calibration=null`` is the same as none: the pair is replaced
+                    # and never met by a second one (``'calibration' given twice``).
+                    parsed = parse_params(
+                        entry.plugin.Params,
+                        [
+                            *(pair for pair in params if pair != "calibration=null"),
+                            f"calibration={chosen.path}",
+                        ],
+                    )
             check_ready(
                 entry.plugin,
                 doc,
@@ -6249,6 +6374,88 @@ class PlatePage:
                 self._labels_of(microscope),
                 self._light_in_place(microscope),
             )
+
+    def _plan_reading(
+        self,
+    ) -> tuple[str | None, tuple[str, ...], tuple[int, int] | None]:
+        """The objective in place, every position's label and the camera's frame, read together inside one read a Disconnect waits for (m5 §18.6 D25, #617).
+
+        ``_turret_reading`` without the light and with the frame: ``(None, (), None)`` with the stand
+        closed. The frame is ``Camera.image_shape()`` **now**, as ``(height, width)`` of ints,
+        never a tick's copy (FM-177, FM-151): ``None`` for no camera, a read that raised (one
+        WARNING with the error's class and one line, nothing kept: FM-98) or a side under 1, and
+        then the page adds nothing and refuses nothing about the frame (unknown beats guessed).
+        Nothing here moves or turns anything (FM-14, FM-88): a read is not a move.
+        """
+        with self._reading() as microscope:
+            if microscope is None:
+                return None, (), None
+            return (
+                self._objective_in_place(microscope),
+                self._labels_of(microscope),
+                self._frame_in_place(microscope),
+            )
+
+    def _plan_calibration_for(
+        self, doc: RunDocument, parsed: ScanPlanParams
+    ) -> PlanCalibration:
+        """What ``_prepare`` gives a ``scan-plan`` run as its calibration, from what the turret, the documents and the camera say **now** (m5 §18.6 D24, D25, FM-177, FM-151, FM-216).
+
+        ``doc`` is the page's own run document, read by ``_prepare`` for this click. The cheap
+        conditions are asked first so that a plan at the plate's own objective, a plate registered
+        by eye and a typed ``calibration`` or ``pixel_size_um`` read neither the turret nor a
+        file: no offer, or the operator chose, is ``PlanCalibration()``, nothing. Then one
+        ``_plan_reading`` (the turret's label, every label and the frame), the plan's objective
+        (``parsed.objective`` when set, as the tool reads it, else the label in place) and, only
+        for an objective other than the plate's, the documents (``_held_calibrations``: twelve
+        ``stat`` and at most three reads) and ``plan_calibration``, which the Wells screen's note
+        and the command also read (FM-169). ``run`` has refused a busy page before this
+        (FM-238), and a chain's second tool is prepared on the worker: nothing here assumes the
+        UI thread.
+        """
+        offer = self._offsets_offer(self._slot(doc, "plate", PlateResult, []))
+        given = parsed.calibration is not None or parsed.pixel_size_um is not None
+        if offer is None or given:
+            return PlanCalibration()
+        now, labels, frame = self._plan_reading()
+        objective = parsed.objective if parsed.objective is not None else now
+        if not calibration_goes_to_a_document(offer.plate_objective, objective):
+            return PlanCalibration()
+        if frame is None:
+            # Unknown beats guessed (D25): the page cannot say whether the document fits this
+            # camera, so it gives nothing and refuses nothing, and the tool decides as it did
+            # before this page gave it anything. (The tool reads the same frame: a camera that
+            # cannot answer here fails its own run, loudly.) Only the tick compares no frame.
+            return PlanCalibration()
+        found = self._held_calibrations()
+        return plan_calibration(
+            plate_objective=offer.plate_objective,
+            objective=objective,
+            given=False,
+            labels=labels,
+            documents=found.documents,
+            denied=found.denied,
+            frame_px=frame,
+        )
+
+    @staticmethod
+    def _frame_in_place(microscope: Microscope) -> tuple[int, int] | None:
+        """The camera's frame as ``(height, width)`` px now, or ``None``: no camera, a read that raised, or a side under 1 (m5 §18.6 D25)."""
+        camera = microscope.get(Camera)
+        if camera is None:
+            return None
+        try:
+            height, width = (int(side) for side in camera.image_shape())
+        except Exception as exc:
+            log.warning(
+                "camera: its frame could not be read before a scan plan: %s: %s",
+                type(exc).__name__,
+                _one_line(exc),
+            )
+            return None
+        if height < 1 or width < 1:
+            return None
+        return height, width
 
     @staticmethod
     def _light_in_place(microscope: Microscope) -> bool | None:
