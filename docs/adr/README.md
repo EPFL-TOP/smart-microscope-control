@@ -18,6 +18,7 @@ and why.
 | [0008](0008-repository-workflow.md) | Repository workflow: issues, branches, PRs, CI | accepted (amended in part by 0009, 0010) |
 | [0009](0009-light-ci-full-nightly.md) | A light CI on pull requests, the full matrix every night (amends 0005, 0008) | accepted (amended in part by 0010) |
 | [0010](0010-two-tracks.md) | Two tracks in one repository: the stand track and the analysis track (amends 0008, 0009) | accepted |
+| [0011](0011-where-the-models-run.md) | Where the models run: one detector interface, local or served by imaging-server-kit | proposed |
 
 ## Statuses
 
