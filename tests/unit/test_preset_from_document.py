@@ -556,7 +556,15 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "focus_range_um": 2.5,
             "focus_step_um": 0.5,
             "focus_score": "normalized-variance",
-        }
+        },
+        # The 10x lock map (m3 §21.12.5): its path with a backslash and a space is
+        # the one a reader may take for an escape (FM-190).
+        {
+            "cell_focus": "map",
+            "focus_map": "C:\\runs\\a b\\run-10x.json",
+            "map_check_every": 25,
+            "autofocus": "off",
+        },
     ],
     "scan-plan": [
         {

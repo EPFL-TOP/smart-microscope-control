@@ -62,10 +62,18 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from smc.hardware.capabilities import (
     Autofocus,
@@ -133,9 +141,16 @@ from smc.plugins.scan.algorithm import (
     well_centres_um,
     wells_to_scan,
 )
+from smc.plugins.scan.map_focus import (
+    MapFocus,
+    anchor_well,
+    focus_field,
+    prepare_map,
+)
 from smc.plugins.slots import (
     FailedField,
     FieldFocus,
+    FocusMapUse,
     FocusSweep,
     PlannedField,
     PlateCheck,
@@ -252,14 +267,16 @@ class ScanParams(PluginParams):
             "demo's 10x (a field of view of 128 x 96 µm)."
         ),
     )
-    cell_focus: Literal["off", "per-field", "per-well"] = Field(
+    cell_focus: Literal["off", "per-field", "per-well", "map"] = Field(
         "off",
         description=(
             "The focus on the cells (m3 §21): per-field sweeps Z around every "
             "field and takes its frame at the sharpest plane; per-well sweeps "
             "until one field of the well finds a peak, then reuses its offset. "
             "The autofocus is off for the sweep and the frame, and the next "
-            "field locks it again."
+            "field locks it again. map (with the autofocus off) takes each "
+            "field's Z from focus_map, a scan taken with the autofocus locked, "
+            "plus one offset per well swept near its centre (m3 §21.12)."
         ),
     )
     focus_range_um: float = Field(
@@ -289,6 +306,26 @@ class ScanParams(PluginParams):
             "measured on cells."
         ),
     )
+    focus_map: Path | None = Field(
+        None,
+        description=(
+            "cell_focus=map: the run document whose scan, taken with the "
+            "autofocus locked on this registration of the plate (the 10x scan the "
+            "fields were planned from), maps the plate's bottom. A copy of it, "
+            "never the run document this run writes."
+        ),
+    )
+    map_check_every: int = Field(
+        0,
+        ge=0,
+        le=100_000,
+        description=(
+            "cell_focus=map: every field whose index in its well is a multiple of "
+            "this also sweeps around the map's Z, and its frame stays at the "
+            "map's Z (the check measures the map, it does not correct it); 0 "
+            "checks none."
+        ),
+    )
 
     @model_validator(mode="after")
     def _a_sweep_with_planes(self) -> ScanParams:
@@ -297,6 +334,15 @@ class ScanParams(PluginParams):
         )
         if problem is not None:
             raise ValueError(problem)
+        if self.cell_focus == "map" and self.focus_map is None:
+            raise ValueError(
+                "cell_focus=map takes each field's Z from a map: set focus_map to a "
+                "run document whose scan was taken with the autofocus locked"
+            )
+        if self.focus_map is not None and self.cell_focus != "map":
+            raise ValueError("focus_map is read only with cell_focus=map")
+        if self.map_check_every > 0 and self.cell_focus != "map":
+            raise ValueError("map_check_every is read only with cell_focus=map")
         return self
 
 
@@ -314,6 +360,19 @@ class ScanCheckpoint(BaseModel):
     wells_done: tuple[str, ...]
     frames: tuple[ScanFrame, ...]
     failed: tuple[FailedField, ...]
+    #: ``cell_focus=map``: the map and the anchors of the wells done (m3 §21.12.5).
+    focus_map: FocusMapUse | None = None
+
+    @model_serializer(mode="wrap")
+    def _leave_out_the_map_when_unused(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> dict[str, Any]:
+        # A scan without the map saves its checkpoint as before the field existed,
+        # so its run document is written byte for byte as before (FM-107).
+        data: dict[str, Any] = handler(self)
+        if self.focus_map is None:
+            data.pop("focus_map", None)
+        return data
 
 
 @dataclass
@@ -417,9 +476,11 @@ class _Prepared:
     """A field's focus step up to its snap: when it started, and what the frame will record."""
 
     started: float
-    source: Literal["swept", "well"]
+    source: Literal["swept", "well", "map"]
     sweep: FocusSweep | None
     dz_um: float
+    map_z_um: float | None = None
+    anchor_um: float | None = None
 
 
 def _focus_before_snap(
@@ -512,6 +573,9 @@ class ScanPlugin:
     provides = "scan"
     reads: tuple[str, ...] = ("scan-plan",)
     reads_optional: tuple[str, ...] = ("plate",)
+    #: ``check_run_doc`` refuses a ``focus_map`` that names the document this run
+    #: writes, whose ``scan`` the run replaces (F15, #626), before anything is written.
+    reuses_from: tuple[str, ...] = ("focus_map",)
 
     def run(
         self,
@@ -560,7 +624,7 @@ class ScanPlugin:
         camera = microscope.require(Camera)
         plan = ctx.upstream("scan-plan", ScanPlanResult)
 
-        token, wells_done, frames, failed = _resume(ctx, plan)
+        token, wells_done, frames, failed, resumed_map = _resume(ctx, plan)
         resumed_frames = len(frames)
         # Counted before the loop appends: a checkpoint of an smc that did not
         # record a frame's place in its well keeps its frames as they were, and
@@ -625,6 +689,19 @@ class ScanPlugin:
                 params.focus_range_um,
                 params.focus_step_um,
             )
+        mapping: MapFocus | None = None
+        if params.cell_focus == "map" and bounds is not None:
+            # After §21.6's checks, before the plate check (m3 §21.12.5).
+            mapping = prepare_map(
+                microscope,
+                xy,
+                params,
+                ctx,
+                bounds,
+                groups,
+                autofocus_used=stand.used,
+                resumed=resumed_map,
+            )
         # The last check before anything moves (m3 §27.5): a plate lifted and
         # put back since it was registered is refused before its first frame.
         check_setup, check_skipped = _prepare_plate_check(
@@ -637,7 +714,13 @@ class ScanPlugin:
         # The autofocus the focus step switches off: the one the scan uses.
         focus_af = af if stand.used else None
         unused_af_line: str | None = None
-        if focusing and params.autofocus != "off" and af is not None and not stand.used:
+        if (
+            focusing
+            and mapping is None
+            and params.autofocus != "off"
+            and af is not None
+            and not stand.used
+        ):
             # A stop during the focus on the cells leaves the autofocus off,
             # and a stop in the first well leaves no checkpoint for the resume
             # refusal to read: the next run must not go on without it silently.
@@ -668,6 +751,19 @@ class ScanPlugin:
         # Whether the next engage is the first after a wall's switch-off; a
         # field that reads locked, or any engage made, ends its claim.
         after_wall = False
+        if mapping is not None and resumed_map is None and groups:
+            # Before the first move (FM-141): the start anchor is read from the
+            # stage, and a stop during the first well's sweeps leaves Z on a sweep
+            # plane; a resume without this checkpoint would read its anchor there.
+            ctx.save_checkpoint(
+                ScanCheckpoint(
+                    token=token,
+                    wells_done=tuple(wells_done),
+                    frames=tuple(frames),
+                    failed=tuple(failed),
+                    focus_map=mapping.record(),
+                )
+            )
         t0 = time.monotonic()
         for well, fields in groups:
             _check_well(camera, plan, stand, f" at well {well}")
@@ -695,6 +791,28 @@ class ScanPlugin:
                 # ``t_s`` counts from the attempt's first field: the check's
                 # 20 s are not the first frame's time (#576, item 7).
                 t0 = time.monotonic()
+            if (
+                mapping is not None
+                and z_stage is not None
+                and not ctx.dry_run
+                and mapping.anchor_um(well) is None
+            ):
+                # After the well's checks and the plate check, before its first
+                # field; a well whose anchor the checkpoint holds keeps it (D18).
+                anchor_well(
+                    well,
+                    fields,
+                    centres[well],
+                    xy=xy,
+                    z=z_stage,
+                    camera=camera,
+                    state=mapping,
+                    params=params,
+                    tolerance_um=tolerance_um,
+                    ctx=ctx,
+                    done=done,
+                    total=total,
+                )
             for planned in fields:
                 ctx.raise_if_stopped()
                 error: str | None = None
@@ -769,7 +887,29 @@ class ScanPlugin:
                                     "lock it on the sample, then run scan --resume",
                                 )
                         if focusing and bounds is not None and z_stage is not None:
-                            if focus_af is not None and not locked:
+                            if mapping is not None:
+                                in_step = True
+                                stepped = focus_field(
+                                    z_stage,
+                                    camera,
+                                    mapping,
+                                    planned,
+                                    readback,
+                                    params,
+                                    ctx,
+                                )
+                                if isinstance(stepped, str):
+                                    error = stepped
+                                else:
+                                    prepared = _Prepared(
+                                        stepped.started,
+                                        "map",
+                                        stepped.sweep,
+                                        0.0,
+                                        stepped.map_z_um,
+                                        stepped.anchor_um,
+                                    )
+                            elif focus_af is not None and not locked:
                                 # Its Z is where a search left it (FM-154).
                                 focus.skipped += 1
                             else:
@@ -811,6 +951,8 @@ class ScanPlugin:
                                     np.asarray(pixels), params.focus_score
                                 ),
                                 duration_s=time.perf_counter() - prepared.started,
+                                map_z_um=prepared.map_z_um,
+                                anchor_um=prepared.anchor_um,
                             )
                 except (MicroscopeHaltedError, MotionStoppedError):
                     raise
@@ -874,6 +1016,8 @@ class ScanPlugin:
                 failed_in_row = 0
                 if cell_focus is not None:
                     focus.record(cell_focus)
+                    if mapping is not None:
+                        mapping.count(cell_focus)
                 if not ctx.dry_run:
                     target = paths[planned.well, planned.name]
                     # The place in the well is the readback's, not the target's:
@@ -926,6 +1070,7 @@ class ScanPlugin:
                     wells_done=tuple(wells_done),
                     frames=tuple(frames),
                     failed=tuple(failed),
+                    focus_map=mapping.record() if mapping is not None else None,
                 )
             )
 
@@ -989,7 +1134,17 @@ class ScanPlugin:
             assumed.append(f"dry run: {done} fields walked, no frame taken")
         if unused_af_line is not None:
             assumed.append(unused_af_line)
-        if focusing and bounds is not None:
+        if mapping is not None:
+            # In place of §21.6's lines on the focus (m3 §21.12.5).
+            assumed.extend(
+                mapping.assumed(
+                    dry_run=ctx.dry_run,
+                    fields=focus.fields,
+                    step_s=focus.step_s,
+                    every=params.map_check_every,
+                )
+            )
+        elif focusing and bounds is not None:
             assumed.extend(
                 focus.assumed(
                     dry_run=ctx.dry_run,
@@ -1024,6 +1179,7 @@ class ScanPlugin:
             frames=() if ctx.dry_run else tuple(frames),
             failed=tuple(failed),
             plate_check=plate_check,
+            focus_map=mapping.record() if mapping is not None else None,
             assumed=tuple(assumed),
         )
 
@@ -1216,8 +1372,8 @@ def _check_the_plate(
 
 def _resume(
     ctx: RunContext, plan: ScanPlanResult
-) -> tuple[str, list[str], list[ScanFrame], list[FailedField]]:
-    """The token, wells done, frames and failed fields to continue from; or a fresh start.
+) -> tuple[str, list[str], list[ScanFrame], list[FailedField], FocusMapUse | None]:
+    """The token, wells done, frames, failed fields and the map to continue from; or a fresh start.
 
     A checkpoint's wells must be the plan's, and every frame it names must
     still be in the run folder: a result that names a file nobody can read is
@@ -1225,7 +1381,7 @@ def _resume(
     """
     checkpoint = ctx.checkpoint(ScanCheckpoint)
     if checkpoint is None:
-        return new_token(), [], [], []
+        return new_token(), [], [], [], None
     foreign = [well for well in checkpoint.wells_done if well not in plan.wells]
     if foreign:
         raise PluginRunError(
@@ -1250,6 +1406,7 @@ def _resume(
         list(checkpoint.wells_done),
         list(checkpoint.frames),
         list(checkpoint.failed),
+        checkpoint.focus_map,
     )
 
 
