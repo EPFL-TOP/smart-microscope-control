@@ -3860,8 +3860,12 @@ def _seed_map(
     reads: str | None = "a1",
     attempt: str = "m1",
     name: str = "run-10x.json",
+    record: dict[str, Any] | None = None,
 ) -> Path:
     """A copy of the rig's run document with a 10x scan taken under the lock: the map.
+
+    ``record`` replaces fields of the map's stage record (its status, profile,
+    dry run or result).
 
     ``reads`` is the plate attempt its scan read, ``None`` for none. Another
     attempt than the rig's ``a1`` is a map scanned on another registration of
@@ -3902,7 +3906,7 @@ def _seed_map(
                 if reads is None
                 else {"plate": ReadRecord(plugin="plate-registration", attempt=reads)}
             ),
-        ),
+        ).model_copy(update=record or {}),
     )
     return path
 
@@ -4341,8 +4345,14 @@ def test_a_dry_run_plans_the_maps_z_and_moves_no_z(
     assert match is not None, line
     lo, hi, anchor = (float(v) for v in match.groups())
     assert anchor == pytest.approx(start, abs=0.005)
-    # The map spans 1.28 µm over the plan's fields (±64 µm at 10 µm/mm).
-    assert z_start - 1.0 <= lo <= hi <= z_start + 1.0
+    # The targets of the plan's fields with the operator's anchor, by the oracle.
+    oracle = FocusMap(_locked_points(_map_frames()))
+    plan = ScanPlanResult.model_validate(
+        RunDocument.load(rig.run_doc).stages["scan-plan"].result
+    )
+    targets = [oracle.z_at(f.well, f.x_um, f.y_um) + start for f in plan.fields]
+    assert (lo, hi) == pytest.approx((min(targets), max(targets)), abs=0.005)
+    assert hi - lo > 1.0  # the map's slope is seen: lo and hi are not one number
     assert result.focus_map is not None
     assert result.focus_map.anchors == ()
 
@@ -4373,31 +4383,53 @@ def test_focus_map_and_map_check_every_are_refused_without_cell_focus_map_and_ma
         ScanParams(cell_focus="map", focus_map=Path("m.json"), map_check_every=-1)
 
 
-def test_a_halt_during_an_anchor_sweep_is_not_a_plugin_error(rig: _Rig) -> None:
+def test_a_halt_during_an_anchor_sweep_is_not_a_plugin_error(
+    rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
     """FM-64: the emergency stop ends the scan from inside the anchor's sweep."""
     _focused_at_a1(rig)
     path = _seed_map(rig)
     rig.camera.watch = lambda: rig.microscope.stop() if rig.camera.snaps == 3 else None
     try:
-        with pytest.raises(MicroscopeHaltedError):
+        with (
+            caplog.at_level(logging.WARNING, logger=LOGGER),
+            pytest.raises(MicroscopeHaltedError),
+        ):
             _map_scan(rig, path)
     finally:
         rig.microscope.resume()
 
+    # Not swallowed as a failed try: no next try moved the stage, none is named.
+    assert rig.stage.moves == 1
+    assert not [r for r in caplog.records if "anchor's try" in r.getMessage()]
+
     stored = _stored(rig)
     assert stored.status is StageStatus.failed
-    assert stored.checkpoint is None
+    # The checkpoint saved before the first move (FM-141): no well, the map.
+    checkpoint = _checkpoint(rig)
+    assert (checkpoint.wells_done, checkpoint.frames, checkpoint.failed) == ((), (), ())
+    assert checkpoint.focus_map is not None
+    assert checkpoint.focus_map.anchors == ()
     # The third plane of A1's first try was the last: no frame, no field failed.
     assert rig.camera.snaps == 3
     assert _tiffs(rig) == []
 
 
 class _RefusesZ:
-    """The demo's focus drive that refuses the moves numbered in ``refuse_at`` (from 1)."""
+    """The demo's focus drive that refuses the moves numbered in ``refuse_at`` (from 1).
 
-    def __init__(self, inner: ZStage, refuse_at: set[int]) -> None:
+    ``error`` is what a refused move raises: a guard's refusal by default.
+    """
+
+    def __init__(
+        self,
+        inner: ZStage,
+        refuse_at: set[int],
+        error: Callable[[], BaseException] | None = None,
+    ) -> None:
         self._inner = inner
         self.refuse_at = refuse_at
+        self.error = error
         self.moves = 0
 
     def position_um(self) -> float:
@@ -4406,6 +4438,8 @@ class _RefusesZ:
     def move_to_um(self, z_um: float, *, keep_autofocus: bool = True) -> float:
         self.moves += 1
         if self.moves in self.refuse_at:
+            if self.error is not None:
+                raise self.error()
             raise SafetyRefusedError("the target is outside the soft limits")
         return self._inner.move_to_um(z_um, keep_autofocus=keep_autofocus)
 
@@ -4491,3 +4525,202 @@ def test_a_scan_without_the_map_writes_no_map_key(rig: _Rig) -> None:
     text = rig.run_doc.read_text(encoding="utf-8")
     for key in ("map_z_um", "anchor_um", "start_anchor_um", "anchors"):
         assert key not in text
+
+
+def test_a_motion_stop_during_an_anchor_sweep_ends_the_scan(
+    rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """FM-64: the Stop button's motion stop is not a failed try: no next try runs."""
+    _focused_at_a1(rig)
+    rig.microscope.override(
+        ZStage,
+        _RefusesZ(
+            rig.microscope.require(ZStage), {2}, lambda: MotionStoppedError("focus Z")
+        ),
+    )
+    path = _seed_map(rig)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER),
+        pytest.raises(MotionStoppedError),
+    ):
+        _map_scan(rig, path)
+
+    assert _stored(rig).status is StageStatus.failed
+    assert (rig.stage.moves, rig.camera.snaps) == (1, 1)
+    assert not [r for r in caplog.records if "anchor's try" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    ("record", "why"),
+    [
+        (
+            {"status": StageStatus.stopped},
+            "the last run of scan ended stopped; run it again",
+        ),
+        (
+            {"profile": "another-stand"},
+            "scan was run on another-stand, this is demo; run scan again on this profile",
+        ),
+        ({"dry_run": True}, "scan was a dry run; run it without --dry-run"),
+    ],
+)
+def test_a_map_the_runner_would_not_read_is_refused_before_anything_moves(
+    rig: _Rig, record: dict[str, Any], why: str
+) -> None:
+    # m3 §21.12.5 check 2: the runner's own rule, as calibration_from reads one.
+    _focused_at_a1(rig)
+    path = _seed_map(rig, record=record)
+
+    reason = _refused(rig, cell_focus="map", focus_map=path, **FOCUS)
+
+    assert reason == f"the focus map in {path.as_posix()}: {why}"
+
+
+def test_a_map_that_cannot_be_read_is_refused_with_no_error_kept(rig: _Rig) -> None:
+    _focused_at_a1(rig)
+    missing = rig.run_dir / "nowhere.json"
+
+    with pytest.raises(PluginRunError) as raised:
+        _map_scan(rig, missing)
+
+    assert raised.value.reason == f"the focus map {missing.as_posix()}: does not exist"
+    # Raised outside the handler: no load error kept alive with its frames (FM-98).
+    assert raised.value.__context__ is None
+    assert (rig.stage.moves, rig.camera.snaps) == (0, 0)
+
+    result = ScanResult(
+        folder="scan/000000000000",
+        objective=IN_PLACE,
+        pixel_size_um=PIXEL_UM,
+        matrix_um_per_px=pixel_matrix(PIXEL_UM),
+        image_shape_px=SHAPE,
+        exposure_ms=10.0,
+        frames=(),
+        failed=(),
+    ).model_dump(mode="json")
+    path = _seed_map(rig, record={"result": {**result, "exposure_ms": -1.0}})
+
+    with pytest.raises(PluginRunError) as raised:
+        _map_scan(rig, path)
+
+    assert raised.value.reason == (
+        f"the scan in {path.as_posix()} is not one this smc reads: it cannot be the "
+        "focus map; run scan again there"
+    )
+    assert raised.value.__context__ is None
+    assert (rig.stage.moves, rig.camera.snaps) == (0, 0)
+
+
+def test_a_start_in_a_well_with_too_few_locked_frames_is_refused(rig: _Rig) -> None:
+    # A3 is mapped with three locked frames and is not planned: check 3 passes,
+    # and the operator's focus there cannot be read against the map.
+    a3 = [
+        ScanFrame(
+            well="A3",
+            index=k,
+            name=f"A3_{k:04d}",
+            file=f"scan/000000000000/A3/A3_{k:04d}.tif",
+            x_um=18000.0 + 100.0 * k,
+            y_um=0.0,
+            z_um=MAP_BASE_UM,
+            focus="locked",
+            pfs_offset=4242.0,
+            t_s=0.0,
+        )
+        for k in range(3)
+    ]
+    _focused_at_a1(rig, x_um=18000.0)
+    path = _seed_map(rig, frames=[*_map_frames(), *a3])
+
+    reason = _refused(rig, cell_focus="map", focus_map=path, **FOCUS)
+
+    assert reason == (
+        "the stage at (18000.0, 0.0) µm is nearest the map's locked frame A3_0000 in "
+        f"A3, and the focus map in {path.as_posix()} holds 3 locked frames there, "
+        "fewer than 4: focus by eye on the cells inside a mapped well, then start "
+        "the scan"
+    )
+
+
+def test_a_map_reach_below_the_lower_soft_limit_or_past_the_profiles_jog_limit_is_refused(
+    rig: _Rig,
+) -> None:
+    plan = _plan(rig)
+    _focused_at_a1(rig)
+    # The first sweep around the start reaches -7 µm, inside; a field left of
+    # A1's centre reaches -7.6 µm from the map.
+    z = _LimitedZ(rig.microscope.require(ZStage), Limits(-7.5, 1000.0))
+    rig.microscope.override(ZStage, z)
+    path = _seed_map(rig)
+    name, reach = _first_reach_outside(plan, _map_frames(), lambda r: r < -7.5)
+
+    reason = _refused(rig, cell_focus="map", focus_map=path, **FOCUS)
+
+    assert reason == (
+        f"the focus from the map would reach {reach:.2f} µm at {name}, outside the "
+        "soft limits [-7.5, 1000] µm"
+    )
+    assert z.moves == 0
+
+    # The profile's own jog limit, not the layer's default of 100 µm: 10.5 µm
+    # takes the sweep's 10 at the start, and not a field's 10.6 from the map.
+    z.limits = Limits(-1000.0, 1000.0)
+    safety = rig.microscope.profile.safety.model_copy(update={"max_z_jog_um": 10.5})
+    rig.microscope.profile = rig.microscope.profile.model_copy(
+        update={"safety": safety}
+    )
+    name, reach = _first_reach_outside(
+        plan, _map_frames(), lambda r: abs(r - PFS_PLANE_UM) > 10.5
+    )
+
+    reason = _refused(rig, cell_focus="map", focus_map=path, **FOCUS)
+
+    assert reason == (
+        f"the focus from the map would reach {reach:.2f} µm at {name}, "
+        f"{abs(reach - PFS_PLANE_UM):.2f} µm from the Z the scan starts at, beyond "
+        "the Z jog limit of 10.5 µm"
+    )
+    assert z.moves == 0
+
+
+@pytest.mark.parametrize(
+    "stop_at",
+    [
+        # The fourth plane of A1's first anchor try: no well is done, and only
+        # the checkpoint saved before the first move holds the anchor (FM-141).
+        pytest.param(4, id="first-well"),
+        # The fourth plane of A2's second try, after A1's four frames.
+        pytest.param(3 * 11 + 4 + 11 + 4, id="second-well"),
+    ],
+)
+def test_a_resume_after_a_stop_in_a_sweep_keeps_the_operators_anchor(
+    rig: _Rig, stop_at: int
+) -> None:
+    # A stop inside an anchor's sweep leaves Z on a sweep plane, up to 10 µm from
+    # the operator's focus: a start anchor read there would centre every later
+    # well's sweeps off the cells (#623's review).
+    _focused_at_a1(rig)
+    path = _seed_map(rig)
+    stop = threading.Event()
+
+    def watch() -> None:
+        if rig.camera.snaps == stop_at:
+            stop.set()
+
+    rig.camera.watch = watch
+    assert _map_scan(rig, path, stop=stop).status is StageStatus.stopped
+    rig.camera.watch = None
+    first = _checkpoint(rig).focus_map
+    assert first is not None
+    assert first.start_anchor_um == pytest.approx(START_ANCHOR_UM, abs=1e-9)
+    assert abs(rig.microscope.require(ZStage).position_um() - PFS_PLANE_UM) > 2.0
+
+    result = _result(_map_scan(rig, path, resume=True))
+
+    assert result.focus_map is not None
+    assert result.focus_map.start_anchor_um == first.start_anchor_um
+    assert [a.source for a in result.focus_map.anchors] == ["swept"] * 3
+    for frame in result.frames:
+        assert frame.z_um is not None
+        assert abs(frame.z_um) <= 1.5

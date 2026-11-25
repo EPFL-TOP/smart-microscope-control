@@ -375,9 +375,10 @@ visit measures it.
 2. At the 40×, PFS off, focus by eye on cells near the first well's centre, then:
 
    ```text
-   smc run scan -p nikon-ti2 --run-doc run.json --param cell_focus=map \
-       --param focus_map=run-10x.json --param map_check_every=25 --param autofocus=off
+   smc run scan -p nikon-ti2 --run-doc run.json --param cell_focus=map --param focus_map=run-10x.json --param map_check_every=25 --param autofocus=off
    ```
+
+   One line: `cmd` and PowerShell do not read a trailing `\` as a continuation.
 
 **The map** at a field is the Z of the 4 locked frames of the map's scan nearest the
 field's **XY readback**, in the field's own well, weighted by 1/d (a frame within 1 µm
@@ -426,7 +427,10 @@ After check 9's (a dry run too), in this order:
    is not the one the scan being resumed used: run scan again without --resume`.
 5. The stage's XY lies within the map scan's larger field side of a locked frame: `the
    stage at (<x>, <y>) µm is <d> µm from the map's nearest locked frame (<name> in
-   <well>): focus by eye on the cells inside a mapped well, then start the scan`.
+   <well>): focus by eye on the cells inside a mapped well, then start the scan`. On
+   `--resume` this check is not made: the start anchor is the one the checkpoint holds,
+   the operator's focus when the scan started, because a stop during a sweep leaves Z on
+   a sweep plane up to `focus_range_um` away from it.
 6. Every planned field's `map + start anchor ± focus_range_um` lies inside the soft limits
    and within the Z jog limit of the Z the scan starts at (the moves are absolute, so the
    layer's jog guard does not reach them): `the focus from the map would reach <z> µm at
@@ -438,9 +442,12 @@ After check 9's (a dry run too), in this order:
 Each frame's `cell_focus` has `source` `map`, `dz_um` 0.0, `map_z_um` (the map at its
 readback) and `anchor_um` (its well's): its Z command was their sum. Its `sweep` is the
 check's, or `null`. The result's `focus_map` holds the run document as typed, the map
-scan's attempt and time, this attempt's `start_anchor_um` and each well's anchor with its
+scan's attempt and time, the `start_anchor_um` of the attempt that started the scan (a
+`--resume` keeps it) and each well's anchor with its
 tries (the field, the readback, the map there, the sweep or the error). The checkpoint
 keeps the anchors of the wells done: a `--resume` keeps them and anchors only the others.
+It is saved once before the first move too, with the start anchor and no well, so that a
+stop inside the first well's sweeps leaves a `--resume` the operator's anchor.
 A scan without the map has neither `focus_map` nor the two keys of a frame, so it is
 written as before; one with them is refused by an older smc. `assumed` says where the
 map came from, each well's anchor (`<well>: anchored <a> µm from the map by <p> peaks of
@@ -558,12 +565,12 @@ recorded: they carry no well_dx_um or well_dy_um`.
 
 **The focus from the map** (m3 §21.12.7, for the next visit at the Ti2-E, on a plate with
 cells):
+
 1. the 10× scan of two wells with PFS locked, as in session 6; copy the run document
    (`run-10x.json`);
 2. at the 40×, PFS off, condenser N2, focus by eye on cells near the first well's centre,
-   then `smc run scan --param cell_focus=map --param focus_map=run-10x.json --param
-   map_check_every=25 --param autofocus=off` over one whole well (1544 fields, about 62
-   checks);
+   then the command of [the workflow](#the-focus-from-the-10-lock-map-cell_focusmap),
+   with `map_check_every=25`, over one whole well (1544 fields, about 62 checks);
 3. read `assumed`: the time a field and the anchors' (against D16's 0.4–0.75 s and 26–68
    s), and the check: the fraction of the checked fields whose peak lies within 1 µm and 2
    µm of the map's Z. The same records give what a fixed Z would have given (each check's
@@ -573,7 +580,6 @@ cells):
    here;
 5. focus by eye in the second well and compare with its anchor: whether the 10× → 40×
    difference holds from one well to the next.
-
 
 Nothing in this page was measured on a microscope. For the first hardware session
 (#198): the scan on the Ti2-E; PFS over a 96-well well at 40×; an `engage()` on a

@@ -392,11 +392,17 @@ def prepare_map(
         kept = resumed.anchors
     # 5. The operator's focus, inside a mapped well.
     z_start = bounds.z_start_um
-    if groups:
+    if resumed is not None:
+        # A resume keeps the operator's anchor of the attempt it resumes: a stop
+        # during an anchor's or a check's sweep leaves Z on a sweep plane, up to
+        # focus_range_um from the operator's focus, and an anchor read from it
+        # would centre every later well's sweeps there (#623's review).
+        start_anchor = resumed.start_anchor_um
+    elif groups:
         start_anchor = _start_anchor(xy, loaded, z_start, where)
     else:
         # Every well was done by an earlier attempt: nothing is read, nothing moves.
-        start_anchor = resumed.start_anchor_um if resumed is not None else 0.0
+        start_anchor = 0.0
     configured = microscope.profile.safety.max_z_jog_um
     jog_um = DEFAULT_MAX_Z_JOG_UM if configured is None else float(configured)
     state = MapFocus(
@@ -410,6 +416,12 @@ def prepare_map(
     # 6. D19: every field's reach, its anchor's sweeps and its target.
     _check_reach(state, groups, params.focus_range_um)
     return state
+
+
+def _um(value: float) -> str:
+    """One decimal, with no ``-0.0``: a stage read as -0.0 is at 0.0 for the operator."""
+    text = f"{value:.1f}"
+    return "0.0" if text == "-0.0" else text
 
 
 def _start_anchor(xy: XYStage, loaded: _Loaded, z_start: float, where: str) -> float:
@@ -433,14 +445,14 @@ def _start_anchor(xy: XYStage, loaded: _Loaded, z_start: float, where: str) -> f
     if not distance <= loaded.fov_side_um:
         raise PluginRunError(
             _NAME,
-            f"the stage at ({x0:.1f}, {y0:.1f}) µm is {distance:.1f} µm from the "
+            f"the stage at ({_um(x0)}, {_um(y0)}) µm is {distance:.1f} µm from the "
             f"map's nearest locked frame ({name} in {point.well}): {_FOCUS_INSIDE}",
         )
     count = loaded.focus_map.count(point.well)
     if count < MAP_NEIGHBOURS:
         raise PluginRunError(
             _NAME,
-            f"the stage at ({x0:.1f}, {y0:.1f}) µm is nearest the map's locked frame "
+            f"the stage at ({_um(x0)}, {_um(y0)}) µm is nearest the map's locked frame "
             f"{name} in {point.well}, and the focus map in {where} holds {count} "
             f"locked frames there, fewer than {MAP_NEIGHBOURS}: {_FOCUS_INSIDE}",
         )

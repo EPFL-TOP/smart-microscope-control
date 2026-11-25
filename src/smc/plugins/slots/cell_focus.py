@@ -189,8 +189,9 @@ class FocusMapUse(SlotValue):
     ``run_doc`` is the path as typed, forward slashes, never resolved (FM-24,
     FM-50); ``measured`` the map's ``finished_utc`` to the second, or ``at an
     unknown time``; ``start_anchor_um`` is ``z_start`` minus the map at the
-    start XY, this attempt's; ``anchors`` are in scan order, a resumed
-    attempt's first.
+    start XY, of the attempt that started the scan (a resume keeps it: a stop
+    leaves Z on a sweep plane, not at the operator's focus); ``anchors`` are in
+    scan order, a resumed attempt's first.
     """
 
     run_doc: str

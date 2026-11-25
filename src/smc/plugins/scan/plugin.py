@@ -751,6 +751,19 @@ class ScanPlugin:
         # Whether the next engage is the first after a wall's switch-off; a
         # field that reads locked, or any engage made, ends its claim.
         after_wall = False
+        if mapping is not None and resumed_map is None and groups:
+            # Before the first move (FM-141): the start anchor is read from the
+            # stage, and a stop during the first well's sweeps leaves Z on a sweep
+            # plane; a resume without this checkpoint would read its anchor there.
+            ctx.save_checkpoint(
+                ScanCheckpoint(
+                    token=token,
+                    wells_done=tuple(wells_done),
+                    frames=tuple(frames),
+                    failed=tuple(failed),
+                    focus_map=mapping.record(),
+                )
+            )
         t0 = time.monotonic()
         for well, fields in groups:
             _check_well(camera, plan, stand, f" at well {well}")
