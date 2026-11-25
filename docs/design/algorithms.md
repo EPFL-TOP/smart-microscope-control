@@ -935,3 +935,5 @@ cells, a working example to replace), `tests/test_selector_<module>.py`
 - A decision during an acquisition (#556, #32): the contract here is for
   a choice made after a scan.
 - pandas as a dependency: not now; `cells_table` gives the columns.
+
+<!-- trial of the Code owners ruleset, never to be merged -->
