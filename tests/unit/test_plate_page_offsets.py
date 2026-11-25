@@ -56,6 +56,7 @@ from smc.ui.guide import (
     OFFSETS_RESTART_FIRST,
     OFFSETS_TOO_MANY,
     OFFSETS_TURRET_UNREAD,
+    CalibrationNumbers,
     busy_note,
     offsets_no_objective,
     offsets_plate_refusal,
@@ -679,6 +680,20 @@ def _document(
     return path
 
 
+def _numbers_written_in(path: Path) -> CalibrationNumbers:
+    """The numbers of the calibration a seeded document holds, read back from its own JSON."""
+    record = RunDocument.load(path).stages["camera-calibration"]
+    assert record.result is not None
+    result = record.result
+    return CalibrationNumbers(
+        pixel_size_um=result["pixel_size_um"],
+        rotation_deg=result["rotation_deg"],
+        mirrored=result["mirrored"],
+        residual_um=result["residual_um"],
+        step_um=result["step_um"],
+    )
+
+
 def _typed(*paths: Path | str) -> str:
     """What an operator typed: one path per line, as they are."""
     return "\n".join(str(path) for path in paths)
@@ -714,9 +729,32 @@ def test_offsets_step_reads_each_document_and_derives_the_objectives_in_line_ord
     when = "2026-11-09T09:30:00+00:00"
     assert step.reads == (
         # The frame the seeded calibration was measured in is read too (#617: the scan plan's
-        # click compares it with the camera's), so the read is not equal to one without it.
-        CalibrationRead(str(twenty), TWENTY, when, None, image_shape_px=(384, 512)),
-        CalibrationRead(str(forty), FORTY, when, None, image_shape_px=(384, 512)),
+        # click compares it with the camera's), and its numbers (#627, m5 §23.2 D4: the Stand
+        # screen's pane), so the read is not equal to one without them. The numbers are the
+        # ones the document holds, read back from the file the test wrote (FM-203).
+        CalibrationRead(
+            str(twenty),
+            TWENTY,
+            when,
+            None,
+            image_shape_px=(384, 512),
+            numbers=_numbers_written_in(twenty),
+        ),
+        CalibrationRead(
+            str(forty),
+            FORTY,
+            when,
+            None,
+            image_shape_px=(384, 512),
+            numbers=_numbers_written_in(forty),
+        ),
+    )
+    assert _numbers_written_in(forty) == CalibrationNumbers(
+        pixel_size_um=1.1,
+        rotation_deg=180.0,
+        mirrored=False,
+        residual_um=0.01,
+        step_um=48.0,
     )
     # The pairs are what `smc run objective-offsets` is given, read back by the parameters'
     # own parser, never compared as strings (FM-45).

@@ -725,20 +725,31 @@ def test_a_rerun_of_an_upstream_makes_its_reader_stale(
 # --- optional reads ----------------------------------------------------------
 
 
-def test_an_unusable_optional_read_is_recorded_as_none(
+def test_an_optional_slot_nothing_provides_is_recorded_as_none_and_logged_at_debug(
     fake_microscope: Microscope,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level(logging.INFO, logger="smc.plugins")
+    # #627, m5 §23 D8: a stand before its first registration or calibration is
+    # the normal state, and the plugin's own `assumed` says what it did without:
+    # the line is a DEBUG one, not a notice on every run (the owner's symptom).
+    caplog.set_level(logging.DEBUG, logger="smc.plugins")
     plugin = Optional()
     record = _run(plugin, fake_microscope, tmp_path)
     assert record.reads == {"timings": None}
     assert plugin.seen == {"timings": None}
-    assert (
-        "optional: not using timings: the run document has no timings; smc run "
-        "--list shows which plugin provides it"
-    ) in caplog.messages
+    about_timings = [r for r in caplog.records if "not using timings" in r.getMessage()]
+    assert [(r.levelno, r.getMessage()) for r in about_timings] == [
+        (
+            logging.DEBUG,
+            "optional: not using timings: the run document has no timings; smc run "
+            "--list shows which plugin provides it",
+        )
+    ]
+    caplog.clear()
+    caplog.set_level(logging.INFO, logger="smc.plugins")
+    _run(Optional(), fake_microscope, tmp_path)
+    assert [r for r in caplog.records if "not using" in r.getMessage()] == []
 
 
 def _timing_failed() -> list[StageRecord]:

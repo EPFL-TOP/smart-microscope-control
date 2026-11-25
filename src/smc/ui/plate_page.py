@@ -84,6 +84,7 @@ from smc.ui.controller import (
     ToolView,
     WellView,
     plan_calibration,
+    stand_calibration,
 )
 from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
@@ -136,6 +137,7 @@ from smc.ui.guide import (
     calibration_light,
     calibration_missing_line,
     calibration_note_line,
+    calibration_numbers_text,
     calibration_paths,
     calibration_read_line,
     calibrations_held_heading,
@@ -1511,6 +1513,12 @@ class PlatePageView:
         self.stand_text = _wrapped_text()
         self.stand_connect_button = pn.widgets.Button(label=f"Connect {stand}")
         self.known_block = _wrapped_text()
+        # The numbers of the calibration of the objective in place and the file they are in,
+        # under the known block and outside ``calibrate_box``: the box hides when the objective
+        # needs no calibration, which is when the numbers are wanted most (m5 §23.2 D2). No
+        # height while there is nothing to say (``_say``).
+        self.calibration_numbers = _wrapped_text()
+        self.calibration_numbers.visible = False
         self.calibrate_button = pn.widgets.Button(label="Calibrate the camera")
         self.calibrate_note = _wrapped_text()
         # What the last calibration said when it failed, kept where the operator works: the
@@ -2357,6 +2365,7 @@ class PlatePageView:
                 stand_region,
                 preset_region,
                 self.known_block,
+                self.calibration_numbers,
                 self.calibrate_box,
             ],
             "plate": [
@@ -4201,7 +4210,7 @@ class PlatePageView:
             self.plate_confirm_button.label = f"The plate is a {plate}"
 
     def _draw_stand(self, status: PageStatus) -> None:
-        """The Stand screen's line, its *Connect* and its "known" block, from the status the tick just read (m5 §17.4.1).
+        """The Stand screen's line, its *Connect*, its "known" block and the numbers of the calibration in place, from the status the tick just read (m5 §17.4.1, §23).
 
         The block says what the page knows and where from (D7): the objective in place and
         the light as the status read them, the camera's calibration as the last redraw read
@@ -4209,7 +4218,9 @@ class PlatePageView:
         is offered only when the calibration is missing or made at another objective
         (``needs_calibration``), and only while the tool is loaded. The strip and the screen
         draw one stand, so the second *Connect* follows the strip's rule: it is there while
-        the stand is closed and disabled while any activity goes.
+        the stand is closed and disabled while any activity goes. The pane under the block
+        says the numbers of the calibration of the objective in place and the file they are
+        in (``stand_calibration``), outside the box that hides when none is needed.
         """
         if status.running == "connect":
             line = f"{status.stand}: connecting…"
@@ -4237,6 +4248,24 @@ class PlatePageView:
         )
         self.calibrate_box.visible = "camera-calibration" in self.tool_runs and (
             needs_calibration(objective, calibration)
+        )
+        # The numbers of the calibration of the objective in place (m5 §23.2 D1, D2), from the
+        # last view and the page's copy of the turret's labels: no device is read here
+        # (FM-145) and every tab draws what the controller holds (FM-151). Nothing with no
+        # view yet.
+        shown = None
+        if view is not None:
+            offer = view.offsets
+            shown = stand_calibration(
+                objective=objective,
+                plate_objective=None if offer is None else offer.plate_objective,
+                run_calibration=calibration,
+                labels=self._objective_labels,
+                documents=view.calibrations,
+            )
+        self._say(
+            self.calibration_numbers,
+            "" if shown is None else calibration_numbers_text(shown),
         )
 
     def _calibration_failed_line(self) -> str:

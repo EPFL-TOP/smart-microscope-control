@@ -144,6 +144,7 @@ from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     GOTO_ESTIMATED,
+    GOTO_REFUSED_DURING_LIVE,
     GOTO_UNPLACED,
     GOTO_WALL_NEEDS_REGISTRATION,
     MAP_FIELDS_UP_TO,
@@ -170,6 +171,7 @@ from smc.ui.guide import (
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     CalibrationNote,
+    CalibrationNumbers,
     GotoAnswer,
     NextStep,
     a1_corner,
@@ -256,6 +258,7 @@ __all__ = [
     "WellView",
     "jog_crossing",
     "plan_calibration",
+    "stand_calibration",
 ]
 
 log = logging.getLogger("smc.ui")
@@ -670,7 +673,9 @@ class CalibrationRead:
     has a ``problem`` has none. ``image_shape_px`` is the frame the calibration was measured in,
     ``(height, width)`` as the tool keeps it (m5 §18.6 D24, #617): ``scan-plan`` refuses a
     document of another frame, and the click compares it with the camera's. ``None`` for a read
-    that has a ``problem`` and for one built without it.
+    that has a ``problem`` and for one built without it. ``numbers`` are the calibration's pixel
+    size, rotation, mirror, residual and probe step, for the Stand screen's pane (m5 §23.2 D4):
+    ``None`` under the same conditions as ``image_shape_px``.
     """
 
     path: str
@@ -679,6 +684,7 @@ class CalibrationRead:
     problem: str | None
     notes: tuple[str, ...] = ()
     image_shape_px: tuple[int, int] | None = None
+    numbers: CalibrationNumbers | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1431,13 +1437,121 @@ def _read_calibration(path: str, *, profile: str, dry_run: bool) -> CalibrationR
     if found.objective is None or not found.objective.strip():
         # A calibration made at an empty turret position holds a blank label: no objective to turn to.
         return CalibrationRead(path, None, "", offsets_no_objective(path))
-    # The calibration's own assumptions, bounded like a card's lines: a line is a tool's
-    # words and a reused calibration carries the path it was reused from (FM-205).
-    notes = tuple(
+    return CalibrationRead(
+        path,
+        found.objective,
+        measured,
+        None,
+        _calibration_notes(found),
+        found.image_shape_px,
+        _numbers_of(found),
+    )
+
+
+def _calibration_notes(found: CameraCalibration) -> tuple[str, ...]:
+    """The calibration's own assumptions, each on one line and bounded like a card's, at most the card's count (m5 §18.6 D15, §23.2 D4).
+
+    A line is a tool's words and a reused calibration carries the path it was reused from
+    (FM-205). The one place that makes them, so that the held documents' reads and the run
+    document's note, which the Stand screen's pane shows side by side, cannot say two things.
+    """
+    return tuple(
         _cut(_flat(line), _CARD_TEXT_CHARS) for line in found.assumed[:_CARD_LINES]
     )
-    return CalibrationRead(
-        path, found.objective, measured, None, notes, found.image_shape_px
+
+
+def _numbers_of(found: CameraCalibration) -> CalibrationNumbers:
+    """The numbers of a calibration that the Stand screen says, as the document holds them (m5 §23.2 D3, D4).
+
+    Nothing is rounded or converted here: the pane's text does that, and the page keeps what
+    the tool measured (CLAUDE.md: device-native values are never silently converted).
+    """
+    return CalibrationNumbers(
+        pixel_size_um=found.pixel_size_um,
+        rotation_deg=found.rotation_deg,
+        mirrored=found.mirrored,
+        residual_um=found.residual_um,
+        step_um=found.step_um,
+    )
+
+
+def _measured_times(measured: str) -> tuple[str, str]:
+    """A document's time as the Stand screen says it: the card's UTC form and the PC's local form (m5 §23.2 D4).
+
+    ``measured`` is what ``calibration_from`` returns, the record's time as ``isoformat(timespec=
+    "seconds")`` or ``at an unknown time``. A text that is not an ISO time is the card's unknown
+    time and no local one, never an exception (FM-98, FM-125): the page says it as the known block
+    says an unknown time. A time with no zone is UTC, as every time of a run document is, and one
+    that UTC cannot hold (year 1 under an offset) is the unknown time too.
+    """
+    try:
+        when = datetime.fromisoformat(measured)
+    except ValueError:
+        return _UNKNOWN_TIME, ""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    try:
+        utc = when.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, ValueError):
+        utc = _UNKNOWN_TIME
+    return utc, local_time(when)
+
+
+def stand_calibration(
+    *,
+    objective: str | None,
+    plate_objective: str | None,
+    run_calibration: CalibrationNote | None,
+    labels: Sequence[str],
+    documents: Sequence[HeldCalibration],
+) -> CalibrationNote | None:
+    """The calibration the Stand screen gives the numbers of: the one of the objective in place, as the page itself would use it (m5 §23.2 D1, FM-216).
+
+    The first that holds. The objective is not known (a closed stand, a turret that does not
+    answer, an empty position): the run document's calibration, which is what the known block's
+    ``Camera:`` line speaks of. No registration from the plate's walls (``plate_objective`` is
+    ``None``) or the objective in place is the plate's: the run document's calibration, **when its
+    objective is the one in place or is not recorded**, since the numbers of another objective's
+    calibration are never shown as this one's. Otherwise: the document held at the turret position
+    of the objective, **when it is usable, has numbers and is the position's**
+    (``calibration_at_its_position``, D21 of §18.6, the check ``plan_calibration`` and the click make);
+    a position the page cannot name, no document, a problem or a document of another objective give
+    ``None``. A rule of the pane: it does not replace D19 (where a click writes) or D24 (which
+    document ``scan-plan`` is given), which read the same position by the same check.
+
+    No hardware, no file and no widget: ``documents`` are what ``_held_calibrations`` read, ``labels``
+    what the turret reads, ``run_calibration`` the run document's note ``view()`` built.
+    """
+    if objective is None or not objective.strip():
+        return run_calibration
+    if not calibration_goes_to_a_document(plate_objective, objective):
+        if run_calibration is None:
+            return None
+        if (
+            run_calibration.objective is not None
+            and run_calibration.objective != objective
+        ):
+            return None
+        return run_calibration
+    position = turret_position(labels, objective)
+    if position is None:
+        return None
+    held = next((doc for doc in documents if doc.position == position), None)
+    if held is None:
+        return None
+    read = held.read
+    if read.problem is not None or read.numbers is None:
+        return None
+    if calibration_at_its_position(labels, position, read.objective) is not True:
+        return None
+    utc, local = _measured_times(read.measured)
+    return CalibrationNote(
+        objective=read.objective,
+        when_utc=utc,
+        when_local=local,
+        numbers=read.numbers,
+        notes=read.notes,
+        where=read.path,
     )
 
 
@@ -2524,8 +2638,14 @@ class PlatePage:
                 side of the image; an image side with no usable calibration
                 (``NO_CALIBRATION_FOR_SIDES``), or one whose camera is off a quarter
                 turn (``frames``' own text).
-            RuntimeError: A run is going, or the page is closed.
+            RuntimeError: A run is going (while Live runs, ``GOTO_REFUSED_DURING_LIVE``:
+                why the stage did not move and what to press), or the page is closed.
         """
+        # Live is the one activity whose refusal says what to press (m5 §23.2 D6): ``is_live``
+        # is read here, at the call, never from the label a tab drew (FM-177), and Live is
+        # never ended for the click (§5.2). A closed page says it is closed, below.
+        if not self._closed and self.is_live:
+            raise RuntimeError(GOTO_REFUSED_DURING_LIVE)
         # A click refused because an activity runs leaves the page's drive text as it was
         # (the running drive's own, #444's Report): it is not an answer to this click.
         self._refuse_if_busy()
@@ -5568,6 +5688,10 @@ class PlatePage:
                     objective=calibration.objective,
                     when_utc=_when_utc(calibration_record),
                     when_local=_when_local(calibration_record),
+                    numbers=_numbers_of(calibration),
+                    notes=_calibration_notes(calibration),
+                    # As the page was given the run document, never resolved (FM-24).
+                    where=str(self._run_doc),
                 )
             ),
             registered=None if plate_record is None else registered,

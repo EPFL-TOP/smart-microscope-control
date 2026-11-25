@@ -114,6 +114,7 @@ from smc.ui.guide import (
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     CalibrationNote,
+    CalibrationNumbers,
     GotoAnswer,
     local_time,
     scan_plan_card_lines,
@@ -4548,8 +4549,7 @@ def test_live_and_every_other_activity_refuse_each_other(
             page.live(True)
         with _refuses(RuntimeError, "live is running"):
             page.resume()
-        with _refuses(RuntimeError, "live is running"):
-            page.goto("A1")
+        # `goto` refuses with a text of its own: it says what to press (#627, D6).
     finally:
         page.live(False)
     assert page.join(10.0)
@@ -4563,6 +4563,129 @@ def test_live_and_every_other_activity_refuse_each_other(
         Slow.release.set()
     assert page.join(10.0)
     assert not page.is_live
+
+
+#: What a drive click says while Live runs (m5 §23.2 D6), written out whole (FM-45).
+GOTO_UNDER_LIVE = (
+    "live is running, so the stage did not move: press End live, switch Drive on and "
+    "click the well again. The arrows work during Live."
+)
+
+
+def _run_threads() -> list[str]:
+    """The names of the live threads that are the page's activities, never its background stand read.
+
+    ``status()`` starts ``smc-stand-read`` while an activity goes and it ends when the read does:
+    a count of all threads across a ``status()`` call is raced by it (FM-44).
+    """
+    return sorted(
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name != "smc-stand-read"
+    )
+
+
+def test_a_goto_while_live_goes_says_why_and_what_to_press(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page = _page(fake_microscope, run_doc)
+    try:
+        stage = fake_microscope.require(XYStage)
+        before = stage.position_um()
+        page.live(True)
+        assert page.is_live
+        # The threads by name, without the stand read that `status()` may start and end
+        # on its own (a count across a `status()` call raced it: 3 failures in 15 runs).
+        threads = _run_threads()
+        shown = (page.current, page.status().goto, page.status().goto_answer)
+        with _refuses(RuntimeError, GOTO_UNDER_LIVE):
+            page.goto("B2")
+        with _refuses(RuntimeError, GOTO_UNDER_LIVE):
+            page.goto("B2", "left")
+        # Live goes on: the click never ends it (m5 §5.2); no thread was started; the stage
+        # did not move; and a refusal that is not an answer to a drive leaves the drive's
+        # text and the row's answer as they were (#444).
+        assert page.is_live
+        assert page.status().running == "live"
+        assert _run_threads() == threads
+        assert StubGoto.ran == []
+        assert stage.position_um() == before
+        assert (page.current, page.status().goto, page.status().goto_answer) == shown
+        assert shown == (None, "", None)
+    finally:
+        page.live(False)
+        assert page.join(10.0)
+        page.close()
+
+
+def test_a_goto_while_another_activity_goes_keeps_its_own_refusal(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # Only Live has the text that says what to press: the mutant that gives it for any
+    # activity says `press End live` to a page that is running a tool.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.run("slow", [])
+        try:
+            assert Slow.started.wait(5)
+            assert not page.is_live
+            with _refuses(RuntimeError, "slow is running"):
+                page.goto("B2")
+        finally:
+            Slow.release.set()
+        assert page.join(10.0)
+    finally:
+        page.close()
+    assert StubGoto.ran == []
+
+
+def test_a_goto_after_live_ended_goes(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `is_live` is read at the call, never from a label a tab drew (FM-177): a Live that
+    # ended meanwhile lets the click go, and the text's own instruction works.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.live(True)
+        with _refuses(RuntimeError, GOTO_UNDER_LIVE):
+            page.goto("B2")
+        page.live(False)
+        assert page.join(10.0)
+        assert not page.is_live
+        page.goto("B2")
+        assert page.join(10.0)
+        assert StubGoto.ran == [("B2", "centre")]
+    finally:
+        page.close()
+
+
+def test_a_goto_on_a_closed_page_whose_live_has_not_ended_says_the_page_is_closed(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `close()` gives up on an activity that does not end within `_CLOSE_WAIT_S`: a Live worker
+    # held in a snap keeps `is_live` true on a closed page, and its text (press End live) would be
+    # the wrong one for a page that no longer answers a press.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    camera = FrameCamera(_ramp_frame(), block=True)
+    fake_microscope.override(Camera, camera)
+    monkeypatch.setattr(controller_module, "_CLOSE_WAIT_S", 0.05)
+    page = _page(fake_microscope, run_doc)
+    page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        page.close()
+        assert page.is_live
+        with _refuses(RuntimeError, "the page is closed"):
+            page.goto("B2")
+    finally:
+        camera.release.set()
+        assert page.join(10.0)
+    assert StubGoto.ran == []
 
 
 def test_end_live_stops_only_the_live_it_started(
@@ -6255,15 +6378,26 @@ def test_the_view_carries_the_calibration_and_the_registered_plate(
         assert view.camera_calibration is None
         assert view.registered is None
         assert view.registered_by is None
-        seed_camera_calibration(run_doc, objective=TEN_X)
+        written = seed_camera_calibration(run_doc, objective=TEN_X)
         _seed(run_doc, "plate-registration", "plate", _plate("96-well"), minute=1)
         view = page.view()
-        # The objective and the time of the same record as the matrix: the card's UTC string.
+        # The objective and the time of the same record as the matrix: the card's UTC string;
+        # and the numbers of the pane under the known block (#627), the document's own as the
+        # fixture wrote them, with the run document's path as the page was given it.
         assert view.camera_matrix is not None
         assert view.camera_calibration == CalibrationNote(
             objective=TEN_X,
             when_utc="2026-11-09 09:30:00",
             when_local=local_time(datetime(2026, 11, 9, 9, 30, tzinfo=timezone.utc)),
+            numbers=CalibrationNumbers(
+                pixel_size_um=written.pixel_size_um,
+                rotation_deg=written.rotation_deg,
+                mirrored=written.mirrored,
+                residual_um=written.residual_um,
+                step_um=written.step_um,
+            ),
+            notes=(),
+            where=str(run_doc),
         )
         assert view.registered == _plate("96-well")
         # The tool that wrote it, so that the screen shows that tool's `assumed` lines.
@@ -6273,11 +6407,19 @@ def test_the_view_carries_the_calibration_and_the_registered_plate(
         assert page.view().registered is None
         assert page.view().registered_by is None
         # A calibration that did not record its objective says so, and is still the matrix's.
-        seed_camera_calibration(run_doc, objective=None)
+        written = seed_camera_calibration(run_doc, objective=None)
         assert page.view().camera_calibration == CalibrationNote(
             objective=None,
             when_utc="2026-11-09 09:30:00",
             when_local=local_time(datetime(2026, 11, 9, 9, 30, tzinfo=timezone.utc)),
+            numbers=CalibrationNumbers(
+                pixel_size_um=written.pixel_size_um,
+                rotation_deg=written.rotation_deg,
+                mirrored=written.mirrored,
+                residual_um=written.residual_um,
+                step_um=written.step_um,
+            ),
+            where=str(run_doc),
         )
     finally:
         page.close()
@@ -7096,3 +7238,127 @@ def test_the_failed_words_are_one_line_plain_and_cut_at_the_cards_bound(
     assert shown.startswith("the frame is <b>dark</b> in C:\\Users\\lab\\run xxx")
     assert len(shown) == 601
     assert shown.endswith("…")
+
+
+# -- the numbers of a calibration: the read and the view's note (m5 §23, #627) ----------------------
+
+#: What a ``camera-calibration`` record holds as its result, written out by hand: the numbers the
+#: demo measured at the 40X (m5 §23.1) and two ``assumed`` lines, one of them on two lines.
+CALIBRATION_RESULT: dict[str, Any] = {
+    "objective": "Nikon 40X Plan Fluor ELWD",
+    "image_shape_px": [384, 512],
+    "matrix_um_per_px": [[0.2166, -0.1249], [-0.1249, -0.2166]],
+    "pixel_size_um": 0.249966,
+    "rotation_deg": 29.9891,
+    "mirrored": True,
+    "residual_um": 0.0437417,
+    "response": 0.97,
+    "return_error_um": 0.4,
+    "step_um": 32.0,
+    "assumed": ["the pixel size is the profile's", "second\nline of a note"],
+}
+CALIBRATION_NUMBERS = CalibrationNumbers(
+    pixel_size_um=0.249966,
+    rotation_deg=29.9891,
+    mirrored=True,
+    residual_um=0.0437417,
+    step_um=32.0,
+)
+
+
+def test_a_read_calibration_carries_the_numbers_of_its_document(
+    run_doc: Path,
+) -> None:
+    _seed_calibration_record(
+        run_doc, status=StageStatus.done, error=None, result=CALIBRATION_RESULT
+    )
+
+    read = controller_module._read_calibration(
+        str(run_doc), profile="demo", dry_run=False
+    )
+
+    assert read.problem is None
+    assert read.numbers == CALIBRATION_NUMBERS
+    # The notes are the calibration's own lines, each on one line, from the same helper
+    # the run document's note uses.
+    assert read.notes == (
+        "the pixel size is the profile's",
+        "second line of a note",
+    )
+
+
+def test_a_read_that_has_a_problem_has_no_numbers(run_doc: Path) -> None:
+    _seed_calibration_record(
+        run_doc, status=StageStatus.failed, error="PluginRunError: x", result=None
+    )
+
+    failed = controller_module._read_calibration(
+        str(run_doc), profile="demo", dry_run=False
+    )
+    missing = controller_module._read_calibration(
+        str(run_doc.parent / "none.json"), profile="demo", dry_run=False
+    )
+
+    assert failed.problem is not None
+    assert failed.numbers is None
+    assert missing.problem is not None
+    assert missing.numbers is None
+
+
+def test_the_views_run_calibration_note_carries_numbers_notes_and_the_run_documents_path(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed_calibration_record(
+        run_doc, status=StageStatus.done, error=None, result=CALIBRATION_RESULT
+    )
+    page = _page(fake_microscope, run_doc, _real("camera-calibration"))
+    try:
+        note = page.view().camera_calibration
+    finally:
+        page.close()
+
+    assert note == CalibrationNote(
+        objective="Nikon 40X Plan Fluor ELWD",
+        when_utc="2026-10-29 09:00:00",
+        when_local=local_time(T0),
+        numbers=CALIBRATION_NUMBERS,
+        notes=("the pixel size is the profile's", "second line of a note"),
+        where=str(run_doc),
+    )
+
+
+def test_the_run_calibration_notes_file_is_the_path_the_page_was_given_never_resolved(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-24: a relative `--run-doc` is shown as given, as `calibrations_folder` is read.
+    _seed_calibration_record(
+        run_doc, status=StageStatus.done, error=None, result=CALIBRATION_RESULT
+    )
+    monkeypatch.chdir(run_doc.parent)
+    page = _page(fake_microscope, Path("run.json"), _real("camera-calibration"))
+    try:
+        note = page.view().camera_calibration
+    finally:
+        page.close()
+
+    assert note is not None
+    assert note.where == "run.json"
+
+
+def test_a_note_longer_than_the_cards_bound_is_cut_in_the_run_documents_note(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-205: a tool's line is cut at the card's bound, and only the card's count of them is kept.
+    long = {**CALIBRATION_RESULT, "assumed": ["y" * 700] + [f"n{i}" for i in range(30)]}
+    _seed_calibration_record(run_doc, status=StageStatus.done, error=None, result=long)
+    page = _page(fake_microscope, run_doc, _real("camera-calibration"))
+    try:
+        note = page.view().camera_calibration
+    finally:
+        page.close()
+
+    assert note is not None
+    assert note.notes[0] == "y" * 600 + "…"
+    assert len(note.notes) == controller_module._CARD_LINES

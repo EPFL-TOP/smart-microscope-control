@@ -67,6 +67,7 @@ from smc.ui.guide import (
     OFFSETS_TOO_MANY,
     OFFSETS_TURRET_UNREAD,
     SCAN_HALTED,
+    CalibrationNumbers,
     busy_note,
     calibrate_changed,
     calibrate_is_the_plates,
@@ -1718,6 +1719,8 @@ def test_the_held_calibrations_are_read_for_positions_1_to_12_in_order_and_for_n
         "2026-11-17T09:00:00+00:00",
         None,
         image_shape_px=(384, 512),
+        # The numbers `_calibration` wrote (m5 §23.2 D4), for the Stand screen's pane.
+        numbers=CalibrationNumbers(0.5, 0.0, True, 0.01, 48.0),
     )
     assert by_position[12].problem is None
     # A page's path, as the page was given the run document, never resolved.
