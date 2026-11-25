@@ -1928,20 +1928,48 @@ def test_check_run_doc_accepts_a_copy_another_document_and_the_same_name_elsewhe
     check_run_doc(Reuses(), ReuseParams(source=Path("missing.json")), run_doc)
 
 
-@pytest.mark.parametrize("relative", [False, True], ids=["absolute", "relative"])
+@pytest.mark.parametrize(
+    "spelling", ["absolute", "relative", "through a linked folder"]
+)
 def test_check_run_doc_refuses_a_document_that_does_not_exist_yet(
-    relative: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The first write would create it as `failed`: the run reads what it just made.
+    # Neither file is there, so `samefile` has nothing to compare: the names are
+    # resolved, and a folder that is a link (`/var` for `/private/var` on macOS, a
+    # junction on Windows) is told from the lexical `abspath`, which would differ.
     monkeypatch.chdir(tmp_path)
     run_doc = tmp_path / "new.json"
-    source = Path("new.json") if relative else run_doc
+    source = Path("new.json") if spelling == "relative" else run_doc
+    if spelling == "through a linked folder":
+        (tmp_path / "real").mkdir()
+        try:
+            (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"this machine cannot make a symbolic link: {exc}")
+        run_doc = tmp_path / "link" / "new.json"
+        source = tmp_path / "real" / "new.json"
     assert not run_doc.exists()
+    assert not source.exists()
 
     assert _refusal_of(Reuses(), run_doc, source=source) == _RUN_DOC_NAMED.format(
         shown=source.as_posix()
     )
     check_run_doc(Reuses(), ReuseParams(source=tmp_path / "old.json"), run_doc)
+
+
+def test_check_run_doc_folds_the_case_of_a_document_that_does_not_exist_yet_where_the_platform_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `os.path.normcase` is the identity on POSIX and lower-cases on Windows, so the
+    # platform's own is stood in for here: this runs the same on every OS, and
+    # the fold is what makes `New.json` and `new.json` one document on NTFS.
+    run_doc = tmp_path / "new.json"
+    with monkeypatch.context() as patch:
+        patch.setattr(os.path, "normcase", lambda path: os.fspath(path).lower())
+        assert _refusal_of(Reuses(), run_doc, source=tmp_path / "NEW.JSON")
+        # The control: another name is not folded into this one.
+        check_run_doc(Reuses(), ReuseParams(source=tmp_path / "NEWER.JSON"), run_doc)
 
 
 def test_check_run_doc_ignores_a_path_that_is_not_declared_a_reuse(
@@ -1964,9 +1992,22 @@ def test_check_run_doc_of_a_name_that_is_no_parameter_is_a_bug_not_a_pass(
         check_run_doc(ReusesFromNothing(), ReuseParams(source=run_doc), run_doc)
 
 
-@pytest.mark.parametrize("asked", ["exists", "samefile", "resolve"])
+@pytest.mark.parametrize(
+    ("asked", "error"),
+    [
+        ("exists", OSError),
+        ("samefile", OSError),
+        ("resolve", OSError),
+        # Python 3.10 and 3.11 raise it from `resolve` for an embedded NUL (a typed
+        # path in the page's field); 3.12 does not.
+        ("resolve", ValueError),
+    ],
+)
 def test_check_run_doc_answers_no_when_the_file_system_cannot_be_asked(
-    asked: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    asked: str,
+    error: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # FM-116: `Path.resolve` re-raises a `winerror` outside its tolerated list on a
     # share that dropped, and `samefile` and `exists` fail the same way. The run
@@ -1977,7 +2018,7 @@ def test_check_run_doc_answers_no_when_the_file_system_cannot_be_asked(
     missing = tmp_path / "missing.json"
 
     def refuse(self: Path, *args: object, **kwargs: object) -> bool:
-        raise OSError("The specified network name is no longer available")
+        raise error("The specified network name is no longer available")
 
     with monkeypatch.context() as patch:
         patch.setattr(Path, asked, refuse)

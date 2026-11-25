@@ -625,8 +625,10 @@ it or another run document (nothing was written)`.
   `os.path.normcase`; a lexical `abspath` is not enough (measured: a temporary folder
   that is a symbolic link, `/var` for `/private/var` on macOS).
 - **The file system may not answer** (FM-116): an `OSError` from `exists`,
-  `samefile` or `resolve` is answered *no*. The document was read a line before and
-  is written a line after, and says so in its own words if the drop lasts.
+  `samefile` or `resolve`, and the `ValueError` that Python 3.10 and 3.11 raise from
+  `resolve` for a path with a NUL (the page's field can hold one), are answered *no*.
+  The document was read a line before and is written a line after, and says so in
+  its own words if the drop lasts.
 - It writes nothing and touches no hardware, but it asks the file system, which
   `check_ready` never does (its contract is a document object, never a path). It
   is a function of its own for that reason, and a name in `reuses_from` that is no

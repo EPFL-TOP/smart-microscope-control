@@ -180,15 +180,16 @@ def _same_file(first: Path, second: Path) -> bool:
     yet (the run document the first write would create) has no identity to
     compare, so the names are resolved and compared, and folded where the platform
     folds them. The file system may fail to answer, on Windows a share that dropped
-    raises from ``resolve`` too (FM-116): the answer is then no, since the run
-    document was read a moment ago and is written a moment later, and says so in its
-    own words if the drop lasts.
+    raises from ``resolve`` too (FM-116), and Python 3.10 and 3.11 raise
+    ``ValueError`` from it for a path with a NUL, which the page's text field can
+    hold: the answer is then no, since the run document was read a moment ago and is
+    written a moment later, and says so in its own words if the drop lasts.
     """
     try:
         if first.exists() and second.exists():
             return first.samefile(second)
         return os.path.normcase(first.resolve()) == os.path.normcase(second.resolve())
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
