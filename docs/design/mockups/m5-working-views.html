@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Working views mock-up</title>
+<!--
+  m5 §24 (#631, #679, #680): a static mock-up of the image and the plate at working size, for
+  the owner to decide on before any code. It is not the page: nothing here talks to a stand.
+  The three buttons at the top switch between the page as it opens, the image enlarged over the
+  page (#631, with smoothing from #679), and the map framed on one well (#680). Sizes are those
+  measured at 1280 x 623 (m5 §24.1).
+-->
+<style>
+:root {
+  --ink: #17202b; --ink-2: #4a5663; --ink-3: #7b8692;
+  --canvas: #eef1f4; --surface: #ffffff; --rule: #d5dbe1;
+  --primary: #2457a6; --primary-soft: #e3ecf8;
+  --done: #2e7d4f; --stop: #c62828; --well: #f3f4f6; --well-rim: #9aa3ad;
+  --field: #ff7f0e; --imaged: #2ca02c; --route: #d62728; --cell: #ffd700;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body { background: var(--canvas); color: var(--ink); font: 14px/1.45 system-ui, sans-serif; min-width: 1280px; }
+button { font: inherit; cursor: pointer; }
+.switcher { display: flex; gap: 8px; padding: 8px 16px; background: #fff8e1; border-bottom: 1px solid var(--rule); font-size: 13px; }
+.switcher b { margin-right: 8px; }
+.switcher button { border: 1px solid var(--rule); background: #fff; border-radius: 4px; padding: 2px 10px; }
+.switcher button[aria-pressed="true"] { background: var(--primary); color: #fff; border-color: var(--primary); }
+.frame { position: relative; width: 1280px; height: 623px; margin: 12px auto; background: var(--surface); border: 1px solid var(--rule); overflow: hidden; }
+.strip { height: 44px; display: flex; align-items: center; gap: 16px; padding: 0 12px; background: var(--ink); color: #e9edf1; }
+.strip .stop, .bar .stop { background: var(--stop); color: #fff; border: 0; border-radius: 4px; padding: 0 22px; height: 32px; font-weight: 600; }
+.steps { height: 52px; display: flex; gap: 4px; align-items: center; padding: 0 8px; border-bottom: 1px solid var(--rule); }
+.steps span { padding: 4px 10px; color: var(--ink-2); }
+.steps span.on { border-bottom: 3px solid var(--primary); color: var(--ink); font-weight: 600; }
+.body { display: grid; grid-template-columns: 400px 1fr 1fr; height: calc(623px - 96px); }
+.panel { padding: 12px; border-right: 1px solid var(--rule); color: var(--ink-2); }
+.col { padding: 8px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.bar button, .bar select { border: 1px solid var(--rule); background: #f6f7f8; border-radius: 4px; padding: 3px 10px; height: 30px; }
+.bar .toggle[aria-pressed="true"] { background: var(--primary-soft); border-color: var(--primary); }
+.note { font-size: 12px; color: var(--ink-3); }
+.fig { position: relative; height: 360px; border: 1px solid var(--rule); background: #fafafa; display: grid; place-items: center; overflow: hidden; }
+.cam { position: relative; background: radial-gradient(circle at 30% 40%, #555 0 6%, transparent 7%), radial-gradient(circle at 62% 58%, #666 0 5%, transparent 6%), radial-gradient(circle at 75% 25%, #4a4a4a 0 4%, transparent 5%), #1b1b1b; }
+.box { position: absolute; border: 2px solid var(--cell); }
+.box i { position: absolute; left: -2px; top: -16px; font: 11px system-ui; color: var(--cell); font-style: normal; white-space: nowrap; }
+.scale { position: absolute; right: 10px; bottom: 8px; background: #fff; border: 1px solid var(--rule); padding: 2px 10px; font-size: 11px; text-align: center; }
+.scale::before { content: ""; display: block; width: 90px; height: 2px; background: #000; margin: 2px auto; }
+.tools { position: absolute; right: 4px; top: 4px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-3); }
+.title { font-size: 12px; color: var(--ink-2); }
+.drive { display: flex; gap: 6px; flex-wrap: wrap; }
+.drive span { border: 1px solid var(--rule); border-radius: 4px; padding: 2px 8px; font-size: 12px; background: #f6f7f8; }
+.overlay { position: absolute; inset: 0; background: #fff; padding: 8px; display: none; flex-direction: column; gap: 6px; z-index: 10; }
+.overlay .fig { flex: 1; height: auto; }
+.plate { width: 100%; height: 100%; }
+.callout { position: absolute; background: #fff8e1; border: 1px solid #e0a54a; border-radius: 4px; padding: 6px 8px; font-size: 12px; max-width: 260px; z-index: 20; }
+[data-view] { display: none; }
+</style>
+</head>
+<body>
+<div class="switcher">
+  <b>m5 §24 mock-up</b>
+  <button data-show="page" aria-pressed="true">1. The page (#631)</button>
+  <button data-show="enlarged" aria-pressed="false">2. Enlarged, smoothing on (#631, #679)</button>
+  <button data-show="well" aria-pressed="false">3. The map at a well (#680)</button>
+</div>
+
+<div class="frame">
+  <div class="strip"><span><b>demo-sample</b></span><span>XY 1 204, −3 410 µm</span><span>Z 1 520 µm</span><span>10X</span><span style="margin-left:auto">live: 42 frames</span><button class="stop">STOP</button></div>
+  <div class="steps"><span>1. Stand ✓</span><span>2. Plate ✓</span><span>3. Wells ✓</span><span>4. Scan ✓</span><span class="on">5. Results</span><span style="margin-left:auto">Expert view</span></div>
+  <div class="body">
+    <div class="panel"><b>Results</b><br>the step panel, unchanged</div>
+
+    <div class="col" id="mapcol">
+      <div class="bar"><select><option>Density of single</option></select><button>Refresh</button><button data-view="well" style="display:none">Whole plate</button></div>
+      <div class="title" id="maptitle">96-well, registered · 4 wells, 36 fields</div>
+      <div class="fig" id="mapfig">
+        <svg class="plate" id="plateall" viewBox="0 0 440 360">
+          <g fill="var(--well)" stroke="var(--well-rim)"></g>
+        </svg>
+        <svg class="plate" id="platewell" viewBox="0 0 440 360" style="display:none">
+          <circle cx="220" cy="180" r="160" fill="var(--well)" stroke="#1f4e9c" stroke-width="3"/>
+          <g id="fields"></g>
+          <polyline id="routeline" fill="none" stroke="var(--route)" stroke-width="2"/>
+          <g id="stops"></g>
+          <text x="40" y="34" font-size="13" font-weight="600">B3</text>
+        </svg>
+        <div class="tools">✥<br>⊕<br>⟲</div>
+      </div>
+      <div class="note" id="mapnote">Double-click a well to frame it. The wheel zooms.</div>
+    </div>
+
+    <div class="col" id="imgcol">
+      <div class="bar"><button>Snap</button><button class="toggle" aria-pressed="true">End live</button><select><option>Smoothing: Off</option><option>2 frames</option><option>4 frames</option><option>8 frames</option></select><button class="toggle" id="enl">Enlarge</button></div>
+      <div class="fig">
+        <div class="cam" style="width:340px;height:340px">
+          <div class="box" style="left:80px;top:110px;width:46px;height:40px"><i>single 0.93</i></div>
+          <div class="box" style="left:190px;top:170px;width:42px;height:44px;border-color:#00e5ff"><i style="color:#00e5ff">doublet 0.71</i></div>
+        </div>
+        <div class="scale">100 µm</div>
+        <div class="tools">✥<br>⊕<br>⟲<br>⤓</div>
+      </div>
+      <div class="title" id="imgtitle">1200x1200 uint16, exposure 50 ms, min 98, max 3 811</div>
+      <div class="drive"><span>←</span><span>→</span><span>↑</span><span>↓</span><span>XY 100 µm</span><span>Z+</span><span>Z−</span><span>Z 1 µm</span><span>Autofocus on/off</span><span>10X ▾</span><span>Light on/off</span><span>Drive</span></div>
+    </div>
+  </div>
+
+  <div class="overlay" id="overlay">
+    <div class="bar"><button class="stop">STOP</button><button>Snap</button><button class="toggle" aria-pressed="true">End live</button><select><option>Smoothing: 4 frames</option></select><button class="toggle" aria-pressed="true" id="red">Reduce</button>
+      <span class="title" style="margin-left:12px">1200x1200 uint16, exposure 50 ms, min 98, max 3 811; mean of 4 frames</span></div>
+    <div class="fig">
+      <div class="cam" style="width:470px;height:470px">
+        <div class="box" style="left:110px;top:152px;width:64px;height:55px"><i>single 0.93</i></div>
+        <div class="box" style="left:262px;top:235px;width:58px;height:61px;border-color:#00e5ff"><i style="color:#00e5ff">doublet 0.71</i></div>
+      </div>
+      <div class="scale">100 µm</div>
+      <div class="tools">✥<br>⊕<br>⟲<br>⤓</div>
+    </div>
+    <div class="drive"><span>←</span><span>→</span><span>↑</span><span>↓</span><span>XY 100 µm</span><span>Z+</span><span>Z−</span><span>Z 1 µm</span><span>Autofocus on/off</span><span>10X ▾</span><span>Light on/off</span><span>Drive</span></div>
+  </div>
+
+  <div class="callout" data-view="page" style="left:860px;top:470px">The image keeps its place and its height (360 px); it loses its axes, so the frame takes the figure. Boxes appear on a scanned field (#680) and in the review (#677), not on a snap.</div>
+  <div class="callout" data-view="enlarged" style="left:880px;top:60px">Over the whole window (1280 x 540 measured). The strip is under it, so the bar carries a second STOP. The arrows and Z work. Smoothing is per tab, Off by default; the mean starts again after every drive action.</div>
+  <div class="callout" data-view="well" style="left:20px;top:380px;max-width:360px">Double-clicked B3: its scanned fields at their real footprint (green), the plan's other fields (orange), the chosen fields numbered in route order, the route as a line. A click on a field, Drive off, shows its frame with its cells in the image. <b>Whole plate</b> frames the plate again.</div>
+</div>
+
+<script>
+// The plate at full scale: 8 x 12 wells, four selected (outlined), with a few imaged fields.
+const all = document.querySelector('#plateall g');
+const selected = new Set(['B2', 'B3', 'C2', 'C3']);
+for (let r = 0; r < 8; r++) for (let c = 0; c < 12; c++) {
+  const name = 'ABCDEFGH'[r] + (c + 1);
+  const el = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  el.setAttribute('cx', 36 + c * 33); el.setAttribute('cy', 62 + r * 33); el.setAttribute('r', 14);
+  if (selected.has(name)) { el.setAttribute('stroke', '#1f4e9c'); el.setAttribute('stroke-width', '3'); el.setAttribute('fill', '#c9dcb7'); }
+  all.appendChild(el);
+}
+// One well: a 3 x 3 grid of fields, some imaged, three chosen in route order.
+const fields = document.getElementById('fields');
+const chosen = [[2, 0], [1, 1], [0, 2]];
+const pts = [];
+for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) {
+  const x = 130 + j * 62, y = 92 + i * 62;
+  const imaged = (i * 3 + j) < 7;
+  const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  rect.setAttribute('x', x); rect.setAttribute('y', y); rect.setAttribute('width', 56); rect.setAttribute('height', 56);
+  rect.setAttribute('transform', `rotate(1.2 ${x + 28} ${y + 28})`);
+  rect.setAttribute('fill', imaged ? 'var(--imaged)' : 'var(--field)');
+  rect.setAttribute('fill-opacity', imaged ? 0.45 : 0.2);
+  rect.setAttribute('stroke', imaged ? 'var(--imaged)' : 'var(--field)');
+  fields.appendChild(rect);
+}
+const stops = document.getElementById('stops');
+chosen.forEach(([i, j], k) => {
+  const x = 130 + j * 62 + 28, y = 92 + i * 62 + 28;
+  pts.push(`${x},${y}`);
+  const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  c.setAttribute('cx', x); c.setAttribute('cy', y); c.setAttribute('r', 11); c.setAttribute('fill', '#fff'); c.setAttribute('stroke', 'var(--route)'); c.setAttribute('stroke-width', 2);
+  const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+  t.setAttribute('x', x); t.setAttribute('y', y + 4); t.setAttribute('text-anchor', 'middle'); t.setAttribute('font-size', 12); t.textContent = k + 1;
+  stops.append(c, t);
+});
+document.getElementById('routeline').setAttribute('points', pts.join(' '));
+
+function show(view) {
+  document.querySelectorAll('.switcher button').forEach(b => b.setAttribute('aria-pressed', b.dataset.show === view));
+  document.querySelectorAll('[data-view]').forEach(e => {
+    e.style.display = e.dataset.view !== view ? 'none' : (e.tagName === 'BUTTON' ? 'inline-block' : 'block');
+  });
+  document.getElementById('overlay').style.display = view === 'enlarged' ? 'flex' : 'none';
+  document.getElementById('plateall').style.display = view === 'well' ? 'none' : '';
+  document.getElementById('platewell').style.display = view === 'well' ? '' : 'none';
+  document.getElementById('maptitle').textContent = view === 'well'
+    ? 'B3 · 9 fields, 7 scanned, 3 chosen in route order'
+    : '96-well, registered · 4 wells, 36 fields';
+  document.getElementById('mapnote').textContent = view === 'well'
+    ? 'Click a field to see its frame. Whole plate frames the plate again.'
+    : 'Double-click a well to frame it. The wheel zooms.';
+}
+document.querySelectorAll('.switcher button').forEach(b => b.addEventListener('click', () => show(b.dataset.show)));
+document.getElementById('enl').addEventListener('click', () => show('enlarged'));
+document.getElementById('red').addEventListener('click', () => show('page'));
+show('page');
+</script>
+</body>
+</html>
