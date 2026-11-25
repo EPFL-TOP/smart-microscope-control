@@ -791,6 +791,12 @@ class PlateView:
     ``calibrations_denied`` is one line about the folder when the page could not look into it
     (``None`` otherwise, and with no offer, m5 §18.6 D22): no position is listed for it, and the
     block lists no objective as having no calibration while it is set.
+    ``calibration_failed`` is the tool's own words of the run document's latest
+    ``camera-calibration`` record when it ended ``failed`` with an error (m5 §22.2 D2, D3), read
+    from the document ``view()`` holds and never from the stand (FM-145): the Stand screen's
+    *Calibrate the camera* writes into that document when the click is not routed, and the
+    strip's outcome is gone at the next activity. ``None`` for no record, one that did not fail
+    and one with no error; a calibration of that document that ends ``done`` takes it away.
     """
 
     plate: str
@@ -820,6 +826,7 @@ class PlateView:
     checkpoint_notes: Mapping[str, str] = field(default_factory=dict)
     calibrations: tuple[HeldCalibration, ...] = ()
     calibrations_denied: str | None = None
+    calibration_failed: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1433,6 +1440,21 @@ def _read_calibration(path: str, *, profile: str, dry_run: bool) -> CalibrationR
     )
 
 
+def _failed_words(record: StageRecord | None) -> str | None:
+    """The tool's own words of a ``camera-calibration`` record that ended ``failed`` with an error, or ``None`` (m5 §22.2 D3).
+
+    One line, without the exception's type and the tool's name, cut at the card's bound
+    (FM-205), plain text (FM-139: the words are a tool's and a path in them is the stand's).
+    A record that did not fail, one with no error and no record at all are ``None``: a line
+    that says nothing is better than one that guesses. The one place that makes the words,
+    so that the Plate screen's block (from a file, D15) and the Stand screen's line (from
+    the record the click wrote) cannot say two things.
+    """
+    if record is None or record.status is not StageStatus.failed or not record.error:
+        return None
+    return _cut(page_words(error_words(_flat(record.error))), _CARD_TEXT_CHARS)
+
+
 def _failed_calibration_words(path: Path) -> str | None:
     """The tool's own words of a document whose latest ``camera-calibration`` record ended ``failed``, or ``None`` (m5 §18.6 D15).
 
@@ -1441,16 +1463,13 @@ def _failed_calibration_words(path: Path) -> str | None:
     wrapped) is what the operator acts on: the strip's outcome is gone at the next activity. Read
     only for a document that already has a problem, and never an exception for a file that is
     data (FM-98, FM-125): anything that cannot be read, a record that did not fail, one with no
-    error, is ``None`` and the generic problem stands. The words are one line, cut at the
-    card's bound (FM-205).
+    error, is ``None`` and the generic problem stands. The words are ``_failed_words``'s.
     """
     try:
         record = RunDocument.load(path).provider("camera-calibration")
     except Exception:
         return None
-    if record is None or record.status is not StageStatus.failed or not record.error:
-        return None
-    return _cut(page_words(error_words(_flat(record.error))), _CARD_TEXT_CHARS)
+    return _failed_words(record)
 
 
 def _offsets_offer_of(registered: PlateResult | None) -> OffsetsOffer | None:
@@ -5568,6 +5587,9 @@ class PlatePage:
             },
             calibrations=held.documents,
             calibrations_denied=held.denied,
+            # The latest record of the document the click writes to: a ``done`` one, or
+            # none, gives nothing, so a calibration that ends well takes the line away (D4).
+            calibration_failed=_failed_words(doc.provider("camera-calibration")),
         )
 
     def _scan_end(self, doc: RunDocument) -> ScanEnd | None:
