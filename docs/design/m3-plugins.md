@@ -7864,7 +7864,8 @@ MAX_STEP_UM = 10.0
 MAX_PLANES = 101
 #: A sweep measures its own noise between neighbouring planes, so it needs
 #: this many (§21.11 D9). Measured on synthetic peaks (planning #622): with
-#: fewer, a clean peak's own curvature reads as noise.
+#: fewer, a clean peak's own curvature reads as noise. The rule's floor, not
+#: a sweep for cells: the defaults are 21 planes (§21.11.6 D11).
 MIN_PLANES = 9
 #: A sweep whose smoothed rise is not above this many noises of a smoothed
 #: score is flat (§21.11 D7). Measured on session 6's 49 sweeps at the
@@ -7940,10 +7941,15 @@ its noise, got <n>`). With `s` the scores and `n` their number:
   over the same `k`: the second difference of
   white noise of σ has a standard deviation of σ√6, 1.4826 times a median
   absolute value is a robust σ, and a mean of three planes has σ/√3. A
-  median, so that the curvature of a peak on a few planes does not count;
-- `k*` the first index of `max(m)`, `best_index = k* + 1`, `rise = max(m) -
-  min(m)`, and `prominence = rise / noise` (`inf` when the noise is 0 and the
-  rise is not, `0.0` when both are).
+  median, so that the curvature of a peak on a few planes does not count.
+  When that median is 0 (more than half the second differences exactly 0),
+  `noise = sqrt(pi / 2) * mean(|…|) / sqrt(18)` instead, the mean's own
+  robust σ (§21.11.6 D13);
+- `k*` the middle of the run of consecutive indices where `m` equals
+  `max(m)` (the lower middle when the run is even; one index in a sweep with
+  noise, §21.11.6 D12), `best_index = k* + 1`, `rise = max(m) - min(m)`, and
+  `prominence = rise / noise` (`inf` when the noise is 0 and the rise is not,
+  `0.0` when both are).
 
 In this order:
 1. `max(s) <= 0`, or `not rise > NOISE_FACTOR * noise`: `flat`;
@@ -8094,7 +8100,7 @@ with the step does not read in an older smc, which refuses the key
 ```python
 class ScanParams(PluginParams):  # gains, last
     cell_focus: Literal["off", "per-field", "per-well"] = "off"
-    focus_range_um: float = Field(5.0, gt=0.0, le=MAX_RANGE_UM)
+    focus_range_um: float = Field(10.0, gt=0.0, le=MAX_RANGE_UM)  # §21.11.6 D11
     focus_step_um: float = Field(1.0, ge=MIN_STEP_UM, le=MAX_STEP_UM)
     focus_score: ScoreName = DEFAULT_SCORE
 ```
@@ -8188,7 +8194,7 @@ optional `XYStage`, `Autofocus`, `ObjectiveTurret` through `get`.
 
 ```python
 class FocusOnCellsParams(PluginParams):
-    range_um: float = Field(5.0, gt=0.0, le=MAX_RANGE_UM)
+    range_um: float = Field(10.0, gt=0.0, le=MAX_RANGE_UM)  # §21.11.6 D11
     step_um: float = Field(1.0, ge=MIN_STEP_UM, le=MAX_STEP_UM)
     score: ScoreName = DEFAULT_SCORE
     relock: bool = True
@@ -8430,7 +8436,8 @@ smoothed best and its two smoothed neighbours.
 **D9. A sweep has at least 9 planes.** With fewer, its noise cannot be told
 from its peak's curvature: the parameters refuse them (`sweep_size_problem`),
 `find_peak` raises, and `focus_scores.py` skips such a stack. The defaults
-(11) and every sweep at a stand so far (21) are above it.
+(21 planes since #644, §21.11.6 D11) and every sweep at a stand so far (21)
+are above it.
 
 **D10. A Z readback off its command is read again once.** After
 `REREAD_WAIT_S` (0.3 s, through the plugin's `ctx.wait_s`), one
@@ -8503,6 +8510,144 @@ sweeps). They keep the centre, the by-eye focus.
 - `NOISE_FACTOR` at another plate, objective or exposure: each sweep's
   prominence can be recomputed from the run document's scores, and
   `scripts/dev/focus_scores.py` prints it for the tool's stacks.
+
+#### 21.11.6 The sweep the rule is used with (#644)
+
+§21.11's rule was fitted to 21-plane sweeps, and the defaults were ±5 µm at
+1 µm, 11 planes: under the rule, the default sweep calls 21 of session 6's
+24 cell sweeps flat (the review of #642). This section makes the defaults
+the sweep that was measured, keeps `MIN_PLANES`, and settles three edges of
+`find_peak` that the `/code-review` of #642 found. It changes no interface:
+two defaults, the best index of a tie and the noise of a sweep whose median
+second difference is 0.
+
+**What was measured** (2026-11-25, planning #644), on `main` `e2d793e`,
+Python 3.13, numpy 2.5.3, in throwaway scripts (not committed), on the 49
+sweeps of 21.11.1, each cut to a sub-sweep around its own centre (the
+recorded plane 10 of 0–20): the same scores, no new frame.
+- **§21.3's rule on the sub-sweeps** (peak / flat / at-edge; the review's
+  table, re-measured, the same):
+
+  | sub-sweep | planes | B4 cells (24) | C3 beads (25) |
+  |---|---|---|---|
+  | ±10 µm, step 1 (session 6, **the defaults from here**) | 21 | **17** / 7 / 0 | 1 / 19 / 5 |
+  | ±8 µm, step 1 | 17 | 14 / 10 / 0 | 1 / 19 / 5 |
+  | ±7 µm, step 1 | 15 | 12 / 12 / 0 | 0 / 19 / 6 |
+  | ±6 µm, step 1 | 13 | 8 / 16 / 0 | 0 / 19 / 6 |
+  | ±5 µm, step 1 (the defaults until #644) | 11 | 3 / 21 / 0 | 0 / 19 / 6 |
+  | ±10 µm, step 2 | 11 | 8 / 16 / 0 | 1 / 18 / 6 |
+  | ±4 µm, step 1 | 9 | 4 / 19 / 1 | 0 / 20 / 5 |
+  | ±8 µm, step 2 | 9 | 3 / 21 / 0 | 0 / 19 / 6 |
+
+- **A noise that a peak's curvature does not inflate** (#644's option 2):
+  the same rule and `NOISE_FACTOR`, the noise of one score read another way
+  (then divided by √3 for a smoothed score); peaks on B4 / peaks on C3:
+
+  | the noise from | ±10 µm, step 1 (21) | ±5 µm, step 1 (11) | ±10 µm, step 2 (11) |
+  |---|---|---|---|
+  | second differences, median (§21.3) | 17 / 1 | 3 / 0 | 8 / 1 |
+  | third differences, median (`/ √20`) | 15 / 2 | 7 / 1 | 4 / 0 |
+  | fourth differences, median (`/ √70`) | 16 / 2 | 8 / 1 | 7 / 0 |
+  | the residual of a quartic fit (rms) | 12 / 2 | 1 / 0 | 4 / 0 |
+  | the residual of a Gaussian and a constant (rms) | 11 / 2 | 0 / 0 | 3 / 0 |
+
+  None gives the 11-plane sweep back its peaks: the best finds 8 of 24, and
+  the two fits, which read the noise and not the curvature, find fewer. Over
+  ±5 µm the sweep sees only part of the rise: on the 17 cell peaks, the
+  smoothed rise over 11 planes is 34–93 % of the rise over 21 (median 65 %;
+  B4_0002 0.97 % of the score against 2.84 %), because the cells' curve is
+  9–11 planes wide at half its rise (21.11.1). The sweep needs the range,
+  not another noise.
+- **Noise only** (`1 + 0.003 x`, 20 000 draws each, `default_rng(644)`; peak
+  / at-edge): white, 0.54 / 0.38 % at 9 planes, 0.54 / 0.29 % at 11, 0.26 /
+  0.03 % at 21. AR(1) of ρ = 0.2: 1.02 / 0.94 %, 1.17 / 0.66 %, 1.04 / 0.18 %.
+  ρ = 0.5: 2.91 / 2.87 %, 3.44 / 2.54 %, 8.10 / 1.70 % (and 0.60 % two-peaks
+  at 21). The recorded noise is close to white: the lag-1 autocorrelation of
+  the residual after a quartic fit is −0.18 (median of C3's 19 flat sweeps)
+  and −0.06 (B4's 7), against −0.24 for white noise, −0.07 for ρ = 0.3 and
+  +0.03 for ρ = 0.5 on 21 synthetic planes.
+- **The cost**: the scans' `assumed` lines say 8.50 s a field (B4) and 7.53 s
+  (C3) for 21 planes, the frames' `duration_s` a median of 8.46 and 7.53 s:
+  0.36–0.40 s a plane. 11 planes would cost about 4.0–4.4 s (estimated from
+  that, not measured).
+- **The edges** (§21.3's rule as merged, then with D12 and D13):
+  `find_peak(range(9), [0, 1, 0, 1, 40, 0, 1, 0, 1])` is a peak at plane 3
+  refined to 3.5 (a tie of three smoothed values at planes 3–5), then at plane
+  4 refined to 4.0, prominence 19.08 both times.
+  `[5, 5, 5, 5, 5.0001, 5, 5, 5, 5]` and `[0, 0, 0, 0, 10, 0, 0, 0, 0]` are
+  peaks of prominence `inf`, then flat at 1.97. On the 49 sweeps, at 21 and at
+  11 planes, D12 and D13 change no outcome, refined Z or prominence (no
+  median is 0, no top is tied). A straight line (every second difference 0)
+  stays at-edge at `inf`.
+- **The vertex on an asymmetric curve**: on the 17 cell peaks, the refined Z
+  and the vertex of a least-squares parabola through the 5 raw scores around
+  the best differ by 0.07 µm (median), 0.29 µm at most (B4_0014); through 7
+  raw scores, 0.24 µm and 0.64 µm (B4_0009).
+
+**D11. The defaults are the sweep that was measured: ±10 µm, 1 µm apart,
+21 planes**, for the scan (`focus_range_um`, `focus_step_um`) and the tool
+(`range_um`, `step_um`). On the 49 sweeps: B4 17 peaks, 7 flat, 0 at-edge;
+C3 1, 19, 5 (21.11.3). 17 of 24 is enough: the seven flats are the three
+empty fields and four with one or two small objects (by eye), which keep the
+centre, the by-eye focus, as every field did before #622; every field seen
+holding a large cell or three objects or more is a peak, and no empty field
+is. The cost is 21 frames, about 8 s a field at the Ti2-E, twice the 11
+planes'. The step stays 1 µm: ±10 µm at 2 µm costs the old 11 planes and
+finds 8.
+- Not chosen: *a noise estimate a peak's curvature does not inflate* (the
+  second table): no estimate tried gives the 11-plane sweep more than 8 of
+  the 17 peaks, and each would need its own `NOISE_FACTOR`.
+- Not chosen: *±8 µm* (17 planes, 14 peaks): about 1.5 s a field saved for
+  three peaks fewer, on one well; the rule's bound was set on 21 planes.
+- Unknown: the curve's width at another objective, sample or exposure, which
+  sets the range a sweep needs. Each run document keeps every sweep's scores,
+  so the table can be made again from any later scan.
+
+**D12. A tie at the top takes the middle of the tie.** Equal smoothed
+maxima come from one plane far above neighbours that do not move (a peak
+narrower than a step): the first of them put the refined Z half a step low.
+`k*` is the middle of the run of consecutive indices at `max(m)`, the lower
+middle when the run is even; three equal values make the vertex their middle
+plane.
+
+**D13. A median second difference of 0 reads the noise from their mean.**
+`sqrt(pi / 2) * mean(|…|) / sqrt(18)`, the mean absolute value's own σ of
+a normal law. A guard, not a fix: real frames carry noise, and no recorded
+sweep has a median of 0. Without it, more than half the second differences
+exactly 0 made any rise a peak of prominence `inf`.
+- Not chosen: *a floor on the noise*, relative to the score: the example
+  stays a peak at any rise above the floor, and the floor's value would be
+  chosen.
+
+**D14. `MIN_PLANES` stays 9.** It is the rule's floor, measured on clean
+synthetic peaks (21.11.1): below it a peak's own curvature reads as noise.
+What a sweep finds on cells depends on its range against the cells' curve,
+which D11's defaults carry; a shorter sweep stays allowed for a sample whose
+curve is narrower, and the scan's `assumed` line already says on how many
+sweeps it found a peak.
+
+**D15. The vertex stays on the smoothed scores.** The pull of an
+asymmetric curve toward its tail is measured at 0.29 µm at most against a
+parabola through the raw scores, under a third of a step; through more raw
+planes the parabola moves too, so neither is the truth. Whether the frames
+at the found plane are sharper is 21.11.5's check at the stand.
+
+**Tests** (in addition to 21.11.4):
+- `tests/unit/test_cell_focus_algorithm.py`:
+  `test_the_default_sweep_finds_the_weakest_recorded_cell_peak` (B4_0014 cut
+  to the planes of both parameters' defaults: 21 planes, a peak at 10.74; cut
+  to ±5 µm it is flat at 6.32),
+  `test_a_peak_narrower_than_a_step_refines_to_its_own_plane` (D12),
+  `test_a_sweep_whose_second_differences_are_mostly_zero_is_flat` (D13); the
+  noiseless tent of `test_unequal_spacing_is_refined_through_the_readbacks`
+  now has a finite prominence (27.65).
+- The tool's demo tests that count an 11-plane sweep pass `range_um=5.0`:
+  they test the sweep, not its default.
+
+**Not verified** (for the owner): at the next 40× scan with
+`cell_focus=per-field` and no `focus_range_um`, how many sweeps of a well
+find a peak, the time a field, and that ±10 µm around the start Z stays
+inside the Z soft limits (D3 refuses before the first move otherwise).
 
 ## 22. The lab's own plate definitions (#400)
 
