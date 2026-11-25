@@ -49,7 +49,7 @@ smc run camera-calibration -p <profile> --run-doc run.json --param from_run_doc=
 |---|---|---|
 | `step_um` | a quarter of the smaller side of the frame, from the camera's pixel size; 50 µm when the camera reports none | The probe distance, at most 2000 µm (a larger default is capped to it). Far enough for a precise shift, and well inside half the frame (below). On a **periodic** target, a grid slide or a stage micrometer, give a step under half the period (below). |
 | `settle_ms` | 0 | A wait after each move, before the frame: for a stage that rings. |
-| `from_run_doc` | none | Reuse the calibration in another run document. Nothing moves. |
+| `from_run_doc` | none | Reuse the calibration in another run document, never the one `--run-doc` names. Nothing moves. |
 
 The sequence is a reference frame, a move in +X, a frame, a move in +Y, a frame,
 the return to the start, and a last frame that checks the return. Progress is
@@ -350,6 +350,22 @@ the parameter in its own spelling). A path with a space is the first
 `--param "from_run_doc=C:\runs\Lab Book\earlier.json"`, as the
 [quoting note](README.md#running-a-plugin-smc-run) says for JSON values. Not tried
 on a Windows shell: check it at the stand.
+
+**The other document is not the one the run writes.** `--run-doc run.json --param
+from_run_doc=run.json` is refused before anything is written, whichever way the one
+file is spelt (relative or absolute, `./run.json`, a link):
+
+```text
+✗ parameters of camera-calibration: from_run_doc names the run document this run writes (run.json), where this run replaces the camera-calibration it would copy: name a copy of it or another run document (nothing was written). smc run camera-calibration --show-params lists the keys
+```
+
+The run marks the stage running in its own document before it reads its source,
+which would be that same stage: with no refusal first, the document's calibration
+ended `failed` and the morning's measurement was lost (Ti2-E session 6, F15, #626).
+Copy the document (`copy run.json run-10x.json`) and name the copy, or name the
+document of the calibration you mean. The check is the runner's (`check_run_doc`, [m3
+§1.8](../design/m3-plugins.md)), so the plate page's expert view says the same line as
+its outcome and writes nothing.
 
 **A calibration is for the state of the stand it was measured in.** The objective
 and the frame shape are compared; the Ti2-E's intermediate-magnification lever
