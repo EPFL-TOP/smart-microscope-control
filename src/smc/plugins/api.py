@@ -107,6 +107,13 @@ class Plugin(Protocol[P, R]):
     ``_MEMBERS`` and ``isinstance`` do not ask for it, and ``smc run --offline``
     reads it with ``getattr(plugin, "offline", False)``. A plugin that sets it
     to ``True`` never drives the stand, so it must need no capability.
+
+    ``reuses_from`` is another optional class attribute read with ``getattr``: the
+    names of ``Params`` fields (each ``Path | None``) from which the plugin copies
+    **its own slot** out of another run document (``camera-calibration``'s
+    ``from_run_doc``). ``check_run_doc`` refuses one that names the document the run
+    writes, before anything is written: the stage's ``running`` record would replace
+    the very record the reuse copies (F15, #626).
     """
 
     name: str

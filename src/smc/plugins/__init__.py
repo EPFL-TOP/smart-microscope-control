@@ -35,7 +35,7 @@ from smc.plugins.registry import (
     discover,
     load,
 )
-from smc.plugins.runner import check_ready, run_plugin
+from smc.plugins.runner import check_ready, check_run_doc, run_plugin
 
 __all__ = [
     "GROUP",
@@ -58,6 +58,7 @@ __all__ = [
     "StopRequested",
     "UpstreamError",
     "check_ready",
+    "check_run_doc",
     "describe_params",
     "discover",
     "load",

@@ -72,6 +72,7 @@ from smc.plugins import (
     Progress,
     Registry,
     check_ready,
+    check_run_doc,
     describe_params,
     discover,
     load,
@@ -3236,6 +3237,9 @@ class PlatePage:
                 dry_run=dry_run,
                 resume=resume,
             )
+            # A reuse of the document this run writes would replace its own source (F15,
+            # #626): the runner refuses it too, and this one writes nothing, at the click.
+            check_run_doc(entry.plugin, parsed, doc_path or self._run_doc)
             # After `check_ready`, so that a stage that reads what is not usable says
             # that first, as `view().blocked` does. The stand's capabilities are the
             # runner's, in the worker, and come after.

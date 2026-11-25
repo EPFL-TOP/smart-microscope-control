@@ -96,6 +96,7 @@ from smc.plugins import (
     ResumeError,
     UpstreamError,
     check_ready,
+    check_run_doc,
     describe_params,
     parse_params,
     run_plugin,
@@ -2706,6 +2707,8 @@ def run_command(
             dry_run=dry_run,
             resume=resume,
         )
+        # Before the stand opens and before anything is written (FM-30, F15).
+        check_run_doc(entry.plugin, params, path)
         if offline:
             _say(
                 f"offline: no stand is opened; the profile, "

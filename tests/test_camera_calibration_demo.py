@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import shutil
 import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ from smc.hardware import Microscope
 from smc.hardware.capabilities import XY, Camera, Limits, ObjectiveTurret, XYStage
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError
 from smc.plugins import (
+    ParamsError,
     PluginRunError,
     Progress,
     RunContext,
@@ -668,6 +670,64 @@ def test_reuse_refuses_a_document_that_is_missing_or_whose_run_did_not_end_done(
     )
     with pytest.raises(PluginRunError, match="ended failed"):
         _run(demo_microscope, tmp_path, from_run_doc=failed)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    ["from_run_doc relative", "from_run_doc absolute", "run document relative"],
+)
+def test_reuse_from_its_own_run_document_is_refused_before_anything_is_written(
+    spelling: str,
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F15 (#626): `smc run camera-calibration --run-doc run.json --param
+    # from_run_doc=run.json` marked the stage running, read its own running stage and
+    # refused, and the morning's calibration in `run.json` was `failed`. The same file
+    # is named two ways here; the document's `done` calibration must be as it was.
+    monkeypatch.chdir(tmp_path)
+    run_doc = tmp_path / "run.json"
+    objective = demo_microscope.require(ObjectiveTurret).current()
+    earlier = _write_calibration(run_doc, objective=objective, shape=(512, 512))
+    before = run_doc.read_bytes()
+    stored = _stored(tmp_path)
+    start = _here(demo_microscope)
+    source = Path("run.json") if spelling == "from_run_doc relative" else run_doc
+    named = Path("run.json") if spelling == "run document relative" else run_doc
+
+    with pytest.raises(ParamsError) as raised:
+        run_plugin(
+            CameraCalibrationPlugin(),
+            demo_microscope,
+            CameraCalibrationParams(from_run_doc=source),
+            named,
+        )
+
+    assert str(raised.value) == (
+        "parameters of camera-calibration: from_run_doc names the run document this "
+        f"run writes ({source.as_posix()}), where this run replaces the "
+        "camera-calibration it would copy: name a copy of it or another run document "
+        "(nothing was written). smc run camera-calibration --show-params lists the keys"
+    )
+    assert run_doc.read_bytes() == before
+    assert _stored(tmp_path) == stored
+    assert stored.status is StageStatus.done
+    assert stored.result == earlier.model_dump(mode="json")
+    assert _here(demo_microscope) == start
+
+
+def test_reuse_from_a_copy_of_its_own_run_document_still_runs(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    # What the refusal tells the operator to do: the copy is another file.
+    objective = demo_microscope.require(ObjectiveTurret).current()
+    _write_calibration(tmp_path / "run.json", objective=objective, shape=(512, 512))
+    copy = Path(shutil.copyfile(tmp_path / "run.json", tmp_path / "run-10x.json"))
+
+    result = _result(_run(demo_microscope, tmp_path, from_run_doc=copy))
+
+    assert result.reused_from == copy.as_posix()
 
 
 # ---------------------------------------- what the result says it assumed
