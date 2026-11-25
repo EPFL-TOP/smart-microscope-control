@@ -7,9 +7,12 @@ writing to a terminal) and clears ``SMC_PROFILE``, so an operator's
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import logging
 import os
+import platform
 import re
 import stat
 import subprocess
@@ -103,6 +106,195 @@ def test_the_cli_leaves_the_smc_logger_as_it_found_it() -> None:
 
     assert result.exit_code == 0, result.output
     assert (logger.level, list(logger.handlers)) == before
+
+
+@contextlib.contextmanager
+def _root_holding(
+    *handlers: logging.Handler, level: int | None = None
+) -> Iterator[logging.Logger]:
+    """Give the root logger exactly ``handlers`` (and ``level``), then put it back.
+
+    Under pytest the root always holds the plugin's capture handlers, and a
+    library's module-level ``logging.debug()`` only configures a root that has
+    none. Used inside the test body and never as a fixture: a fixture's restore
+    would run after pytest has taken its own call-phase handler off the root,
+    and would put the old list back for the rest of the session.
+    """
+    root = logging.getLogger()
+    saved = (list(root.handlers), root.level)
+    root.handlers[:] = list(handlers)
+    if level is not None:
+        root.setLevel(level)
+    try:
+        yield root
+    finally:
+        root.handlers[:] = saved[0]
+        root.setLevel(saved[1])
+
+
+def _library(
+    monkeypatch: pytest.MonkeyPatch, calls: Callable[[], None]
+) -> list[list[str]]:
+    """Run ``calls`` from inside ``smc version``, as a library's code would.
+
+    ``version`` calls ``platform.platform()``; the stand-in records the root's
+    handlers before and after ``calls`` (the class names, in order) and returns
+    a platform string. The list is filled when the command runs.
+    """
+    seen: list[list[str]] = []
+
+    def stand_in(*args: object, **kwargs: object) -> str:
+        root = logging.getLogger()
+        seen.append([type(h).__name__ for h in root.handlers])
+        calls()
+        seen.append([type(h).__name__ for h in root.handlers])
+        return "test-platform"
+
+    monkeypatch.setattr(platform, "platform", stand_in)
+    return seen
+
+
+@pytest.mark.parametrize("flag", ["-v", "--debug"])
+def test_a_librarys_module_level_debug_call_does_not_configure_the_root_logger(
+    flag: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #624: bokeh's `logging.debug("Dropping a patch ...")` ran basicConfig() on
+    # the page's console: every smc line twice, then every library's DEBUG.
+    def calls() -> None:
+        logging.debug("library debug at module level")
+        logging.getLogger("markdown_it").debug("markdown rule debug")
+        smc_ui = logging.getLogger("smc.ui")
+        smc_ui.info("an smc line")
+        smc_ui.debug("an smc debug line")
+
+    seen = _library(monkeypatch, calls)
+
+    with _root_holding(level=logging.DEBUG):
+        result = runner.invoke(app, [flag, "version"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == [["_CliLogHandler"], ["_CliLogHandler"]]
+    lines = result.output.splitlines()
+    assert "library debug" not in result.output
+    assert "markdown rule debug" not in result.output
+    assert "DEBUG:root" not in result.output
+    assert lines.count("INFO an smc line") == 1
+    assert not any(line.startswith("INFO:smc.ui") for line in lines)
+    # smc's own level: --debug is "everything" for the smc loggers, once.
+    assert lines.count("DEBUG an smc debug line") == (flag == "--debug")
+
+
+def test_the_root_logger_is_as_it_was_after_a_command_that_added_a_handler_to_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _library(monkeypatch, lambda: logging.debug("x"))
+
+    for flag in ("-v", "--debug"):
+        with _root_holding(level=logging.DEBUG) as root:
+            result = runner.invoke(app, [flag, "version"])
+
+            assert result.exit_code == 0, result.output
+            assert root.handlers == []
+            assert root.level == logging.DEBUG
+
+
+def test_a_command_leaves_the_handlers_of_a_root_that_has_some_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An application's (or pytest's) handlers are neither counted as ours nor
+    # added to: the CLI gives a root a handler only when it has none.
+    sentinel = logging.NullHandler()
+    seen = _library(monkeypatch, lambda: logging.debug("x"))
+
+    with _root_holding(sentinel, level=logging.DEBUG) as root:
+        result = runner.invoke(app, ["-v", "version"])
+
+        assert result.exit_code == 0, result.output
+        assert seen == [["NullHandler"], ["NullHandler"]]
+        assert root.handlers == [sentinel]
+
+
+def test_a_librarys_warning_reaches_the_console_once_with_its_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A handler on the root turns off logging.lastResort, which printed these
+    # (tornado's "Uncaught exception GET /ws"): the CLI's handler gives the
+    # rule back, with the logger's name.
+    def calls() -> None:
+        logging.getLogger("tornado.application").error("Uncaught exception GET /ws")
+        logging.warning("a root warning")
+
+    _library(monkeypatch, calls)
+
+    with _root_holding(level=logging.DEBUG):
+        result = runner.invoke(app, ["version"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines.count("ERROR tornado.application: Uncaught exception GET /ws") == 1
+    assert lines.count("WARNING root: a root warning") == 1
+    assert "WARNING:root" not in result.output
+
+
+def test_a_library_with_a_console_handler_of_its_own_prints_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # pymmcore-plus's case: a console handler on its own logger, propagation on.
+    # The root handler must not print the same record a second time.
+    def calls() -> None:
+        own = logging.StreamHandler(sys.stderr)
+        own.setFormatter(logging.Formatter("OWN %(message)s"))
+        library = logging.getLogger("libwithconsole")
+        library.addHandler(own)
+        try:
+            library.warning("lib warning")
+            logging.getLogger("libwithconsole.sub").error("sub error")
+        finally:
+            library.removeHandler(own)
+
+    _library(monkeypatch, calls)
+
+    with _root_holding(level=logging.DEBUG):
+        result = runner.invoke(app, ["version"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines.count("OWN lib warning") == 1
+    assert lines.count("OWN sub error") == 1
+    assert "WARNING libwithconsole" not in result.output
+    assert "ERROR libwithconsole.sub" not in result.output
+
+
+def test_a_second_configure_without_an_undo_leaves_one_root_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A command whose undo never ran must not leave its handler to be counted
+    # as "the root already has one" by the next (CliRunner swaps the stream for
+    # every invocation, and the stale handler is bound to the closed one).
+    smc_logger = logging.getLogger("smc")
+
+    def cli_handlers(logger: logging.Logger) -> list[logging.Handler]:
+        return [h for h in logger.handlers if isinstance(h, cli._CliLogHandler)]
+
+    first_stream, second_stream = io.StringIO(), io.StringIO()
+    with _root_holding() as root:
+        monkeypatch.setattr(sys, "stderr", first_stream)
+        first_undo = cli._configure_logging(logging.INFO)
+        monkeypatch.setattr(sys, "stderr", second_stream)
+        second_undo = cli._configure_logging(logging.INFO)
+
+        assert len(cli_handlers(root)) == 1
+        assert len(cli_handlers(smc_logger)) == 1
+        assert len(root.handlers) == 1
+        (root_handler,) = cli_handlers(root)
+        assert isinstance(root_handler, logging.StreamHandler)
+        assert root_handler.stream is second_stream
+
+        second_undo()
+        first_undo()
+
+        assert root.handlers == []
+        assert cli_handlers(smc_logger) == []
 
 
 def test_no_arguments_shows_help() -> None:
