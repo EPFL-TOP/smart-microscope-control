@@ -2773,6 +2773,72 @@ def test_a_square_welled_plate_refuses_plate_walls_in_the_controller_and_writes_
         page.close()
 
 
+@pytest.mark.parametrize(
+    "typed", ["run.json", "ABSOLUTE"], ids=["relative", "absolute"]
+)
+def test_a_reuse_of_the_run_document_itself_is_refused_in_the_controller_and_writes_nothing(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    typed: str,
+) -> None:
+    # F15 (#626): the expert view's Run camera-calibration takes a typed `from_run_doc`.
+    # Naming the page's own document, the stage marked itself running over the usable
+    # calibration, read its own running stage and refused: the document was `failed`.
+    # The runner refuses it too (FM-169: the controller does not rely on one guard), and
+    # this one is the click's outcome, before a worker starts.
+    monkeypatch.chdir(run_doc.parent)
+    _seed(run_doc, "camera-calibration", "camera-calibration")
+    path = str(run_doc) if typed == "ABSOLUTE" else typed
+    page = _stood_page(fake_microscope, run_doc, "camera-calibration")
+    try:
+        before = run_doc.read_bytes()
+
+        page.run("camera-calibration", [f"from_run_doc={path}"])
+
+        assert page.status().running is None
+        assert page.status().outcome == (
+            "camera-calibration: ParamsError: parameters of camera-calibration: "
+            f"from_run_doc names the run document this run writes ({Path(path).as_posix()}), "
+            "where this run replaces the camera-calibration it would copy: name a copy "
+            "of it or another run document (nothing was written). smc run "
+            "camera-calibration --show-params lists the keys"
+        )
+        assert run_doc.read_bytes() == before
+        provider = RunDocument.load_or_new(run_doc).provider("camera-calibration")
+        assert provider is not None
+        assert provider.status is StageStatus.done
+    finally:
+        page.close()
+
+
+def test_a_reuse_is_compared_with_the_document_the_run_is_into_not_the_pages_own(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A block's calibration goes into a document of its own (m5 §18.6 D14): the one
+    # `_prepare` is given is the one the run replaces its record in. The page's own
+    # `run.json` is another file there, and a reuse from it is the way to register the
+    # plate afresh; a reuse of the block's own document is the refusal.
+    target = run_doc.parent / "position-1.json"
+    page = _stood_page(fake_microscope, run_doc, "camera-calibration")
+    try:
+        allowed = page._prepare(
+            "camera-calibration", [f"from_run_doc={run_doc}"], doc_path=target
+        )
+        refused = page._prepare(
+            "camera-calibration", [f"from_run_doc={target}"], doc_path=target
+        )
+    finally:
+        page.close()
+
+    assert not isinstance(allowed, str)
+    assert isinstance(refused, str)
+    assert refused.startswith(
+        "camera-calibration: ParamsError: parameters of camera-calibration: "
+        f"from_run_doc names the run document this run writes ({target.as_posix()})"
+    )
+
+
 def test_the_dry_run_comes_before_square_wells_when_plate_walls_is_run(
     fake_core: FakeCore, run_doc: Path
 ) -> None:

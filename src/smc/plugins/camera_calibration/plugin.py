@@ -26,6 +26,11 @@ harm.
   gives is believed only when it stands out and is a rigid camera's, the fit
   then judges it as ever, and the result says it was read this way. No move, no
   snap: the second look runs after the return, on arithmetic.
+* **A reuse never names the document the run writes** (F15, #626). The runner
+  marks the stage ``running`` in its own document before ``run``, which replaces
+  the calibration a ``from_run_doc`` of that same document would copy: the refusal
+  that followed left the morning's calibration ``failed``. ``check_run_doc`` refuses
+  it first, from the declaration ``reuses_from``, and writes nothing.
 * **The stage is waited for before its start is read** (FM-85), and the step is
   sized from the camera's own pixel size only when that is finite and positive
   (FM-104): a pixel size of 0 means "not measured".
@@ -140,6 +145,11 @@ class CameraCalibrationPlugin:
     provides = "camera-calibration"
     reads: tuple[str, ...] = ()
     reads_optional: tuple[str, ...] = ()
+    #: The one parameter that copies this stage from another run document: the
+    #: runner refuses it before anything is written when it names the document the
+    #: run writes, whose ``camera-calibration`` the run would first replace (F15,
+    #: #626; ``check_run_doc``).
+    reuses_from: tuple[str, ...] = ("from_run_doc",)
 
     def run(
         self,

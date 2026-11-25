@@ -9,7 +9,9 @@ exactly (FM-45); threads meet on ``Event`` and are joined with a timeout (FM-44)
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
 import threading
 import weakref
 from datetime import datetime, timezone
@@ -38,12 +40,18 @@ from smc.plugins.api import (
     StopRequested,
 )
 from smc.plugins.errors import (
+    ParamsError,
     PluginRunError,
     RequirementsError,
     ResumeError,
     UpstreamError,
 )
-from smc.plugins.runner import check_ready, reachable_checkpoint, run_plugin
+from smc.plugins.runner import (
+    check_ready,
+    check_run_doc,
+    reachable_checkpoint,
+    run_plugin,
+)
 from smc.run import (
     ReadRecord,
     RunDocument,
@@ -1790,3 +1798,288 @@ def _run_on_a_fresh_stand(
     microscope = Microscope.from_core(cast("CMMCorePlus", core), Profile.demo())
     watched: list[weakref.ref[Any]] = [weakref.ref(microscope), weakref.ref(core)]
     return _outcome_of(lambda: _run(plugin, microscope, tmp_path)), watched
+
+
+# --- a reuse from the document the run writes (#626, F15) -----------------------
+
+
+class ReuseParams(PluginParams):
+    source: Path | None = None
+    # Also a path, and never a reuse: a plugin that reads another document's stage of
+    # *another* slot (`scan-plan`'s calibration) may name its own.
+    template: Path | None = None
+
+
+class Reuses(Base):
+    """Copies its own slot from another run document, ``source`` naming it."""
+
+    name = provides = "reuses"
+    Params = ReuseParams
+    reuses_from = ("source",)
+
+    def body(self, microscope: Any, params: Any, ctx: RunContext) -> Result:
+        return Result()
+
+
+class ReusesWithAStage(Reuses):
+    requires = (XYStage,)
+
+
+class ReadsAnother(Base):
+    """Names a document it reads another stage from: nothing is declared."""
+
+    name = provides = "reads-another"
+    Params = ReuseParams
+
+
+class ReusesFromNothing(Base):
+    name = provides = "reuses-from-nothing"
+    Params = ReuseParams
+    reuses_from = ("no_such_field",)
+
+
+def _refusal_of(plugin: Base, run_doc: Path, **params: Path | None) -> str:
+    with pytest.raises(ParamsError) as raised:
+        check_run_doc(plugin, ReuseParams(**params), run_doc)
+    return str(raised.value)
+
+
+def _written(path: Path) -> Path:
+    path.write_text("{}\n", encoding="utf-8")
+    return path
+
+
+def _alias_of(kind: str, run_doc: Path, tmp_path: Path) -> Path:
+    """Another way to name the file ``run_doc`` is, or a skip where the volume has none."""
+    if kind == "through a parent":
+        (tmp_path / "sub").mkdir()
+        return tmp_path / "sub" / ".." / run_doc.name
+    if kind in ("a symbolic link", "a hard link"):
+        alias = tmp_path / "alias.json"
+        try:
+            if kind == "a hard link":
+                os.link(run_doc, alias)
+            else:
+                alias.symlink_to(run_doc)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"this machine cannot make {kind}: {exc}")
+        return alias
+    assert kind == "in another case"
+    other_case = tmp_path / run_doc.name.upper()
+    if not other_case.exists():
+        pytest.skip("this volume tells RUN.JSON from run.json")
+    return other_case
+
+
+_RUN_DOC_NAMED = (
+    "parameters of reuses: source names the run document this run writes ({shown}), "
+    "where this run replaces the reuses it would copy: name a copy of it or another "
+    "run document (nothing was written). smc run reuses --show-params lists the keys"
+)
+
+
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        "as typed",
+        "relative, the run document absolute",
+        "absolute, the run document relative",
+        "through a parent",
+        "a symbolic link",
+        "a hard link",
+        "in another case",
+    ],
+)
+def test_check_run_doc_refuses_a_document_named_in_any_spelling(
+    spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # F15: `smc run camera-calibration --run-doc A --param from_run_doc=A`. One file has
+    # many names (FM-24), and `==` on two `Path`s compares only the names.
+    monkeypatch.chdir(tmp_path)
+    run_doc = _written(tmp_path / "run.json")
+    given_run_doc = run_doc
+    if spelling == "as typed":
+        source = run_doc
+    elif spelling == "relative, the run document absolute":
+        source = Path("run.json")
+    elif spelling == "absolute, the run document relative":
+        source, given_run_doc = run_doc, Path("run.json")
+    else:
+        source = _alias_of(spelling, run_doc, tmp_path)
+
+    # The text is the one typed, never resolved (FM-50).
+    assert _refusal_of(Reuses(), given_run_doc, source=source) == (
+        _RUN_DOC_NAMED.format(shown=source.as_posix())
+    )
+
+
+def test_check_run_doc_accepts_a_copy_another_document_and_the_same_name_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    run_doc = _written(tmp_path / "run.json")
+    copy = Path(shutil.copyfile(run_doc, tmp_path / "run-10x.json"))
+    (tmp_path / "elsewhere").mkdir()
+    namesake = _written(tmp_path / "elsewhere" / "run.json")
+    for source in (copy, _written(tmp_path / "other.json"), namesake, None):
+        check_run_doc(Reuses(), ReuseParams(source=source), run_doc)
+    # A document that is not there is not this one, whichever way it is named.
+    check_run_doc(Reuses(), ReuseParams(source=tmp_path / "missing.json"), run_doc)
+    check_run_doc(Reuses(), ReuseParams(source=Path("missing.json")), run_doc)
+
+
+@pytest.mark.parametrize(
+    "spelling", ["absolute", "relative", "through a linked folder"]
+)
+def test_check_run_doc_refuses_a_document_that_does_not_exist_yet(
+    spelling: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first write would create it as `failed`: the run reads what it just made.
+    # Neither file is there, so `samefile` has nothing to compare: the names are
+    # resolved, and a folder that is a link (`/var` for `/private/var` on macOS, a
+    # junction on Windows) is told from the lexical `abspath`, which would differ.
+    monkeypatch.chdir(tmp_path)
+    run_doc = tmp_path / "new.json"
+    source = Path("new.json") if spelling == "relative" else run_doc
+    if spelling == "through a linked folder":
+        (tmp_path / "real").mkdir()
+        try:
+            (tmp_path / "link").symlink_to(tmp_path / "real", target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"this machine cannot make a symbolic link: {exc}")
+        run_doc = tmp_path / "link" / "new.json"
+        source = tmp_path / "real" / "new.json"
+    assert not run_doc.exists()
+    assert not source.exists()
+
+    assert _refusal_of(Reuses(), run_doc, source=source) == _RUN_DOC_NAMED.format(
+        shown=source.as_posix()
+    )
+    check_run_doc(Reuses(), ReuseParams(source=tmp_path / "old.json"), run_doc)
+
+
+def test_check_run_doc_folds_the_case_of_a_document_that_does_not_exist_yet_where_the_platform_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `os.path.normcase` is the identity on POSIX and lower-cases on Windows, so the
+    # platform's own is stood in for here: this runs the same on every OS, and
+    # the fold is what makes `New.json` and `new.json` one document on NTFS.
+    run_doc = tmp_path / "new.json"
+    with monkeypatch.context() as patch:
+        patch.setattr(os.path, "normcase", lambda path: os.fspath(path).lower())
+        assert _refusal_of(Reuses(), run_doc, source=tmp_path / "NEW.JSON")
+        # The control: another name is not folded into this one.
+        check_run_doc(Reuses(), ReuseParams(source=tmp_path / "NEWER.JSON"), run_doc)
+
+
+def test_check_run_doc_ignores_a_path_that_is_not_declared_a_reuse(
+    tmp_path: Path,
+) -> None:
+    # `scan-plan`'s calibration, `plate-check`'s and `objective-offsets`' name another
+    # stage of a document, and their own document is their default (#626, measured).
+    run_doc = _written(tmp_path / "run.json")
+    check_run_doc(ReadsAnother(), ReuseParams(source=run_doc), run_doc)
+    # Of the two paths of the parameters, only the declared one is a reuse.
+    check_run_doc(Reuses(), ReuseParams(template=run_doc), run_doc)
+
+
+def test_check_run_doc_of_a_name_that_is_no_parameter_is_a_bug_not_a_pass(
+    tmp_path: Path,
+) -> None:
+    # A typo in `reuses_from` would otherwise switch the guard off without a word.
+    run_doc = _written(tmp_path / "run.json")
+    with pytest.raises(AttributeError, match="no_such_field"):
+        check_run_doc(ReusesFromNothing(), ReuseParams(source=run_doc), run_doc)
+
+
+@pytest.mark.parametrize(
+    ("asked", "error"),
+    [
+        ("exists", OSError),
+        ("samefile", OSError),
+        ("resolve", OSError),
+        # Python 3.10 and 3.11 raise it from `resolve` for an embedded NUL (a typed
+        # path in the page's field); 3.12 does not.
+        ("resolve", ValueError),
+    ],
+)
+def test_check_run_doc_answers_no_when_the_file_system_cannot_be_asked(
+    asked: str,
+    error: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-116: `Path.resolve` re-raises a `winerror` outside its tolerated list on a
+    # share that dropped, and `samefile` and `exists` fail the same way. The run
+    # document was read a line before and is written a line after: that is where such
+    # a drop is told, with the run document's own words, and not as a bare `OSError`
+    # out of a check of the parameters.
+    run_doc = _written(tmp_path / "run.json")
+    missing = tmp_path / "missing.json"
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> bool:
+        raise error("The specified network name is no longer available")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, asked, refuse)
+        # `resolve` is asked of a document that is not there, the others of two that are.
+        source = missing if asked == "resolve" else run_doc
+        check_run_doc(Reuses(), ReuseParams(source=source), run_doc)
+
+
+def test_run_plugin_refuses_a_reuse_of_its_own_document_before_it_writes_or_requires_anything(
+    two_stage_less_stand: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stage marks itself `running` before `run`, and that replaces the record the
+    # reuse would have copied: the refusal that comes after leaves the document's own
+    # result `failed` (F15, #626). It also comes before the capabilities are asked: it
+    # needs no stand to know (§1.8).
+    monkeypatch.chdir(tmp_path)
+    earlier = _done_record("reuses", result={"assumed": [], "value": 7})
+    write_stage(_path(tmp_path), earlier)
+    before = _path(tmp_path).read_bytes()
+    plugin = ReusesWithAStage()
+
+    with pytest.raises(ParamsError) as raised:
+        run_plugin(
+            plugin,
+            two_stage_less_stand,
+            ReuseParams(source=Path("run.json")),
+            _path(tmp_path),
+        )
+
+    assert str(raised.value) == _RUN_DOC_NAMED.format(shown="run.json")
+    assert plugin.calls == 0
+    assert _path(tmp_path).read_bytes() == before
+    assert _stored(tmp_path, "reuses") == earlier
+
+
+def test_run_plugin_creates_no_document_for_a_reuse_of_the_one_it_would_create(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    plugin = Reuses()
+    with pytest.raises(ParamsError):
+        run_plugin(
+            plugin,
+            fake_microscope,
+            ReuseParams(source=_path(tmp_path)),
+            _path(tmp_path),
+        )
+    assert plugin.calls == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_run_plugin_runs_a_reuse_from_another_document(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    # The control: what the refusal leaves alone still runs.
+    other = tmp_path / "earlier.json"
+    write_stage(other, _done_record("reuses"))
+    plugin = Reuses()
+
+    record = run_plugin(
+        plugin, fake_microscope, ReuseParams(source=other), _path(tmp_path)
+    )
+
+    assert record.status is StageStatus.done
+    assert plugin.calls == 1
