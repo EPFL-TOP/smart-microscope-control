@@ -214,6 +214,22 @@ def test_a_command_leaves_the_handlers_of_a_root_that_has_some_alone(
         assert root.handlers == [sentinel]
 
 
+def test_the_undo_spares_a_handler_that_a_library_put_on_the_root_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # "Not ours: not counted, not removed" (#624): tornado's pretty logging or an
+    # application's setup can add a root handler while the command runs, and the
+    # command's end takes off only the CLI's own.
+    late = logging.NullHandler()
+    _library(monkeypatch, lambda: logging.getLogger().addHandler(late))
+
+    with _root_holding(level=logging.DEBUG) as root:
+        result = runner.invoke(app, ["-v", "version"])
+
+        assert result.exit_code == 0, result.output
+        assert root.handlers == [late]
+
+
 def test_a_librarys_warning_reaches_the_console_once_with_its_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -223,6 +239,10 @@ def test_a_librarys_warning_reaches_the_console_once_with_its_name(
     def calls() -> None:
         logging.getLogger("tornado.application").error("Uncaught exception GET /ws")
         logging.warning("a root warning")
+        # The smc logger has a handler of its own: only the filter keeps these
+        # two (the lines the operator reads on the STOP loop) from a second print.
+        logging.getLogger("smc.ui").warning("an smc warning")
+        logging.getLogger("smc").error("an smc error")
 
     _library(monkeypatch, calls)
 
@@ -234,6 +254,9 @@ def test_a_librarys_warning_reaches_the_console_once_with_its_name(
     assert lines.count("ERROR tornado.application: Uncaught exception GET /ws") == 1
     assert lines.count("WARNING root: a root warning") == 1
     assert "WARNING:root" not in result.output
+    assert lines.count("WARNING an smc warning") == 1
+    assert lines.count("ERROR an smc error") == 1
+    assert not any("smc.ui:" in line or "smc:" in line for line in lines)
 
 
 def test_a_library_with_a_console_handler_of_its_own_prints_once(
