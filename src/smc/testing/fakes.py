@@ -185,6 +185,11 @@ class FakeCore:
     * ``make_reads_stale(device, prop, *, reads)``: the next ``reads`` reads of
       that property after each write of a different value return the value it
       held before the write; assumed shape: seen once on the Ti2-E (#330).
+    * ``make_positions_stale(label, *, reads)``: the same for a ``Stage``'s
+      position: after each ``setPosition`` that changes it, the next ``reads``
+      reads (``getPosition``, named or, for the focus slot's device, not)
+      return the position held before the set; assumed shape: one Z read in
+      504 returned the plane before, at the Ti2-E (session 6, F17, #622).
     * ``move_z_on_turn(label, delta_um, *, escape_um=None, escape_reads=0)``: a
       turn of any ``State`` device to the position ``label`` adds ``delta_um``
       to the focus device's Z, and the next ``escape_reads`` reads of its
@@ -236,6 +241,11 @@ class FakeCore:
         #: held before that write and the stale reads still owed.
         self._stale_reads: dict[tuple[str, str], int] = {}
         self._held_back: dict[tuple[str, str], tuple[str, int]] = {}
+        #: ``Stage`` label -> how many position reads stay stale after a set
+        #: (``make_positions_stale``), and, per stage set since: the position it
+        #: held before that set and the stale reads still owed.
+        self._stale_positions: dict[str, int] = {}
+        self._held_position: dict[str, tuple[float, int]] = {}
         #: Position label -> ``(delta_um, escape_um, escape_reads)``
         #: (``move_z_on_turn``); the escape the last such turn left, and the
         #: reads of the focus device's position it is still served for.
@@ -499,6 +509,40 @@ class FakeCore:
                 f"never changes it and it is never stale"
             )
         self._stale_reads[(device, prop)] = reads
+
+    def make_positions_stale(self, label: str, *, reads: int) -> None:
+        """Make a ``Stage`` read its previous position for ``reads`` reads after a set.
+
+        The Ti2-E's Z drive read 4198.30 µm after a move to 4199.30 µm, the
+        plane before, once in 504 moves of session 6 (F17, #622): a sweep that
+        trusts its one readback fails the field, and the demo, which reads the
+        position it was set to, cannot show it. After each ``setPosition(label,
+        ...)`` that **changes** the stored position (after ``hold_whole_units``),
+        the next ``reads`` reads of that device's position (``getPosition(label)``
+        and, when ``label`` is the focus slot's device, ``getPosition()``) return
+        the position held before the set; each such set restarts the count; a set
+        to the position already held leaves nothing stale. A turn's escape
+        (``move_z_on_turn``) is served first, as always, and costs no stale read.
+        ``reads=1`` is F17 once, a read again then finds the plane; ``reads=2``
+        is F17 twice. How long the stand's stale read lasts was not measured, so
+        the number is the test's.
+
+        Raises:
+            ValueError: ``reads`` is below 1, or ``label`` names no loaded
+                ``Stage`` device (an XY stage included): a misspelt label would
+                otherwise build a stand that reads fresh and a test that passes
+                whatever the code does (FM-119).
+        """
+        if reads < 1:
+            raise ValueError(
+                f"make_positions_stale: reads must be at least 1, got {reads}"
+            )
+        found = self._devices.get(label)
+        if found is None or found.type != DeviceType.Stage:
+            raise ValueError(
+                f"make_positions_stale: {label!r} names no loaded Stage device"
+            )
+        self._stale_positions[label] = reads
 
     def move_z_on_turn(
         self,
@@ -811,13 +855,28 @@ class FakeCore:
         ):
             self._escape_left -= 1
             return escape
+        held = self._held_position.get(label)
+        if held is not None:
+            before, left = held
+            if left > 1:
+                self._held_position[label] = (before, left - 1)
+            else:
+                del self._held_position[label]
+            return before
         return self._z[label]
 
     def setPosition(self, label: str, z_um: float) -> None:
         """Move a stage at once; on the focus device, the Nikon quirk may apply (FM-12)."""
         self._record("setPosition", label, z_um)
         self._typed(label, DeviceType.Stage)
+        before = self._z[label]
         self._z[label] = self._held(label, float(z_um))
+        reads = self._stale_positions.get(label)
+        if reads is not None:
+            if self._z[label] == before:
+                self._held_position.pop(label, None)
+            else:
+                self._held_position[label] = (before, reads)
         autofocus = self._slots["autofocus"]
         if (
             self.quirk_z_move_disables_autofocus
@@ -1230,6 +1289,8 @@ class FakeCore:
         self._continuous.pop(label, None)
         self._af_offset.pop(label, None)
         self._whole_units.discard(label)
+        self._stale_positions.pop(label, None)
+        self._held_position.pop(label, None)
         for key in [k for k in self._stale_reads if k[0] == label]:
             del self._stale_reads[key]
             self._held_back.pop(key, None)

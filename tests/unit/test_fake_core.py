@@ -919,6 +919,113 @@ def test_a_stale_read_of_a_failing_device_raises_its_failure() -> None:
     assert _lamp_reads(core, 3) == ["501", "501", "210"]
 
 
+# --- a stage's position read stale (session 6, F17, #622) ----------------------
+
+
+def test_make_positions_stale_returns_the_previous_position_for_that_many_reads_then_the_new_one() -> (
+    None
+):
+    # The Ti2-E's Z drive read the plane before once in 504 moves (F17).
+    core = FakeCore.demo_like()
+    core.make_positions_stale("Z", reads=2)
+    core.setPosition("Z", 5.0)
+    assert core.getPosition("Z") == 0.0
+    assert core.getPosition() == 0.0  # the focus slot's device, named or not
+    assert core.getPosition("Z") == 5.0
+    assert core.getPosition() == 5.0
+    # A set to the position already held leaves nothing stale.
+    core.setPosition("Z", 5.0)
+    assert [core.getPosition("Z"), core.getPosition()] == [5.0, 5.0]
+    # A set to a new one is stale again, with the position held before it.
+    core.setPosition("Z", 7.0)
+    assert [core.getPosition("Z"), core.getPosition(), core.getPosition("Z")] == [
+        5.0,
+        5.0,
+        7.0,
+    ]
+
+
+def test_each_stage_set_restarts_the_stale_position_count() -> None:
+    core = FakeCore.demo_like()
+    core.make_positions_stale("Z", reads=3)
+    core.setPosition("Z", 5.0)
+    assert core.getPosition("Z") == 0.0
+    core.setPosition("Z", 9.0)
+    # What was held before the second set is 5.0, not the 0.0 of the first.
+    assert [core.getPosition("Z") for _ in range(4)] == [5.0, 5.0, 5.0, 9.0]
+    # A set of the value it holds ends what an earlier set left stale.
+    core.setPosition("Z", 1.0)
+    assert core.getPosition("Z") == 9.0
+    core.setPosition("Z", 1.0)
+    assert core.getPosition("Z") == 1.0
+
+
+def test_a_stage_not_made_stale_and_an_xy_stage_read_fresh() -> None:
+    core = FakeCore.demo_like(
+        [FakeDevice("Aux", DeviceType.Stage), FakeDevice("Other", DeviceType.Stage)]
+    )
+    core.make_positions_stale("Aux", reads=2)
+    core.setPosition("Other", 3.0)
+    core.setPosition("Z", 4.0)
+    core.setXYPosition("XY", 1.0, 2.0)
+    assert (core.getPosition("Other"), core.getPosition("Z")) == (3.0, 4.0)
+    assert core.getXYPosition("XY") == [1.0, 2.0]
+    core.setPosition("Aux", 6.0)
+    assert core.getPosition("Aux") == 0.0
+
+
+def test_a_stale_position_obeys_a_whole_unit_hold_and_a_turns_escape_first() -> None:
+    core = FakeCore.demo_like(
+        [FakeDevice("Turret", DeviceType.State, state_labels=("A", "B"), properties={})]
+    )
+    core.hold_whole_units("Z")
+    core.make_positions_stale("Z", reads=1)
+    # 0.4 is stored as 0, the position it already held: nothing is stale.
+    core.setPosition("Z", 0.4)
+    assert core.getPosition("Z") == 0.0
+    core.setPosition("Z", 7.9)
+    assert core.getPosition("Z") == 0.0
+    assert core.getPosition("Z") == 7.0
+    # A turn's escape is served before the stale read and costs none of them.
+    core.move_z_on_turn("B", 2.0, escape_um=99.0, escape_reads=1)
+    core.setPosition("Z", 9.0)
+    core.setStateLabel("Turret", "B")
+    assert [core.getPosition("Z") for _ in range(3)] == [99.0, 7.0, 11.0]
+
+
+def test_a_stale_position_read_of_a_failing_device_raises_its_failure() -> None:
+    core = FakeCore.demo_like()
+    core.make_positions_stale("Z", reads=1)
+    core.setPosition("Z", 5.0)
+    boom = RuntimeError("Z: no answer")
+    core.failing["Z"] = boom
+    with pytest.raises(RuntimeError) as caught:
+        core.getPosition("Z")
+    assert caught.value is boom
+    core.failing.clear()
+    # The failed read was no read of the drive: its stale read is still owed.
+    assert [core.getPosition("Z"), core.getPosition("Z")] == [0.0, 5.0]
+
+
+def test_make_positions_stale_refuses_a_misspelt_label_an_xy_stage_and_zero_reads() -> (
+    None
+):
+    core = FakeCore.demo_like()
+    refusals = [
+        ("Z", 0, "make_positions_stale: reads must be at least 1, got 0"),
+        ("Z", -2, "make_positions_stale: reads must be at least 1, got -2"),
+        ("ZZ", 1, "make_positions_stale: 'ZZ' names no loaded Stage device"),
+        ("XY", 1, "make_positions_stale: 'XY' names no loaded Stage device"),
+        ("Core", 1, "make_positions_stale: 'Core' names no loaded Stage device"),
+    ]
+    for label, reads, message in refusals:
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            core.make_positions_stale(label, reads=reads)
+    # None of the refusals registered anything.
+    core.setPosition("Z", 5.0)
+    assert core.getPosition("Z") == 5.0
+
+
 def _ti2_at(z_um: float) -> FakeCore:
     core = ti2_core()
     core.setPosition("ZDrive", z_um)
