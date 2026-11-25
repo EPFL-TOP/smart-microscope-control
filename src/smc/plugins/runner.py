@@ -338,7 +338,18 @@ def _reads_of(
             reads[slot] = _read_of(doc, slot, plugin.name)
         else:
             reads[slot] = None
-            log.info("%s: not using %s: %s", plugin.name, slot, reason)
+            # Nothing provides it: the normal state of a stand before its first
+            # registration or calibration, and the plugin's own ``assumed`` says
+            # what it did without. A provider that exists and cannot be used (failed,
+            # stale, another stand, a dry run) is something the operator can fix: a
+            # notice. The level is decided from the field, never from the reason's
+            # words (FM-155; m5 §23 D8).
+            level = (
+                logging.DEBUG
+                if doc.provider(slot, excluding=plugin.name) is None
+                else logging.INFO
+            )
+            log.log(level, "%s: not using %s: %s", plugin.name, slot, reason)
     return reads
 
 

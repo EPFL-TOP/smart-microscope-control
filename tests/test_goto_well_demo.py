@@ -783,6 +783,24 @@ def test_goto_well_without_a_plate_drives_to_the_holders_estimate(
     ]
 
 
+def test_a_drive_before_a_registration_logs_no_info_line_about_the_plate(
+    holder_stand: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # #627, m5 §23 D8: a stand before its first registration has no `plate` at all,
+    # which is its normal state; the drive said "not using plate" at INFO on every click.
+    line = (
+        f"goto-well: not using plate: {NO_PLATE}"  # the runner's words, as `unusable`
+    )
+    with caplog.at_level(logging.DEBUG, logger="smc"):
+        _run(holder_stand, tmp_path, well="A1", plate="96-well")
+    about_the_plate = [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if "not using plate" in r.getMessage()
+    ]
+    assert about_the_plate == [(logging.DEBUG, line)]
+
+
 def test_goto_well_on_a_turned_estimate_drives_to_the_turned_well(
     holder_stand: Microscope, tmp_path: Path
 ) -> None:
