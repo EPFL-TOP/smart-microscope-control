@@ -1,1 +1,2 @@
 tests/data/nis/*.xml binary
+.github/CODEOWNERS text eol=lf

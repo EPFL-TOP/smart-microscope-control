@@ -1,0 +1,30 @@
+name: Interface idea
+description: "An idea for the interface, from your own use: the task you were doing, what is wrong or missing, a sketch. No code."
+title: "idea: "
+labels: ["type: feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us about the task, not the code. The lead of the track it lands in plans
+        it (ADR-0010): the owner for what drives or needs a microscope, the analysis
+        lead for what works on acquired data. You need not know which.
+  - type: textarea
+    id: task
+    attributes:
+      label: The task you were doing
+      description: What you were trying to get done with the tool, in a few lines, and where (at a stand, on a scan you had already acquired).
+    validations:
+      required: true
+  - type: textarea
+    id: today
+    attributes:
+      label: What is wrong or missing today
+      description: What you do now, and where it gets in your way. Name the screen and the step.
+    validations:
+      required: true
+  - type: textarea
+    id: sketch
+    attributes:
+      label: A sketch
+      description: Words, a drawing, a photo of one on paper, or a screenshot with notes. No code and no file names.

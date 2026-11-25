@@ -1,7 +1,18 @@
-/src/smc/hardware/  @clementhelsens
-/profiles/          @clementhelsens
-/docs/adr/          @clementhelsens
-/docs/design/       @clementhelsens
-/.github/           @clementhelsens
-/.claude/           @clementhelsens
-/CLAUDE.md          @clementhelsens
+# The map of the two tracks (ADR-0010).
+#
+# The default is the stand: the last matching line wins, so a path that no line
+# below names belongs to the owner. A line with no owner is a path of the analysis
+# track: a pull request that touches only such paths needs the light set and
+# nothing else. A path joins that list through a pull request the owner approves.
+*                               @clementhelsens
+
+# The selection kit, but not the contract between the tracks.
+/src/smc/selection/
+/src/smc/selection/api.py       @clementhelsens
+/src/smc/selection/registry.py  @clementhelsens
+
+# The analysis track's own modules, guide and tests.
+/src/smc/analysis/
+/docs/algorithms/
+/tests/**/test_selector_*.py
+/tests/analysis/
