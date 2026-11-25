@@ -251,6 +251,7 @@ from smc.ui.guide import (
     scanned_line,
     side_words,
     stage_label,
+    stand_calibration_failed,
     step_button_label,
     step_states,
     stop_refused_text,
@@ -4899,6 +4900,14 @@ def test_the_calibrate_texts_say_what_they_say() -> None:
     assert calibration_failed("the frame is dark or flat") == (
         "the last calibration failed: the frame is dark or flat"
     )
+    # The Stand screen's line is the same words with a capital (m5 §22.2 D1), on one line.
+    assert stand_calibration_failed("the frame is dark or flat") == (
+        "The last calibration failed: the frame is dark or flat"
+    )
+    assert stand_calibration_failed("the frame\nis dark") == (
+        "The last calibration failed: the frame is dark"
+    )
+    assert stand_calibration_failed("") == "The last calibration failed: "
 
 
 def test_the_stand_routed_note_the_folder_note_and_the_measured_other_text_are_the_designs() -> (

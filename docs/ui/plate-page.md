@@ -334,6 +334,24 @@ disclosure shows the `smc run` line it makes.
   objective was recorded** has no block, so this button still writes the run document and puts that
   plate out of date.
 
+  **A calibration the tool refused stays on the screen** (since #625). The strip says why once,
+  as every tool's outcome, and the next activity or *Refresh* clears it; so the box also holds
+  one line under the note, in the warning colour, taking no height while it has nothing to say:
+  `The last calibration failed: <the tool's words>`, the same words the Plate screen's block gives
+  a document whose record failed (`the last calibration failed: ...`), without the exception's type
+  and the tool's name, on one line and cut at 600 characters, as plain text. It reads the
+  document the click writes to: **the run document's** latest `camera-calibration` record when the
+  click goes into the run document, and **the position's own document** when it goes into
+  `calibrations/position-<n>.json` (a problem of that document that is not a failure, no file or
+  not JSON, is the block's and not this line's). It stays as long as the record: *Refresh*, the
+  next activity, a closed stand and *Disconnect* leave it, and a calibration of that document
+  that ends `done` replaces the record and takes the line away. A calibration stopped by STOP is
+  a failed record and reads the same way. It is drawn from the last read of the run document at
+  every tick and at the end of every redraw, and never from the stand; the strip, the expert
+  view's card, the known block and the other screens are as they were. **Not looked at in a real
+  browser** at 1280 x 620 and the stand PC's font size, with a refusal from a stand
+  (`docs/design/m5-web-ui.md` §22).
+
 **2. Plate: "Where is the plate?"** From the top:
 
 - **Plate** and, under it, where the choice comes from: `the page's placeholder: choose the
