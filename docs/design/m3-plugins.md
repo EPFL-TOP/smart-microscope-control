@@ -1867,14 +1867,17 @@ locked), scikit-image 0.26.0, numpy 2.5.5, scipy 1.18.1, Python 3.13:
   3 px excluded.
 - **D3 When.** `PARALLEL_SHIFTS_NOTE` is in the first fit's notes **and** at least one probe's first
   shift is within `FIXED_SHIFT_PX` (2.0) of zero on both axes (`reads_the_fixed_pattern`). Nothing else
-  triggers it: a blank field ("barely correlate"), a rigid-camera refusal, a trustworthy fit and a
-  dark probe keep their paths. When it runs, it runs for **both** probes.
+  triggers it: a fit whose only note is "barely correlate", a rigid-camera refusal, a trustworthy fit
+  and a dark probe keep their paths. When it runs, it runs for **both** probes, and a refusal that
+  follows it says what it saw (D5).
 - **D4 Accepted** when both probes' `peak_ratio` is at least `MIN_PEAK_RATIO` (1.5) **and** the two
   shifts are a rigid camera's (`shifts_of_a_rigid_camera`: lengths within `RIGID_MAGNITUDE_TOLERANCE`,
   10 %, and the angle between them within `RIGID_ANGLE_TOLERANCE_DEG`, 10°, of a right angle, for a
   mirrored camera as for the others). `fit` is then run again on the second look's shifts and judged
-  as ever (its notes, the rigidity, the response, `precision_reasons`): a second look that is accepted
-  and a fit that is not is a refusal with the fit's own notes. The second test is a guard independent of the first: on the same fields the two together accepted 123 and 60, the same fields as the ratio alone.
+  as ever (its notes, the rigidity, the response, `precision_reasons`): a second look that is
+  accepted and a fit that is not is a refusal with the fit's own notes. The second test guards
+  independently of the first: on the 148 and the 74 emulated fields it rejected none that the ratio
+  had accepted, so it costs nothing there.
 - **D5 What it says.** *Accepted*: one line of `assumed`, after the step lines and before
   `precision_line`'s, at most 160 characters (FM-205): `sparse field: the camera's own pattern won at
   zero shift, so both shifts are the strongest peaks away from it (<a> and <b> times the next, 1.5
@@ -1922,8 +1925,9 @@ def reads_the_fixed_pattern(shift: Shift) -> bool: ...
 def shifts_of_a_rigid_camera(shift_x: Shift, shift_y: Shift) -> bool: ...
 ```
 
-`plugin.py` keeps the probe frames (three 12 MB frames at most), asks the second look only on D3's
-condition, after the dark-probe judgement and before the error is raised, and builds D5's two texts.
+`plugin.py` keeps the three frames (12 MB in all at 1412 x 1412 and 16 bits), asks the second look
+only on D3's condition, after the dark-probe judgement and before the error is raised, and builds
+D5's two texts.
 
 #### 4.4.4 Tests
 
