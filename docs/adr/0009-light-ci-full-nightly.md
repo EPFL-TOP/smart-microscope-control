@@ -1,6 +1,6 @@
 # 0009 — A light CI on pull requests, the full matrix every night
 
-- **Status**: **accepted** 2026-11-05 by the owner (in chat)
+- **Status**: **accepted** 2026-11-05 by the owner (in chat); amended in part by 0010
 - **Date**: 2026-11-05
 - **Issue**: #354 (implemented by #353)
 - **Amends**: [0005](0005-testing-strategy.md) (the CI paragraph and the

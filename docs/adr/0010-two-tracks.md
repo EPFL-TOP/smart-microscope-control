@@ -1,6 +1,6 @@
 # 0010 — Two tracks in one repository: the stand track and the analysis track
 
-- **Status**: proposed
+- **Status**: **accepted** 2026-11-25 by the owner (in chat)
 - **Date**: 2026-11-25
 - **Issue**: #606
 - **Amends**: [0008](0008-repository-workflow.md) (the protection of `main`
