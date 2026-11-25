@@ -35,6 +35,12 @@ tracking issue (where the lane is). Memory keeps nothing of it.
    is started again the same way. Only a third failure in a row ends the
    lane, with the note `GitHub did not answer three times; resume with
    /lane <S>`.
+
+   **A PR is the step's by what it closes or by its branch.** `lane.py` finds it when GitHub
+   lists the issue among the ones it closes, or when its branch is `<type>/<N>-<slug>` and
+   it was created after the Point: a PR that says `Refs #N` on purpose (an item of the
+   issue stays open, #614) ends its `develop`, `feature`, `review` and `merge` steps all the
+   same, and `docs/` and `adr/` branches (a plan's design PR) never do (#658).
 2. `NEXT: session <skill> <arg> <model>` followed by `BRIEF: <text>`: **one**
    `Agent` call with `subagent_type: "general-purpose"`, `model: <model>`,
    `isolation: "worktree"`, `description: "<skill> <arg> (lane <S>)"` and, as
