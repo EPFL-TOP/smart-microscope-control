@@ -162,12 +162,34 @@ else:  # StreamHandler is subscriptable only from Python 3.11
 
 
 class _CliLogHandler(_StreamHandler):
-    """The handler the CLI puts on the ``smc`` logger; marked so it can be replaced.
+    """The handler the CLI puts on the ``smc`` logger, and on the root when it has none.
 
-    Each command builds a new one on ``sys.stderr`` as it is at that moment:
-    ``CliRunner`` swaps the stream for every invocation, and a handler bound
-    to an earlier one writes into a closed buffer.
+    Marked so a leftover one can be replaced. Each command builds new ones on
+    ``sys.stderr`` as it is at that moment: ``CliRunner`` swaps the stream for
+    every invocation, and a handler bound to an earlier one writes into a
+    closed buffer.
     """
+
+
+class _NoOtherHandler(logging.Filter):
+    """Pass a record only when no handler of its own chain would print it.
+
+    This is ``logging.lastResort``'s rule, which a handler on the root turns
+    off: a logger with a handler of its own (``smc``, ``pymmcore-plus``) has
+    already printed the record, and the propagation that reaches the root
+    would print it a second time. A record that finds no handler on the way
+    up is the one nobody prints, and the root's handler is then the console's
+    only chance to show it (``tornado.application``'s "Uncaught exception").
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        node: logging.Logger | None = logging.getLogger(record.name)
+        # The root is not "below" itself: its handler is the one asking.
+        while node is not None and node.parent is not None:
+            if node.handlers:
+                return False
+            node = node.parent
+        return True
 
 
 @dataclass(frozen=True)
@@ -180,25 +202,50 @@ class _Settings:
 def _configure_logging(level: int) -> Callable[[], None]:
     """Send the ``smc`` loggers to stderr at ``level``; return the call that undoes it.
 
-    The root logger is left alone, and records still propagate, so an
-    application or ``pytest`` that configured it keeps receiving them. The
-    undo runs when the command ends: ``app`` also runs inside other programs
-    (``CliRunner``), where a handler left on a stream that was closed turns
-    every later record into a "Logging error" traceback.
+    A root logger that has no handler gets the CLI's own for the command's life
+    (WARNING, ``LEVEL name: message``, only for a record no other handler of its
+    chain prints). Without it, a library's module-level ``logging.debug()``
+    (bokeh's "Dropping a patch") runs ``basicConfig()`` mid-session: a handler
+    on the root prints every ``smc`` record a second time, then every library's
+    DEBUG, on the console of the loop that handles STOP (#624, FM-148). Not a
+    ``NullHandler``: a handler on the root turns off ``logging.lastResort``, so
+    a library's warning would print nowhere. A root that already has handlers
+    (an application's, ``pytest``'s) is left alone, and records still propagate
+    to it. The root's level is never touched.
+
+    The undo runs when the command ends and removes only what this call added:
+    ``app`` also runs inside other programs (``CliRunner``), where a handler left
+    on a stream that was closed turns every later record into a "Logging error"
+    traceback.
     """
     logger = logging.getLogger("smc")
-    for handler in list(logger.handlers):
-        if isinstance(handler, _CliLogHandler):
-            logger.removeHandler(handler)
+    root = logging.getLogger()
+    # A command whose undo never ran must not make the next one see "a root that
+    # has handlers", nor print through its stale stream.
+    for owner in (logger, root):
+        for stale in list(owner.handlers):
+            if isinstance(stale, _CliLogHandler):
+                owner.removeHandler(stale)
     previous_level = logger.level
     handler = _CliLogHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(level)
+    root_handler: _CliLogHandler | None = None
+    if not root.handlers:
+        root_handler = _CliLogHandler(sys.stderr)
+        root_handler.setLevel(logging.WARNING)
+        root_handler.addFilter(_NoOtherHandler())
+        root_handler.setFormatter(
+            logging.Formatter("%(levelname)s %(name)s: %(message)s")
+        )
+        root.addHandler(root_handler)
 
     def undo() -> None:
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
+        if root_handler is not None:
+            root.removeHandler(root_handler)
 
     return undo
 

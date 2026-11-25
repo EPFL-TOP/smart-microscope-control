@@ -1443,6 +1443,13 @@ negative number (`smc stage jog -100 0`) parses as an unknown option.
 - Root options go before the command: `--verbose/-v` (INFO log on stderr,
   one line per command sent) and `--debug` (DEBUG log, and the traceback
   instead of the one-line error).
+- While a command runs, a root logger that has no handler gets the CLI's own
+  (WARNING, `LEVEL name: message`, only for a record that no other handler of
+  its chain prints), so that a library's module-level `logging.debug()` cannot
+  configure the root (`basicConfig()` printed every `smc` line twice, then every
+  library's DEBUG, #624) and a library's warning still reaches the console once.
+  A root that already has handlers is left alone; the undo removes only what the
+  command added and never sets the root's level (FM-266).
 - **Negative numbers.** The move commands set Click's
   `ignore_unknown_options`, so `-100` is a number, not an option. A
   misspelt option (`--dryrun`) then fails as a bad number or an extra

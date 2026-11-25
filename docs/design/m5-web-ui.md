@@ -1130,7 +1130,10 @@ server's lifetime stays the command's.
 - **`release()` waits for a connect that is still opening**, bounded, inside the
   service's stop budget, and the closing lines say what became of it.
 - **The log**: `smc ui` puts `smc.ui` at INFO (§7.1), so the page's outcomes and
-  STOP's note are in the service's log without `-v`.
+  STOP's note are in the service's log without `-v`. The console holds one line
+  per record: the CLI gives a root that has no handler its own for the command's
+  life, so that a library's module-level `logging` call cannot configure it
+  (m1 §9, FM-266).
 
 ### 7.1 The command (`smc/cli.py`)
 
