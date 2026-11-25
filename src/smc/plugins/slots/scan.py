@@ -23,7 +23,7 @@ from pydantic import (
 from smc.plugins.api import PluginResult
 from smc.plugins.geometry import Matrix2
 from smc.plugins.slots.base import SlotValue
-from smc.plugins.slots.cell_focus import FieldFocus
+from smc.plugins.slots.cell_focus import FieldFocus, FocusMapUse
 from smc.plugins.slots.plate_check import PlateCheck
 from smc.run.files import resolve_in_run, retry_on_permission_error
 
@@ -123,6 +123,10 @@ class ScanResult(PluginResult):
     frames are placed against was last confirmed. ``None`` when the check was
     skipped (its line in ``assumed`` says why) and in every scan written before
     it existed.
+
+    ``focus_map`` is the map the frames' Z came from with ``cell_focus=map`` (m3
+    §21.12.4): the run document, the operator's anchor and each well's. ``None``
+    in every other scan, which is written as before it existed.
     """
 
     folder: str
@@ -134,6 +138,7 @@ class ScanResult(PluginResult):
     frames: tuple[ScanFrame, ...]
     failed: tuple[FailedField, ...]
     plate_check: PlateCheck | None = None
+    focus_map: FocusMapUse | None = None
 
     @model_serializer(mode="wrap")
     def _leave_out_a_check_not_made(
@@ -145,6 +150,8 @@ class ScanResult(PluginResult):
         data: dict[str, Any] = handler(self)
         if self.plate_check is None:
             data.pop("plate_check", None)
+        if self.focus_map is None:
+            data.pop("focus_map", None)
         return data
 
     def frame_index(self) -> dict[str, list[int]]:

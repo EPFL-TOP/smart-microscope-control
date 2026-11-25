@@ -26,6 +26,7 @@ import smc
 from smc.plugins import slots
 from smc.plugins.slots import (
     IMAGE_SIDES,
+    AnchorTry,
     CameraCalibration,
     Cell,
     CellFocusResult,
@@ -36,6 +37,8 @@ from smc.plugins.slots import (
     DensityWell,
     FailedField,
     FieldFocus,
+    FocusAnchor,
+    FocusMapUse,
     FocusSweep,
     LatticeFit,
     MeasuredOffset,
@@ -207,6 +210,72 @@ _FIELD_FOCUS: dict[str, Any] = {
     "dz_um": 0.2,
     "frame_score": 0.3,
     "duration_s": 0.25,
+}
+#: A field whose Z came from the 10x lock map (m3 §21.12.4), with its check sweep
+#: around the map's Z (``map_check_every``): the full sample of ``FieldFocus``.
+_FIELD_FOCUS_MAP: dict[str, Any] = {
+    "source": "map",
+    "sweep": {**_SWEEP, "centre_um": 1500.25},
+    "dz_um": 0.0,
+    "frame_score": 0.3,
+    "duration_s": 0.5,
+    "map_z_um": 1581.5,
+    "anchor_um": -81.25,
+}
+#: The same field without a check: its frame at the map's Z, no sweep.
+_FIELD_FOCUS_MAP_UNCHECKED: dict[str, Any] = {
+    **_FIELD_FOCUS_MAP,
+    "sweep": None,
+    "duration_s": 0.05,
+}
+_ANCHOR_TRY: dict[str, Any] = {
+    "name": "B4_0771",
+    "x_um": 1000.5,
+    "y_um": 2000.25,
+    "map_z_um": 1581.5,
+    "sweep": {**_SWEEP, "centre_um": 1500.25},
+    "error": None,
+}
+#: A try whose move landed and whose sweep failed: its readback, no sweep.
+_ANCHOR_TRY_FAILED: dict[str, Any] = {
+    **_ANCHOR_TRY,
+    "name": "B4_0772",
+    "sweep": None,
+    "error": "FocusDriveOffTarget: Z read 1499.20 µm after a move to 1500.00 µm",
+}
+#: A try whose move failed: nothing read.
+_ANCHOR_TRY_UNMOVED: dict[str, Any] = {
+    "name": "B4_0773",
+    "x_um": None,
+    "y_um": None,
+    "map_z_um": None,
+    "sweep": None,
+    "error": "SafetyRefusedError: the move is outside the soft limits",
+}
+_FOCUS_ANCHOR: dict[str, Any] = {
+    "well": "B4",
+    "source": "swept",
+    "anchor_um": -81.25,
+    "tries": [_ANCHOR_TRY, _ANCHOR_TRY_FAILED],
+    "duration_s": 17.5,
+}
+_FOCUS_MAP_USE: dict[str, Any] = {
+    "run_doc": "C:/runs/2026-11-24/run-10x.json",
+    "scan_attempt": "b50d0123abcd",
+    "measured": "2026-11-24T13:40:05+00:00",
+    "start_anchor_um": -81.75,
+    "anchors": [
+        _FOCUS_ANCHOR,
+        {
+            "well": "C4",
+            "source": "start",
+            "anchor_um": -81.75,
+            # A flat sweep's best_z_um is None: the start anchor's try is a
+            # failed one, whose None is the sweep's (by design).
+            "tries": [{**_ANCHOR_TRY_FAILED, "name": "C4_0771"}],
+            "duration_s": 0.5,
+        },
+    ],
 }
 #: A frame of a scan that ran the focus on the cells (m3 §21.6) and that
 #: records its place in its well (m3 §8, #430): the full sample of ``ScanFrame``.
@@ -478,7 +547,16 @@ SAMPLES: dict[type[BaseModel], Sample] = {
     ),
     FailedField: (_FAILED, _FAILED),
     ScanResult: (
-        {**_SCAN, "frames": [_FRAME, _FRAME_FOCUSED], "plate_check": _PLATE_CHECK},
+        {
+            **_SCAN,
+            "frames": [
+                _FRAME,
+                _FRAME_FOCUSED,
+                {**_FRAME_FOCUSED, "cell_focus": _FIELD_FOCUS_MAP},
+            ],
+            "plate_check": _PLATE_CHECK,
+            "focus_map": _FOCUS_MAP_USE,
+        },
         {**_SCAN, "objective": None, "frames": [], "failed": []},
     ),
     FocusSweep: (
@@ -486,9 +564,15 @@ SAMPLES: dict[type[BaseModel], Sample] = {
         {**_SWEEP, "outcome": "two-peaks", "best_z_um": None},
     ),
     FieldFocus: (
-        _FIELD_FOCUS,
+        _FIELD_FOCUS_MAP,
         {**_FIELD_FOCUS, "source": "well", "sweep": None},
     ),
+    AnchorTry: (_ANCHOR_TRY, _ANCHOR_TRY_UNMOVED),
+    FocusAnchor: (
+        _FOCUS_ANCHOR,
+        {**_FOCUS_ANCHOR, "source": "start", "tries": [], "duration_s": 0.0},
+    ),
+    FocusMapUse: (_FOCUS_MAP_USE, {**_FOCUS_MAP_USE, "anchors": []}),
     CellFocusResult: (
         _CELL_FOCUS,
         {
@@ -604,6 +688,26 @@ def _without(sample: dict[str, Any], path: tuple[Any, ...]) -> dict[str, Any]:
     return changed
 
 
+def _none_by_design(dump: dict[str, Any], path: tuple[Any, ...]) -> bool:
+    """Whether a ``None`` at ``path`` is one a full sample cannot fill.
+
+    An anchor try holds exactly one of its sweep and its error (m3 §21.12.4), so
+    the other is ``None`` in every try, the fullest included.
+    """
+    parent: Any = dump
+    for step in path[:-1]:
+        parent = parent[step]
+    pair = {"sweep": "error", "error": "sweep"}
+    other = pair.get(path[-1]) if path else None
+    return (
+        other is not None
+        and isinstance(parent, dict)
+        and "map_z_um" in parent
+        and "name" in parent
+        and parent.get(other) is not None
+    )
+
+
 def _error_types(model: type[BaseModel], data: dict[str, Any]) -> list[str]:
     with pytest.raises(ValidationError) as raised:
         model.model_validate(data)
@@ -638,7 +742,11 @@ def test_every_slot_model_round_trips_through_json(model: type[BaseModel]) -> No
         assert model.model_validate(original.model_dump(mode="json")) == original
     # The full sample must really be full, or the round trip proves little.
     full_dump = model.model_validate(full).model_dump(mode="json")
-    assert [path for path, leaf in _leaves(full_dump) if leaf is None] == []
+    assert [
+        path
+        for path, leaf in _leaves(full_dump)
+        if leaf is None and not _none_by_design(full_dump, path)
+    ] == []
 
 
 @MODELS
@@ -721,6 +829,7 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (ScanFrame, ("index",), [-1], [0]),
     (ScanFrame, ("t_s",), [-0.1], [0.0]),
     (FieldFocus, ("duration_s",), [-0.1], [0.0]),
+    (FocusAnchor, ("duration_s",), [-0.1], [0.0]),
     (FailedField, ("index",), [-1], [0]),
     (ScanResult, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
     (ScanResult, ("exposure_ms",), [-0.1], [0.0]),
@@ -825,6 +934,7 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (ScanFrame, ("z_um",)),
     (ScanFrame, ("pfs_offset",)),
     (ScanResult, ("objective",)),
+    (AnchorTry, ("error",)),
     (CellFocusResult, ("objective",)),
     (CellFocusResult, ("x_um",)),
     (CellFocusResult, ("pfs_offset",)),
@@ -1267,6 +1377,89 @@ def test_a_field_focus_has_its_sweep_exactly_when_swept() -> None:
     assert _error_types(FieldFocus, well) == ["value_error"]
 
 
+def test_a_map_field_focus_needs_its_map_z_and_its_anchor() -> None:
+    # m3 §21.12.4: the frame's Z command is map_z_um + anchor_um, so a map focus
+    # without either says nothing of where the frame was taken.
+    for key in ("map_z_um", "anchor_um"):
+        assert _error_types(FieldFocus, {**_FIELD_FOCUS_MAP, key: None}) == [
+            "value_error"
+        ]
+        assert _error_types(FieldFocus, _without(_FIELD_FOCUS_MAP, (key,))) == [
+            "value_error"
+        ]
+        # And the other side: a swept or well focus holds neither.
+        assert _error_types(FieldFocus, {**_FIELD_FOCUS, key: 1.0}) == ["value_error"]
+        well = {**_FIELD_FOCUS, "source": "well", "sweep": None, key: 1.0}
+        assert _error_types(FieldFocus, well) == ["value_error"]
+    # A map focus with or without its check sweep: both are frames at the map's Z,
+    # and both come back through their dump.
+    for sample in (_FIELD_FOCUS_MAP, _FIELD_FOCUS_MAP_UNCHECKED):
+        focus = FieldFocus.model_validate(sample)
+        assert (focus.sweep is None) == (sample["sweep"] is None)
+        assert FieldFocus.model_validate(focus.model_dump(mode="json")) == focus
+
+
+def test_a_swept_or_well_focus_dumps_no_map_key() -> None:
+    # A scan with per-field or per-well is written as before the map existed, so
+    # an older smc reads it: its model refuses a key it does not know (FM-107).
+    well = {**_FIELD_FOCUS, "source": "well", "sweep": None}
+    for sample in (_FIELD_FOCUS, well):
+        focus = FieldFocus.model_validate(sample)
+        for dump in (
+            focus.model_dump(),
+            focus.model_dump(mode="json"),
+            json.loads(focus.model_dump_json()),
+        ):
+            assert set(dump) == set(sample)
+    mapped = FieldFocus.model_validate(_FIELD_FOCUS_MAP).model_dump(mode="json")
+    assert (mapped["map_z_um"], mapped["anchor_um"]) == (1581.5, -81.25)
+    # Nested in a frame, each is left out by its own rule.
+    frame = ScanFrame.model_validate(_FRAME_FOCUSED).model_dump(mode="json")
+    assert set(frame["cell_focus"]) == set(_FIELD_FOCUS)
+
+
+def test_a_scan_without_the_map_dumps_no_focus_map_key() -> None:
+    result = ScanResult.model_validate({**_SCAN, "plate_check": _PLATE_CHECK})
+    assert result.focus_map is None
+    for dump in (
+        result.model_dump(),
+        result.model_dump(mode="json"),
+        json.loads(result.model_dump_json()),
+    ):
+        assert "focus_map" not in dump
+    mapped = ScanResult.model_validate({**_SCAN, "focus_map": _FOCUS_MAP_USE})
+    dumped = mapped.model_dump(mode="json")
+    assert dumped["focus_map"]["start_anchor_um"] == -81.75
+    assert ScanResult.model_validate(dumped) == mapped
+
+
+def test_an_anchor_try_holds_its_sweep_or_its_error_not_both() -> None:
+    both = {**_ANCHOR_TRY, "error": "HardwareError: x"}
+    assert _error_types(AnchorTry, both) == ["value_error"]
+    neither = {**_ANCHOR_TRY, "sweep": None}
+    assert _error_types(AnchorTry, neither) == ["value_error"]
+    AnchorTry.model_validate(_ANCHOR_TRY_FAILED)
+    # The readback and the map's Z go together: all set or all None.
+    for key in ("x_um", "y_um", "map_z_um"):
+        assert _error_types(AnchorTry, {**_ANCHOR_TRY_FAILED, key: None}) == [
+            "value_error"
+        ]
+        assert _error_types(AnchorTry, {**_ANCHOR_TRY_UNMOVED, key: 1.0}) == [
+            "value_error"
+        ]
+
+
+def test_a_swept_anchor_needs_a_peak_and_a_start_anchor_none() -> None:
+    flat = {**_ANCHOR_TRY, "sweep": {**_SWEEP, "outcome": "flat", "best_z_um": None}}
+    no_peak = {**_FOCUS_ANCHOR, "tries": [flat, _ANCHOR_TRY_FAILED]}
+    assert _error_types(FocusAnchor, no_peak) == ["value_error"]
+    assert _error_types(FocusAnchor, {**_FOCUS_ANCHOR, "tries": []}) == ["value_error"]
+    FocusAnchor.model_validate({**no_peak, "source": "start"})
+    assert _error_types(FocusAnchor, {**_FOCUS_ANCHOR, "source": "start"}) == [
+        "value_error"
+    ]
+
+
 def test_a_cell_focus_result_names_one_file_per_plane_or_none() -> None:
     two = {**_CELL_FOCUS, "files": _CELL_FOCUS["files"][:2]}
     assert _error_types(CellFocusResult, two) == ["value_error"]
@@ -1524,6 +1717,7 @@ def test_the_foundation_imports_no_hardware_and_files_imports_no_plugins() -> No
 #: The names of design §3's map that ``smc.plugins.slots`` re-exports, and that eight
 #: parallel issues import: a rename or a drop is a plan deviation, not a quiet edit.
 SLOTS_MAP = {
+    "AnchorTry",
     "CameraCalibration",
     "Cell",
     "CellFocusResult",
@@ -1534,6 +1728,8 @@ SLOTS_MAP = {
     "DensityWell",
     "FailedField",
     "FieldFocus",
+    "FocusAnchor",
+    "FocusMapUse",
     "FocusState",
     "FocusSweep",
     "IMAGE_SIDES",

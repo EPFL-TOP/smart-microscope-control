@@ -11,7 +11,14 @@ from __future__ import annotations
 
 from smc.plugins.slots.base import SlotValue
 from smc.plugins.slots.camera_calibration import CameraCalibration
-from smc.plugins.slots.cell_focus import CellFocusResult, FieldFocus, FocusSweep
+from smc.plugins.slots.cell_focus import (
+    AnchorTry,
+    CellFocusResult,
+    FieldFocus,
+    FocusAnchor,
+    FocusMapUse,
+    FocusSweep,
+)
 from smc.plugins.slots.cells import Cell, CellsFile, CellsResult, load_cells
 from smc.plugins.slots.density import DensityResult, DensityWell
 from smc.plugins.slots.nis_export import NisExportResult
@@ -59,6 +66,7 @@ from smc.plugins.slots.timings import TimingsResult
 
 __all__ = [
     "IMAGE_SIDES",
+    "AnchorTry",
     "CameraCalibration",
     "Cell",
     "CellFocusResult",
@@ -69,6 +77,8 @@ __all__ = [
     "DensityWell",
     "FailedField",
     "FieldFocus",
+    "FocusAnchor",
+    "FocusMapUse",
     "FocusState",
     "FocusSweep",
     "ImageSide",
