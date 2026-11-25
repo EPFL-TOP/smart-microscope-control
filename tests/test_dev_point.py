@@ -2,6 +2,7 @@
 
 import importlib.util
 import io
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -478,18 +479,37 @@ def test_the_nightly_issue_is_not_counted_among_the_issues_by_status(point) -> N
 # --- the report, end to end on canned data ------------------------------------
 
 
-def _canned(runs: list[dict], issues: list[dict], seen: list[tuple[str, ...]]):
+def _canned(
+    runs: list[dict],
+    issues: list[dict],
+    seen: list[tuple[str, ...]],
+    prs=(),
+    merged=(),
+    closed=(),
+    refs: dict | None = None,
+):
+    """A stand-in for ``gh_json``: the listings, and the state of a referenced issue.
+
+    ``refs`` maps an issue number to what ``gh api repos/<repo>/issues/<n>`` answers
+    (open by default); any other ``api`` call answers ``[]`` (the milestones).
+    """
+
     def fake(*args: str):
         seen.append(args)
         if args[:2] == ("repo", "view"):
             return {"nameWithOwner": "EPFL-TOP/smart-microscope-control"}
         if args[:2] == ("issue", "list"):
-            return issues if "open" in args else []
+            return issues if "open" in args else list(closed)
         if args[:2] == ("pr", "list"):
-            return []
+            if "open" in args:
+                return list(prs)
+            return list(merged) if "merged" in args else []
         if args[0] == "run":
             return runs
         if args[0] == "api":
+            found = re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\d+)", args[1])
+            if found:
+                return (refs or {}).get(int(found.group(1)), {"state": "open"})
             return []
         raise AssertionError(f"unexpected gh call: {args}")
 
@@ -1158,3 +1178,529 @@ def test_every_gh_child_of_the_point_has_no_console_a_timeout_and_utf8(
     monkeypatch.setattr(point.subprocess, "run", hang)
     with pytest.raises(SystemExit, match="timed out"):
         point.gh("api", "--paginate", "repos/o/r/issues/51/comments")
+
+
+# --- two tracks (ADR-0010, #653): one report per track --------------------------------
+
+
+def _work(number: int, title: str, labels: list[str], body: str = "") -> dict:
+    return {**_issue(number, title, labels), "body": body}
+
+
+# The open issues of 2026-11-25, in `gh`'s shape (titles are invented, labels are the day's).
+TODAY = [
+    _work(
+        636,
+        "feat: the ten-to-forty plan",
+        [
+            "type: feature",
+            "status: in-progress",
+            "priority: p1",
+            "area: algorithms",
+            "track: analysis",
+        ],
+    ),
+    _work(
+        632,
+        "adr: the notebook",
+        [
+            "type: adr",
+            "area: ui",
+            "status: needs-decision",
+            "priority: p1",
+            "track: analysis",
+        ],
+    ),
+    _work(
+        654,
+        "chore: the analysis docs",
+        ["type: chore", "area: docs", "priority: p1", "track: analysis"],
+    ),
+    _work(
+        600,
+        "feat: models by name",
+        [
+            "type: feature",
+            "area: plugins",
+            "area: ui",
+            "status: blocked",
+            "priority: p1",
+            "track: analysis",
+        ],
+        "**Depends on**: #599, #567",
+    ),
+    _work(
+        634,
+        "feat: the focus screen",
+        [
+            "type: feature",
+            "area: plugins",
+            "area: ui",
+            "scope: nikon-ti2",
+            "priority: p0",
+        ],
+    ),
+    _work(
+        644,
+        "feat: the focus sweep",
+        [
+            "type: feature",
+            "area: plugins",
+            "scope: nikon-ti2",
+            "status: in-progress",
+            "priority: p1",
+        ],
+    ),
+    _work(653, "chore: the tracks", ["type: chore", "area: ci", "priority: p1"]),
+    _work(
+        599,
+        "adr: the models",
+        ["type: adr", "area: plugins", "status: needs-decision", "priority: p1"],
+    ),
+    _work(
+        635,
+        "feat: the stand side of the models",
+        ["type: feature", "area: plugins", "status: blocked", "priority: p1"],
+        "**Depends on**: #599",
+    ),
+    _issue(51, "Point: next steps", []),
+    _issue(670, "Point (analysis): next steps", ["track: analysis"]),
+]
+CLOSED_REFS = {567: {"state": "closed"}}
+
+
+def _report(
+    point,
+    monkeypatch,
+    capsys,
+    tmp_path,
+    issues,
+    *,
+    track: str | None = None,
+    since: str | None = "2026-11-01",
+    **canned,
+) -> str:
+    """The report of a track on canned data, with ``point.ROOT`` in an empty folder.
+
+    The real ADR files and survey folders must not make an assertion pass by accident.
+    """
+    monkeypatch.setattr(point, "ROOT", tmp_path)
+    monkeypatch.setattr(point, "gh_json", _canned([], issues, [], **canned))
+    argv = ["point.py"]
+    if since:
+        argv += ["--since", since]
+    if track:
+        argv += ["--track", track]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert point.main() == 0
+    return capsys.readouterr().out
+
+
+def _section(out: str, heading: str) -> str:
+    return out.split(f"## {heading}")[1].split("\n## ")[0]
+
+
+def _mentions(out: str, number: int) -> bool:
+    return re.search(rf"#{number}\b", out) is not None
+
+
+def test_the_analysis_report_lists_the_analysis_issues_and_none_of_the_stands(
+    point, monkeypatch, capsys, tmp_path
+) -> None:
+    out = _report(
+        point,
+        monkeypatch,
+        capsys,
+        tmp_path,
+        TODAY,
+        track="analysis",
+        refs=CLOSED_REFS,
+    )
+    assert out.splitlines()[0].startswith("# Point facts (analysis track, ")
+    status = _section(out, "Open issues by status").strip().splitlines()
+    assert status == [
+        "- in-progress: #636",
+        "- blocked: #600",
+        "- needs-decision: #632",
+        "- no status: #654",
+    ]
+    for number in (634, 644, 653, 635, 51, 670):
+        assert not _mentions(out, number), number
+    # #599 is the stand's: it is named in the last section only
+    before_asks, asks = out.split("## Asks to the other track")
+    assert not _mentions(before_asks, 599)
+    assert asks.strip().splitlines() == [
+        "- #599 (stand track, needs-decision): awaited by #600"
+    ]
+    blocked = _section(out, "Blocked issues and their dependencies")
+    assert "- #600: #567 closed; waits on the stand track (see Asks)" in blocked
+    assert "ALL MERGED" not in blocked
+
+
+def test_the_stand_report_names_the_analysis_issues_only_among_the_asks(
+    point, monkeypatch, capsys, tmp_path
+) -> None:
+    waiting = _work(
+        637, "feat: wires the plan", ["type: feature"], "**Depends on**: #636"
+    )
+    out = _report(
+        point,
+        monkeypatch,
+        capsys,
+        tmp_path,
+        [*TODAY, waiting],
+        refs=CLOSED_REFS,
+    )
+    assert out.splitlines()[0].startswith("# Point facts (stand track, ")
+    for number in (632, 654, 600, 670):
+        assert not _mentions(out, number), number
+    before_asks, asks = out.split("## Asks to the other track")
+    assert not _mentions(before_asks, 636)
+    assert asks.strip().splitlines() == [
+        "- #636 (analysis track, in-progress): awaited by #637"
+    ]
+    # the stand's own issues are all there
+    status = _section(out, "Open issues by status")
+    for number in (634, 644, 653, 599, 635, 637):
+        assert _mentions(status, number), number
+    # #635 waits on #599, an open issue of its own track: it is named, not an ask
+    assert "- #635: #599 open" in _section(out, "Blocked issues")
+
+
+def test_an_ask_is_an_open_issue_of_the_other_track_only(point) -> None:
+    rules = point.tracks.read_rules()
+    issues = [
+        _work(10, "a", ["status: blocked"], "**Depends on**: #20, #11"),
+        _work(11, "b", [], "**Depends on**: #99"),  # #99 is closed: not in the listing
+        _work(12, "c", [], "**Depends on**: #20"),
+        _work(20, "d", ["status: ready", "track: analysis"], "**Depends on**: #10"),
+    ]
+    assert point.asks("stand", issues, [], rules) == [
+        "- #20 (analysis track, ready): awaited by #10, #12"
+    ]
+    # the same list read by the other track: #20 waits on the stand's #10
+    assert point.asks("analysis", issues, [], rules) == [
+        "- #10 (stand track, blocked): awaited by #20"
+    ]
+    assert point.asks("stand", issues[:3], [], rules) == ["- none"]
+
+
+def test_the_asks_are_in_number_order_and_name_a_waiting_issue_once(point) -> None:
+    rules = point.tracks.read_rules()
+    issues = [
+        # listed in the order that would give the wrong answer if nothing sorted them
+        _work(12, "c", [], "**Depends on**: #20, #20"),
+        _work(10, "a", [], "**Depends on**: #21, #20"),
+        _work(21, "d", ["track: analysis", "status: ready"]),
+        _work(20, "e", ["track: analysis", "status: blocked"]),
+    ]
+    assert point.asks("stand", issues, [], rules) == [
+        "- #20 (analysis track, blocked): awaited by #10, #12",
+        "- #21 (analysis track, ready): awaited by #10",
+    ]
+    crossings = [
+        _pr_of(9, ["pyproject.toml"], (21,)),
+        _pr_of(7, ["pyproject.toml"], (21,)),
+    ]
+    lines = point.asks("analysis", [issues[2]], crossings, rules)
+    assert [ln.split(" of ")[0] for ln in lines] == ["- PR #7", "- PR #9"]
+
+
+def test_the_first_issue_of_a_pr_is_the_one_github_says_it_closes(point) -> None:
+    # closing #5 on a branch named for #9: both are open issues, #5 is the first
+    pr = _pr_of(8, ["pyproject.toml"], (5,), branch="feat/9-x")
+    by_number = {5: _work(5, "a", ["track: analysis"]), 9: _work(9, "b", [])}
+    assert point.pr_open_issue(pr, by_number)["number"] == 5
+    assert point.pr_open_issue(_pr_of(8, [], branch="feat/7-x"), by_number) is None
+
+
+def test_an_ask_takes_a_plans_depends_on_line_before_the_body(point) -> None:
+    rules = point.tracks.read_rules()
+    planned = {
+        **_work(10, "a", [], "**Depends on**: #11"),
+        "comments": [_c("## Plan (design session)\n\n**Depends on**: #20", "t")],
+    }
+    issues = [planned, _work(11, "b", []), _work(20, "c", ["track: analysis"])]
+    assert point.asks("stand", issues, [], rules) == [
+        "- #20 (analysis track, no status): awaited by #10"
+    ]
+
+
+def _pr_of(
+    number: int,
+    paths: list[str],
+    closing: tuple[int, ...] = (),
+    branch: str = "",
+    changed: int | None = None,
+) -> dict:
+    return {
+        "number": number,
+        "title": f"pr {number}",
+        "mergeStateStatus": "CLEAN",
+        "statusCheckRollup": [],
+        "reviews": [],
+        "comments": [],
+        "isDraft": False,
+        "headRefName": branch,
+        "closingIssuesReferences": [{"number": n} for n in closing],
+        "files": [{"path": p} for p in paths],
+        "changedFiles": len(paths) if changed is None else changed,
+    }
+
+
+ANALYSIS_PATH = "src/smc/selection/builtin.py"
+
+
+def test_a_pr_is_listed_in_the_report_of_the_track_of_its_paths(
+    point, monkeypatch, capsys, tmp_path
+) -> None:
+    prs = [
+        _pr_of(701, [ANALYSIS_PATH, "docs/algorithms/README.md"], (654,)),
+        _pr_of(702, [ANALYSIS_PATH, "pyproject.toml"], (636,)),
+        # two files listed of three: a cut listing is read as the stand's (FM-256)
+        _pr_of(703, [ANALYSIS_PATH, "docs/algorithms/README.md"], changed=3),
+        # a plain PR of the stand's own issue and paths: nobody is asked anything
+        _pr_of(707, ["pyproject.toml"], branch="feat/653-x"),
+    ]
+    stand = _report(point, monkeypatch, capsys, tmp_path, TODAY, prs=prs)
+    analysis = _report(
+        point, monkeypatch, capsys, tmp_path, TODAY, prs=prs, track="analysis"
+    )
+    stand_prs = _section(stand, "Open pull requests")
+    analysis_prs = _section(analysis, "Open pull requests")
+    assert not _mentions(stand_prs, 701)
+    assert [ln[:6] for ln in analysis_prs.strip().splitlines()] == ["- #701"]
+    # a crossing: the issue is the analysis track's, a path is the stand's
+    (crossing,) = (ln for ln in stand_prs.splitlines() if ln.startswith("- #702"))
+    assert crossing.endswith("| crossing: its issue is the analysis track's")
+    (cut,) = (ln for ln in stand_prs.splitlines() if ln.startswith("- #703"))
+    assert "crossing" not in cut
+    # the analysis lead is asked for the crossing, by its stand paths, and for nothing else:
+    # #701 and #707 are each track's own, #703 has no issue (the whole section, both ways)
+    assert (
+        _section(analysis, "Asks to the other track").strip().splitlines()
+        == [
+            "- #599 (stand track, needs-decision): awaited by #600",  # TODAY's, before the PRs
+            "- PR #702 of #636 is on the stand track's paths: pyproject.toml",
+        ]
+    )
+    assert not _mentions(analysis_prs, 702)
+    assert _section(stand, "Asks to the other track").strip().splitlines() == ["- none"]
+
+
+def test_a_pr_of_a_stand_issue_on_analysis_paths_is_the_analysis_leads_and_an_ask(
+    point, monkeypatch, capsys, tmp_path
+) -> None:
+    prs = [_pr_of(704, [ANALYSIS_PATH], branch="feat/653-x")]
+    stand = _report(point, monkeypatch, capsys, tmp_path, TODAY, prs=prs)
+    analysis = _report(
+        point, monkeypatch, capsys, tmp_path, TODAY, prs=prs, track="analysis"
+    )
+    assert not _mentions(_section(stand, "Open pull requests"), 704)
+    assert (
+        "- PR #704 of #653 is on the analysis track's paths: " + ANALYSIS_PATH
+    ) in stand.split("## Asks to the other track")[1]
+    (line,) = (
+        ln
+        for ln in _section(analysis, "Open pull requests").splitlines()
+        if ln.startswith("- #704")
+    )
+    assert line.endswith("| crossing: its issue is the stand track's")
+
+
+def test_a_cut_listing_with_no_path_to_name_is_still_an_ask(point) -> None:
+    rules = point.tracks.read_rules()
+    issues = [_work(636, "x", ["track: analysis"])]
+    cut = _pr_of(705, [ANALYSIS_PATH], (636,), changed=4)
+    (line,) = point.asks("analysis", issues, [cut], rules)
+    assert line == (
+        "- PR #705 of #636 is on the stand track's paths: 1 of 4 files listed, the rest cut"
+    )
+    many = _pr_of(706, [f"src/smc/ui/p{i}.py" for i in range(5)], (636,))
+    (line,) = point.asks("analysis", issues, [many], rules)
+    assert line.endswith(
+        "src/smc/ui/p0.py, src/smc/ui/p1.py, src/smc/ui/p2.py (+2 more)"
+    )
+
+
+def test_the_merged_prs_are_listed_in_the_report_of_the_track_of_their_paths(
+    point, monkeypatch, capsys, tmp_path
+) -> None:
+    def merged(number: int, paths: list[str]) -> dict:
+        return {
+            "number": number,
+            "title": f"merged {number}",
+            "mergedAt": "2026-11-10T00:00:00Z",
+            "reviews": [],
+            "comments": [],
+            "files": [{"path": p} for p in paths],
+            "changedFiles": len(paths),
+        }
+
+    done = [
+        merged(801, [ANALYSIS_PATH]),
+        merged(802, ["pyproject.toml", ANALYSIS_PATH]),
+    ]
+    stand = _report(point, monkeypatch, capsys, tmp_path, TODAY, merged=done)
+    analysis = _report(
+        point, monkeypatch, capsys, tmp_path, TODAY, merged=done, track="analysis"
+    )
+    assert _mentions(_section(stand, "Merged since the last point"), 802)
+    assert not _mentions(_section(stand, "Merged since the last point"), 801)
+    assert _mentions(_section(analysis, "Merged since the last point"), 801)
+    assert not _mentions(_section(analysis, "Merged since the last point"), 802)
+
+
+def test_each_report_reads_the_lanes_of_its_own_tracking_issue(
+    point, monkeypatch, capsys, tmp_path
+) -> None:
+    stand_issue = {
+        **_issue(51, "Point: next steps", []),
+        "comments": [
+            _c("## Point (design session, 2026-11-11)\n\nS", "2026-11-11T08:00:00Z"),
+            _lane("S1", "2026-11-11T09:00:00Z", "S1.1 stand", "S1.2 next"),
+        ],
+    }
+    analysis_issue = {
+        **_issue(670, "Point (analysis): next steps", ["track: analysis"]),
+        "comments": [
+            _c("## Point (design session, 2026-11-14)\n\nA", "2026-11-14T08:00:00Z"),
+            _lane("A1", "2026-11-14T09:00:00Z", "A1.1 analysis", "A1.2 next"),
+            _lane("S2", "2026-11-14T10:00:00Z", "a stray note", "x"),
+        ],
+    }
+    issues = [stand_issue, analysis_issue]
+    stand = _report(point, monkeypatch, capsys, tmp_path, issues, since=None)
+    analysis = _report(
+        point, monkeypatch, capsys, tmp_path, issues, since=None, track="analysis"
+    )
+    # each window opens at the last Point of its own tracking issue (FM-220)
+    assert "since 2026-11-11T08:00:00Z" in stand.splitlines()[0]
+    assert "since 2026-11-14T08:00:00Z" in analysis.splitlines()[0]
+    stand_lanes = _section(stand, "Lanes since the last point")
+    assert "- S1 (2026-11-11T09:00:00Z): S1.1 stand / S1.2 next" in stand_lanes
+    assert "A1" not in stand_lanes
+    analysis_lanes = _section(analysis, "Lanes since the last point")
+    assert "- A1 (2026-11-14T09:00:00Z): A1.1 analysis / A1.2 next" in analysis_lanes
+    assert "S1" not in analysis_lanes
+
+
+def test_a_lane_note_of_an_analysis_lane_is_read(point) -> None:
+    comments = [
+        _lane("A2", "2026-11-12T11:00:00Z", "A2.1 `/plan 700`", "wait"),
+        _lane("A1", "2026-11-12T09:00:00Z", "A1.1 done", "A1.2 develop"),
+        _lane("S1", "2026-11-12T08:00:00Z", "stand", "x"),
+        _lane("A10", "2026-11-12T12:00:00Z", "tenth", "n10"),
+    ]
+    assert point.lane_notes(comments, "") == [
+        "- A1 (2026-11-12T09:00:00Z): A1.1 done / A1.2 develop",
+        "- A2 (2026-11-12T11:00:00Z): A2.1 `/plan 700` / wait",
+        "- A10 (2026-11-12T12:00:00Z): tenth / n10",
+        "- S1 (2026-11-12T08:00:00Z): stand / x",
+    ]
+    note = _note("A1", "2026-11-18T09:00:00Z", "**For /point**: an A1 line", "u1")
+    assert point.for_point_lines([note], "") == [
+        "- A1 (2026-11-18T09:00:00Z): an A1 line u1"
+    ]
+
+
+def test_both_tracking_issues_are_left_out_of_the_work(point) -> None:
+    issues = [
+        _issue(51, "Point: next steps", []),
+        _issue(670, "Point (analysis): next steps", ["track: analysis"]),
+        _issue(5, "feat: x", []),
+    ]
+    assert [i["number"] for i in point.work_issues(issues)] == [5]
+
+
+@pytest.mark.parametrize("track", [None, "analysis"])
+def test_the_report_ends_with_the_asks_to_the_other_track(
+    point, monkeypatch, capsys, tmp_path, track
+) -> None:
+    out = _report(point, monkeypatch, capsys, tmp_path, [], track=track)
+    headings = [line for line in out.splitlines() if line.startswith("## ")]
+    assert headings[-1] == "## Asks to the other track"
+    assert out.split("## Asks to the other track")[1].strip() == "- none"
+
+
+def test_the_survey_folders_are_listed_in_the_stand_report_only(
+    point, monkeypatch, capsys, tmp_path
+) -> None:
+    (tmp_path / "local" / "surveys" / "stand-x").mkdir(parents=True)
+    stand = _report(point, monkeypatch, capsys, tmp_path, [])
+    analysis = _report(point, monkeypatch, capsys, tmp_path, [], track="analysis")
+    assert "- stand-x: NOT CURATED YET" in stand
+    assert "Survey folders" not in analysis
+    assert "stand-x" not in analysis
+
+
+def test_the_listings_ask_for_the_paths_and_the_labels_the_tracks_need(
+    point, monkeypatch, capsys, tmp_path
+) -> None:
+    seen: list[tuple[str, ...]] = []
+    monkeypatch.setattr(point, "ROOT", tmp_path)
+    monkeypatch.setattr(point, "gh_json", _canned([], [], seen))
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+    assert point.main() == 0
+    capsys.readouterr()
+
+    def fields(kind: str, state: str) -> set[str]:
+        call = next(a for a in seen if a[:2] == (kind, "list") and state in a)
+        return set(call[call.index("--json") + 1].split(","))
+
+    assert {"files", "changedFiles", "headRefName"} <= fields("pr", "open")
+    assert {"files", "changedFiles"} <= fields("pr", "merged")
+    assert "labels" in fields("issue", "closed")
+
+
+def test_the_closed_issues_of_the_other_track_are_not_read_as_news(
+    point, monkeypatch, capsys, tmp_path
+) -> None:
+    closed = [
+        {
+            **_issue(660, "feat: done", ["track: analysis"]),
+            "comments": [_c("a note on the analysis side", "2026-11-12T10:00:00Z")],
+        },
+        {
+            **_issue(661, "feat: done", []),
+            "comments": [_c("a note on the stand side", "2026-11-12T10:00:00Z")],
+        },
+    ]
+    stand = _report(point, monkeypatch, capsys, tmp_path, [], closed=closed)
+    analysis = _report(
+        point, monkeypatch, capsys, tmp_path, [], closed=closed, track="analysis"
+    )
+    assert "#661 note" in stand
+    assert "#660" not in stand
+    assert "#660 note" in analysis
+    assert "#661" not in analysis
+
+
+def test_an_unknown_track_is_a_usage_error(point, monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["point.py", "--track", "lab"])
+    with pytest.raises(SystemExit) as stop:
+        point.main()
+    assert stop.value.code == 2
+
+
+def test_the_default_track_is_the_stand_and_the_stand_title_is_unchanged(
+    point,
+) -> None:
+    assert point.TRACKING_TITLE == "Point: next steps"
+    assert point.tracks.TRACKING_TITLES["stand"] == point.TRACKING_TITLE
+
+
+def test_a_blocked_line_with_no_dependency_keeps_its_words(point) -> None:
+    issue = {"number": 9}
+    assert point.blocked_line(issue, {}, "stand", {}) == "- #9: no Depends-on line"
+    states = {4: "merged", 5: "closed"}
+    assert point.blocked_line(issue, states, "stand", {}) == (
+        "- #9: #4 merged, #5 closed  -> ALL MERGED, can be unblocked"
+    )
+    # an open issue of the other track is the whole line after the colon when alone
+    other = {7: _work(7, "x", ["track: analysis"])}
+    assert point.blocked_line(issue, {7: "open"}, "stand", other) == (
+        "- #9: waits on the analysis track (see Asks)"
+    )
+    # the same issue seen by its own track is an ordinary dependency
+    assert point.blocked_line(issue, {7: "open"}, "analysis", other) == "- #9: #7 open"

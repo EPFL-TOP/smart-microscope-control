@@ -43,6 +43,17 @@ def test_the_number_is_the_whole_leading_number(refs) -> None:
     assert refs.allowed("fix/13x-y") == set()
 
 
+def test_a_branch_names_its_issue_whatever_its_type(refs) -> None:
+    # `allowed` is what a PR may close: a design branch closes nothing, yet it is
+    # still the issue's (tracks.pr_issues reads the PR of a plan's design branch).
+    assert refs.branch_issue("feat/653-x") == 653
+    assert refs.branch_issue("docs/654-x") == 654
+    assert refs.branch_issue("adr/606") == 606
+    assert refs.branch_issue("main") is None
+    assert refs.branch_issue("feat/x") is None
+    assert refs.allowed("docs/654-x") == set()
+
+
 def test_main_exits_1_and_names_the_fix(refs, capsys) -> None:
     assert refs.main(["docs/48-probe", "48"]) == 1
     out = capsys.readouterr().out
