@@ -65,13 +65,16 @@ class _Z:
         self.engaged_at_move: list[bool] = []
         self.fail: dict[int, BaseException] = {}
         self.off_um: dict[int, float] = {}
+        #: The same, for the read of ``position_um()`` after that move: the read
+        #: again of a readback that was off (#622).
+        self.reread_off_um: dict[int, float] = {}
         #: The soft limits this drive reports; ``None``: the stand's.
         self.limits: Limits | None = None
         #: Called with the move's number after each move.
         self.after_move: Callable[[int], None] | None = None
 
     def position_um(self) -> float:
-        return self._inner.position_um()
+        return self._inner.position_um() + self.reread_off_um.get(len(self.moves), 0.0)
 
     def move_to_um(self, z_um: float, *, keep_autofocus: bool = True) -> float:
         assert keep_autofocus is False, "the sweep moves Z with the autofocus off"
@@ -234,22 +237,25 @@ def test_the_entry_point_loads_focus_on_cells() -> None:
     assert entry.target == "smc.plugins.cell_focus.plugin:FocusOnCellsPlugin"
 
 
-def test_a_sweep_from_20_um_finds_the_sharp_plane_within_one_step(
+def test_a_sweep_from_10_um_finds_the_sharp_plane_within_one_step(
     open_stand: Callable[..., Microscope], run_doc: Path
 ) -> None:
+    # From 20 µm, as before #622, the sharp plane is the sweep's second of 11
+    # and the sweep is at-edge (§21.11 D8): the smoothed curve has no score on
+    # the end planes, so it will not call a peak there.
     stand = open_stand()
     z = stand.require(ZStage)
-    start = z.move_to_um(20.0)
+    start = z.move_to_um(10.0)
 
     result = _result(_run(stand, run_doc, range_um=25.0, step_um=5.0))
 
     sweep = result.sweep
     assert sweep.centre_um == start
     assert len(sweep.z_um) == 11
-    assert sweep.z_um[0] == pytest.approx(-5.0, abs=0.01)
+    assert sweep.z_um[0] == pytest.approx(-15.0, abs=0.01)
     assert sweep.outcome == "peak"
     assert sweep.best_z_um is not None
-    # Measured 0.03 (§21.1); a sweep that kept its centre would end at 20.
+    # Measured -0.04 (§21.11); a sweep that kept its centre would end at 10.
     assert abs(sweep.best_z_um) <= 5.0
     assert result.z_um == pytest.approx(sweep.best_z_um, abs=1.25)
     assert z.position_um() == result.z_um
@@ -263,7 +269,7 @@ def test_a_sweep_from_20_um_finds_the_sharp_plane_within_one_step(
     ):
         meta = _meta(run_doc.parent / relative)
         assert meta["z_um"] == readback
-        assert meta["z_command_um"] == pytest.approx(-5.0 + 5.0 * k)
+        assert meta["z_command_um"] == pytest.approx(-15.0 + 5.0 * k)
         assert meta["score"] == score
         assert meta["score_name"] == "brenner"
     best = _meta(run_doc.parent / result.best_file)
@@ -457,19 +463,42 @@ def test_a_readback_off_its_command_fails_the_sweep(
 ) -> None:
     stand = open_stand()
     z = _Z(stand.require(ZStage))
-    z.off_um[4] = 0.3  # step 1 µm: a quarter step is 0.25 µm
+    # Step 1 µm: a quarter step is 0.25 µm. The read again is off too (#622).
+    z.off_um[4] = 0.3
+    z.reread_off_um[4] = 0.3
     stand.override(ZStage, z)
 
     reason = _refused(stand, run_doc)
 
     assert re.fullmatch(
         r"the focus sweep ended at plane 4 of 11 \(FocusDriveOffTarget: Z read "
-        r"-?\d+\.\d\d µm after a move to -?\d+\.\d\d µm, more than 0\.25 µm away\); "
+        r"-?\d+\.\d\d µm after a move to -?\d+\.\d\d µm and -?\d+\.\d\d µm "
+        r"0\.3 s later, more than 0\.25 µm away\); "
         r"the 3 frames taken are kept in cell-focus/[0-9a-f]{12}/; Z was left where "
         r"it stopped",
         reason,
     ), reason
     assert len(_tiffs(run_doc)) == 3
+
+
+def test_a_readback_off_once_is_read_again_and_the_sweep_goes_on(
+    open_stand: Callable[..., Microscope], run_doc: Path
+) -> None:
+    # F17 (#622): the drive reported the plane before once; the drive itself is
+    # where it was told, and a second read says so.
+    stand = open_stand()
+    z = _Z(stand.require(ZStage))
+    z.off_um[4] = 0.3
+    stand.override(ZStage, z)
+
+    result = _result(_run(stand, run_doc))
+
+    assert len(result.files) == 11
+    assert len(_tiffs(run_doc)) == 12
+    # The fourth plane's readback is the second read: the inner drive's position,
+    # not the first read, which was 0.3 µm off.
+    assert result.sweep.z_um[3] == pytest.approx(z.moves[3], abs=0.05)
+    assert result.sweep.z_um[3] != pytest.approx(z.moves[3] + 0.3, abs=0.05)
 
 
 def test_a_readback_within_a_quarter_step_passes(
@@ -674,6 +703,13 @@ def test_params_refuse_a_step_above_the_range_and_too_many_planes() -> None:
     with pytest.raises(ValueError, match=r"range_um=50 with step_um=0\.1 makes 1001"):
         FocusOnCellsParams(range_um=50.0, step_um=0.1)
     FocusOnCellsParams(range_um=5.0, step_um=0.1)  # 101 planes, the bound
+    # Fewer than 9 planes cannot tell a peak's curvature from noise (#622).
+    with pytest.raises(
+        ValueError,
+        match=r"range_um=3 with step_um=1 makes 7 planes, fewer than 9",
+    ):
+        FocusOnCellsParams(range_um=3.0, step_um=1.0)
+    FocusOnCellsParams(range_um=4.0, step_um=1.0)  # 9 planes, the bound
 
 
 @pytest.mark.parametrize(
@@ -683,7 +719,7 @@ def test_params_refuse_a_step_above_the_range_and_too_many_planes() -> None:
         ({"range_um": 50.1}, False),
         ({"step_um": 0.1, "range_um": 5.0}, True),
         ({"step_um": 0.09}, False),
-        ({"step_um": 10.0, "range_um": 10.0}, True),
+        ({"step_um": 10.0, "range_um": 40.0}, True),
         ({"step_um": 10.1, "range_um": 20.0}, False),
     ],
 )

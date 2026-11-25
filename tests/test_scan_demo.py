@@ -3230,6 +3230,13 @@ def test_scan_params_refuse_a_focus_step_above_its_range() -> None:
         ScanParams(focus_range_um=1.0, focus_step_um=2.0)
     with pytest.raises(ValueError, match=r"makes 1001 planes, more than 101"):
         ScanParams(focus_range_um=50.0, focus_step_um=0.1)
+    # Fewer than 9 planes cannot tell a peak's curvature from noise (#622).
+    with pytest.raises(
+        ValueError,
+        match=r"focus_range_um=3 with focus_step_um=1 makes 7 planes, fewer than 9",
+    ):
+        ScanParams(focus_range_um=3.0, focus_step_um=1.0)
+    ScanParams(focus_range_um=4.0, focus_step_um=1.0)  # 9 planes, the bound
 
 
 @pytest.mark.parametrize(
@@ -3239,7 +3246,7 @@ def test_scan_params_refuse_a_focus_step_above_its_range() -> None:
         ({"focus_range_um": 50.1}, False),
         ({"focus_step_um": 0.1, "focus_range_um": 5.0}, True),
         ({"focus_step_um": 0.09}, False),
-        ({"focus_step_um": 10.0, "focus_range_um": 10.0}, True),
+        ({"focus_step_um": 10.0, "focus_range_um": 40.0}, True),
         ({"focus_step_um": 10.1, "focus_range_um": 20.0}, False),
     ],
 )
