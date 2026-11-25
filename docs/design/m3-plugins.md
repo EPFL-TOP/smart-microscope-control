@@ -7574,11 +7574,21 @@ MIN_STEP_UM = 0.1
 MAX_STEP_UM = 10.0
 #: Bounds the frames of one sweep (FM-74). Chosen.
 MAX_PLANES = 101
-#: A sweep whose (max - min) / max is below this is flat. Chosen: the demo
-#: gives 0.17 at its narrowest sweep; no real flat sweep was read.
-MIN_RISE = 0.05
-#: A second interior maximum whose rise above the sweep's minimum reaches
-#: this fraction of the best's makes the sweep "two-peaks". Chosen.
+#: A sweep measures its own noise between neighbouring planes, so it needs
+#: this many (§21.11 D9). Measured on synthetic peaks (planning #622): with
+#: fewer, a clean peak's own curvature reads as noise.
+MIN_PLANES = 9
+#: A sweep whose smoothed rise is not above this many noises of a smoothed
+#: score is flat (§21.11 D7). Measured on session 6's 49 sweeps at the
+#: Ti2-E's 40x (#622): the least prominence of a field with cells is 10.7
+#: (B4_0014), the most of an empty field 8.9 (B4_0020); white noise passes
+#: it 0.2-0.6 % of the time. It replaces MIN_RISE = 0.05, chosen on the demo,
+#: which called every real sweep flat.
+NOISE_FACTOR = 10.0
+#: A second interior maximum of the smoothed scores whose rise above their
+#: minimum reaches this fraction of the best's, and which stands
+#: NOISE_FACTOR noises above the dip between the two, makes the sweep
+#: "two-peaks". The fraction is chosen; the dip is §21.11 D8.
 SECOND_PEAK_FRACTION = 0.5
 #: A Z readback farther from its command than this fraction of the step
 #: fails the sweep (FM-167). Chosen.
@@ -7590,6 +7600,7 @@ class Peak:
     outcome: PeakOutcome
     best_index: int
     z_um: float | None  # the refined plane; None unless outcome == "peak"
+    prominence: float  # the smoothed rise over a smoothed score's noise (#622)
 
 
 def score_frame(frame: npt.NDArray[Any], name: ScoreName) -> float: ...
@@ -7620,23 +7631,49 @@ dimensionless or in counts, and only compared within one sweep:
 MAX_PLANES` is a `ValueError` naming the numbers (the parameters' own
 validators refuse them first, §21.5).
 
+**`sweep_size_problem`** (the parameters' validators, §21.6, §21.7) refuses,
+after its step-above-range check and before its `MAX_PLANES` check, a range
+and a step that make fewer than `MIN_PLANES` planes: `<range_name>=<r> with
+<step_name>=<s> makes <p> planes, fewer than 9: the sweep measures its
+noise between neighbouring planes; take a smaller step or a larger range`
+(#622). `plan_planes` keeps its own bound (one step on each side).
+
 **`first_outside`** returns the first plane outside `[low_um, high_um]`,
 or `None`.
 
-**`find_peak`.** `z_um` strictly increasing, the same length as `scores`,
-at least 3, every value finite, else `ValueError`. With `i` the first index
-of the maximum, in this order:
-1. `(max - min) / max < MIN_RISE`, or `max <= 0`: `flat`;
-2. `i` is 0 or the last: `at-edge`;
-3. another interior index `j`, with `scores[j]` strictly above both its
-   neighbours and `scores[j] - min >= SECOND_PEAK_FRACTION * (max - min)`:
-   `two-peaks`;
-4. otherwise `peak`, and `z_um` is the vertex of the parabola through the
-   points `i - 1`, `i`, `i + 1` (unequal spacing allowed: the readbacks),
-   clamped to `[z[i - 1], z[i + 1]]`; when the three are collinear or
-   convex, `z[i]`.
+**`find_peak`** (rewritten by #622, §21.11). `z_um` strictly increasing, the
+same length as `scores`, at least `MIN_PLANES`, every value finite, else
+`ValueError` (the count's text: `a sweep needs at least 9 planes to measure
+its noise, got <n>`). With `s` the scores and `n` their number:
+- the **smoothed scores** `m[k] = (s[k] + s[k + 1] + s[k + 2]) / 3` for `k`
+  in `0…n − 3`: `m[k]` belongs to plane `k + 1`, and the end planes have none;
+- the **noise** of a smoothed score,
+  `noise = 1.4826 * median(|s[k] - 2 s[k + 1] + s[k + 2]|) / sqrt(18)`
+  over the same `k`: the second difference of
+  white noise of σ has a standard deviation of σ√6, 1.4826 times a median
+  absolute value is a robust σ, and a mean of three planes has σ/√3. A
+  median, so that the curvature of a peak on a few planes does not count;
+- `k*` the first index of `max(m)`, `best_index = k* + 1`, `rise = max(m) -
+  min(m)`, and `prominence = rise / noise` (`inf` when the noise is 0 and the
+  rise is not, `0.0` when both are).
 
-`best_index` is `i` in every outcome.
+In this order:
+1. `max(s) <= 0`, or `not rise > NOISE_FACTOR * noise`: `flat`;
+2. `k*` is 0 or `n − 3` (the best on the sweep's second or second-to-last
+   plane: a smoothed curve cannot tell a peak there from a rise that goes on
+   past the end): `at-edge`;
+3. another `j` in `1…n − 4`, with `m[j]` strictly above `m[j − 1]` and
+   `m[j + 1]`, `m[j] - min(m) >= SECOND_PEAK_FRACTION * rise`, **and**
+   `m[j] - min(m[min(j, k*) … max(j, k*)]) >= NOISE_FACTOR * noise` (it stands
+   above the dip between the two as a peak must stand above the sweep):
+   `two-peaks`;
+4. otherwise `peak`, and `z_um` is the vertex of the parabola through
+   `(z[i − 1], m[k* − 1])`, `(z[i], m[k*])`, `(z[i + 1], m[k* + 1])` with
+   `i = k* + 1` (unequal spacing allowed: the readbacks), clamped to
+   `[z[i − 1], z[i + 1]]`; when the three are collinear or convex, `z[i]`.
+
+`best_index` is `k* + 1` and `prominence` is set in every outcome. Plain
+Python (`statistics.median`), as the rest of `find_peak`.
 
 ### 21.4 The sweep — `smc/plugins/cell_focus/loop.py`
 
@@ -7662,9 +7699,23 @@ def sweep(
     score: ScoreName,
     *,
     raise_if_stopped: Callable[[], None],
+    wait_s: Callable[[float], None],  # #622: the caller's ctx.wait_s
     on_plane: Callable[[int, float, npt.NDArray[Any]], None] | None = None,
 ) -> tuple[tuple[float, ...], tuple[float, ...]]: ...
-def move_checked(z: ZStage, target_um: float, tolerance_um: float) -> float: ...
+def move_checked(
+    z: ZStage,
+    target_um: float,
+    tolerance_um: float,
+    *,
+    wait_s: Callable[[float], None],  # #622
+) -> float: ...
+```
+
+```python
+#: How long move_checked waits before it reads Z again after a readback off
+#: its command (§21.11 D10, FM-188). Chosen: one read in 504 at the Ti2-E
+#: returned the plane before (session 6, F17); the lag was not measured.
+REREAD_WAIT_S = 0.3
 ```
 
 Neither exception is a `HardwareError`: each names what the sweep saw,
@@ -7678,15 +7729,24 @@ and its callers catch both by name.
   in a dry run: `disengage()` is a safe call that acts in dry run too (m2
   §3.2).
 - **`sweep`**: for each plane, `raise_if_stopped()`, then
-  `move_checked(z, plane, LANDING_FRACTION * step_um)`, then
+  `move_checked(z, plane, LANDING_FRACTION * step_um, wait_s=wait_s)`, then
   `camera.snap()`, the score, and `on_plane(k,
   readback, frame)` (the tool writes the frame there, so a failure later
   keeps the frames taken). It returns the readbacks and the scores.
   Every move is `move_to_um(plane, keep_autofocus=False)`.
-- **`move_checked`**: `move_to_um(target, keep_autofocus=False)`, and a
-  readback with `not abs(readback - target) <= tolerance` (a NaN fails,
-  FM-104) raises `FocusDriveOffTarget`: `Z read <r> µm after a move to <t>
-  µm, more than <tol> µm away` (two decimals).
+- **`move_checked`**: `move_to_um(target, keep_autofocus=False)`; a readback
+  with `abs(readback - target) <= tolerance` is returned, with no wait and
+  no second read. Otherwise (#622, FM-188) it calls `wait_s(REREAD_WAIT_S)`,
+  read at the call, then reads `z.position_um()` **once**: within the
+  tolerance, that second read is returned (never the first) and an INFO line
+  says the first read was stale; otherwise `FocusDriveOffTarget`: `Z read
+  <r1> µm after a move to <t> µm and <r2> µm <w> s later, more than <tol> µm
+  away` (two decimals; `<w>` as `%g`). Each comparison accepts a read only
+  when `abs(read - target) <= tolerance` is true, so a NaN read is off
+  target, the first and the second (FM-104). A plugin never
+  calls `time.sleep` (FM-83): the callers pass their `ctx.wait_s`, so a stop
+  during the wait raises `StopRequested`, which passes (FM-64). A dry run's
+  readback is its command: it is never read again.
 - **Errors pass through**: the sweep catches nothing. A
   `MicroscopeHaltedError`, a `MotionStoppedError` and `StopRequested` reach
   the caller as they are (FM-64); so does any `HardwareError`. Nothing is
@@ -7751,8 +7811,9 @@ class ScanParams(PluginParams):  # gains, last
     focus_score: ScoreName = DEFAULT_SCORE
 ```
 
-A model validator refuses `focus_step_um > focus_range_um` and more than
-`MAX_PLANES` planes, naming both. The defaults are chosen (11 planes,
+A model validator refuses `focus_step_um > focus_range_um`, fewer than
+`MIN_PLANES` planes (#622) and more than `MAX_PLANES`, naming both
+(`sweep_size_problem`, §21.3). The defaults are chosen (11 planes,
 ±5 µm): session 3 measures them (§21.10). A `--resume` of a scan stopped
 by an smc without these keys is refused as "the parameters differ"
 (the runner's rule, §1.8): run it again without `--resume`.
@@ -7794,7 +7855,8 @@ when `cell_focus != "off"` and not in a dry run:
 5. The sweep (§21.4), then `find_peak`. With a peak, the target is its
    `z_um`, and `per-well` keeps `dz_um = target - centre` for the well's
    later fields; without one, the target is the centre.
-6. `move_checked(z, target, LANDING_FRACTION * focus_step_um)`. Then §8's
+6. `move_checked(z, target, LANDING_FRACTION * focus_step_um,
+   wait_s=ctx.wait_s)` (the sweep gets `wait_s=ctx.wait_s` too). Then §8's
    `z_um` read, the snap, `frame_score = score_frame(frame, focus_score)`,
    and `FieldFocus(..., duration_s=…)` from `time.perf_counter()` taken
    before step 4 and after the snap.
@@ -7893,11 +7955,12 @@ empty, `best_file` and `relocked` are `None`, and `assumed` gains `dry run:
 dir]`. Each folder is one stack: the TIFFs in it whose JSON metadata has
 `z_um` (the tool's frames; `best.tif` is left out). For each stack it
 prints one row per plane (Z, the four scores) and, per score, the outcome
-and the refined Z of `find_peak`. `--csv` writes every row with its
+and the refined Z of `find_peak`, then its prominence against
+`NOISE_FACTOR` (#622). `--csv` writes every row with its
 folder; `--plot` writes one PNG per stack (score normalised to its
 maximum, against Z) when `matplotlib` imports, and says so and goes on
-when it does not. A folder with fewer than 3 such frames is reported and
-skipped. Exit 0 when one stack was scored, else 1. It imports
+when it does not. A folder with fewer than `MIN_PLANES` (9) such frames is
+reported and skipped (#622; 3 before). Exit 0 when one stack was scored, else 1. It imports
 `smc.plugins.cell_focus.algorithm`, so the script and the tool score
 alike. UTF-8 everywhere, `pathlib`, no shell.
 
@@ -7911,17 +7974,21 @@ alike. UTF-8 everywhere, `pathlib`, no shell.
   - `test_the_peak_is_refined_between_planes` (a sweep centred on 1.3 µm,
     step 1: the refined Z within 0.3 µm of 0, and not equal to a plane);
   - `test_a_flat_sweep_keeps_no_peak`, `test_a_best_at_the_end_is_at_edge`,
-    `test_two_maxima_are_two_peaks`, on score lists written out by hand,
-    each from both sides of its bound (`MIN_RISE` at 0.04 and 0.06,
-    `SECOND_PEAK_FRACTION` at 0.4 and 0.6, FM-73);
+    `test_two_maxima_are_two_peaks`, each from both sides of its bound
+    (FM-73): since #622, `NOISE_FACTOR` between two sweeps recorded at the
+    Ti2-E (B4_0020 at 8.85 is flat, B4_0014 at 10.74 is a peak) and
+    `SECOND_PEAK_FRACTION` at 0.4 and 0.6 on a synthetic pair of bumps
+    (§21.11.4);
   - `test_unequal_spacing_is_refined_through_the_readbacks`;
   - `test_plan_planes_is_symmetric_and_bounded`, `test_too_many_planes_is_refused`,
     `test_first_outside_names_the_first_plane_past_a_limit`;
   - `test_a_dark_frame_scores_zero`, `test_find_peak_refuses_nan_and_unsorted_z`.
 - **The tool** (`tests/test_cell_focus_demo.py`, `profiles/demo-sample.toml`):
-  - `test_a_sweep_from_20_um_finds_the_sharp_plane_within_one_step`
+  - `test_a_sweep_from_10_um_finds_the_sharp_plane_within_one_step`
     (`range_um=25`, `step_um=5`: `best_z_um` within 5 µm of 0 and Z ends
-    there; measured 0.03);
+    there; measured −0.04 under #622's rule. From 20 µm, as before #622,
+    the sharp plane is the sweep's second and the sweep is `at-edge`,
+    §21.11 D8);
   - `test_a_sweep_past_the_soft_limit_is_refused_before_any_move` (Z at
     990, `range_um=25`: `PluginRunError`, Z still 990, no file);
   - `test_a_guard_trip_ends_the_sweep_and_keeps_the_frames` (a `ZStage`
@@ -7978,6 +8045,176 @@ At the Ti2-E, 40× on a plate with cells, PFS locked on them (m2 §12.10.7):
 - Whether a Z readback lands within a quarter step of its command.
 - The cells' plane in the route and the export: §26.9 (#392). The 40×'s offset
   factor is in the profile since session 3 (#401).
+
+### 21.11 Session 6's sweeps: the noise decides (#622)
+
+Session 6 (#620, F16) ran `scan` with `cell_focus=per-field`,
+`focus_range_um=10`, `focus_step_um=1` (21 planes) at the 40×, PFS off, on two
+plates. `MIN_RISE = 0.05` called 48 of the 49 sweeps flat and one at-edge: the
+per-field focus never moved Z at the stand. One sweep move in 504 also failed
+on a stale readback (F17). This section replaces §21.3's flat rule, gives its
+two-peaks rule a dip, and adds one read again to §21.4's `move_checked`. It
+changes no layer interface: `sweep` and `move_checked` gain a required
+`wait_s`, `Peak` gains `prominence`, `MIN_RISE` goes, `MIN_PLANES`,
+`NOISE_FACTOR` and `REREAD_WAIT_S` come, and the parameters refuse fewer than
+9 planes. §21.3 and §21.4 are written as they now hold.
+
+#### 21.11.1 What was measured (2026-11-25, planning #622)
+
+On `main` `d811ea0`, Python 3.13, numpy 2.5.3, in throwaway scripts (not
+committed), on the `cell_focus.sweep` records of
+`local/scans/2026-11-24/run-40x-short.json` (B4, cells, 24 sweeps; B4_0018
+failed on F17) and `local/scans/2026-11-24-train/run-40x-short.json` (C3,
+beads in water, 25 sweeps), on B4's 24 frames, and on the demo-sample:
+- **The curves.** On cells, a broad maximum 9 to 11 planes wide at half its
+  smoothed rise, its best at planes 8 to 10 of 0–20; the scores' plane-to-plane
+  noise is 0.12–0.43 % of the score, their rise 0.8–3.9 %. On beads in water,
+  noise only, or a rise that goes on past the sweep's top end (5 sweeps). With
+  a noise of the order of the rise, the raw maximum lands anywhere on the
+  plateau, and the raw curve has several local maxima above half its rise.
+- **The frames, by eye**: B4_0003, B4_0017 and B4_0020 are empty; B4_0000,
+  B4_0006 (a small object), B4_0014 and B4_0016 hold one object, B4_0008 and
+  B4_0023 two, B4_0010 three or four, B4_0012 six, B4_0004 a large cell and a
+  small object. The other 11 were not looked at.
+- **The relative rise cannot tell an empty field from one with a cell**: the
+  empty B4_0003 rises 1.07 %, B4_0006 (one object) 0.78 %, B4_0014 (one)
+  1.06 %; the beads' noise-only sweeps 0.36–0.88 %. No `MIN_RISE` separates
+  them, and the rise follows the exposure's noise (the 40× frames used 2 % of
+  the camera's range at 10 ms, #620).
+- **The prominence** (§21.3, `rise / noise`): the fields with cells taken as
+  a peak 10.7–33.7; the empty fields 3.6, 6.8 and 8.9; the beads' noise-only
+  sweeps 1.9–9.7 (C3_0001 at 9.2 and C3_0002 at 9.7 rise weakly toward the top
+  end), their ramps 29–72.
+- **§21.3's rule with `NOISE_FACTOR = 10`**: cells 17 peaks and 7 flat
+  (21.11.3); beads 19 flat, 5 at-edge, 1 peak (C3_0012, +6.44 µm, a maximum
+  near the top end at 31). Without the dip condition of two-peaks, 14 of the
+  17 cell peaks would be two-peaks, B4_0004 among them.
+- **White noise** (`1 + 0.003 N(0, 1)`, 20000 draws each): a peak 0.55 % of
+  the time at 9 planes, 0.47 % at 11, 0.21 % at 21, 0.04 % at 41; at-edge
+  0.41 %, 0.27 %, 0.04 %, 0.01 %. Of seeds 0–199 of
+  `default_rng(seed).normal(1.0, 0.003, 21)`, seed 92 alone gives a peak
+  (10.9). Seed 0's draw, rounded to six decimals, is flat at 5.07.
+- **The noise needs planes.** Clean synthetic Gaussian peaks, no noise: at 9
+  planes a peak of σ ≥ 1.5 planes is a peak and one of σ ≤ 1 plane is flat
+  (its own curvature reads as noise); at 11 planes σ ≥ 1 plane is a peak; at 7
+  planes none of σ 0.7 to 5 planes is. B4's peaks are about 4 planes in σ.
+- **The demo-sample** (`focus-on-cells`, `range_um=25`, `step_um=5`): from
+  Z = 10, 12 and 8 µm, a peak at −0.04, −0.03 and −0.05 µm (prominence 45, 16,
+  17); from 20 µm, #341's criterion, the sharp plane is the second of 11 and
+  the sweep is at-edge (D8). With the rule swapped in, every other test of
+  `tests/test_cell_focus_demo.py`, `tests/test_scan_demo.py` and
+  `tests/test_dev_focus_scores.py` passed (209); the unit tests on hand-written
+  lists of 3 to 6 planes are rewritten (21.11.4).
+- **Where the cells' peak lies**: the refined dz runs from −2.17 to +2.97 µm,
+  median −0.78 µm, from the scan's start Z (the by-eye focus at the well's
+  centre).
+- **F17**: `B4_0018: FocusDriveOffTarget: Z read 4198.30 µm after a move to
+  4199.30 µm, more than 0.25 µm away`; 4198.30 is the plane before, one move
+  in 504. The lag was not measured. On `FakeCore.demo_like()` a sweep's move
+  is one `setPosition` then one `getPosition`, and `position_um()` one more
+  `getPosition` (measured): a position read stale for one read after a move
+  is F17 once, for two reads it is F17 twice.
+
+#### 21.11.2 Decisions
+
+**D7. A sweep is flat against its own noise.** The noise is read between
+neighbouring planes (the median absolute second difference), so the bound
+follows the exposure and the stand; the smoothed rise must be above
+`NOISE_FACTOR` noises of a smoothed score. 10 lies between the empty fields
+(8.9 the most) and the fields with cells (10.7 the least). A field with one
+small object can be flat (B4_0006, B4_0016): it keeps the centre, as before.
+- Not chosen: *`MIN_RISE`, measured*: no value of the relative rise separates
+  an empty field from one with a cell here, and it moves with the exposure.
+- Not chosen: *a model fitted to the curve* (a Gaussian and a constant): it
+  would decide the edge and the second peak too, but needs a search and its
+  own bounds; the smoothed curve answers the 49 sweeps.
+
+**D8. The smoothed curve decides the best, the edge and a second peak.** The
+mean of three neighbouring planes; the end planes have no smoothed score, so a
+best on the sweep's second or second-to-last plane is at-edge: a peak there
+cannot be told from a rise that goes on past the end, and the centre is kept.
+A second maximum counts only when it stands `NOISE_FACTOR` noises above the
+dip between it and the best, as well as at half the best's rise: the two
+maxima of brightfield on either side of focus (D4) have a dip between them,
+the plateau's noise has none. The refined plane is the vertex through the
+smoothed best and its two smoothed neighbours.
+
+**D9. A sweep has at least 9 planes.** With fewer, its noise cannot be told
+from its peak's curvature: the parameters refuse them (`sweep_size_problem`),
+`find_peak` raises, and `focus_scores.py` skips such a stack. The defaults
+(11) and every sweep at a stand so far (21) are above it.
+
+**D10. A Z readback off its command is read again once.** After
+`REREAD_WAIT_S` (0.3 s, through the plugin's `ctx.wait_s`), one
+`position_um()`: within the tolerance, the sweep goes on with that read; off
+again, `FocusDriveOffTarget` names both reads. Once, as #622 asks: a drive
+that did not arrive is still a failed field, 0.3 s later.
+- Not chosen: *the layer's `_reread` (FM-188) on every Z move*: freshness
+  there means "the value set", and a Z readback differs from its command by
+  the drive's own step (4186.28 for 4186.3), so the layer would need the
+  caller's tolerance. Other readers of a Z move's readback are not changed
+  here.
+
+#### 21.11.3 The 24 cell sweeps under §21.3's rule
+
+| field | outcome | best plane | prominence | refined dz (µm) | in the frame |
+|---|---|---|---|---|---|
+| B4_0000 | peak | 8 | 12.1 | −2.17 | one object |
+| B4_0001 | peak | 8 | 14.9 | −1.73 | not looked at |
+| B4_0002 | peak | 8 | 19.7 | −1.76 | not looked at |
+| B4_0003 | flat | 9 | 6.8 | | empty |
+| B4_0004 | peak | 9 | 33.7 | −0.78 | a large cell, a small object |
+| B4_0005 | peak | 9 | 17.2 | −0.64 | not looked at |
+| B4_0006 | flat | 14 | 5.8 | | one small object |
+| B4_0007 | peak | 9 | 23.0 | −0.64 | not looked at |
+| B4_0008 | flat | 9 | 8.7 | | two objects |
+| B4_0009 | peak | 9 | 21.7 | −1.33 | not looked at |
+| B4_0010 | peak | 9 | 21.7 | −0.83 | three or four objects |
+| B4_0011 | peak | 9 | 16.9 | −0.95 | not looked at |
+| B4_0012 | peak | 9 | 19.7 | −1.05 | six objects |
+| B4_0013 | peak | 9 | 17.5 | −0.57 | not looked at |
+| B4_0014 | peak | 8 | 10.7 | −1.78 | one object at the frame's edge |
+| B4_0015 | peak | 9 | 24.6 | −0.51 | not looked at |
+| B4_0016 | flat | 14 | 2.6 | | one object; the noisiest sweep (0.43 %) |
+| B4_0017 | flat | 4 | 3.6 | | empty |
+| B4_0019 | peak | 10 | 12.7 | −0.15 | not looked at |
+| B4_0020 | flat | 9 | 8.9 | | empty |
+| B4_0021 | peak | 10 | 23.8 | −0.32 | not looked at |
+| B4_0022 | peak | 10 | 14.5 | −0.05 | not looked at |
+| B4_0023 | flat | 12 | 5.6 | | two objects; noise 0.35 % |
+| B4_0024 | peak | 13 | 16.2 | +2.97 | not looked at |
+
+Flat: the three empty fields, and four with one or two small objects whose
+rise does not stand ten noises above the sweep (two of them the noisiest
+sweeps). They keep the centre, the by-eye focus.
+
+#### 21.11.4 Tests
+
+- `tests/unit/test_cell_focus_algorithm.py`: B4_0004, B4_0014 and B4_0020
+  copied as numbers (no frame): B4_0004 a peak at plane 9 refined to 4192.52
+  µm (prominence 33.67), B4_0014 a peak at 10.74 and B4_0020 flat at 8.85 (the
+  bound from both sides), seed 0's noise flat; at-edge on 9-plane ramps; the
+  two-bump pair at 0.4 and 0.6 of the best; the unequal spacing on a 9-plane
+  tent; the refusal of 8 planes.
+- `tests/unit/test_cell_focus_loop.py` (new): F17 on `FakeCore` (a position
+  read stale once, then twice), the wait before the second read, a NaN read
+  twice, a stop during the wait.
+- `FakeCore.make_positions_stale(label, *, reads)` (new knob) and its tests in
+  `tests/unit/test_fake_core.py`.
+- `tests/test_cell_focus_demo.py`: the sweep from 10 µm; a readback off once
+  read again; off twice still fails; the parameters' bounds of 9 planes.
+
+#### 21.11.5 Not verified (for the owner)
+
+- At the next 40× scan with `cell_focus=per-field`: whether the frames taken
+  at the found plane are sharper than at the centre (by eye, and each frame's
+  `frame_score` against its sweep's score at the centre plane), and how many
+  sweeps of a well find a peak.
+- The Ti2-E's stale Z read: how often, and whether 0.3 s covers it (each
+  read again that was fresh is an INFO line in the log).
+- `NOISE_FACTOR` at another plate, objective or exposure: each sweep's
+  prominence can be recomputed from the run document's scores, and
+  `scripts/dev/focus_scores.py` prints it for the tool's stacks.
 
 ## 22. The lab's own plate definitions (#400)
 
