@@ -250,7 +250,9 @@ def find_peak(z_um: Sequence[float], scores: Sequence[float]) -> Peak:
 
     A tie at the top of the smoothed scores takes the middle of its run (the
     lower middle when the run is even): a peak narrower than a step makes three
-    equal values, and the first of them put Z half a step low. When the
+    equal values, and the first of them put Z half a step low; a tie that
+    reaches the first or the last smoothed plane is at an edge, whatever its
+    middle is, for the sweep did not bracket it. When the
     median second difference is 0 the noise is read from their mean, so that a
     bare blip on a sweep of exact zeros is not a peak of prominence ``inf``.
 
@@ -306,7 +308,9 @@ def find_peak(z_um: Sequence[float], scores: Sequence[float]) -> Peak:
 
     if max(s) <= 0.0 or not rise > NOISE_FACTOR * noise:
         return Peak("flat", best_index, None, prominence)
-    if k_star in (0, n - 3):
+    # The run, not its middle: a plateau that reaches the first or the last
+    # smoothed plane is not bracketed on that side, whatever its middle is.
+    if first == 0 or last == n - 3:
         return Peak("at-edge", best_index, None, prominence)
     for j in range(1, n - 3):
         if j == k_star or not (m[j] > m[j - 1] and m[j] > m[j + 1]):

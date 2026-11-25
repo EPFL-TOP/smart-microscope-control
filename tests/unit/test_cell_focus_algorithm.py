@@ -288,6 +288,46 @@ def test_a_peak_narrower_than_a_step_refines_to_its_own_plane() -> None:
     assert (narrow.outcome, narrow.best_index) == ("peak", 4)
     assert narrow.z_um == pytest.approx(4.0)
     assert narrow.prominence == pytest.approx(19.08, abs=0.01)
+    # A peak symmetric about the middle of two planes ties two smoothed values:
+    # the lower middle is the best plane, and the vertex is halfway between.
+    even = find_peak(
+        _Z21,
+        [0, 0, 0, 1, 2, 5, 12, 25, 40, 40, 25, 12, 5, 2, 1, 0, 0, 0, 0, 0, 0],
+    )
+    assert (even.outcome, even.best_index) == ("peak", 8)
+    assert even.z_um == pytest.approx(8.5)
+
+
+def test_a_plateau_that_reaches_an_end_of_the_sweep_is_at_edge() -> None:
+    # A run of equal top values takes its middle (D12), but the sweep did not
+    # bracket a run that reaches the first or the last smoothed plane: the
+    # middle is not what the edge rule reads, the run is. Each case was an
+    # at-edge before D12, or moved Z to a plane in the middle of a plateau.
+    for scores in (
+        [10.0, 10.0, 10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+    ):
+        plateau = find_peak(_Z9, scores)
+        assert (plateau.outcome, plateau.z_um) == ("at-edge", None)
+    # A rise into a plateau at the far end of 21 planes, and the same plateau
+    # at the start, whose middle is well inside the sweep.
+    rising = [0.0, 1.0, 3.0, 5.0, 8.0, 13.0, 21.0] + [30.0] * 9 + [30.0] * 5
+    assert find_peak(_Z21, rising).outcome == "at-edge"
+    falling = [30.0] * 9 + [
+        21.0,
+        13.0,
+        8.0,
+        5.0,
+        3.0,
+        2.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+    ]
+    assert find_peak(_Z21, falling).outcome == "at-edge"
 
 
 def test_a_sweep_whose_second_differences_are_mostly_zero_is_flat() -> None:
