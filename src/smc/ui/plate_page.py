@@ -628,6 +628,11 @@ class TextPane(pn.pane.Str):  # type: ignore[misc]
     ``<pre> </pre>`` keeps the height of an empty line. ``_transform_object`` is a private
     method of Panel's ``Str``; a test names it and Panel's version, and the render path was
     measured on Panel 1.9.5, 1.10.0 and 1.11.1.
+
+    The model also says ``disable_math``: Bokeh hands the text of a ``Str``'s model to MathJax
+    when it is loaded (the CDN, with the PC online), which set a ``$$`` pair as a formula and
+    swallowed the words between two of TeX's inline delimiters, whose characters a Windows
+    path can hold (Chromium 159, #657).
     """
 
     # `Str` has priority 0 and panes of equal priority are tried newest first, so a subclass
@@ -636,8 +641,10 @@ class TextPane(pn.pane.Str):  # type: ignore[misc]
 
     def _transform_object(self, obj: Any) -> Any:
         if obj is None or (isinstance(obj, str) and obj == ""):
-            return super()._transform_object(obj)
-        return super()._transform_object(html.escape(str(obj)))
+            sent = super()._transform_object(obj)
+        else:
+            sent = super()._transform_object(html.escape(str(obj)))
+        return {**sent, "disable_math": True}
 
 
 def _wrapped_text(

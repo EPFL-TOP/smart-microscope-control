@@ -973,6 +973,21 @@ def test_a_result_card_is_plain_text_under_its_tool(
     assert view.tool_cards["goto-well"].object == ""
 
 
+def test_every_str_pane_in_the_pages_layout_is_a_text_pane(page: PlatePage) -> None:
+    """FM-271: the layout holds no bare `Str`, however a constructor was spelled.
+
+    The source test of ``test_plate_page_text_pane`` reads the spellings it knows; this one
+    reads the built page, whose panes are counted so that a layout with none is not a pass.
+    """
+    view = PlatePageView(page)
+    panes = view.layout.select(pn.pane.Str)
+    assert len(panes) >= 40
+    assert [type(o).__name__ for o in panes if type(o) is not TextPane] == []
+    # The drive bar's, the objective confirmation's and the snap line, which no screen walk reads.
+    for pane in (view.drive_note, view.objective_confirm_text, view.snap_note):
+        assert pane in panes
+
+
 def test_a_card_of_another_stand_names_it_and_one_of_this_stand_does_not(
     page: PlatePage, run_doc: Path
 ) -> None:
