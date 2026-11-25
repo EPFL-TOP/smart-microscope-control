@@ -7403,8 +7403,8 @@ def calibration_denied(folder: str, reason: str) -> str: ...
   position past the labels, an objective that is `None` or blank, another label).
 - `calibrate_stand_routed(P, X, f)` (D19): `The plate was registered with <P>: a calibration at <X> here
   is kept in its own document, calibrations/<f>, and the plate's calibration stays as it is.
-  Measure the offsets between objectives (Plate screen) uses it.` (`<f>` is `calibration_file(n)`).
-  `calibrate_command_folder_note(F)`: `The folder <F> must exist first: the page makes it, a terminal
+  Measure the offsets between objectives (Plate screen) uses it.` (`<f>` is `calibration_file(n)`;
+  *its last sentence is D27's since #617*). `calibrate_command_folder_note(F)`: `The folder <F> must exist first: the page makes it, a terminal
   does not.`
 - `calibrate_measured_other(e, m, f)` (D21): `it measured <m>, not <e> as the button said (the turret
   was turned during the run): <f> holds a calibration of <m> and <e> has none; put <e> in place and
