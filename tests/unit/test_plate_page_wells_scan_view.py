@@ -562,6 +562,8 @@ def test_the_wells_screen_lists_the_wells_box_the_two_fields_and_the_action_befo
         view.autofocus_from_text,
         view.layout_button,
         view.layout_wait,
+        # Which camera calibration the plan will use or assume, before the click (m5 §18.6 D26).
+        view.layout_calibration_text,
         view.wells_known_block,
         # *Measure the time* and the chain's line under what is known (m5 §17.12 D18).
         view.measure_time_button,

@@ -713,8 +713,10 @@ def test_offsets_step_reads_each_document_and_derives_the_objectives_in_line_ord
     assert backwards.targets == (FORTY, TWENTY)
     when = "2026-11-09T09:30:00+00:00"
     assert step.reads == (
-        CalibrationRead(str(twenty), TWENTY, when, None),
-        CalibrationRead(str(forty), FORTY, when, None),
+        # The frame the seeded calibration was measured in is read too (#617: the scan plan's
+        # click compares it with the camera's), so the read is not equal to one without it.
+        CalibrationRead(str(twenty), TWENTY, when, None, image_shape_px=(384, 512)),
+        CalibrationRead(str(forty), FORTY, when, None, image_shape_px=(384, 512)),
     )
     # The pairs are what `smc run objective-offsets` is given, read back by the parameters'
     # own parser, never compared as strings (FM-45).
