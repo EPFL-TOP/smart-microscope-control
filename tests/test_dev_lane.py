@@ -627,6 +627,15 @@ def test_a_pr_from_the_issues_branch_older_than_the_point_is_the_last_points_wor
         "feature 5",
     )
     assert _state(_seg("merge"), _facts([_issue(5)], [old]))[0] == "owner"
+    # the review segment reads the PR through the same link: an earlier cycle's merged PR is not
+    # "PR merged" for this Point's review either (the review of #614's lane, the same skip)
+    assert _state(_seg("review"), _facts([_issue(5)], [old])) == (
+        "owner",
+        "no PR for #5",
+    )
+    # a PR created at the very second of the Point counts: "at or after"
+    on_time = _refs_only(12, 5, state="MERGED", at=T0)
+    assert _state(_seg("feature"), _facts([_issue(5)], [on_time])) == ("done", "PR #12")
     closing = _pr(12, (5,), state="MERGED", at=BEFORE, branch="feat/5-x")
     assert _state(_seg("feature"), _facts([_issue(5)], [closing])) == ("done", "PR #12")
     # the newest of two wins, by either link

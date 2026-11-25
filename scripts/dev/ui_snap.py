@@ -774,7 +774,10 @@ class Stand:
 
         A seed that is meant to leave a ``failed`` record: a step that passed, hung or ended
         with another code (2, a renamed parameter) is no such record, so the state is *not
-        reached* with that sentence and a regression of the tool is never a quiet pass.
+        reached* with that sentence and a regression of the tool is never a quiet pass. Exit 1
+        is shared with a run document that cannot be read or written (``smc run`` says so with
+        ``<path>: ...`` where a tool's own failure says ``<tool>: ...``, FM-82): that line is
+        no failed record either, and the sentence names it, since no failed line would come.
         """
         outcome = self._run(step)
         if outcome.ok:
@@ -782,6 +785,12 @@ class Stand:
         if outcome.timed_out or outcome.exit_code != FAILED_EXIT_CODE:
             raise ChainFailedError(
                 f"{outcome.failure()} (wanted a failed record, exit {FAILED_EXIT_CODE})"
+            )
+        # ``<mark> <tool>: <words>``: the line is the tool's own when its head names the tool.
+        if not outcome.last_line.split(":", 1)[0].endswith(step.plugin):
+            raise ChainFailedError(
+                f"{outcome.failure()} (exit {FAILED_EXIT_CODE}, but not {step.plugin}'s "
+                "own failure: the run document may not be readable or writable)"
             )
         return outcome.failure() or ""
 
