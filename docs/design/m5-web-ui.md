@@ -8409,3 +8409,109 @@ bool`; `_draw_algorithm_choices()`; `_ensure_option(select, name)`;
 the default and its positions loaded in NIS-Elements (#569's last criterion; #570's
 selector or a throwaway one); the hover on the map in a real browser at 1280 px, on the
 stand PC and over RDP; the long option labels in the stand PC's browser; Panel 1.9.x.
+
+## 22. The Stand screen says a calibration that failed (#625)
+
+Fixed by #625's plan (2026-11-25). At the Ti2-E (session 6, F14) the owner pressed *Calibrate the
+camera* on the Stand screen at fields where the tool refuses it, and did not see why: the strip said
+it, once, and the screen kept nothing. This section adds one line to the Stand screen. It adds no
+plugin, slot, command or guard, and changes none of the Stand screen's other texts. **Merging this
+section decides it.**
+
+### 22.1 What was measured (2026-11-25, planning #625)
+
+Throwaway scripts, not committed, on `main` at `60c6c44`, Python 3.13, Panel 1.11.0, over
+`fake_microscope` with the real `camera-calibration` (the fake camera's frame is flat, so the tool
+refuses it with `the camera's frame is dark or flat ...`):
+
+- After the click on the Stand screen's button, `view.run_text` (the strip, in the header) reads
+  `Camera calibration failed: camera-calibration: the camera's frame is dark or flat (...)`, in the
+  default colour: `run_text` carries no colour, `message` and `problems_text` carry `_WARNING`.
+  `view.known_block` still reads `Camera: not calibrated (the arrows cannot say which way the image
+  moves)`, as before the click, and the button is still offered.
+- After *Refresh* (`clear_outcome`, §8.8.3) the strip is empty and no line of the Stand screen says
+  that a calibration failed. The run document's record does (`failed`, with the error), and the
+  expert view's card is persistent: `failed 2026-11-25 09:29:06 UTC`, then `error: PluginRunError:
+  camera-calibration: ...`.
+- What the owner saw on the afternoon of 2026-11-24 is not known: the page's console was not saved,
+  and the owner reported `done`. No state of the page that says `done` for a refused calibration was
+  found: a run that raised ends `<title> failed: <line>` (§17.12 D20). This section does not
+  guess; it makes the failure stay where the operator works.
+
+### 22.2 Decisions
+
+- **D1 A line under the button.** The Stand screen's calibrate box (`calibrate_box`) gets a text pane,
+  `calibrate_failed`, between `calibrate_note` and the *Command* disclosure, in the warning colour
+  (`_WARNING`), taking no height while it is empty (`_say`). Its text is `The last calibration
+  failed: <words>` (`calibration_failed(words)` of §18.6 D15 with its first letter in capitals, so
+  that the Plate screen's block and this line say one thing).
+- **D2 From the document the click writes to.** Into the run document (the click is not routed:
+  `_stand_destination` says `False`) the words are those of the run document's latest
+  `camera-calibration` record **when it ended `failed` with an error**: a new field of the view,
+  `PageView.calibration_failed: str | None = None` (the last field), read from the `doc` that
+  `view()` already holds, never from the stand (FM-145). Into the position's own document (routed,
+  D19) the line is the problem text of the document the page holds at the objective in place's
+  position (`_at_position(objective, objective).held.read.problem`) **when it begins with the words
+  of `calibration_failed`**, which is what D15 gives a record that ended `failed`: any other problem
+  of that document (no file, not JSON, another objective) is the block's, not this line's. A
+  document that holds a usable calibration, or none, gives no line.
+- **D3 The tool's words.** `PageView.calibration_failed` is `_failed_calibration_words`'s text for a
+  record (one line, without the exception's type and the tool's name, cut at the card's bound), and
+  the helper is split so that the same words come from a path (D15's) and from a record (this).
+  Nothing is raised for a record that cannot be read (FM-98): the line is then empty and the strip
+  and the card say what they say.
+- **D4 It stays.** The line lives as long as the record: *Refresh*, the next activity, a closed
+  stand and *Disconnect* leave it, and a calibration of that document that ends `done` replaces
+  the record and takes the line away. A calibration stopped by STOP is a `failed` record (FM-64)
+  and reads here as `The last calibration failed: <the error's words>`; it is not special-cased.
+- **D5 What does not change.** The strip's outcome and its colour (all tools share it), the expert
+  view's card, the Stand screen's known block and note, the Wells and Scan screens, the Plate
+  screen's block, the tool and its record.
+- **D6 Plain text.** The words are a tool's and a path in them is the stand's: a plain-text pane
+  (FM-139), the run folder scrubbed as every outcome is (FM-50).
+
+### 22.3 Interface
+
+```python
+# smc/ui/controller.py
+@dataclass(frozen=True, slots=True)
+class PageView:
+    ...
+    calibration_failed: str | None = None  # new, the last field (D2, D3)
+
+
+# D3: the words of a failed record; the path's version loads the record, then calls it
+def _failed_words(record: StageRecord | None) -> str | None: ...
+def _failed_calibration_words(path: Path) -> str | None: ...
+
+
+# smc/ui/guide.py: D1, calibration_failed's line with a capital
+def stand_calibration_failed(text: str) -> str: ...
+```
+
+`PlatePageView._draw_stand` draws `calibrate_failed` from the view and the status, in the same
+pass that sets `calibrate_box.visible` (FM-145: no device is read there).
+
+### 22.4 Tests and failure modes
+
+`tests/unit/test_plate_page_stand_plate_view.py` (the real tool over `fake_microscope`, the way
+§22.1 was measured) and `tests/unit/test_plate_page_controller.py` (the view's field):
+`test_a_failed_calibration_from_the_stand_screen_stays_on_the_screen_in_the_warning_colour` (click,
+join, tick: the whole text, the colour, the strip's own line unchanged; then *Refresh*: the strip
+is empty and the line stays), `test_a_calibration_that_ends_done_takes_the_failed_line_away`,
+`test_a_routed_click_reads_the_failure_of_the_position_document_not_the_run_document`,
+`test_the_failed_line_is_plain_text_and_bounded`, `test_a_record_that_cannot_be_read_gives_no_failed_line`.
+Failure modes: FM-145, FM-139, FM-98, FM-50, FM-45 (every text whole), FM-169 (the line is a courtesy,
+the controller's refusals stay), and a new one named by its text: *a failure that only the strip says*.
+
+### 22.5 What this does not do
+
+- It does not colour the strip's failures, or keep it past the next activity: a header line shared
+  by every tool, and the owner has not asked.
+- It does not offer the reuse of a calibration on the screen: the refusal's own text does
+  (m3 §4.4), and the Stand screen's route refuses a typed `from_run_doc` (D19).
+- It does not add a `/ui-check` state: a one-off session with a failing calibration is cited in
+  the Report and not committed (§17.8's way).
+
+**Not verified (for the owner)**: the line in a real browser at 1280 x 620, with the Stand screen's
+text at the stand PC's font size; a refused calibration at the stand after the build.
