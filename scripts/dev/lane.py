@@ -1,18 +1,22 @@
 """The next action of one lane of the Point, for /lane.
 
-A Point (``point.py``'s tracking issue, "Point: next steps") lists up to three
-lanes, `S1`..`S3`, one session at a time inside each. This script reads the
-newest ``## Point`` comment, derives from GitHub where every step of one lane
-stands, and prints what the lane session does next: start a session for a step
-(with the exact prompt, ``BRIEF:``), wait for something (a CI run, a merge),
-hand over to the owner, or stop. The lane session decides nothing: its
-decisions are the ``NEXT:`` line.
+A Point (``point.py``'s tracking issue) lists up to three lanes, one session at a
+time inside each: ``S1``..``S3`` on the stand track's Point ("Point: next steps"),
+``A1``, ``A2`` on the analysis track's ("Point (analysis): next steps", ADR-0010).
+The lane's letter picks the track and so the tracking issue. This script reads the
+newest ``## Point`` comment of that issue, derives from GitHub where every step of
+one lane stands, and prints what the lane session does next: start a session for a
+step (with the exact prompt, ``BRIEF:``), wait for something (a CI run, a merge),
+hand over to the lead of the track (``NEXT: owner``), or stop. The lane session
+decides nothing: its decisions are the ``NEXT:`` line.
 
     python scripts/dev/lane.py S1 [--from S1.3] [--wait [--every 120] [--timeout 28800]]
+    python scripts/dev/lane.py A1 [--from A1.2] [--wait ...]
     python scripts/dev/lane.py --check <file with a draft Point>
 
-Exit codes: 0 done (or the next action printed); 1 an unknown lane, no Point,
-or the problems that ``--check`` found; 2 a ``gh`` failure; 3 ``--wait`` timed
+Exit codes: 0 done (or the next action printed); 1 an unknown lane (a letter other
+than ``S`` and ``A`` included: it ends before any ``gh`` call), no Point, or the
+problems that ``--check`` found; 2 a ``gh`` failure; 3 ``--wait`` timed
 out; 4 a usage error or an unexpected crash (a crash must not read as the
 verdict of 1, FM-82). A ``gh`` call that fails for a short GitHub reason (a 5xx,
 a timeout, a body that is not JSON) is tried again, three tries with a pause
@@ -73,6 +77,10 @@ def _load_point() -> Any:
 
 point = _load_point()
 
+# The one reader of the two tracks, already loaded by `point.py` under this name: a lane's
+# letter picks its track, and the CODEOWNERS map is not read here.
+tracks = _load_script("smc_dev_tracks", HERE / "tracks.py")
+
 # The CI's own reader of a branch name (``<type>/<N>-<slug>``, ``docs/`` and ``adr/`` close
 # nothing): a PR is the issue's by its branch under the same grammar that the closing
 # references check enforces, and never under a second copy of it (#658).
@@ -84,12 +92,13 @@ closing_refs = _load_script(
 # -- the grammar of a lane (pure) ----------------------------------------------
 
 _ARROW = " \N{RIGHTWARDS ARROW} "
-_LANE_HEAD = re.compile(r"^\*\*(S\d+)(?=[\s*])")
-_STEP = re.compile(r"^(S\d+)\.(\d+)\s+(.*)$")
+_LANE_HEAD = re.compile(rf"^\*\*({tracks.LANE_ID})(?=[\s*])")
+_STEP = re.compile(rf"^({tracks.LANE_ID})\.(\d+)\s+(.*)$")
 _AFTER = re.compile(
-    r"^after\s+(S\d+\.\d+(?:\s*(?:,|and)\s*S\d+\.\d+)*)\s*:\s*", re.IGNORECASE
+    rf"^after\s+({tracks.LANE_ID}\.\d+(?:\s*(?:,|and)\s*{tracks.LANE_ID}\.\d+)*)\s*:\s*",
+    re.IGNORECASE,
 )
-_STEP_ID = re.compile(r"S\d+\.\d+")
+_STEP_ID = re.compile(rf"{tracks.LANE_ID}\.\d+")
 _PLAN = re.compile(r"`/plan\s+(\d+)`")
 _DEVELOP = re.compile(r"`/develop\s+(\d+)`")
 _FEATURE = re.compile(r"`/feature\s+(\d+)`")
@@ -184,8 +193,9 @@ def _model_of(text: str) -> str | None:
 def parse_point(body: str) -> dict[str, list[Step]]:
     """The lanes of a Point: ``{"S1": [Step, ...], ...}`` in the order written.
 
-    A lane starts at a line beginning ``**S<k> ``; its steps are the following
-    lines beginning ``S<k>.<n> ``; it ends at the next line beginning ``**``
+    A lane starts at a line beginning ``**S<k> `` (``**A<k> `` on the analysis track's
+    Point); its steps are the following lines beginning ``S<k>.<n> `` (``A<k>.<n> ``);
+    it ends at the next line beginning ``**``
     that is not a step. A segment's issue is its own command's, else the last
     issue seen before it on the line or in the lane's earlier steps.
     """
@@ -241,6 +251,10 @@ def check_point(body: str) -> list[str]:
     lanes = parse_point(body)
     known = {step.id for steps in lanes.values() for step in steps}
     problems: list[str] = []
+    if len({lane[0] for lane in lanes}) > 1:
+        # One Point is one track's (ADR-0010): `lane.py A1` reads the analysis track's
+        # Point and `S1` the stand's, so a lane of the other letter could never be run.
+        problems.append(f"a Point holds the lanes of one track: {', '.join(lanes)}")
     for lane, steps in lanes.items():
         if not steps:
             problems.append(f"{lane}: a lane with no step")
@@ -831,14 +845,14 @@ def ref_state(repo: str, number: int) -> tuple[str, bool]:
     return ("open" if is_open else "closed", False)
 
 
-def fetch_point() -> tuple[int, dict[str, Any]]:
-    """The tracking issue's number and its newest ``## Point`` comment."""
+def fetch_point(title: str) -> tuple[int, dict[str, Any]]:
+    """The number of the open issue titled ``title`` and its newest ``## Point`` comment."""
     issues = gh_json(
         "issue", "list", "--state", "open", "--limit", "300", "--json", "number,title"
     )
-    tracking = next((i for i in issues if i["title"] == point.TRACKING_TITLE), None)
+    tracking = next((i for i in issues if i["title"] == title), None)
     if tracking is None:
-        raise NoLaneError(f"no open issue titled {point.TRACKING_TITLE!r}")
+        raise NoLaneError(f"no open issue titled {title!r}")
     full = gh_json(
         "issue", "view", str(tracking["number"]), "--json", "number,comments"
     )
@@ -880,9 +894,17 @@ def fetch_facts(repo: str, lanes: dict[str, list[Step]]) -> Facts:
 
 
 def collect(lane_id: str, start: str | None) -> View:
-    """Everything one run needs from GitHub, then its output."""
+    """Everything one run needs from GitHub, then its output.
+
+    The lane's letter says whose Point it is: a lane of no track is an unknown lane (exit 1),
+    said before any ``gh`` call and never as a crash (FM-82).
+    """
+    try:
+        track = tracks.lane_track(lane_id)
+    except ValueError as exc:
+        raise NoLaneError(str(exc)) from None
     repo = str(gh_json("repo", "view", "--json", "nameWithOwner")["nameWithOwner"])
-    tracking, newest = fetch_point()
+    tracking, newest = fetch_point(tracks.TRACKING_TITLES[track])
     lanes = parse_point(str(newest["body"]))
     if lane_id not in lanes:
         raise NoLaneError(
@@ -941,7 +963,9 @@ def main(argv: list[str] | None = None) -> int:
     ap = _Parser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("lane", nargs="?", help="the lane to run, e.g. S1")
+    ap.add_argument(
+        "lane", nargs="?", help="the lane to run: S1 (stand track), A1 (analysis track)"
+    )
     ap.add_argument("--check", metavar="FILE", help="check a draft Point and exit")
     ap.add_argument(
         "--from", dest="start", metavar="S<k>.<n>", help="steps before it are done"
@@ -974,7 +998,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(ascii_only(p) for p in problems) if problems else "ok")
         return 1 if problems else 0
     if not ns.lane:
-        ap.error("a lane (S1, S2, ...) or --check FILE is required")
+        ap.error("a lane (S1, S2, ... or A1, A2) or --check FILE is required")
     try:
         return run_lane(ns.lane, ns.start, ns.wait, ns.every, ns.timeout)
     except GhError as exc:

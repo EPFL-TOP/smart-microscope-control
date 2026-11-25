@@ -1524,3 +1524,137 @@ def test_the_facts_are_one_listing_of_prs_the_named_issues_and_the_plans_refs(
     } <= set(fields)
     # each ref is asked once, though two plans name it
     assert sum(1 for c in calls if c[0] == "api") == 2
+
+
+# --- the analysis track's lanes (ADR-0010, #653) ----------------------------------------
+
+ANALYSIS_POINT = (
+    "## Point (analysis, 2026-11-26)\n\n"
+    "**A1 \N{EM DASH} the ten-to-forty plan (#636)** \N{EM DASH} the selection kit\n"
+    "A1.1 `/plan 636` (Sonnet) \N{RIGHTWARDS ARROW} merge its design PR"
+    " \N{RIGHTWARDS ARROW} `/develop 636` \N{RIGHTWARDS ARROW} `/review` (Sonnet)"
+    " \N{RIGHTWARDS ARROW} merge\n"
+    "A1.2 after A1.1: `/feature 700` (Sonnet) \N{RIGHTWARDS ARROW} `/review` (Sonnet)"
+    " \N{RIGHTWARDS ARROW} merge\n\n"
+    "**A2 \N{EM DASH} the models (#600)**\n"
+    "A2.1 `/plan 600` (Sonnet) \N{RIGHTWARDS ARROW} `/develop 600`"
+    " \N{RIGHTWARDS ARROW} `/review` (Sonnet) \N{RIGHTWARDS ARROW} merge\n\n"
+    "**Asks to the other track** \N{EM DASH} #599 (awaited by #600)\n"
+    "A2.2 `/feature 701` is a line of no lane: the Asks line ended A2\n"
+)
+
+
+def test_an_analysis_point_parses_into_its_a_lanes() -> None:
+    lanes = lane.parse_point(ANALYSIS_POINT)
+    assert list(lanes) == ["A1", "A2"]
+    assert [s.id for s in lanes["A1"]] == ["A1.1", "A1.2"]
+    assert lanes["A1"][1].after == ("A1.1",)
+    # the Asks line ends A2: the step written under it belongs to no lane
+    assert [s.id for s in lanes["A2"]] == ["A2.1"]
+    assert lane.check_point(ANALYSIS_POINT) == []
+
+
+def test_an_after_of_one_lane_can_name_a_step_of_another_of_the_same_point() -> None:
+    body = (
+        "**A1 \N{EM DASH} x**\nA1.1 `/feature 5`\n"
+        "**A2 \N{EM DASH} y**\nA2.1 after A1.1: `/feature 6`\n"
+    )
+    assert lane.check_point(body) == []
+    assert lane.parse_point(body)["A2"][0].after == ("A1.1",)
+    # a step of the other track's Point is no step of this one
+    other = "**A1 \N{EM DASH} x**\nA1.1 after S1.1: `/feature 5`\n"
+    assert lane.check_point(other) == ["A1.1: after S1.1 names no step"]
+
+
+def test_check_flags_a_point_that_mixes_the_lanes_of_two_tracks() -> None:
+    body = (
+        "**S1 \N{EM DASH} x**\nS1.1 `/feature 5`\n"
+        "**A1 \N{EM DASH} y**\nA1.1 `/feature 6`\n"
+    )
+    (problem,) = lane.check_point(body)
+    assert problem == "a Point holds the lanes of one track: S1, A1"
+    assert lane.check_point("**S1 \N{EM DASH} x**\nS1.1 `/feature 5`\n") == []
+    assert lane.check_point(POINT) == []
+
+
+def _two_tracking_issues(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """Two tracking issues behind a decoy, each with a Point of its own track."""
+    stand = (
+        "## Point (design session, 2026-11-26)\n\n"
+        "**S1 \N{EM DASH} today**\nS1.1 `/feature 5` (Sonnet)\n"
+    )
+    analysis = (
+        "## Point (design session, 2026-11-26)\n\n"
+        "**A1 \N{EM DASH} today**\nA1.1 `/feature 6` (Sonnet)\n"
+    )
+    comments = {
+        51: [{"id": "IC_stand", "createdAt": T0, "body": stand}],
+        670: [{"id": "IC_analysis", "createdAt": T0, "body": analysis}],
+    }
+    calls: list[tuple[str, ...]] = []
+
+    def fake(*args: str) -> Any:
+        calls.append(args)
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": "o/r"}
+        if args[:2] == ("issue", "list"):
+            return [
+                {"number": 7, "title": "feat: something else"},
+                {"number": 670, "title": "Point (analysis): next steps"},
+                {"number": 51, "title": "Point: next steps"},
+            ]
+        if args[:2] == ("issue", "view"):
+            number = int(args[2])
+            return {"number": number, "comments": comments.get(number, [])}
+        if args[:2] == ("pr", "list"):
+            return []
+        raise AssertionError(args)
+
+    monkeypatch.setattr(lane, "gh_json", fake)
+    return calls
+
+
+def test_lane_a1_reads_the_newest_point_of_the_analysis_tracking_issue(
+    monkeypatch, capsys
+) -> None:
+    _two_tracking_issues(monkeypatch)
+    assert lane.main(["A1"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"lane A1 | point {T0} (comment IC_analysis) | tracking #670"
+    assert "NEXT: session feature 6 sonnet" in out
+    assert lane.main(["S1"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[0] == f"lane S1 | point {T0} (comment IC_stand) | tracking #51"
+    assert "NEXT: session feature 5 sonnet" in out
+    # each Point holds the lanes of its own track only
+    assert lane.main(["A2"]) == 1
+    assert "no lane A2: A1" in capsys.readouterr().err
+
+
+def test_a_lane_whose_tracking_issue_is_missing_names_its_title(
+    monkeypatch, capsys
+) -> None:
+    def fake(*args: str) -> Any:
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": "o/r"}
+        if args[:2] == ("issue", "list"):
+            return [{"number": 51, "title": "Point: next steps"}]
+        raise AssertionError(args)
+
+    monkeypatch.setattr(lane, "gh_json", fake)
+    assert lane.main(["A1"]) == 1
+    assert "Point (analysis): next steps" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("lane_id", ["X1", "S", "s1", "A1.2", "1"])
+def test_a_lane_of_an_unknown_track_ends_with_exit_1_before_any_gh_call(
+    monkeypatch, capsys, lane_id
+) -> None:
+    def boom(*args: str) -> Any:
+        raise AssertionError(f"gh was called: {args}")
+
+    monkeypatch.setattr(lane, "gh_json", boom)
+    assert lane.main([lane_id]) == 1
+    err = capsys.readouterr().err
+    assert "S<k>" in err
+    assert "A<k>" in err
