@@ -2021,6 +2021,51 @@ Ph1 on the plate with cells (or any sparse field), reading the pixel size and ro
 (1.12432 µm per pixel, 178.33°), is the check; so is one on a field the tool must still refuse (an empty
 well).
 
+### 4.5 A stage that read its start after a probe: its own words first (#614)
+
+Decided by #614's plan (2026-11-25), item 1 of the issue; item 2 (the signal floor beside the probe
+frames' spread) waits for a real figure at the stand and is not built. `XYStage.move_to_um` returns the
+stage's readback once the move is done (§4.2 step 3), and the plugin discarded it. A stage that accepts a
+probe move and goes nowhere gives two shifts of exactly zero, which the fit can only call
+`PARALLEL_SHIFTS_NOTE`, so the refusal named the frames first and the stage last (F12, FM-222). The
+readback says what the image cannot (FM-167: a move that returns is not a move that arrived).
+
+- **D1 Measured, then assumed.** The demo stage lands within **0.005 µm** of a command (127.995 for 128,
+  1999.995 for 2000; `open_core(None)`, 2026-11-25), `FakeCore` exactly; both return to the start with an
+  error of 0.0, and a stage that goes nowhere reads its start with the same read. A real Ti2-E stage's
+  idle readback was not measured.
+- **D2 A probe stood still** when the distance from the start to its readback, over both axes, is `<=`
+  `min(1.0 µm, 5 % of step_um)`: 1 µm is two hundred times the demo's rounding and far under any step the
+  tool sends; the share keeps the claim true for a step under 20 µm. The test is positive, so that a
+  readback that is not a number is not the start (FM-104). The 1 µm is **assumed**.
+- **D3 When.** Only on a refusal (`not fitted.trustworthy`), for the probes that stood still; a fit that
+  is trustworthy is the measurement and is never refused or relabelled for its readbacks (a stale readback
+  over images that followed the stage). One probe is enough: an axis that goes nowhere makes a zero column
+  of the shifts and the determinant zero whatever the frames hold. The second look still runs on the
+  fit's own condition (§4.4 D3 is untouched).
+- **D4 What it says.** The reason is the stage's line, then the fit's notes other than
+  `PARALLEL_SHIFTS_NOTE`, then `step <s> µm`. The line, both probes: `the stage read its start after the +X
+  probe (0.0 µm from it) and after the +Y probe (0.0 µm from it): the moves did not arrive, so the frames
+  are not the cause; check the stage (its controller on, nothing else holding it)`; one probe: `the stage
+  read its start after the +Y probe (0.0 µm from it): that move did not arrive, so the frames are not the
+  cause; ...`. The distance is to a tenth of a µm. What goes: `PARALLEL_SHIFTS_NOTE` (it ranks the frames
+  above the stage), the probe frames' spread, the second look's ratios, the wrap hint and the reuse
+  sentence (§4.4 D6: a reuse is no way out of a stage that did not obey). 291 characters at the longest
+  (both probes at the tolerance, a 2000 µm step, the weak-response note kept), under the card's 600.
+- **D5 What does not change.** A refusal whose probes all read a position away from the start is the
+  texture refusal of §4.4 D5 and D6, byte for byte (it has 28 characters of room under the card's 600, so
+  it quotes no readback), the slot's fields (the readbacks are not stored), the loop's moves and its
+  FM-88 returns, the dark-probe refusal, and the rule that nothing fills the slot on a refusal.
+- **Not built**: the readback of a probe that arrived is the distance the stage really moved, and the
+  fit's ruler is the command. A stage that lands half way on both axes gives a rigid fit of a pixel size
+  twice too large, with no refusal. Using the readback as the ruler changes the result: it needs a decision.
+
+Tests, `tests/test_camera_calibration_demo.py` (a `_FlakyStage` with `y_fraction` and `lying`, on the
+still-background camera of §4.4.4): both axes dead, a dead X axis and a dead Y axis (the reason whole),
+a creep of 1.92 µm per axis (the texture text) and of 0.48 µm (the stage's line), the tolerance at its
+boundary on both axes and for a small step and `nan`/`inf`, a stage that moves and reads its start
+(`done`, no line), the stage's line over a weak response, its length, and no angle bracket.
+
 ## 5. Plate registration and going to a well (#19)
 
 `smc/plugins/plate_registration/algorithm.py` and `plugin.py`
