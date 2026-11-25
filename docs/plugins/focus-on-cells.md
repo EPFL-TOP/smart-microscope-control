@@ -30,7 +30,7 @@ It never moves XY: it sweeps where the stage is.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `range_um` | 5 | The sweep's half-range, in µm (above 0, at most 50, and at most the stand's Z jog limit). |
-| `step_um` | 1 | The distance between two planes, in µm (0.1 to 10, and at most `range_um`). At most 101 planes. |
+| `step_um` | 1 | The distance between two planes, in µm (0.1 to 10, and at most `range_um`). At least 9 planes and at most 101: the sweep measures its noise between neighbouring planes. |
 | `score` | `brenner` | `brenner`, `normalized-variance`, `gradient-energy` or `laplacian-variance`. |
 | `relock` | true | Lock PFS again after the sweep, when it was locked at the start. |
 
@@ -56,13 +56,22 @@ range and the step are a guess at a 40×'s depth of field. Session 3's stacks de
    offset factor, which is not measured (m2 §12.10.9).
 3. **Sweeps**: for each plane in increasing Z, a move with the readback compared with
    the command (more than a quarter step away fails the sweep), a frame, its score, and
-   the frame written as `cell-focus/<token>/<k>.tif`.
-4. **Finds the peak**: the best score's plane, refined through a parabola on its two
-   neighbours. Only a sweep with **one clear interior maximum** is taken. A flat sweep
-   (an empty field: the scores vary by less than 5 %), a best at an end of the sweep
-   (the focus is outside it), or two maxima (brightfield of unstained cells can lose
-   contrast exactly at focus and show a maximum on either side) **keep the centre**,
-   and the result says which.
+   the frame written as `cell-focus/<token>/<k>.tif`. A Z read more than a quarter step
+   off its command is read **once again** after 0.3 s (the Ti2-E returned the plane
+   before on one move in 504): the second read is the readback, and an INFO line says the
+   first was stale; read off again, the sweep fails and its text names both reads.
+4. **Finds the peak**: the scores are smoothed over three neighbouring planes, and the
+   sweep's own noise is read between its neighbouring planes (hence at least 9 planes).
+   Only a sweep with **one clear interior maximum** is taken. It is **flat** (an empty
+   field, or noise) unless the smoothed rise stands ten times that noise; a smoothed best
+   on the second or second-to-last plane is **at an edge** (the focus may be outside the
+   sweep); and a second maximum that reaches half the best's rise and stands ten noises
+   above the dip between the two makes **two peaks** (brightfield of unstained cells can
+   lose contrast exactly at focus and show a maximum on either side). Otherwise the best
+   plane is refined through a parabola on its two smoothed neighbours. Flat, at an edge
+   and two peaks **keep the centre**, and the result says which. The bound is read against
+   the noise, not against a fixed rise: no fixed rise told an empty field from one with a
+   cell on session 6's 49 real sweeps (m3 §21.11).
 5. **Moves** to the refined plane and takes `best.tif` there, or moves back to the
    centre.
 6. **Locks PFS again** (`relock=true`): PFS takes Z back to the plane it holds. When the
@@ -114,11 +123,12 @@ python scripts/dev/focus_scores.py local/cell-focus/* --csv scores.csv --plot pl
 
 Each folder is one stack: the TIFFs whose metadata has `z_um` (`best.tif` is left out).
 It prints one row per plane (Z, the four scores) and, per score, the outcome and the
-refined Z of the same peak finder the tool uses. `--csv` writes every row with its
+refined Z of the same peak finder the tool uses, with its prominence (the smoothed rise
+over the noise; a peak needs more than 10). `--csv` writes every row with its
 folder; `--plot` writes one PNG per stack (each score divided by its maximum, against Z)
 when `matplotlib` is installed, and says so when it is not. The script expands a pattern
 such as `local/cell-focus/*` itself, since cmd.exe and PowerShell do not. A folder with
-fewer than 3 frames is reported and skipped; a TIFF without `z_um` is left out and
+fewer than 9 frames is reported and skipped; a TIFF without `z_um` is left out and
 counted; a frame Windows refuses to read for a moment is read again, and one that stays
 unreadable skips its stack (a curve with a hole in it would mislead). Exit 0 when one
 stack was scored and every output asked for was written, else 1.
@@ -141,8 +151,9 @@ eye, whether the curves show two maxima, and what range and step the sweep needs
 ## Trying it without a microscope
 
 On the `demo-sample` stand, the frames blur by `|z| / 10` pixels around Z = 0, a
-stand-in for defocus: a sweep from 20 µm with `range_um=25` and `step_um=5` finds Z = 0
-within a few hundredths of a micrometre. The demo's autofocus is off when it opens.
+stand-in for defocus: a sweep from 10 µm with `range_um=25` and `step_um=5` finds Z = 0
+within a few hundredths of a micrometre (from 20 µm the sharp plane is the sweep's second
+and the sweep is at an edge, as it should be). The demo's autofocus is off when it opens.
 
 ```text
 smc run focus-on-cells -p demo-sample --run-doc run.json --param range_um=25 --param step_um=5
@@ -158,3 +169,11 @@ how far Z moved in it; the time per plane and per field; whether a Z readback la
 a quarter step of its command. The 40×'s offset factor at the offsets the route uses, and
 that NIS-Elements engages PFS at a derived offset on the cells' plane, are for the route's
 own check (m3 §26.9).
+
+The rule against the noise (m3 §21.11.5) was fitted to session 6's recorded sweeps (49,
+one well of cells and one of beads in water) and not run at a stand: whether the frames
+taken at the found plane are sharper than the centre's, how many sweeps of a well find a
+peak, how often the Ti2-E's Z read is stale and whether 0.3 s covers it (each read again
+that was fresh is an INFO line in the log), and the factor of 10 on another plate,
+objective or exposure (each sweep's prominence is recomputed from the run document's
+scores, and `focus_scores.py` prints it).

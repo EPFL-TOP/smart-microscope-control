@@ -42,7 +42,7 @@ smc run scan -p <profile> --run-doc run.json --dry-run
 | `landing_tolerance` | 0.05 | How far a field may land from its target, as a fraction of the smaller side of the plan's field of view (above 0, at most 0.5). A field that landed farther is failed, not photographed. 0.05 is 4.8 µm for the demo's 10× (a field of 128 × 96 µm). Read the stand's real agreement at the first hardware session before trusting a fraction. |
 | `cell_focus` | `off` | The focus on the cells ([below](#the-focus-on-the-cells-cell_focus)): `per-field` sweeps Z at every field, `per-well` until one field of the well finds a peak. |
 | `focus_range_um` | 5 | The sweep's half-range, in µm (above 0, at most 50, and at most the stand's Z jog limit). |
-| `focus_step_um` | 1 | The distance between two planes, in µm (0.1 to 10, at most `focus_range_um`, at most 101 planes). |
+| `focus_step_um` | 1 | The distance between two planes, in µm (0.1 to 10, at most `focus_range_um`, at least 9 and at most 101 planes: the sweep measures its noise between neighbouring planes). |
 | `focus_score` | `brenner` | `brenner`, `normalized-variance`, `gradient-energy` or `laplacian-variance`. The four `focus_*` defaults are chosen, not measured. |
 
 ## What is checked before anything moves
@@ -321,8 +321,9 @@ peak; every later field of the well then moves to its own centre plus that field
 offset, with no sweep. An empty first field (a flat sweep) therefore does not decide a
 well.
 
-**A sweep that fails** (a readback more than a quarter step from its command, an
-autofocus that still reads on, a camera that does not answer) is a failed field, and a
+**A sweep that fails** (a readback more than a quarter step from its command that is
+still off when read again once after 0.3 s, an autofocus that still reads on, a camera
+that does not answer) is a failed field, and a
 WARNING names the field and says the autofocus is left off. A halt or a stop ends the
 scan as always, **with the autofocus off**: nothing restores it after a failure or a
 stop, and every refusal of the scan then ends with `; the focus on the cells left the
