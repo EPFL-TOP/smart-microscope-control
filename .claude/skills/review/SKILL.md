@@ -19,14 +19,27 @@ a verdict, do what it unlocks (labels, dependents), and end the session.
 
 1. Read: `gh pr view N` (body), `gh pr checks N`, the issue's `## Plan` and
    `## Report` (with its **Adversarial review** line), `gh pr diff N
-   --name-only`, and only the parts of the diff that implement the
+   --name-only`, **`python scripts/dev/tracks.py --pr N`** (the track of the
+   PR's issue and the paths that are not on it, ADR-0010), and only the parts
+   of the diff that implement the
    interfaces the design doc names. **What a green PR looks like** (ADR-0009):
    three checks, `lint & types`, `tests (ubuntu-latest, py3.13)` and `tests
    (windows-latest, py3.14)`, plus `closing references`; five test jobs with
    the label `ci: full`. A PR that is only behind `main` is not a finding.
 2. Decide on these points only, in order:
    1. **Scope** — the plan, plus "Beyond the plan" fixes that change no
-      interface. A renamed or changed fixed interface is blocking.
+      interface. A renamed or changed fixed interface is blocking. **The
+      track** (rule 2 of ADR-0010): every `other track:` path that `tracks.py
+      --pr N` printed is blocking, as a path outside §7.1 was. Two exceptions,
+      each judged here, never decided by the script:
+      - on the analysis side, a small append to a shared file
+        (`pyproject.toml`'s entry points, `docs/design/failure-modes.md`,
+        `scripts/github/labels.json`), or an interface change on which the
+        issue records **both leads' agreement** and which the plan names. Such a
+        crossing needs **the owner's approval on GitHub** before its merge, and
+        the verdict says so;
+      - on the stand side, an edit of an analysis path on which the issue
+        records the analysis lead's agreement.
    2. **Rules** — ruff enforces most of `CLAUDE.md` (imports, `print`,
       encodings). Check what it cannot: roles rather than labels, safety
       guards that cannot be bypassed, measured versus assumed.
@@ -57,9 +70,11 @@ a verdict, do what it unlocks (labels, dependents), and end the session.
 4. Risk `moves-hardware` only: run `/code-review` on the PR and fold the
    confirmed findings in.
 5. Post a **comment review** — never `--approve` or `--request-changes`:
-   every PR here is opened with the owner's account, and GitHub refuses
-   those from a PR's own author. Branch protection needs green CI, not an
-   approval. `gh pr review N --comment --body-file review.md`, with:
+   an agent's verdict is a comment; an approval is a lead's own act (and
+   GitHub refuses one from a PR's own author, as every PR of a session is
+   opened with its lead's account). Branch protection needs green CI, and the
+   *Code owners* ruleset the owner's approval when a stand path is touched
+   (ADR-0010). `gh pr review N --comment --body-file review.md`, with:
 
    ```markdown
    ## Review (design session, YYYY-MM-DD)
@@ -76,11 +91,13 @@ a verdict, do what it unlocks (labels, dependents), and end the session.
    Anything that does not threaten the default path or break a rule is
    optional, or a follow-up issue you open.
 6. **Ready to merge** → if the PR is still a draft, `gh pr ready N`. Tell
-   the owner in one line that #N can be merged (squash) and what it
-   unblocks; set those issues to `status: ready` if their plan is posted and
-   every dependency is merged. **Changes requested** →
+   **the lead of the PR's issue's track** (the owner for the stand, the
+   collaborator for the analysis track) in one line that #N can be merged
+   (squash) and what it unblocks; a crossing also names the approval it waits
+   for (the owner's, on GitHub); set those issues to `status: ready` if their
+   plan is posted and every dependency is merged. **Changes requested** →
    `gh pr ready N --undo`: the PR goes back to draft, so a green PR with an
-   open blocking item cannot be merged by mistake (#72 was). Tell the owner to run
+   open blocking item cannot be merged by mistake (#72 was). Tell that lead to run
    `/develop <issue>` again: it finds this review, fixes the blocking items
    and marks the PR ready. When the review changes the
    design (a design-doc PR), also replace the issue's `## Plan` with a

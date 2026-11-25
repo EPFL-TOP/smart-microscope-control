@@ -6,7 +6,8 @@ description: Single-session shortcut that runs /plan then /develop on one issue 
 # /feature <issue-number>
 
 The project's normal loop is **/plan** (design session) → **/develop**
-(clean execution session) → **/review** (design session) → owner merges.
+(clean execution session) → **/review** (design session) → the lead of the
+track merges (ADR-0010).
 Use this shortcut only for small, self-contained issues where a hand-off
 costs more than it saves.
 

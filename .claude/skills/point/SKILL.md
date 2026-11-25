@@ -1,6 +1,6 @@
 ---
 name: point
-description: Supervising-session skill — take stock of the project (open PRs and their verdicts, issues by status, develop reports, review outcomes, field feedback from hardware sessions and survey folders), do the housekeeping, and give the owner one short list — what to launch in develop sessions, what to merge, what needs the owner, what is waiting — plus any process improvement. Use at the start of every supervising session and whenever the owner asks where things stand.
+description: Supervising-session skill — take stock of one track of the project (open PRs and their verdicts, issues by status, develop reports, review outcomes, field feedback from hardware sessions and survey folders), do the housekeeping, and give the lead of the track one short list — what to launch in develop sessions, what to merge, what needs the lead, what is waiting, what the other track is asked — plus any process improvement. Use at the start of every supervising session and whenever the lead asks where things stand. Argument - `--track analysis` for the analysis track (the stand's with none).
 ---
 
 # /point
@@ -11,26 +11,40 @@ and you **hand the design work to fresh sessions** by listing it, just as
 you hand implementation to `/develop`. Read the script's output, not GitHub.
 The session ends when the list is posted.
 
-1. **Facts.** Run `python scripts/dev/point.py` and read only its Markdown:
+**Two tracks (ADR-0010).** The repository has two tracks, each with a lead: the
+**stand** (the owner; every path no line of `.github/CODEOWNERS` frees, and the
+issues with no `track:` label) and the **analysis** track (the collaborator; the
+paths of the lines with no owner, and the issues labelled `track: analysis`). A
+Point is one track's: `/point` is the stand's, `/point --track analysis` the
+analysis track's, each posted on its own pinned issue (*Point: next steps*,
+*Point (analysis): next steps*). "The lead" below is the lead of the Point's
+track, and "the owner" in the stand's Point. Everything you list is of this
+track; the other track's issues are named in one place only, *Asks to the other
+track*.
+
+1. **Facts.** Run `python scripts/dev/point.py` (`--track analysis` for the
+   analysis track) and read only its Markdown:
    first the **CI that stops the merges** (a red `main`, an open `CI nightly
    red` issue, a failed nightly run with no issue: ADR-0009), then open PRs with checks and the latest design
-   verdict, issues by status,
+   verdict (the PRs whose paths are this track's; one marked `crossing` belongs
+   to an issue of the other track), issues by status (this track's),
    blocked issues whose dependencies are now merged, what develop sessions
    reported since the last point (follow-ups, not verified, deviations),
-   the owner's own notes, survey folders not yet curated, ADR statuses,
-   milestone progress.
-2. **Field feedback** turns into work, never into chat:
+   the leads' own notes, survey folders not yet curated (the stand's only), ADR
+   statuses, milestone progress, and last **Asks to the other track**.
+2. **Field feedback** (the stand's only: the analysis track reads data, not a
+   microscope) turns into work, never into chat:
    - a new folder in `local/surveys/` → the task "curate survey `<folder>`" for this session (the brief is `docs/hardware/microscope-pc-setup.md` §3). Delegate the reading to one Sonnet subagent with that brief; review its output; never publish raw survey content.
    - a hardware-session report → issues, profile entries, tests or entries in `docs/design/failure-modes.md`.
    - an owner note that asks for something → an issue with acceptance criteria.
-3. **Housekeeping — do it, do not list it.** For a blocked issue whose
+3. **Housekeeping — do it, do not list it**, on this track's issues only. For a blocked issue whose
    dependencies are merged: re-read its plan against the merged code, fix the
    plan if the code moved, then set `status: ready`. Remove status labels
    from closed issues. Open the follow-up issues the reports and reviews
    name, if they do not exist yet. Run `python scripts/dev/worktree.py
    clean` from the main checkout; one line in the output on what it
    removed.
-4. **Plans.** Any issue that belongs in the next wave and has no plan goes on
+4. **Plans.** Any issue of this track that belongs in the next wave and has no plan goes on
    the list as `/plan <issue>`, for a fresh session: Opus for risk
    `moves-hardware` or design-heavy work, Sonnet otherwise. Write a plan here
    only when it is short and needs no design decision.
@@ -46,16 +60,20 @@ The session ends when the list is posted.
    failure-modes list, fix the skill, the agent or the list — a small PR of
    its own — and mention it.
 7. **Output.** Post the list as a comment on the open issue titled
-   `Point: next steps` (create and pin it if missing; one comment per point,
-   in English), then give the owner the same list in their language, at most
+   `Point: next steps` (`Point (analysis): next steps` for `--track analysis`;
+   create it, label it `track: analysis` where it is the analysis track's, and
+   pin it, if missing; one comment per point,
+   in English), then give the lead the same list in their language, at most
    about twenty lines. **A red `main`, or an open `CI nightly red` issue, is
-   step 0**, above everything: no other PR is merged until the owner has
-   chosen to revert or to fix forward (ADR-0009). Name the run or the issue,
-   the tests it names, and the command that fixes it (a `/develop` or a
-   revert), and put every merge of the day after it.
+   step 0**, above everything: no other PR is merged until the lead whose
+   merge turned it red has chosen to revert or to fix forward (ADR-0009,
+   ADR-0010); the failing tests name the code and so the track. Name the run
+   or the issue, the tests it names, and the command that fixes it (a
+   `/develop` or a revert), and put every merge of the day after it.
 
    The list is written as **lanes**: up to three lanes run in parallel
-   (`S1`, `S2`, `S3`), one session at a time inside a lane, so the owner
+   (`S1`, `S2`, `S3` on the stand track; `A1`, `A2` on the analysis track), one
+   session at a time inside a lane, so the lead
    opens at most three sessions and never has to judge what may run with
    what. A lane holds the issues that share files (the plans' **Do not run
    at the same time** lines decide), in priority order; issues on disjoint
@@ -111,13 +129,26 @@ The session ends when the list is posted.
    **End of the day**: `/point`.
    **For you** — decisions and hardware that today's steps do not wait for
    **Waiting** — #26, on #25
+   **Asks to the other track** — #26 (awaited by #25)
    **Process** — the develop skill now asks for …
    ```
 
+   **Every Point ends with *Asks to the other track*** (rule 5 of ADR-0010), as
+   issue numbers: what this track waits for from the other, copied from the
+   last section of `point.py` (`- none` when there is nothing). The analysis
+   track's Point has the same shape, with `A1`, `A2` for its lanes and its own
+   issues. A Point names **no issue of the other track anywhere else**, in a
+   lane or under **For you**. A pull request of the stand's list that is marked
+   `crossing` (an analysis issue that touches a stand path) is a line of **For
+   you** on the stand's Point, "approve #N (a crossing; its lead merges)": the
+   owner approves it on GitHub, the lead of its issue's track merges it. The
+   two leads read both Points together once a week.
+
    **The grammar of a lane** is read by `scripts/dev/lane.py` (`/lane` drives
    the lane from it), so it is written exactly: a lane is a line beginning
-   `**S<k> ` (bold, then a dash and its title); **one step per line**,
-   beginning `S<k>.<n> `; the segments of a step are joined by ` → `; each
+   `**S<k> ` (`**A<k> ` on the analysis track's Point; bold, then a dash and its
+   title; **one Point holds the lanes of one letter**); **one step per line**,
+   beginning `S<k>.<n> ` (`A<k>.<n> `); the segments of a step are joined by ` → `; each
    session segment holds **one backticked command** (`/plan <n>`,
    `/develop <n>`, `/feature <n>`, `/review <pr>`) with its model in the
    parenthesis right after it (`(Opus)`, `(the plan's model)`); a design PR's
@@ -148,3 +179,4 @@ The session ends when the list is posted.
 - Read full diffs or crawl every issue yourself; that is what the script and subagents are for.
 - Launch develop sessions yourself, or merge.
 - Run several reviews or plans in this session: list them for fresh sessions instead.
+- Name an issue of the other track anywhere but *Asks to the other track*.

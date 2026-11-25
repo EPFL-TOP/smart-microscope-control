@@ -19,7 +19,10 @@ the plan, do what it unlocks (labels, dependents), and end the session.
 1. Read the issue (`gh issue view N --comments`), `CLAUDE.md`, the ADRs it
    touches, and the design doc for its milestone (`docs/design/*.md`). If the
    interface the issue needs is not fixed in a design doc, fix it there first
-   (a PR of its own): parallel executors depend on it.
+   (a PR of its own): parallel executors depend on it. **The issue's track is
+   its label** (ADR-0010): `track: analysis`, or the stand's with none. The
+   plan is written for the lead of that track, who also reads the PR; the
+   design documents and the ADRs stay the owner's whichever track asks.
 2. **Think through the failure modes before writing the steps.** For code
    that reads or moves hardware, go through `docs/design/failure-modes.md`
    and name the entries this code must handle. A gap found later in review
@@ -30,7 +33,22 @@ the plan, do what it unlocks (labels, dependents), and end the session.
    labelled `status: in-progress` or `status: ready`; name in **Do not run
    at the same time** every one that edits the files this plan edits (#264's
    plan missed #252's open PR on the same modules, and the branch conflicted).
-4. Post the plan as a comment, exactly in this format:
+   The in-flight PRs and issues are **both tracks'**: a PR of the other track
+   can edit a file this plan edits (a shared file, `pyproject.toml`).
+4. **Check the paths against the issue's track** (rule 2 of ADR-0010). Once
+   *Files* is drafted, run `python scripts/dev/tracks.py <every path of
+   Files>`; it prints the track of each path (`.github/CODEOWNERS` is the
+   map). A path of the other track is one of two things:
+   - a **crossing** of the two kinds that `/review` accepts: a small append to
+     a shared file (`pyproject.toml`'s entry points,
+     `docs/design/failure-modes.md`, `scripts/github/labels.json`), or an
+     interface change on which both leads agree. Name it under *Risks*; for a
+     stand path touched from an analysis issue, say it **needs the owner's
+     approval** on GitHub before the lead merges;
+   - **a need of the other track**: it becomes an issue for that track, labelled
+     for it, named on **Depends on**, and never an edit of this plan. `docs/design/`
+     and the ADRs stay the owner's.
+5. Post the plan as a comment, exactly in this format:
 
    ```markdown
    ## Plan (design session, YYYY-MM-DD)
@@ -70,8 +88,10 @@ the plan, do what it unlocks (labels, dependents), and end the session.
    **Ready for /develop**: yes | blocked by #a
    ```
 
-5. Labels: `status: ready` when unblocked (remove `status: blocked`),
-   otherwise `status: blocked` and name the blocker. Set the milestone.
+6. Labels: `status: ready` when unblocked (remove `status: blocked`),
+   otherwise `status: blocked` and name the blocker. Set the milestone. Keep
+   the issue's `track:` label (and give it to any issue the plan opens for the
+   analysis track).
 
 ## Rules
 

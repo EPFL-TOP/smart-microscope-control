@@ -1,16 +1,22 @@
 ---
 name: lane
-description: Supervising-session skill — run one lane of the latest Point (S1, S2, S3) from where it stands to the next place the owner is needed. Each step is a fresh subagent in its own worktree with the step's model; the session waits for CI and merges, and stops with a note on the tracking issue where a decision, a walk, a stand session, a red PR or a second "changes requested" needs the owner. Argument - the lane, optionally "from S<k>.<n>".
+description: Supervising-session skill — run one lane of the latest Point (S1, S2, S3 on the stand track; A1, A2 on the analysis track) from where it stands to the next place the lead of the track is needed. Each step is a fresh subagent in its own worktree with the step's model; the session waits for CI and merges, and stops with a note on the track's tracking issue where a decision, a walk, a stand session, a red PR or a second "changes requested" needs the lead. Argument - the lane, optionally "from S<k>.<n>" (or "A<k>.<n>").
 ---
 
 # /lane <S> [from S<k>.<n>]
 
 You are a **supervising session** (run it on **Sonnet**, in the main checkout, in
-a fresh session) that drives one lane of the Point: the owner opens up to
-three of these, one per lane, and acts only on merges and decisions. You never
+a fresh session) that drives one lane of the Point: the lead of the track opens up
+to three of these, one per lane, and acts only on merges and decisions. You never
 edit a file, never read a diff, never merge, never decide and never widen a
 step. `scripts/dev/lane.py` reads GitHub and says what to do next; you do
 exactly that, and write one short note after each step.
+
+**The lane's letter picks the track** (ADR-0010): `<S>` below is the lane id,
+`S1` to `S3` on the stand track (the Point on *Point: next steps*, the owner's
+lanes) or `A1`, `A2` on the analysis track (the Point on *Point (analysis): next
+steps*, the collaborator's lanes). The lead of that track opens the lane, and
+"you" in a note and "the owner" in `lane.py`'s `NEXT: owner` line is that lead.
 
 The hand-off is GitHub: the Point's lane (what to do), the plans, reports and
 reviews the subagents post (what was done), and your `## Lane` notes on the
@@ -24,7 +30,8 @@ tracking issue (where the lane is). Memory keeps nothing of it.
    segment with its state, and exactly one `NEXT:` line. Remember the Point's
    comment id from the header: when it differs between two runs, a new Point
    replaced this one; finish nothing new, post a note "a new Point was posted;
-   relaunch `/lane` from it", and end. Exit 1 (an unknown lane, no Point), 4
+   relaunch `/lane` from it", and end. Exit 1 (an unknown lane, a lane of no
+   track such as `X1`, no Point), 4
    (a usage error, or a crash of the script: FM-82) or 130 (interrupted): say
    what it printed and end. Exit 3 is the timeout of `--wait`, step 3.
 
@@ -87,11 +94,13 @@ tracking issue (where the lane is). Memory keeps nothing of it.
 
 ## The note
 
-On the tracking issue (its number is in the header), one comment per step you
-finished or wait you start, written with the Write tool into your scratchpad
-and posted with `gh issue comment <n> --body-file <file>`. Header exactly
-`## Lane (<S>, <date>)`: `point.py` selects on it and lists the newest note of
-each lane in the next Point.
+On the tracking issue (its number is in the header: the stand's *Point: next
+steps*, the analysis track's *Point (analysis): next steps*), one comment per
+step you finished or wait you start, written with the Write tool into your
+scratchpad and posted with `gh issue comment <n> --body-file <file>`. Header
+exactly `## Lane (<S>, <date>)`, `## Lane (A1, <date>)` on the analysis issue:
+`point.py` selects on it and lists the newest note of each lane in the next
+Point of its track.
 
 ```markdown
 ## Lane (S1, 2026-11-12)
@@ -102,9 +111,9 @@ each lane in the next Point.
 
 **Done** is the step and what its subagent's last lines say (a URL, a verdict);
 **Next** is what `lane.py` printed next, in a sentence. Two short lines: this
-is a log for the owner and for `/point`, not a report.
+is a log for the lead and for `/point`, not a report.
 
-**Next asks the owner for one thing, or for nothing.** It is the single
+**Next asks the lead for one thing, or for nothing.** It is the single
 action that lets this lane go on (`you merge #445`, `you: decide the plan
 deviation <url>`), followed by how to resume when the lane has ended. It never
 holds a list, a "meanwhile", a "whenever convenient", or a thing to do before
@@ -113,7 +122,7 @@ tree of side tasks that the owner could not follow.
 
 Everything else a subagent's last lines raise (a decision that blocks nothing
 today, a follow-up to file, a stand check, a label to set, a worktree to
-remove) goes on a third line, **For /point**, which the owner does not act on:
+remove) goes on a third line, **For /point**, which the lead does not act on:
 the next `/point` turns each into an issue, a housekeeping step or a line of
 its list.
 
