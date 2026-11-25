@@ -275,7 +275,7 @@ answers), a sentence, its own regions and *Continue*:
 
 | Step | What its screen holds |
 |---|---|
-| *Stand* | [designed](#the-stand-and-plate-screens): the stand line, the preset, what is known, *Calibrate the camera* |
+| *Stand* | [designed](#the-stand-and-plate-screens): the stand line, the preset, what is known, the numbers of the calibration in place, *Calibrate the camera* |
 | *Plate* | [designed](#the-stand-and-plate-screens): the plate, three centres to capture, *Register the plate* |
 | *Wells* | [designed](#the-wells-and-scan-screens): the wells, coverage and autofocus, *Lay out the fields*, what is known |
 | *Scan* | [designed](#the-wells-and-scan-screens): *Start the scan*, a progress bar, what was scanned |
@@ -301,6 +301,30 @@ disclosure shows the `smc run` line it makes.
   another objective, `... objective not recorded`, or `not calibrated (the arrows cannot
   say which way the image moves)`; `Light: on`, `off` or `not known`; and, while the stand is
   connected, `Disconnect releases <stand> for NIS-Elements or ZEN.`;
+- **the numbers of the calibration in place** (since #627), directly under that block and
+  **outside** the box below, so that they stay when the box hides: after the click the pane is
+  what says what it measured and where it put it, where the strip says only `Camera calibration
+  done in 0.2 s` and goes at the next activity. Three lines and then the tool's own words:
+  `Camera calibration at <objective>, measured <the PC's time to the minute>.`, `Pixel size
+  0.2500 µm, rotation 30.0°, mirrored, residual 0.04 µm, probe step 32 µm.` (four, one, two
+  decimals and the step as it is; `not mirrored` for a camera that is not; a rotation that
+  rounds to nothing reads `0.0`) and `Written to <the file>.`, the file as the page was given
+  it, never resolved; then one `assumed: ...` line for each line the calibration holds, as the
+  cards print them (the tool says there when the residual is large against the step). **Which
+  calibration** is the one of the objective in place that the page itself would use: with the
+  stand closed or the objective not known, the run document's; with no registration from the
+  plate's walls, or at the plate's own objective, the run document's **when it was made at that
+  objective** (or records none), never another objective's under the wrong name; at another
+  objective after a registration from the walls, the document held at that objective's turret
+  position (`calibrations/position-<n>.json`), when it is usable and is that position's. When
+  none holds the pane is empty and takes no height (at the 40X after a registration at the 10X,
+  before the first click: the known block says `not at <the 40X>` and the pane says nothing).
+  It is plain text, one line for each line above and none longer than 600 characters (a value
+  nobody wrote, a long label or path is cut with `…`), drawn from the last view and the status at
+  every tick and never from the stand. It does not judge the numbers: the `assumed` line
+  does. The page does not show `response`, `return_error_um` or the frame; the document
+  holds them (m5 §23). **Not looked at in a real browser** at 1280 x 620 with the stand PC's
+  font size and a long Windows path;
 - **Calibrate the camera**, shown only when there is no calibration or it was made at
   another objective. It runs `camera-calibration` with what the profile suggests, as the
   tool's own *Run* does, and **where the calibration goes depends on the plate**. **Into the run
@@ -1126,8 +1150,14 @@ other, **at most 10 a second**, and the page draws each new frame: the frame num
 what it compares, every 0.1 s, so it draws nothing when there is nothing new. The
 button then says **End live**. While live goes the line under the strip reads
 `live: <n> frames`. A camera slower than 10 frames a second runs at its own rate. Live
-is **one activity**, like a run: **Snap and every Run button are disabled**, a click on
-the map in drive mode is refused, and each says `live is running`. Live is never ended
+is **one activity**, like a run: **Snap and every Run button are disabled** and say `live is
+running`; **a click on the map in drive mode is refused** too, with the text that says what to
+press (since #627): `live is running, so the stage did not move: press End live, switch Drive
+on and click the well again. The arrows work during Live.` The click spends Drive, as every
+click does, which is why the text says to switch it on again; the arrows (the Drive pad) do
+work during Live, and the Plate screen's *Go to* is disabled during Live and says so above
+its rows. The page does not drive to a well under Live: that would run `goto-well` between
+two frames, and a decision of its own (m5 §23 D7). Live is never ended
 for them: end it with **End live**, which ends only the live view and **does not halt
 the stand** (it says `live ended: <n> frames in <s> s`). A click does what the button
 says, so a button that is a second out of date does not do the opposite: a stale
