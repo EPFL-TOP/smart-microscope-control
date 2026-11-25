@@ -154,7 +154,7 @@ An **execution session** — a fresh session, human or agent, Sonnet by
 default — takes one ready issue, implements its plan, has cheap reviewer
 agents attack the change (`/adversarial-review`), opens the PR and posts a
 `## Report` (`/develop`). The supervising session reviews lightly
-(`/review`); the **owner** merges. Each execution runs in its own
+(`/review`); the **lead of the track** merges (ADR-0010). Each execution runs in its own
 `git worktree` with its own `.venv` (`python scripts/dev/worktree.py setup`;
 `clean` removes merged ones). Labels tell you where an issue is: `ready` →
 `in-progress` → `in-review`.

@@ -13,8 +13,9 @@ sessions**, and the GitHub issue is the contract between them:
 
 - **Supervising (design) sessions** orchestrate, and they are **short and
   chained**, like execution sessions. A cycle starts with a fresh **`/point`**
-  session: take stock, do the housekeeping, give the owner one short list,
-  and post it on the pinned issue *Point: next steps*. That list names the
+  session: take stock, do the housekeeping, give the lead of the track one
+  short list, and post it on the track's pinned issue (*Point: next steps*;
+  *Point (analysis): next steps* with `/point --track analysis`). That list names the
   design work as commands to launch in **fresh sessions**, each with a
   suggested model, exactly as it names `/develop` sessions:
   - `/review <pr>` for each PR (light and proportionate);
@@ -29,28 +30,36 @@ sessions**, and the GitHub issue is the contract between them:
   only stable lessons, never the current state. Reviews and plans for
   different PRs or issues run in parallel; changes to the same design
   document run one at a time.
-- A **lane session** (`/lane <S>`, Sonnet, a fresh session) runs one lane of
+- A **lane session** (`/lane <S|A><k>`, Sonnet, a fresh session) runs one lane of
   the Point: each step is a fresh subagent in its own worktree
   (`isolation: worktree`), with the step's model, started from
   `scripts/dev/lane.py`'s `NEXT:` line; it waits for CI and for merges, and
-  stops, with a `## Lane` note on the Point's issue, where the owner is needed
-  (a decision, a walk, a stand session, a red PR, a second "changes
-  requested"). It never edits, reads a diff, merges or decides: the owner
-  opens up to three, one per lane, and acts on merges and decisions only.
+  stops, with a `## Lane` note on the Point's issue, where the lead of the track
+  is needed (a decision, a walk, a stand session, a red PR, a second "changes
+  requested"). It never edits, reads a diff, merges or decides: the lead
+  opens up to three, one per lane (`S1` to `S3` on the stand track, `A1`, `A2`
+  on the analysis track), and acts on merges and decisions only.
 - An **execution session** (a fresh session, Sonnet unless the plan
   suggests otherwise) takes **one** issue labelled `status: ready`,
   implements its plan, attacks the change with **`/adversarial-review`**
   before the PR, opens the PR and reports on the issue (`/develop`). It may
   add defensive fixes that change no interface ("Beyond the plan"); it
   never changes a fixed interface — that comes back as `## Plan deviation`.
-- The **owner** decides ADRs, merges PRs and runs hardware sessions.
-- A **collaborator** (a second developer, with write access, who never merges)
-  runs `/develop` on `area: algorithms` issues, and `/feature` on a small one;
-  the supervising skills stay the owner's. Such an issue touches nothing of
-  `smc.hardware`, `profiles/` or `smc.ui`: it is done when the algorithm passes
+- **Two tracks, two leads (ADR-0010).** `.github/CODEOWNERS` is the map of the
+  paths: the stand is the default, a line with no owner is a path of the analysis
+  track, and the label `track: analysis` marks its issues (`scripts/dev/tracks.py`
+  tells the track of a path or of a PR).
+  The **owner** leads the stand: decides ADRs and `docs/design/`, runs hardware
+  sessions, and merges on the stand's paths. The **collaborator** (a second
+  developer, with write access) leads the analysis track: `/point --track
+  analysis`, `/lane A1`/`A2`, `/plan`, `/review`, `/develop` and `/feature` on its
+  issues, and merges on its paths. A PR that touches a stand path needs the
+  owner's approval on GitHub, whoever wrote it. **A need across the border is an
+  issue for the other track, never an edit**: an analysis issue touches nothing of
+  `smc.hardware`, `profiles/` or `smc.ui`; it is done when the algorithm passes
   its tests on a dataset, and a second issue of the owner's connects the result
   to the tool that drives the microscope and carries the check at the stand
-  (`docs/design/algorithms.md` §7; the guide is `docs/algorithms/README.md`).
+  (`docs/design/algorithms.md` §7.2; the guide is `docs/algorithms/README.md`).
   Their own notes carry no header, as the owner's do: `point.py` names the
   author of each.
 
@@ -68,8 +77,8 @@ supervising session stays in the main checkout.
 
 Every comment an agent writes on GitHub starts with a header naming its
 kind and session — `## Plan (design session, <date>)`, `## Report (develop
-session, <date>)`, `## Lane (S1, <date>)` — so that the owner's own notes
-stand out (`point.py` relies on it).
+session, <date>)`, `## Lane (S1, <date>)` or `(A1, <date>)` — so that the leads'
+own notes stand out (`point.py` relies on it).
 
 ## Workflow: issue → plan → branch → implement → verify → PR
 
@@ -87,7 +96,9 @@ stand out (`point.py` relies on it).
    mypy && pytest`. Fix root causes, never silence a check to pass.
 6. **Open the PR** with the template filled honestly (what was *not*
    verified is stated). Conventional-commit title. Link the issue with
-   `Closes #N`. Request review; **never merge** — that is the owner's call.
+   `Closes #N`. Request review; **never merge** — that is the call of the lead
+   of the issue's track (ADR-0010), after the owner's approval on GitHub when
+   the PR touches a stand path.
    Every other mention of an issue is `Refs #N`: GitHub closes an issue
    for *close*, *fix* or *resolve* followed by `#N` anywhere in the body
    or the squash commit, even after "not" ("Does not close #16" closed
@@ -154,7 +165,8 @@ stand out (`point.py` relies on it).
   full matrix (Linux, macOS, Windows, Python 3.10 to 3.14) before a release
   and every night (ADR-0009).
 - A red `main`, or an open `CI nightly red` issue, stops the merges of the
-  code it names until the owner has chosen to revert or to fix forward.
+  code it names until the lead whose merge turned it red has chosen to revert or
+  to fix forward (ADR-0010).
 - A test that asserts on a measured duration or a frame rate carries
   `@pytest.mark.wallclock`: a pull request runs the suite with `pytest -n
   auto` and those tests apart, in order; the nightly runs everything in
@@ -181,11 +193,11 @@ turned into code, a profile entry, a test or a doc line.
 
 ## Skills
 
-Supervising sessions, each fresh and single-purpose: `/point` take stock
-and list what to do next (it starts every cycle) · `/plan <issue>` write the
-executable plan · `/review <pr>` light review against the plan, the rules
-and the adversarial review · `/lane <S>` run one lane of the Point, each step
-a fresh subagent · `/adr` propose a decision · `/hardware-session`
+Supervising sessions, each fresh and single-purpose: `/point [--track analysis]`
+take stock and list what to do next (it starts every cycle) · `/plan <issue>`
+write the executable plan · `/review <pr>` light review against the plan, the
+rules, the track of its paths and the adversarial review · `/lane <S|A><k>` run
+one lane of the Point, each step a fresh subagent · `/adr` propose a decision · `/hardware-session`
 prepare and write up a session at a stand.
 Execution session: `/develop <issue>` implement one planned issue to a PR;
 it runs `/adversarial-review <issue>` before the PR, and `/ui-check` (the plate
