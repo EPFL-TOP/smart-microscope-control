@@ -33,6 +33,11 @@ Produce a one-page checklist for the operator:
 4. Contract tests: `pytest -m hardware --profile <name> tests/contracts -x`.
 5. The specific checks, each as a command with expected result and the
    safety note (clearance before any Z or turret move; jog guard on).
+   Expected results are copied from a previous session's log, the design
+   doc or the code, never written from memory: session 6 expected role
+   names in the STOP note, which names device labels (#620). A map click is
+   refused while Live runs, by design: the checklist ends Live before any
+   drive from the map (#620, F1).
 6. What to paste back: raw outputs, `smc version`, commit hash.
 7. The console set-up of every step sets `SMC_PROFILE=<name>`: a command
    without `-p` otherwise opens the demo and says nothing (Ti2-E session
@@ -40,6 +45,14 @@ Produce a one-page checklist for the operator:
    The console of every step that is not redirected to a file is saved
    before it is closed (title bar, *Edit → Select All*, Enter, then paste
    into `terminal.log`), so the console comes back as well as the notes.
+   - Every console block sets every variable its commands use (`SC`, `W1`,
+     `W2`, `CAL40`, …): a variable set in another console is not there, and
+     `cmd` passes `%W1%` literally (Ti2-E session 6: `wells not
+     understood: '%W1%', '%W2%'`, a `failed` stage written).
+   - When two consoles hold different folders (`SC`), each console's title
+     says its folder (`title SC=…`) and every step names its console: a
+     reuse typed in the wrong console ran on the practice run document and
+     left its calibration `failed` (#620, F15; #626).
 8. Every item left over from earlier notes on the session issue goes
    into the checklist, or is marked as left for later.
 9. Ask the owner what is on the stage before writing wells, coverage or
@@ -49,7 +62,10 @@ Produce a one-page checklist for the operator:
    beads or debris, medium or dry. Step 1 of the checklist has the operator
    confirm it at the stand. Ti2-E sessions 3 and 5 assumed cells and had
    none (#550, F5), and a wet well and a dry one do not behave alike (#539,
-   #548).
+   #548). Step 1's state read also names the condenser module per objective
+   (Ti2-E: Ph1 for the 10×, N2 for the 40×, turned by hand, #628) and asks
+   whether anyone worked on the stand since the last visit: the camera had
+   been turned by 0.9° (Ti2-E session 6, #620, F4, F13).
 10. Right after any switch-on of an autofocus that drives Z to its
     offset's plane (the Ti2-E's PFS, from smc or from the stand's own
     button), the next line of the checklist reads Z and compares it with
@@ -57,8 +73,8 @@ Produce a one-page checklist for the operator:
     if Z moved: switch the autofocus off with the stand's button, then
     write down both values. The jump went unnoticed in Ti2-E sessions 1
     and 2 (+235 µm, +206.6 µm; #205, #331).
-11. **Commands are typed in Windows `cmd`, as written** (Ti2-E session 5,
-    #550):
+11. **Commands are typed in Windows `cmd`, as written** (Ti2-E sessions 5
+    and 6, #550, #620):
     - Every value is a number, never a placeholder: `<Z − 200>` was typed
       as it stood, and `<` and `>` are redirections (F9). Where a value
       comes from a read at the stand, the line says so and the guide gives
@@ -69,6 +85,10 @@ Produce a one-page checklist for the operator:
     - The drop that clears a turn sits on the turn's own line, so that the
       turn runs only after it: `smc z move 3720 && smc objective set
       "3-Plan Apo LmbdD0.25 40x" --confirm` (F16).
+    - A long `-v` run is redirected to a file under `%S%`. The result is
+      read from the run document or from the file's last lines, not from the
+      scrolled console, where the owner could not find it (session 6, #620,
+      F10).
 12. **SSH, read-only, where the stand has it** (the Ti2-E since session 5;
     owner decision 2026-11-15):
     - **At the start**, the guide gives the operator the whole line with
@@ -78,13 +98,17 @@ Produce a one-page checklist for the operator:
       True -RemoteAddress <the address>`.
     - **At the end**, the operator runs `Stop-Service sshd` and
       `Set-NetFirewallRule -Name OpenSSH-Server-In-TCP -Enabled False`,
-      and the guide checks that port 22 no longer answers.
+      and the guide checks that port 22 no longer answers, before the laptop
+      leaves the stand's network (*During* §5).
     - **Over SSH the guide may only:**
       - read files, `git log` and `git status`;
       - run `smc doctor` while nothing else holds the stand;
       - `scp -r` folders into **new** folders on the laptop.
     - smc over SSH is prefixed with `set PYTHONUTF8=1&&`, or `✓` and `µ`
       arrive in the console's code page (F18).
+    - `-p` is an option of each command, not of `smc`: `smc doctor -p
+      nikon-ti2` works and `smc -p nikon-ti2 doctor` is refused. Over SSH
+      prefer `set SMC_PROFILE=<name>&&` (session 6, #620).
     - Every command that moves anything is still typed by the operator.
 
 ## During
@@ -105,7 +129,11 @@ an objective not seated, a plate whose pitch is not useq's).
    the by-eye focus, the soft limits, the objective in place, the PFS offset
    after a turn: the Ti2-E restores one per objective). Check what the
    operator pastes against them and say **go** or **stop** before the next
-   step.
+   step. After any probe that writes an autofocus offset, the objective's
+   offset is set back to the stand's own value before turning away (Ti2-E:
+   17794 at the 40×, 9370 at the 10×): the stand restores the last offset
+   per objective, and session 6 left the 40× at 2 for the next users (#620,
+   F8).
 3. On a blocking finding: record it with the raw lines, give the
    checklist's fallback if it has one, and move on; what has no fallback is
    left for the write-up, not improvised.
@@ -113,12 +141,27 @@ an objective not seated, a plate whose pitch is not useq's).
    (step, time, command, outcome, finding `F<n>`). It sits outside
    `session<N>/`, which the copy from the stand brings back: session 3's
    copy erased its log. Remind the operator to save each console into
-   `terminal<k>.log` before it is closed, the page's server console
-   included. Name every file the operator saves (run documents, frames,
-   Z-stacks) with its path. The laptop's clock and the stand's differ: the
-   notes take their times from the run documents' UTC stamps where they
-   exist.
-5. At the end, write a **Summary for `/hardware-session <stand> after`** at
+   `terminal<k>.log` before it is closed, the page's server console of
+   every run of the page included, not only the first: session 6's
+   afternoon one was not saved (#620). Name every file the operator saves
+   (run documents, frames, Z-stacks) with its path.
+   - The laptop's clock and the stand's differ: the notes take their times
+     from the run documents' UTC stamps where they exist. Otherwise the
+     time of each line is read from the laptop's clock (`date +%H:%M`),
+     never estimated: the `~` times ran 30 min ahead in session 5 and up to
+     30 min late in session 6 (#620).
+   - A run document keeps only the last attempt of each tool: a refusal met
+     several times is pasted into the log each time. Session 6's
+     calibration refusals on cells survive only in the notes (#625).
+5. **Before the guide's laptop leaves the stand's network**, three things
+   are done, because after it they cannot be (Ti2-E session 6, #620):
+   - the put-back is confirmed with the operator: plate off, objective and
+     its autofocus offset back to the stand's own value (§2);
+   - the SSH service and its firewall rule are closed (*Before* §12);
+   - the large scan folders are copied as each plate ends, not at the end.
+   The laptop left at 16:59 with the 13 GB folder and the put-back unseen,
+   and the VPN address could not reach port 22 afterwards.
+6. At the end, write a **Summary for `/hardware-session <stand> after`** at
    the bottom of the notes: done, not done, the findings in order, what the
    findings unblock offline and what needs the stand again. File only the
    issues the owner asks for that evening (p0, the next visit's critical
