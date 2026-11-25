@@ -84,6 +84,7 @@ from smc.ui.guide import (
 from smc.ui.plate_page import (
     PlatePageView,
     RunFileHandler,
+    TextPane,
     build,
     card_text,
     serve,
@@ -943,10 +944,11 @@ def test_the_card_text_of_a_worst_case_record_is_bounded(
 
 
 def test_a_result_card_is_plain_text_under_its_tool(
-    page: PlatePage, run_doc: Path
+    page: PlatePage, run_doc: Path, browser_text: Callable[[Any], str]
 ) -> None:
-    # Markup in a result must reach the screen as the words it is: a Str pane, not
-    # Markdown (FM-139).
+    # Markup in a result must reach the screen as the words it is: the page's escaping
+    # text pane, not Markdown (FM-139), and what the browser is sent for it is one `pre`
+    # holding the words (`browser_text`, FM-271).
     _seed_raw(
         run_doc,
         "scan",
@@ -954,13 +956,14 @@ def test_a_result_card_is_plain_text_under_its_tool(
     )
     view = PlatePageView(page)
     pane = view.tool_cards["scan"]
-    assert type(pane) is pn.pane.Str
+    assert type(pane) is TextPane
     assert pane.object == (
         "done 2026-10-29 09:03:00 UTC\n"
         "  note: <b>[red]x</b>\n"
         "  in the run document\n"
         "assumed: <i>[bold]guess[/bold]</i>"
     )
+    assert browser_text(pane) == pane.object
     # Under its Run button (and the note that explains a disabled one), in its own
     # section; no other tool shows it.
     run = view.tool_runs["scan"]
@@ -968,6 +971,21 @@ def test_a_result_card_is_plain_text_under_its_tool(
     (section,) = [s for stage in accordion.objects for s in stage if run in s]
     assert list(section).index(pane) == list(section).index(run) + 2
     assert view.tool_cards["goto-well"].object == ""
+
+
+def test_every_str_pane_in_the_pages_layout_is_a_text_pane(page: PlatePage) -> None:
+    """FM-271: the layout holds no bare `Str`, however a constructor was spelled.
+
+    The source test of ``test_plate_page_text_pane`` reads the spellings it knows; this one
+    reads the built page, whose panes are counted so that a layout with none is not a pass.
+    """
+    view = PlatePageView(page)
+    panes = view.layout.select(pn.pane.Str)
+    assert len(panes) >= 40
+    assert [type(o).__name__ for o in panes if type(o) is not TextPane] == []
+    # The drive bar's, the objective confirmation's and the snap line, which no screen walk reads.
+    for pane in (view.drive_note, view.objective_confirm_text, view.snap_note):
+        assert pane in panes
 
 
 def test_a_card_of_another_stand_names_it_and_one_of_this_stand_does_not(

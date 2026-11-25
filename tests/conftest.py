@@ -22,13 +22,14 @@ runs the plugin's own tests (``test_testing_fixtures.py``).
 from __future__ import annotations
 
 import gc
+import html
 import logging
 import math
 import threading
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -106,6 +107,67 @@ def handler_failures() -> Iterator[list[logging.LogRecord]]:
     finally:
         logger.removeHandler(collector)
     assert not seen, [repr(r.exc_info[1]) if r.exc_info else None for r in seen]
+
+
+@pytest.fixture
+def browser_text() -> Callable[[Any], str]:
+    """What the browser shows for a text pane of the plate page, read from the model the browser is sent (FM-271).
+
+    A pane's type and its ``.object`` are Panel's and the page's, not the browser's: Panel
+    builds a ``Str`` as ``'<pre>' + str(obj) + '</pre>'`` and the browser parses it, so a
+    ``<b>`` in the text is an element and a ``<its run document>`` is an unknown one that
+    swallows its words (#625). The Bokeh model of the pane (the pane's clone, which leaves
+    the live pane with no model) holds what is sent; ``html.unescape`` **once** gives the
+    HTML the browser's own unescape produces, and ``HTMLParser`` gives the elements it
+    builds out of it. Unescaping twice would undo the page's own escape and pass a page
+    that is still broken, so there is no second pass here. The helper asserts that the one
+    element is a ``pre`` (an unknown element counts: it is what ate the words), and no
+    comment, declaration or processing instruction either; it returns the concatenated
+    text, which is what a reader sees.
+
+    Measured on Panel 1.9.5, 1.10.0 and 1.11.1; the render path is the same on all three.
+    """
+    from html.parser import HTMLParser
+
+    from bokeh.document import Document
+
+    class Parsed(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.starts: list[str] = []
+            self.other: list[str] = []
+            self.data: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs: Any) -> None:
+            self.starts.append(tag)
+
+        def handle_data(self, data: str) -> None:
+            self.data.append(data)
+
+        def handle_comment(self, data: str) -> None:
+            self.other.append(f"comment {data!r}")
+
+        def handle_decl(self, decl: str) -> None:
+            self.other.append(f"declaration {decl!r}")
+
+        def handle_pi(self, data: str) -> None:
+            self.other.append(f"processing instruction {data!r}")
+
+        def unknown_decl(self, data: str) -> None:
+            self.other.append(f"declaration {data!r}")
+
+    def read(pane: Any) -> str:
+        model = pane.clone().get_root(Document())
+        parsed = Parsed()
+        parsed.feed(html.unescape(model.text))
+        parsed.close()
+        assert parsed.starts == ["pre"], (
+            f"the browser builds {parsed.starts} from {model.text!r}, not one <pre>"
+        )
+        assert not parsed.other, f"the browser reads {parsed.other} in {model.text!r}"
+        return "".join(parsed.data)
+
+    return read
 
 
 @pytest.fixture

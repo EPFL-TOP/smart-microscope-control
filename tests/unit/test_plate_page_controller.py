@@ -7216,9 +7216,9 @@ def test_the_failed_words_are_one_line_plain_and_cut_at_the_cards_bound(
 ) -> None:
     """FM-205: markup, a path and 700 characters in a tool's words, through the bound.
 
-    This pins the model's text (one line, cut at the bound, the words as given). Whether
-    a browser shows a `Str` pane's text as text is not proved here (FM-271: it parses it
-    as HTML), and no test of the model can prove it.
+    This pins the controller's text (one line, cut at the bound, the words as given); the
+    page does not draw it here. What a browser makes of the pane that shows it is read from
+    the Bokeh model it is sent, in the view's tests (``browser_text``, FM-271).
     """
     words = "the frame is <b>dark</b>\nin C:\\Users\\lab\\run\n" + "x" * 700
     _seed_calibration_record(
@@ -7234,7 +7234,7 @@ def test_the_failed_words_are_one_line_plain_and_cut_at_the_cards_bound(
 
     assert shown is not None
     assert "\n" not in shown
-    # The words are kept as given and cut, not rewritten (what a browser makes of `<b>` is FM-271's).
+    # The words are kept as given and cut, not rewritten (the pane's escape of `<b>` is the view's, FM-271).
     assert shown.startswith("the frame is <b>dark</b> in C:\\Users\\lab\\run xxx")
     assert len(shown) == 601
     assert shown.endswith("…")

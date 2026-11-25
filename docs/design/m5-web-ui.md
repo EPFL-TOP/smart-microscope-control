@@ -1882,7 +1882,9 @@ def _card(
   styles={"white-space": "pre-wrap", "overflow-wrap": "anywhere"})`. A path or
   an assumption longer than the column now wraps, where #293's ui-check found
   `assumed: no camera calibration for Nikon 10X S Fluor: ro...` cut at the
-  column's edge. It is still text, never markup (FM-139).
+  column's edge. It is still text, never markup (FM-139): the pane is `TextPane`, a `Str`
+  that escapes its text where Panel builds the `<pre>`, so the browser shows a `<`, a `>` and
+  an `&` as themselves (FM-271).
 
 ### 8.5 The page (`smc/ui/plate_page.py`)
 

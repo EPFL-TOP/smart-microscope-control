@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import html
 import logging
 import math
 import mimetypes
@@ -222,6 +223,7 @@ from smc.ui.selection import (
 __all__ = [
     "PlatePageView",
     "RunFileHandler",
+    "TextPane",
     "build",
     "card_text",
     "next_step_text",
@@ -528,7 +530,7 @@ def run_text(status: PageStatus) -> str:
 
 
 def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
-    """A result card as plain text, for a ``pn.pane.Str``: a result's words are never markup (FM-139).
+    """A result card as plain text, for a ``TextPane``: a result's words are never markup (FM-139).
 
     The header is ``<status> <when_utc> UTC``, then `` on <profile>`` when the
     record was made on another stand than ``stand`` (when ``stand`` is not
@@ -560,7 +562,7 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
 
 
 def next_step_text(step: NextStep | None, *, windows: bool | None = None) -> str:
-    """The next step as plain text, for a ``pn.pane.Str``: never markup (FM-139).
+    """The next step as plain text, for a ``TextPane``: never markup (FM-139).
 
     With a tool, its name, then each line of ``why`` indented by two spaces and the
     command last. Without one (the workflow is done, or no plugin fills the slot),
@@ -607,6 +609,44 @@ def posix_quoting_note(windows: bool | None = None) -> str:
     )
 
 
+# Panel is skipped by mypy (pyproject), so its base class is Any on every PC.
+class TextPane(pn.pane.Str):  # type: ignore[misc]
+    """A ``Str`` pane that shows its text as the words it is, never as HTML (FM-271).
+
+    Panel builds a ``Str`` as ``'<pre>' + str(obj) + '</pre>'`` with no escape of the text, and
+    the browser parses that: a ``<b>`` is an element, ``from_run_doc=<its run document>`` loses
+    the words between the brackets (an unknown element swallows them) and an
+    ``<img src=x onerror=...>`` is live. A turret label, a path, a tool's failure and a
+    record's ``assumed`` line all come from the stand or from a person, so every text pane of
+    the page is this one (``test_the_page_builds_its_panes_from_text_pane_bokeh_and_the_one_html_pane``).
+
+    The escape is where Panel builds the ``<pre>``, through ``super()``: Panel's wrapper, its
+    own transport escape and, on Panel 1.10 and later, the raw copy its streaming reads are
+    kept. ``.object`` keeps the raw text, so the page's ``.object = text`` and every test
+    that reads it are unchanged. ``html.escape`` is FM-139's one function, quotes included.
+    ``None`` and ``""`` are left alone: there is nothing to escape, and Panel's blank
+    ``<pre> </pre>`` keeps the height of an empty line. ``_transform_object`` is a private
+    method of Panel's ``Str``; a test names it and Panel's version, and the render path was
+    measured on Panel 1.9.5, 1.10.0 and 1.11.1.
+
+    The model also says ``disable_math``: Bokeh hands the text of a ``Str``'s model to MathJax
+    when it is loaded (the CDN, with the PC online), which set a ``$$`` pair as a formula and
+    swallowed the words between two of TeX's inline delimiters, whose characters a Windows
+    path can hold (Chromium 159, #657).
+    """
+
+    # `Str` has priority 0 and panes of equal priority are tried newest first, so a subclass
+    # with the same one would take `pn.panel(obj)` from `Str` for an object no pane claims.
+    priority = -1
+
+    def _transform_object(self, obj: Any) -> Any:
+        if obj is None or (isinstance(obj, str) and obj == ""):
+            sent = super()._transform_object(obj)
+        else:
+            sent = super()._transform_object(html.escape(str(obj)))
+        return {**sent, "disable_math": True}
+
+
 def _wrapped_text(
     text: str = "",
     extra: dict[str, str] | None = None,
@@ -614,7 +654,7 @@ def _wrapped_text(
     width: int | None = _TEXT_WIDTH,
 ) -> Any:
     """A text pane whose lines wrap at its width, with ``extra`` styles added to the wrapping ones."""
-    return pn.pane.Str(
+    return TextPane(
         text,
         styles={**_WRAP_STYLES, **(extra or {})},
         width=width,
@@ -1115,8 +1155,8 @@ class PlatePageView:
         # with Panel's 5 px above and below, which the header and the drive bar's budget
         # (D15) cannot spare.
         self.drive_text.margin = (0, 10)
-        self.checklist_text = pn.pane.Str("")
-        self.captures_text = pn.pane.Str("")
+        self.checklist_text = TextPane("")
+        self.captures_text = TextPane("")
         # The run document's path heads its checklist; a path is as long as the
         # folder it is in, so it wraps (m5 §8.4).
         self.run_document_text = _wrapped_text(
@@ -1204,11 +1244,11 @@ class PlatePageView:
         self.walls_capture_button = pn.widgets.Button(label="Capture centre")
         self.walls_forget_button = pn.widgets.Button(label="Forget")
         self.walls_capture_note = _wrapped_text(extra={"color": _WARNING})
-        self.walls_captures_text = pn.pane.Str("")
+        self.walls_captures_text = TextPane("")
         self.walls_touches_note = _wrapped_text()
         self.snap_button = pn.widgets.Button(label="Snap")
         self.live_button = pn.widgets.Button(label=_LIVE_LABEL)
-        self.snap_note = pn.pane.Str("", styles={"color": _WARNING})
+        self.snap_note = TextPane("", styles={"color": _WARNING})
         # ADR-0006's *Connect* (m5 §7.3): the one line that says why every control
         # that needs the stand is disabled while it is closed.
         self.connect_button = pn.widgets.Button(label="Connect")
@@ -1368,7 +1408,7 @@ class PlatePageView:
         self.objective_button = pn.widgets.Button(
             label="Change objective", margin=_DRIVE_MARGIN, align="end"
         )
-        self.objective_confirm_text = pn.pane.Str(
+        self.objective_confirm_text = TextPane(
             "", styles={"color": _WARNING, "white-space": "pre-wrap"}, width=380
         )
         self.objective_confirm_button = pn.widgets.Button(
@@ -1386,7 +1426,7 @@ class PlatePageView:
         self.light_off_button = pn.widgets.Button(
             label="Light off", margin=_DRIVE_MARGIN
         )
-        self.drive_note = pn.pane.Str(
+        self.drive_note = TextPane(
             "", styles={"color": _WARNING, "white-space": "pre-wrap"}, width=380
         )
         # What an arrow does to the image on this stand (m5 §13.2): the arrows are in
@@ -1490,7 +1530,7 @@ class PlatePageView:
         the first step.
         """
         return pn.Column(
-            pn.pane.Str("Preset", styles={"font-weight": "bold"}),
+            TextPane("Preset", styles={"font-weight": "bold"}),
             pn.Row(self.preset_select, self.preset_load_button),
             pn.Row(self.preset_name, self.preset_save_button),
             self.preset_confirm,
@@ -2186,7 +2226,7 @@ class PlatePageView:
     def _next_region(self) -> Any:
         """The head of the tools column: the tool the run document needs next, and one button for it (m5 §8.5)."""
         return pn.Column(
-            pn.pane.Str("Next step", styles={"font-weight": "bold"}),
+            TextPane("Next step", styles={"font-weight": "bold"}),
             self.next_text,
             self.next_button,
             self.next_note,
@@ -2616,7 +2656,7 @@ class PlatePageView:
         # `white-space` in `styles` lands on the pane's host, and the `<pre>` inside
         # its shadow root keeps its own `pre` (measured in Chromium), so the rule
         # goes to the `<pre>` itself.
-        note = pn.pane.Str(
+        note = TextPane(
             "",
             styles={"color": _WARNING},
             width=_TEXT_WIDTH,
@@ -2653,7 +2693,7 @@ class PlatePageView:
         if advanced_widgets:
             parts.append(pn.Card(*advanced_widgets, title="Advanced", collapsed=True))
         parts += [run, note, card]
-        return pn.Column(pn.pane.Str(tool.name, styles={"font-weight": "bold"}), *parts)
+        return pn.Column(TextPane(tool.name, styles={"font-weight": "bold"}), *parts)
 
     def _algorithm_select(
         self, tool: str, name: str, default: str, description: str, value: str

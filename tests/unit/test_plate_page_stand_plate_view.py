@@ -53,7 +53,7 @@ from smc.ui.guide import (
     NextStep,
     local_time,
 )
-from smc.ui.plate_page import _WARNING, PlatePageView, next_step_text
+from smc.ui.plate_page import _WARNING, PlatePageView, TextPane, next_step_text
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -1433,6 +1433,7 @@ def test_the_text_panes_of_the_two_screens_are_plain_text_whatever_the_stand_say
     run_doc: Path,
     fake_microscope: Microscope,
     monkeypatch: pytest.MonkeyPatch,
+    browser_text: Callable[[Any], str],
 ) -> None:
     # FM-139. Free text reaches these screens from the stand (the turret's label, an
     # exception's message) and from a result (`assumed`): it is shown as it is, never as
@@ -1457,8 +1458,17 @@ def test_the_text_panes_of_the_two_screens_are_plain_text_whatever_the_stand_say
     assert HOSTILE in view.centre_slots[0].text.object
     assert view.registered_block.object.split("\n")[1] == f"assumed: {HOSTILE}"
     assert HOSTILE in view.centre_slots[1].note.object
-    # And every text pane of both screens is a `Str`: counted together, so that a pane that
-    # becomes Markdown is a different count and not a pass.
+    # What the browser is sent for the strip's panes and for the known block is one `pre`
+    # with those words in it (FM-271). At least one pane of the strip holds the failed
+    # goto's words, so that the check cannot pass on panes that are empty.
+    strip = [view.status_text, view.run_text, view.problems_text, view.message]
+    holding = [pane for pane in strip if HOSTILE in pane.object]
+    assert holding, [pane.object for pane in strip]
+    for pane in strip:
+        assert browser_text(pane) == (pane.object or " ")
+    assert browser_text(view.known_block) == view.known_block.object
+    # And every text pane of both screens is the page's escaping text pane: counted together,
+    # so that a pane that becomes Markdown, or a bare `Str`, is a different count and not a pass.
     shown: list[Any] = []
     for step in ("stand", "plate"):
         view.show_step(step)
@@ -1472,7 +1482,9 @@ def test_the_text_panes_of_the_two_screens_are_plain_text_whatever_the_stand_say
             and not (type(o) is pn.pane.HTML and o.object in titles)
         ]
     assert len(shown) > 10
-    assert [type(o).__name__ for o in shown if type(o) is not pn.pane.Str] == []
+    assert [type(o).__name__ for o in shown if type(o) is not TextPane] == []
+    for pane in shown:
+        assert browser_text(pane) == (pane.object or " ")
 
 
 def test_the_known_block_reads_the_light_and_the_plate_line_reads_the_preset(
@@ -2147,14 +2159,14 @@ def test_a_record_that_cannot_be_read_gives_no_failed_line(
 
 
 def test_the_failed_line_is_plain_text_and_bounded(
-    page: PlatePage, run_doc: Path
+    page: PlatePage, run_doc: Path, browser_text: Callable[[Any], str]
 ) -> None:
-    """FM-205: markup, a path and 700 characters in a tool's words; the line is one `Str`, on one line, cut.
+    """FM-205: markup, a path and 700 characters in a tool's words; the line is one text pane, on one line, cut.
 
-    The pane is the page's text pane and the words pass as given. That a browser shows
-    them as text is **not** proved by a pane's type: it parses a `Str` pane as HTML
-    (FM-271, read in Chromium), so a placeholder in angle brackets must not be in a tool's
-    text, and the page-wide escape is a change of its own.
+    The pane is the page's escaping text pane and the words pass as given. What a browser
+    shows is not proved by a pane's type (a bare `Str` is parsed as HTML, FM-271, read in
+    Chromium): ``browser_text`` reads the model the browser is sent, and it holds one `pre`
+    with the markup as words.
     """
     words = f"{HOSTILE} in C:\\Users\\lab\\run\nand " + "x" * 700
     _seed_failed_calibration(run_doc, words)
@@ -2162,8 +2174,9 @@ def test_the_failed_line_is_plain_text_and_bounded(
 
     view.on_refresh()
 
-    assert type(view.calibrate_failed) is pn.pane.Str
+    assert type(view.calibrate_failed) is TextPane
     shown = view.calibrate_failed.object
+    assert browser_text(view.calibrate_failed) == shown
     assert shown.startswith(f"{LAST_FAILED}{HOSTILE} in C:\\Users\\lab\\run and xxx")
     assert "\n" not in shown
     # The tool's words are cut at the card's bound, as the Plate screen's block cuts them.

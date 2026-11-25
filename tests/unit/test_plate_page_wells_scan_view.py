@@ -76,7 +76,7 @@ from smc.ui.guide import (
     checkpoint_note,
     plain_default,
 )
-from smc.ui.plate_page import PlatePageView, posix_quoting_note
+from smc.ui.plate_page import PlatePageView, TextPane, posix_quoting_note
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -1683,7 +1683,10 @@ HOSTILE = '<img src=x onerror="alert(1)"> **bold** [x](javascript:y) &amp;'
 
 
 def test_every_text_pane_of_the_wells_and_scan_screens_is_plain_text_whatever_the_stand_says(
-    page: PlatePage, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+    page: PlatePage,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    browser_text: Callable[[Any], str],
 ) -> None:
     # FM-139. Free text reaches these screens from the stand (the turret's label), from a plan
     # (its objective and its assumptions) and from a scan (its assumptions): it is shown as it
@@ -1716,8 +1719,8 @@ def test_every_text_pane_of_the_wells_and_scan_screens_is_plain_text_whatever_th
     assert f"assumed: {HOSTILE}" in view.wells_known_block.object.split("\n")
     assert view.scan_lead_text.object.startswith(f"12 fields at {HOSTILE}. ")
     assert f"assumed: {HOSTILE}" in view.scanned_block.object.split("\n")
-    # And every text pane of both screens is a `Str`, counted together so that a pane that
-    # becomes Markdown is a different count and not a pass.
+    # And every text pane of both screens is the page's escaping text pane, counted together
+    # so that a pane that becomes Markdown, or a bare `Str`, is a different count and not a pass.
     shown: list[Any] = []
     for step in ("wells", "scan"):
         view.show_step(step)
@@ -1731,7 +1734,10 @@ def test_every_text_pane_of_the_wells_and_scan_screens_is_plain_text_whatever_th
             and not (type(o) is pn.pane.HTML and o.object in titles)
         ]
     assert len(shown) > 14
-    assert [type(o).__name__ for o in shown if type(o) is not pn.pane.Str] == []
+    assert [type(o).__name__ for o in shown if type(o) is not TextPane] == []
+    # What the browser is sent for each is one `pre` holding the pane's own text (FM-271).
+    for pane in shown:
+        assert browser_text(pane) == (pane.object or " ")
 
 
 def test_the_imaged_layer_is_a_green_rect_over_the_fields_under_the_route_and_not_hoverable(
