@@ -81,6 +81,12 @@ def test_a_stack_the_tool_kept_is_scored_and_peaks_near_the_sharp_plane(
     )
     assert brenner is not None, printed
     assert abs(float(brenner.group(1))) <= 1.0
+    # Each score's line ends with its prominence against NOISE_FACTOR (#622).
+    assert re.search(
+        r"^  brenner: .*, prominence (\d+\.\d|inf) \(a peak needs more than 10\)$",
+        printed,
+        re.M,
+    )
     # ASCII only: a Windows console decodes with its own code page.
     assert printed.isascii()
     with out_csv.open(encoding="utf-8", newline="") as handle:
@@ -123,10 +129,36 @@ def test_a_folder_of_two_frames_is_skipped_and_nothing_scored_is_exit_1(
     assert code == 1
     err = capsys.readouterr().err
     assert (
-        f"{short}: 2 frames with z_um in their metadata, a stack needs 3: skipped"
+        f"{short}: 2 frames with z_um in their metadata, a stack needs 9: skipped"
         in err
     )
     assert "no stack was scored" in err
+
+
+def test_a_stack_of_eight_planes_is_skipped_and_one_of_nine_is_scored(
+    fs: ModuleType,
+    stack: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # find_peak needs 9 planes to measure its noise (#622): both sides of the bound.
+    frames = sorted(stack.glob("[0-9][0-9][0-9].tif"))
+    assert len(frames) == 11
+    for count in (8, 9):
+        folder = tmp_path / f"stack{count}"
+        folder.mkdir()
+        for frame in frames[:count]:
+            shutil.copy(frame, folder / frame.name)
+        planes, why = fs.read_stack(folder)
+        if count == 8:
+            assert planes == []
+            assert why.endswith(
+                "8 frames with z_um in their metadata, a stack needs 9: skipped"
+            )
+        else:
+            assert (len(planes), why) == (9, "")
+    assert fs.main([str(tmp_path / "stack9")]) == 0
+    assert "prominence " in capsys.readouterr().out
 
 
 def test_a_skipped_folder_does_not_stop_the_others(
