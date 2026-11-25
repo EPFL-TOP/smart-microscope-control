@@ -114,6 +114,7 @@ from smc.ui.guide import (
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     CalibrationNote,
+    CalibrationNumbers,
     GotoAnswer,
     local_time,
     scan_plan_card_lines,
@@ -6189,15 +6190,26 @@ def test_the_view_carries_the_calibration_and_the_registered_plate(
         assert view.camera_calibration is None
         assert view.registered is None
         assert view.registered_by is None
-        seed_camera_calibration(run_doc, objective=TEN_X)
+        written = seed_camera_calibration(run_doc, objective=TEN_X)
         _seed(run_doc, "plate-registration", "plate", _plate("96-well"), minute=1)
         view = page.view()
-        # The objective and the time of the same record as the matrix: the card's UTC string.
+        # The objective and the time of the same record as the matrix: the card's UTC string;
+        # and the numbers of the pane under the known block (#627), the document's own as the
+        # fixture wrote them, with the run document's path as the page was given it.
         assert view.camera_matrix is not None
         assert view.camera_calibration == CalibrationNote(
             objective=TEN_X,
             when_utc="2026-11-09 09:30:00",
             when_local=local_time(datetime(2026, 11, 9, 9, 30, tzinfo=timezone.utc)),
+            numbers=CalibrationNumbers(
+                pixel_size_um=written.pixel_size_um,
+                rotation_deg=written.rotation_deg,
+                mirrored=written.mirrored,
+                residual_um=written.residual_um,
+                step_um=written.step_um,
+            ),
+            notes=(),
+            where=str(run_doc),
         )
         assert view.registered == _plate("96-well")
         # The tool that wrote it, so that the screen shows that tool's `assumed` lines.
@@ -6207,11 +6219,19 @@ def test_the_view_carries_the_calibration_and_the_registered_plate(
         assert page.view().registered is None
         assert page.view().registered_by is None
         # A calibration that did not record its objective says so, and is still the matrix's.
-        seed_camera_calibration(run_doc, objective=None)
+        written = seed_camera_calibration(run_doc, objective=None)
         assert page.view().camera_calibration == CalibrationNote(
             objective=None,
             when_utc="2026-11-09 09:30:00",
             when_local=local_time(datetime(2026, 11, 9, 9, 30, tzinfo=timezone.utc)),
+            numbers=CalibrationNumbers(
+                pixel_size_um=written.pixel_size_um,
+                rotation_deg=written.rotation_deg,
+                mirrored=written.mirrored,
+                residual_um=written.residual_um,
+                step_um=written.step_um,
+            ),
+            where=str(run_doc),
         )
     finally:
         page.close()
@@ -7030,3 +7050,127 @@ def test_the_failed_words_are_one_line_plain_and_cut_at_the_cards_bound(
     assert shown.startswith("the frame is <b>dark</b> in C:\\Users\\lab\\run xxx")
     assert len(shown) == 601
     assert shown.endswith("…")
+
+
+# -- the numbers of a calibration: the read and the view's note (m5 §23, #627) ----------------------
+
+#: What a ``camera-calibration`` record holds as its result, written out by hand: the numbers the
+#: demo measured at the 40X (m5 §23.1) and two ``assumed`` lines, one of them on two lines.
+CALIBRATION_RESULT: dict[str, Any] = {
+    "objective": "Nikon 40X Plan Fluor ELWD",
+    "image_shape_px": [384, 512],
+    "matrix_um_per_px": [[0.2166, -0.1249], [-0.1249, -0.2166]],
+    "pixel_size_um": 0.249966,
+    "rotation_deg": 29.9891,
+    "mirrored": True,
+    "residual_um": 0.0437417,
+    "response": 0.97,
+    "return_error_um": 0.4,
+    "step_um": 32.0,
+    "assumed": ["the pixel size is the profile's", "second\nline of a note"],
+}
+CALIBRATION_NUMBERS = CalibrationNumbers(
+    pixel_size_um=0.249966,
+    rotation_deg=29.9891,
+    mirrored=True,
+    residual_um=0.0437417,
+    step_um=32.0,
+)
+
+
+def test_a_read_calibration_carries_the_numbers_of_its_document(
+    run_doc: Path,
+) -> None:
+    _seed_calibration_record(
+        run_doc, status=StageStatus.done, error=None, result=CALIBRATION_RESULT
+    )
+
+    read = controller_module._read_calibration(
+        str(run_doc), profile="demo", dry_run=False
+    )
+
+    assert read.problem is None
+    assert read.numbers == CALIBRATION_NUMBERS
+    # The notes are the calibration's own lines, each on one line, from the same helper
+    # the run document's note uses.
+    assert read.notes == (
+        "the pixel size is the profile's",
+        "second line of a note",
+    )
+
+
+def test_a_read_that_has_a_problem_has_no_numbers(run_doc: Path) -> None:
+    _seed_calibration_record(
+        run_doc, status=StageStatus.failed, error="PluginRunError: x", result=None
+    )
+
+    failed = controller_module._read_calibration(
+        str(run_doc), profile="demo", dry_run=False
+    )
+    missing = controller_module._read_calibration(
+        str(run_doc.parent / "none.json"), profile="demo", dry_run=False
+    )
+
+    assert failed.problem is not None
+    assert failed.numbers is None
+    assert missing.problem is not None
+    assert missing.numbers is None
+
+
+def test_the_views_run_calibration_note_carries_numbers_notes_and_the_run_documents_path(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed_calibration_record(
+        run_doc, status=StageStatus.done, error=None, result=CALIBRATION_RESULT
+    )
+    page = _page(fake_microscope, run_doc, _real("camera-calibration"))
+    try:
+        note = page.view().camera_calibration
+    finally:
+        page.close()
+
+    assert note == CalibrationNote(
+        objective="Nikon 40X Plan Fluor ELWD",
+        when_utc="2026-10-29 09:00:00",
+        when_local=local_time(T0),
+        numbers=CALIBRATION_NUMBERS,
+        notes=("the pixel size is the profile's", "second line of a note"),
+        where=str(run_doc),
+    )
+
+
+def test_the_run_calibration_notes_file_is_the_path_the_page_was_given_never_resolved(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-24: a relative `--run-doc` is shown as given, as `calibrations_folder` is read.
+    _seed_calibration_record(
+        run_doc, status=StageStatus.done, error=None, result=CALIBRATION_RESULT
+    )
+    monkeypatch.chdir(run_doc.parent)
+    page = _page(fake_microscope, Path("run.json"), _real("camera-calibration"))
+    try:
+        note = page.view().camera_calibration
+    finally:
+        page.close()
+
+    assert note is not None
+    assert note.where == "run.json"
+
+
+def test_a_note_longer_than_the_cards_bound_is_cut_in_the_run_documents_note(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-205: a tool's line is cut at the card's bound, and only the card's count of them is kept.
+    long = {**CALIBRATION_RESULT, "assumed": ["y" * 700] + [f"n{i}" for i in range(30)]}
+    _seed_calibration_record(run_doc, status=StageStatus.done, error=None, result=long)
+    page = _page(fake_microscope, run_doc, _real("camera-calibration"))
+    try:
+        note = page.view().camera_calibration
+    finally:
+        page.close()
+
+    assert note is not None
+    assert note.notes[0] == "y" * 600 + "…"
+    assert len(note.notes) == controller_module._CARD_LINES

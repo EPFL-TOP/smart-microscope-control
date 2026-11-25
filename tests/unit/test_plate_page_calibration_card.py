@@ -8,6 +8,8 @@ given. Every expected text is the design's, written out whole and not built by t
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from smc.ui import controller
@@ -16,6 +18,7 @@ from smc.ui.guide import (
     CalibrationNote,
     CalibrationNumbers,
     calibration_numbers_text,
+    local_time,
 )
 
 FORTY = "Nikon 40X Plan Fluor ELWD"
@@ -206,3 +209,238 @@ def test_the_fixed_text_is_never_cut_at_the_widest_value_the_model_allows() -> N
 
 def test_the_line_bound_is_the_cards_sentence_bound() -> None:
     assert CALIBRATION_LINE_CHARS == controller._CARD_TEXT_CHARS == 600
+
+
+# --- which calibration the pane gives the numbers of (D1) ----------------------------------
+
+TEN = "Nikon 10X S Fluor"
+TWENTY = "Nikon 20X Plan Fluor ELWD"
+#: The fake turret's labels as the page reads them, empty positions included: the 40X is position
+#: 1, the 10X position 2, the 20X position 4 (the index plus one, written here by hand).
+LABELS = (FORTY, TEN, "Objective-2", TWENTY, "Objective-4", "Objective-5")
+WHEN = "2026-11-25T10:20:30+00:00"
+#: The run document's calibration, at the 10X: a note of its own, distinct from every document's.
+RUN_NUMBERS = CalibrationNumbers(0.6500, 1.0, False, 0.5, 48.0)
+RUN = CalibrationNote(
+    TEN,
+    "2026-11-25 09:00:00",
+    "2026-11-25 10:00",
+    RUN_NUMBERS,
+    ("the run document's own line",),
+    "run/run.json",
+)
+
+
+def _read(
+    objective: str | None = FORTY,
+    *,
+    path: str = "run/calibrations/position-1.json",
+    measured: str = WHEN,
+    problem: str | None = None,
+    numbers: CalibrationNumbers | None = DEMO,
+    notes: tuple[str, ...] = ("a line of the document",),
+) -> controller.CalibrationRead:
+    return controller.CalibrationRead(
+        path,
+        objective,
+        measured,
+        problem,
+        notes,
+        image_shape_px=(384, 512),
+        numbers=numbers,
+    )
+
+
+def _stand(**changes: object) -> CalibrationNote | None:
+    """``stand_calibration`` for the 40X after a registration under the 10X, with the 40X's document held."""
+    arguments: dict[str, object] = {
+        "objective": FORTY,
+        "plate_objective": TEN,
+        "run_calibration": RUN,
+        "labels": LABELS,
+        "documents": (controller.HeldCalibration(1, _read()),),
+    }
+    arguments.update(changes)
+    return controller.stand_calibration(**arguments)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("objective", [None, "", "   "])
+def test_the_stand_calibration_with_the_objective_not_known_is_the_run_documents(
+    objective: str | None,
+) -> None:
+    # A closed stand, a turret that does not answer, an empty position: what the known
+    # block's `Camera:` line speaks of, whichever objective the document recorded.
+    assert _stand(objective=objective) is RUN
+    other = CalibrationNote(FORTY, "2026-11-25 09:00:00", numbers=RUN_NUMBERS)
+    assert _stand(objective=objective, run_calibration=other) is other
+    assert _stand(objective=objective, run_calibration=None) is None
+
+
+@pytest.mark.parametrize(
+    ("plate_objective", "objective", "recorded", "shown"),
+    [
+        pytest.param(TEN, TEN, TEN, True, id="the plate's own objective"),
+        pytest.param(None, TEN, TEN, True, id="no offer, the objective it was made at"),
+        pytest.param(TEN, TEN, None, True, id="the plate's own, none recorded"),
+        pytest.param(None, FORTY, None, True, id="no offer, none recorded"),
+        pytest.param(None, FORTY, TEN, False, id="no offer, another objective's"),
+        pytest.param(TEN, TEN, FORTY, False, id="the plate's own, another's"),
+    ],
+)
+def test_at_the_plates_objective_or_with_no_offer_the_run_documents_calibration_is_shown_only_for_that_objective(
+    plate_objective: str | None, objective: str, recorded: str | None, shown: bool
+) -> None:
+    run = CalibrationNote(recorded, "2026-11-25 09:00:00", "", RUN_NUMBERS)
+    # A held document at the objective's own position must never be taken in these cases.
+    documents = (controller.HeldCalibration(1, _read()),)
+
+    found = _stand(
+        plate_objective=plate_objective,
+        objective=objective,
+        run_calibration=run,
+        documents=documents,
+    )
+
+    assert found == (run if shown else None)
+
+
+def test_at_another_objective_the_positions_document_is_shown() -> None:
+    documents = (
+        controller.HeldCalibration(
+            1, _read(FORTY, path="c/position-1.json", numbers=DEMO, notes=("forty",))
+        ),
+        controller.HeldCalibration(
+            4,
+            _read(
+                TWENTY,
+                path="c/position-4.json",
+                numbers=RUN_NUMBERS,
+                notes=("twenty", "twenty again"),
+            ),
+        ),
+    )
+
+    at_twenty = _stand(objective=TWENTY, documents=documents)
+    at_forty = _stand(objective=FORTY, documents=documents)
+
+    assert at_twenty == CalibrationNote(
+        TWENTY,
+        "2026-11-25 10:20:30",
+        local_time(datetime(2026, 11, 25, 10, 20, 30, tzinfo=timezone.utc)),
+        RUN_NUMBERS,
+        ("twenty", "twenty again"),
+        "c/position-4.json",
+    )
+    assert at_forty == CalibrationNote(
+        FORTY,
+        "2026-11-25 10:20:30",
+        local_time(datetime(2026, 11, 25, 10, 20, 30, tzinfo=timezone.utc)),
+        DEMO,
+        ("forty",),
+        "c/position-1.json",
+    )
+    # Not the run document's, which is the 10X's.
+    assert at_twenty != RUN
+    assert text_of(at_forty).splitlines()[2] == "Written to c/position-1.json."
+
+
+def text_of(note: CalibrationNote | None) -> str:
+    assert note is not None
+    return calibration_numbers_text(note)
+
+
+@pytest.mark.parametrize(
+    "held",
+    [
+        pytest.param(
+            controller.HeldCalibration(1, _read(TEN)),
+            id="the document holds another objective's calibration",
+        ),
+        pytest.param(
+            controller.HeldCalibration(
+                1, _read(None, problem="position 1: it is not JSON", numbers=None)
+            ),
+            id="a document with a problem",
+        ),
+        pytest.param(
+            controller.HeldCalibration(1, _read(FORTY, numbers=None)),
+            id="a read with no numbers",
+        ),
+        pytest.param(
+            controller.HeldCalibration(2, _read(FORTY)),
+            id="the document of another position",
+        ),
+    ],
+)
+def test_a_document_that_is_not_its_positions_has_a_problem_or_no_numbers_gives_nothing(
+    held: controller.HeldCalibration,
+) -> None:
+    assert _stand(documents=(held,)) is None
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param({"labels": ()}, id="the turret's labels were not read"),
+        pytest.param({"objective": "Objective-9"}, id="an objective not on the turret"),
+        pytest.param({"documents": ()}, id="no document held"),
+        pytest.param(
+            {"labels": (FORTY, FORTY, TEN)},
+            id="two positions carry the label: which is in place is not said",
+        ),
+    ],
+)
+def test_a_position_the_page_cannot_name_or_a_missing_document_gives_nothing(
+    changes: dict[str, object],
+) -> None:
+    assert _stand(**changes) is None
+
+
+def test_the_rule_never_shows_the_run_documents_numbers_as_another_objectives() -> None:
+    # FM-216, the headline: an offer under the 10X, the 40X in place and nothing held for it.
+    assert _stand(documents=()) is None
+    assert _stand(documents=(), run_calibration=RUN) is None
+
+
+# --- the time of a document (D4) ----------------------------------------------------------
+
+
+def test_the_time_of_a_document_is_the_tools_own_iso_text_and_an_unknown_time_is_said() -> (
+    None
+):
+    instant = datetime(2026, 11, 25, 10, 20, 30, tzinfo=timezone.utc)
+    # The form `calibration_from` returns, built here the way it builds it.
+    iso = instant.isoformat(timespec="seconds")
+
+    assert controller._measured_times(iso) == (
+        "2026-11-25 10:20:30",
+        local_time(instant),
+    )
+    assert controller._measured_times("at an unknown time") == (
+        "????-??-?? ??:??:??",
+        "",
+    )
+    assert controller._measured_times("yesterday") == ("????-??-?? ??:??:??", "")
+    assert controller._measured_times("") == ("????-??-?? ??:??:??", "")
+
+
+def test_a_time_in_another_zone_or_with_none_is_put_in_utc() -> None:
+    plus_two = "2026-11-25T12:20:30+02:00"
+    naive = "2026-11-25T10:20:30"  # a run document's times are UTC: never the PC's zone
+    instant = datetime(2026, 11, 25, 10, 20, 30, tzinfo=timezone.utc)
+
+    assert controller._measured_times(plus_two) == (
+        "2026-11-25 10:20:30",
+        local_time(instant),
+    )
+    assert controller._measured_times(naive) == (
+        "2026-11-25 10:20:30",
+        local_time(instant),
+    )
+
+
+def test_a_time_utc_cannot_hold_is_the_unknown_time_and_raises_nothing() -> None:
+    # Year 1 with an offset: a model accepts it, UTC cannot hold it (FM-98, FM-125).
+    utc, _local = controller._measured_times("0001-01-01T00:00:00+05:00")
+
+    assert utc == "????-??-?? ??:??:??"
