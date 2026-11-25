@@ -19,6 +19,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path, PureWindowsPath
 from typing import Any, ClassVar, Literal
 
@@ -3880,6 +3881,54 @@ def test_files_html_escapes_the_text_only_entries_as_well() -> None:
     assert page.count(html.escape(hostile)) == 4
     assert "&lt;img src=x onerror=1&gt; &amp; &quot;q&quot;" in page
     assert "<a " not in page
+
+
+def test_files_html_is_div_and_link_elements_only_whatever_a_file_is_called() -> None:
+    """FM-271: the one HTML pane is read as a browser reads it, not by looking for substrings.
+
+    A file called ``<img src=x onerror=1>.html``, one called ``"><b>.html`` (a quote and a
+    bracket close the ``href`` attribute and the element if they are not escaped) and a
+    text-only entry that holds ``<its run document>`` come out as ``div`` and ``a`` elements
+    and nothing else; every link has exactly its ``href``, ``target`` and ``rel``; and the
+    text the reader sees holds the hostile characters as they were written.
+    """
+    run = Path("/runs/x")
+    image = "<img src=x onerror=1>.html"
+    quote = '"><b>.html'
+    placeholder = "reuse it with from_run_doc=<its run document>"
+    cards = {
+        "report": _file_card(
+            "report", f"file: /runs/x/report/{image}", f"file: /runs/x/report/{quote}"
+        ),
+        "nis-export": _file_card("nis-export", f"file: /data/{placeholder}"),
+    }
+
+    class Elements(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.starts: list[tuple[str, dict[str, str | None]]] = []
+            self.data: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs: Any) -> None:
+            self.starts.append((tag, dict(attrs)))
+
+        def handle_data(self, data: str) -> None:
+            self.data.append(data)
+
+    parsed = Elements()
+    parsed.feed(files_html(cards, run))
+    parsed.close()
+
+    assert {tag for tag, _ in parsed.starts} == {"div", "a"}
+    links = [attrs for tag, attrs in parsed.starts if tag == "a"]
+    assert len(links) == 2
+    for attrs in links:
+        assert sorted(attrs) == ["href", "rel", "target"]
+        assert (attrs["href"] or "").startswith("/run-files/")
+    seen = "".join(parsed.data)
+    assert f"report/{image}" in seen
+    assert f"report/{quote}" in seen
+    assert placeholder in seen
 
 
 def test_files_html_quotes_a_windows_relative_path_as_posix() -> None:

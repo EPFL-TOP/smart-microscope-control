@@ -41,7 +41,7 @@ from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import NOT_CONNECTED, PlatePage
 from smc.ui.guide import NextStep
-from smc.ui.plate_page import _WARNING, PlatePageView, next_step_text
+from smc.ui.plate_page import _WARNING, PlatePageView, TextPane, next_step_text
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -704,8 +704,9 @@ def test_cards_and_the_step_wrap(
     ]
     assert len(wrapped) == len(view.tool_cards) + 3
     for pane in wrapped:
-        # Plain text, never Markdown: a result's words are not markup (FM-139).
-        assert type(pane) is pn.pane.Str
+        # The page's escaping text pane, never Markdown: a result's words are not markup
+        # (FM-139); what a browser makes of one is `browser_text`'s (FM-271).
+        assert type(pane) is TextPane
         assert pane.styles["white-space"] == "pre-wrap"
         assert pane.styles["overflow-wrap"] == "anywhere"
         # The `<pre>` inside the pane's shadow root keeps its own rule, so the stylesheet

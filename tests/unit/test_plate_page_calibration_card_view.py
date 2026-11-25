@@ -5,8 +5,9 @@ seeded by hand with the numbers the demo measured (m5 §23.1), so that every exp
 design's, written out whole and never built by the code under test (FM-45, FM-203). The real tool
 and the click that writes the document are ``tests/test_plate_page_calibration_card_demo.py``'s.
 What this cannot show is a browser: whether the pane pushes the Stand screen's first action off a
-620 px page, and what a browser makes of a ``Str`` pane's angle brackets (FM-271), are for the
-one-off session of ``/ui-check`` and the owner's walk (FM-161).
+620 px page, is for the one-off session of ``/ui-check`` and the owner's walk (FM-161); what a
+browser makes of the angle brackets of a text pane is read from the model it is sent
+(``browser_text``, FM-271).
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from smc.plugins.slots import CameraCalibration, PlateResult, WallImages, WellFi
 from smc.run import StageRecord, StageStatus, write_stage
 from smc.ui.controller import PlatePage
 from smc.ui.guide import local_time
-from smc.ui.plate_page import PlatePageView
+from smc.ui.plate_page import PlatePageView, TextPane
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -423,12 +424,14 @@ def test_the_pane_is_plain_text_even_for_a_label_that_looks_like_markup(
     make_view: Callable[..., PlatePageView],
     fake_microscope: Microscope,
     run_doc: Path,
+    browser_text: Callable[[Any], str],
 ) -> None:
     """FM-139: a label, a note and a path come from outside; the pane says them as given.
 
-    This pins the model's text and its type (a ``Str``, not Markdown). That a browser shows the
-    angle brackets as text is **not** proved by the pane's type (FM-271: it parses a ``Str``
-    pane as HTML); that is the one-off session's look.
+    This pins the model's text and its type (the page's escaping text pane, not Markdown). The
+    pane's type alone does not prove what a browser shows (FM-271: a bare ``Str`` is parsed as
+    HTML); ``browser_text`` reads the model the browser is sent, and it holds one ``pre`` with
+    the label's angle brackets as text.
     """
     labels = [HOSTILE, TEN]
     fake_microscope.override(ObjectiveTurret, Turret(labels, HOSTILE))
@@ -436,13 +439,14 @@ def test_the_pane_is_plain_text_even_for_a_label_that_looks_like_markup(
 
     view = make_view()
 
-    assert type(view.calibration_numbers) is pn.pane.Str
+    assert type(view.calibration_numbers) is TextPane
     assert view.calibration_numbers.object.split("\n") == [
         f"Camera calibration at {HOSTILE}, measured {LOCAL}.",
         RUN_LINE,
         f"Written to {run_doc}.",
         f"assumed: a note: {HOSTILE}",
     ]
+    assert browser_text(view.calibration_numbers) == view.calibration_numbers.object
 
 
 def test_drawing_the_pane_reads_no_device(

@@ -35,7 +35,7 @@ from smc.plugins.slots import PlateResult, ScanPlanResult
 from smc.run import StageRecord, StageStatus, write_stage
 from smc.ui.controller import PlatePage
 from smc.ui.guide import SCREEN_LEADS, SCREEN_TITLES, STEPS, continue_label
-from smc.ui.plate_page import PlatePageView
+from smc.ui.plate_page import PlatePageView, TextPane
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -799,7 +799,7 @@ def test_the_maps_title_wraps_in_a_pane_and_its_ticks_are_plain_numbers(
     assert view.map_title_text.object == view.figure.title.text != ""
     assert view.figure.title.visible is False
     assert view.map_title_text.styles["white-space"] == "pre-wrap"
-    assert type(view.map_title_text) is pn.pane.Str
+    assert type(view.map_title_text) is TextPane
     # Set where the title is, so a redraw keeps the two the same.
     view.select_input.value = "A1:B2"
     view.refresh()
@@ -824,7 +824,8 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
     assert view.run_text.visible is True
     # Each line wraps at the window's width: a run's outcome is a sentence of 200
     # characters (`plate-orientation done ...; assumed: ...`) and its end ran past the
-    # right edge in `/ui-check`'s `turned` state. Plain text, never Markdown (FM-139).
+    # right edge in `/ui-check`'s `turned` state. The page's escaping text pane, never Markdown
+    # (FM-139); what a browser makes of its text is `browser_text`'s (FM-271).
     for pane in (
         view.connection_text,
         view.drive_text,
@@ -833,7 +834,7 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
         view.problems_text,
         view.status_text,
     ):
-        assert type(pane) is pn.pane.Str
+        assert type(pane) is TextPane
         assert pane.styles["white-space"] == "pre-wrap"
         assert pane.sizing_mode == "stretch_width"
     # The connection line says nothing until a connect or a disconnect goes or fails.

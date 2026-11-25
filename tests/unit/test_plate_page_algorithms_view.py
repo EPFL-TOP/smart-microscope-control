@@ -53,7 +53,7 @@ from smc.selection import registry
 from smc.selection.api import OrdererParams, SelectorParams
 from smc.testing import FakeCore
 from smc.ui.controller import PlatePage
-from smc.ui.plate_page import PlatePageView
+from smc.ui.plate_page import PlatePageView, TextPane
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -1451,7 +1451,9 @@ HOSTILE_ENTRY = _algorithm(
 
 
 def test_a_hostile_summary_key_and_description_stay_plain_text(
-    make_page: Callable[..., PlatePage], registered: Callable[..., None]
+    make_page: Callable[..., PlatePage],
+    registered: Callable[..., None],
+    browser_text: Callable[[Any], str],
 ) -> None:
     registered(selectors=[MOST_CELLS, HOSTILE_ENTRY])
     view = PlatePageView(make_page())
@@ -1459,9 +1461,11 @@ def test_a_hostile_summary_key_and_description_stay_plain_text(
     selector = _selector(view)
     selector.value = "hostile"
     widgets = view._algorithms["selector"]
-    # The summary pane is plain text and holds the string as it is.
-    assert type(widgets.summary) is pn.pane.Str
+    # The summary pane is the page's escaping text pane and holds the string as it is, and
+    # the browser is sent one `pre` that says it (FM-271).
+    assert type(widgets.summary) is TextPane
     assert widgets.summary.object == HOSTILE
+    assert browser_text(widgets.summary) == HOSTILE
     label = next(
         label for label, value in selector.options.items() if value == "hostile"
     )
@@ -1480,9 +1484,10 @@ def test_a_hostile_summary_key_and_description_stay_plain_text(
     assert html.unescape(rendered).strip() == f"<p>int  {HOSTILE}</p>"
     # A note that names a hostile key is plain text too.
     _carrier(view).value = json.dumps({HOSTILE: 1})
-    assert type(widgets.note) is pn.pane.Str
+    assert type(widgets.note) is TextPane
     assert HOSTILE in widgets.note.object
-    # Every pane of the row is a plain-text pane, but the card's own HTML title.
+    assert browser_text(widgets.note) == widgets.note.object
+    # Every pane of the row is a text pane, but the card's own HTML title.
     titles = {"<h3>Choices and command</h3>"}
     panes = [
         o
@@ -1491,7 +1496,9 @@ def test_a_hostile_summary_key_and_description_stay_plain_text(
         and not (type(o) is pn.pane.HTML and o.object in titles)
     ]
     assert panes
-    assert [type(o).__name__ for o in panes if type(o) is not pn.pane.Str] == []
+    assert [type(o).__name__ for o in panes if type(o) is not TextPane] == []
+    for pane in panes:
+        assert browser_text(pane) == (pane.object or " ")
 
 
 def test_every_handler_the_algorithm_widgets_register_is_guarded(

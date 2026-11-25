@@ -70,7 +70,7 @@ from smc.ui.guide import (
     offsets_lead,
     offsets_written_line,
 )
-from smc.ui.plate_page import PlatePageView
+from smc.ui.plate_page import PlatePageView, TextPane
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -519,6 +519,7 @@ def test_the_card_and_the_preview_are_text_and_not_markup(
     run_doc: Path,
     tmp_path: Path,
     seed_camera_calibration: Callable[..., Any],
+    browser_text: Callable[[Any], str],
 ) -> None:
     label = "40X [bold]*lens*\nnext <b>x</b>"
     _seed_plate(run_doc)
@@ -540,7 +541,10 @@ def test_the_card_and_the_preview_are_text_and_not_markup(
         view.offsets_write_note,
         view.calibration_how_text,
     )
-    assert all(type(pane) is pn.pane.Str for pane in panes)
+    assert all(type(pane) is TextPane for pane in panes)
+    # And what the browser is sent for each is one `pre` that says the pane's text (FM-271).
+    for pane in panes:
+        assert browser_text(pane) == (pane.object or " ")
     text = view.offsets_result_text.object
     # The label is in the card whole, on one line, and the markup is the words it is.
     assert "40X [bold]*lens* next <b>x</b>: shift from " in text

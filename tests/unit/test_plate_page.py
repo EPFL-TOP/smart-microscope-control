@@ -84,6 +84,7 @@ from smc.ui.guide import (
 from smc.ui.plate_page import (
     PlatePageView,
     RunFileHandler,
+    TextPane,
     build,
     card_text,
     serve,
@@ -943,10 +944,11 @@ def test_the_card_text_of_a_worst_case_record_is_bounded(
 
 
 def test_a_result_card_is_plain_text_under_its_tool(
-    page: PlatePage, run_doc: Path
+    page: PlatePage, run_doc: Path, browser_text: Callable[[Any], str]
 ) -> None:
-    # Markup in a result must reach the screen as the words it is: a Str pane, not
-    # Markdown (FM-139).
+    # Markup in a result must reach the screen as the words it is: the page's escaping
+    # text pane, not Markdown (FM-139), and what the browser is sent for it is one `pre`
+    # holding the words (`browser_text`, FM-271).
     _seed_raw(
         run_doc,
         "scan",
@@ -954,13 +956,14 @@ def test_a_result_card_is_plain_text_under_its_tool(
     )
     view = PlatePageView(page)
     pane = view.tool_cards["scan"]
-    assert type(pane) is pn.pane.Str
+    assert type(pane) is TextPane
     assert pane.object == (
         "done 2026-10-29 09:03:00 UTC\n"
         "  note: <b>[red]x</b>\n"
         "  in the run document\n"
         "assumed: <i>[bold]guess[/bold]</i>"
     )
+    assert browser_text(pane) == pane.object
     # Under its Run button (and the note that explains a disabled one), in its own
     # section; no other tool shows it.
     run = view.tool_runs["scan"]

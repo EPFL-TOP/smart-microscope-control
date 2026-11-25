@@ -68,7 +68,7 @@ from smc.ui.guide import (
     again_note,
     local_time,
 )
-from smc.ui.plate_page import PlatePageView, posix_quoting_note
+from smc.ui.plate_page import PlatePageView, TextPane, posix_quoting_note
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -1190,7 +1190,7 @@ def test_every_handler_the_results_buttons_register_is_guarded(
 
 
 def test_every_text_pane_of_the_results_screen_is_plain_text_whatever_a_record_says(
-    page: PlatePage, run_doc: Path
+    page: PlatePage, run_doc: Path, browser_text: Callable[[Any], str]
 ) -> None:
     # FM-139. Free text reaches this screen from a result (a file's path), from a tool's
     # failure (its message) and from a class (the density select): it is shown as it is,
@@ -1227,9 +1227,14 @@ def test_every_text_pane_of_the_results_screen_is_plain_text_whatever_a_record_s
             }
         )
     ]
-    # Counted, so that a pane that becomes Markdown is a different count and not a pass.
+    # Counted, so that a pane that becomes Markdown, or a bare `Str`, is a different count and
+    # not a pass.
     assert len(shown) >= 7 + 4 * len(RESULT_TOOLS)
-    assert [type(o).__name__ for o in shown if type(o) is not pn.pane.Str] == []
+    assert [type(o).__name__ for o in shown if type(o) is not TextPane] == []
+    # What the browser is sent for each is one `pre` that says the pane's own text (FM-271).
+    for pane in shown:
+        assert browser_text(pane) == (pane.object or " ")
+    assert any(HOSTILE in pane.object for pane in shown)
 
 
 def test_no_file_is_named_before_a_step_wrote_one(page: PlatePage) -> None:

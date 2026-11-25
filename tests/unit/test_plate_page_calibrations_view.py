@@ -64,7 +64,7 @@ from smc.ui.guide import (
     calibrate_replaces,
     calibration_failed,
 )
-from smc.ui.plate_page import PlatePageView
+from smc.ui.plate_page import PlatePageView, TextPane
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -987,6 +987,7 @@ def test_the_list_is_text_and_not_markup(
     make_view: Callable[..., PlatePageView],
     fake_microscope: Microscope,
     run_doc: Path,
+    browser_text: Callable[[Any], str],
 ) -> None:
     # FM-139: a label, a path and a tool's words come from outside.
     label = "40X [bold]*lens*\nnext <b>x</b>"
@@ -997,9 +998,11 @@ def test_the_list_is_text_and_not_markup(
     view = _ready(make_view, fake_microscope, run_doc, label)
 
     text = view.calibrations_held_text.object
-    assert type(view.calibrations_held_text) is pn.pane.Str
-    assert type(view.offsets_calibrate_wait) is pn.pane.Str
-    assert type(view.calibrate_lead_text) is pn.pane.Str
+    assert type(view.calibrations_held_text) is TextPane
+    assert type(view.offsets_calibrate_wait) is TextPane
+    assert type(view.calibrate_lead_text) is TextPane
+    # What the browser is sent is one `pre` with the label's markup as its words (FM-271).
+    assert browser_text(view.calibrations_held_text) == text
     # The label is on one line, with its markup as the words it is.
     assert "40X [bold]*lens* next <b>x</b>: calibrated on 2026-11-17" in text
     assert "  40X [bold]*lens* next <b>x</b>: a [link](x) second line" in text
@@ -1108,7 +1111,7 @@ def test_a_denied_folder_is_one_line_under_the_heading_and_no_objective_is_liste
     ]
     assert "no calibration yet" not in view.calibrations_held_text.object
     assert view.calibrations_held_text.visible is True
-    assert type(view.calibrations_held_text) is pn.pane.Str
+    assert type(view.calibrations_held_text) is TextPane
 
 
 def test_the_documents_the_look_reached_are_listed_after_the_denial_under_the_heading(
