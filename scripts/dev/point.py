@@ -4,17 +4,23 @@ The supervising (design) session reads this summary instead of crawling
 GitHub: one command, a short Markdown report, no judgement. The decisions
 are the session's.
 
-    python scripts/dev/point.py [--since YYYY-MM-DD]
+    python scripts/dev/point.py [--track {stand,analysis}] [--since YYYY-MM-DD]
 
-"Since" defaults to the last ``## Point`` comment on the open issue titled
-"Point: next steps", or seven days ago when there is none: a lane's note or an
-owner's note posted after the Point does not move it (FM-220). Stdlib only;
+The report is one track's (ADR-0010; ``--track`` defaults to the stand): the issues that
+carry its label, the pull requests whose paths are its own (``.github/CODEOWNERS``, read by
+``tracks.py``), its tracking issue, and a last section, *Asks to the other track*, which is
+the only place where the other track's issues are named.
+
+"Since" defaults to the last ``## Point`` comment on the track's open tracking issue
+("Point: next steps", "Point (analysis): next steps"), or seven days ago when there is none:
+a lane's note or a lead's note posted after the Point does not move it (FM-220). Stdlib only;
 needs an authenticated ``gh``. ASCII output (#42).
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
@@ -24,7 +30,31 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
-TRACKING_TITLE = "Point: next steps"
+
+
+def _load_tracks() -> Any:
+    """``tracks.py`` loaded once, under the name ``lane.py`` and the tests give it.
+
+    The one reader of the two tracks (CODEOWNERS, labels, lane letters): it is not copied
+    here. ``tracks.py`` loads this file only inside its command line, so there is no cycle.
+    """
+    name = "smc_dev_tracks"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parent / "tracks.py"
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+tracks = _load_tracks()
+# The stand's tracking issue: the other's title is `tracks.TRACKING_TITLES[tracks.ANALYSIS]`.
+TRACKING_TITLE = tracks.TRACKING_TITLES[tracks.STAND]
 STATUS = "status: "
 MAX_LINE = 220
 # Every `gh` child has a timeout (FM-31), and none shares the console, which can change
@@ -33,8 +63,8 @@ GH_TIMEOUT_S = 120
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _DEPENDS = re.compile(r"\*\*Depends on\*\*:?\s*(.*)", re.IGNORECASE)
 _REF = re.compile(r"#(\d+)")
-# The lane a note belongs to: the `S<k>` right after the header's opening parenthesis.
-_LANE = re.compile(r"^## Lane \((S\d+)\b")
+# The lane a note belongs to: the `S<k>` or `A<k>` right after the header's opening parenthesis.
+_LANE = re.compile(rf"^## Lane \(({tracks.LANE_ID})\b")
 _ADR_STATUS = re.compile(r"\*\*Status\*\*:\s*(.+)")
 _FAILING = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 # A run that ended without a verdict on the code: a push to main cancels the older run of
@@ -121,7 +151,7 @@ def last_point_time(comments: list[dict[str, Any]]) -> str | None:
 
 
 def lane_notes(comments: list[dict[str, Any]], stamp: str) -> list[str]:
-    """The newest ``## Lane (S<k>, ...)`` note of each lane since ``stamp``, one line each.
+    """The newest ``## Lane (S<k>, ...)`` or ``(A<k>, ...)`` note of each lane since ``stamp``.
 
     A lane session leaves a note whenever it ends or waits (`/lane`); the point
     reads where each lane stands, not its history. ISO strings compare as
@@ -144,7 +174,7 @@ def lane_notes(comments: list[dict[str, Any]], stamp: str) -> list[str]:
             f"- {lane} ({c['createdAt']}): {part(str(c['body']), 'Done')}"
             f" / {part(str(c['body']), 'Next')}"
         )
-        for lane, c in sorted(newest.items(), key=lambda kv: int(kv[0][1:]))
+        for lane, c in sorted(newest.items(), key=lambda kv: (kv[0][0], int(kv[0][1:])))
     ]
 
 
@@ -401,8 +431,9 @@ def merge_stoppers(
 ) -> list[str]:
     """The lines of *CI that stops the merges*: a red ``main``, a failed nightly, an issue.
 
-    Each stops the merges of the code it names until the owner has chosen to
-    revert or to fix forward (ADR-0009), so they come before anything else. A
+    Each stops the merges of the code it names until the lead whose merge turned it
+    red has chosen to revert or to fix forward (ADR-0009, ADR-0010), so they come
+    before anything else. A
     failed nightly whose issue is open is listed through its issue, once.
     """
     out: list[str] = []
@@ -427,10 +458,9 @@ def merge_stoppers(
 
 
 def work_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The open issues that are work: not the tracking issue, not the nightly's."""
-    return [
-        i for i in issues if i["title"] != TRACKING_TITLE and not is_nightly_issue(i)
-    ]
+    """The open issues that are work: not a tracking issue (either track's), not the nightly's."""
+    pinned = set(tracks.TRACKING_TITLES.values())
+    return [i for i in issues if i["title"] not in pinned and not is_nightly_issue(i)]
 
 
 def status_groups(work: list[dict[str, Any]]) -> dict[str, list[str]]:
@@ -445,6 +475,112 @@ def status_of(issue: dict[str, Any]) -> str:
     names = [str(label["name"]) for label in issue.get("labels", [])]
     found = [n[len(STATUS) :] for n in names if n.startswith(STATUS)]
     return found[0] if found else "no status"
+
+
+# -- the two tracks (ADR-0010) ---------------------------------------------------
+
+
+def pr_open_issue(
+    pr: dict[str, Any], by_number: dict[int, dict[str, Any]]
+) -> dict[str, Any] | None:
+    """The first issue of a PR (what it closes, then its branch's) that is in the open listing."""
+    for number in tracks.pr_issues(pr):
+        if number in by_number:
+            return by_number[number]
+    return None
+
+
+def crossing(
+    pr: dict[str, Any], track: str, by_number: dict[int, dict[str, Any]]
+) -> bool:
+    """Whether a PR of ``track`` (by its paths) belongs to an open issue of the other track.
+
+    The lead of the issue's track merges it, after the owner's approval when it touches a
+    stand path (ADR-0010); the list says so, where a reader of one track would otherwise see
+    a pull request with no issue of theirs.
+    """
+    issue = pr_open_issue(pr, by_number)
+    return issue is not None and tracks.issue_track(issue) != track
+
+
+def asks(
+    track: str,
+    issues: list[dict[str, Any]],
+    prs: list[dict[str, Any]],
+    rules: Any,
+) -> list[str]:
+    """What ``track`` waits for from the other one: the lines of *Asks to the other track*.
+
+    Rule 5 of ADR-0010: a Point names no issue of the other track anywhere else. Two kinds
+    of line, the dependencies first. An open issue of the other track that a ``Depends on``
+    line of this track's open work names is awaited by those issues; an open PR of an issue
+    of this track whose paths are the other track's is a crossing the other lead must
+    approve. ``issues`` is the whole open listing, both tracks.
+    """
+    other = tracks.other(track)
+    by_number = {int(i["number"]): i for i in issues}
+    awaited: dict[int, list[int]] = {}
+    for issue in work_issues(issues):
+        if tracks.issue_track(issue) != track:
+            continue
+        for dep in dependencies(issue):
+            target = by_number.get(dep)
+            if target is not None and tracks.issue_track(target) == other:
+                awaited.setdefault(dep, []).append(int(issue["number"]))
+    out = [
+        f"- #{dep} ({other} track, {status_of(by_number[dep])}): awaited by "
+        + ", ".join(f"#{n}" for n in sorted(set(waiting)))
+        for dep, waiting in sorted(awaited.items())
+    ]
+    for pr in sorted(prs, key=lambda p: int(p["number"])):
+        if tracks.pr_track(pr, rules) != other:
+            continue
+        of = pr_open_issue(pr, by_number)
+        if of is None or tracks.issue_track(of) != track:
+            continue
+        listed = [str(f["path"]) for f in pr.get("files") or []]
+        theirs = [p for p in listed if tracks.path_track(p, rules) == other]
+        if theirs:
+            shown = ", ".join(theirs[:3])
+            more = f" (+{len(theirs) - 3} more)" if len(theirs) > 3 else ""
+        else:  # a cut listing is read as the stand's (FM-256): there is no path to name
+            shown = (
+                f"{len(listed)} of {pr.get('changedFiles')} files listed, the rest cut"
+            )
+            more = ""
+        out.append(
+            f"- PR #{pr['number']} of #{of['number']} is on the {other} track's paths:"
+            f" {shown}{more}"
+        )
+    return out or ["- none"]
+
+
+def blocked_line(
+    issue: dict[str, Any],
+    states: dict[int, str],
+    track: str,
+    by_number: dict[int, dict[str, Any]],
+) -> str:
+    """One line of *Blocked issues*: what each dependency's state is, and when it can move.
+
+    Every dependency counts for "ALL MERGED", but an **open** issue of the other track is
+    not named here (rule 5 of ADR-0010): it reads ``waits on the <other> track (see Asks)``,
+    once, after the others. The ``Asks to the other track`` section names it.
+    """
+    other = tracks.other(track)
+    ready = bool(states) and all(s in {"merged", "closed"} for s in states.values())
+    foreign = [
+        n
+        for n, s in states.items()
+        if s == "open" and n in by_number and tracks.issue_track(by_number[n]) == other
+    ]
+    parts = [f"#{n} {s}" for n, s in states.items() if n not in foreign]
+    listed = ", ".join(parts)
+    if foreign:
+        wait = f"waits on the {other} track (see Asks)"
+        listed = f"{listed}; {wait}" if listed else wait
+    listed = listed or "no Depends-on line"
+    return f"- #{issue['number']}: {listed}{'  -> ALL MERGED, can be unblocked' if ready else ''}"
 
 
 # -- GitHub --------------------------------------------------------------------
@@ -558,12 +694,23 @@ def since_default(tracking: dict[str, Any] | None) -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=7)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument("--since", help="YYYY-MM-DD (default: the last point)")
-    ns = ap.parse_args()
+    ap.add_argument(
+        "--track",
+        choices=tracks.TRACKS,
+        default=tracks.STAND,
+        help="the track whose facts are listed (default: the stand's)",
+    )
+    ns = ap.parse_args(argv)
+    track = str(ns.track)
+    other = tracks.other(track)
+    # Read once per run, from the repository the script is in (ADR-0010): a file that cannot
+    # be read ends the run, and never reads as "every path is one track's".
+    rules = tracks.read_rules()
 
     repo = str(gh_json("repo", "view", "--json", "nameWithOwner")["nameWithOwner"])
     issues = gh_json(
@@ -577,7 +724,10 @@ def main() -> int:
         "number,title,labels,milestone,comments,updatedAt,body",
     )
     complete(repo, issues, "issue")
-    tracking = next((i for i in issues if i["title"] == TRACKING_TITLE), None)
+    by_number = {int(i["number"]): i for i in issues}
+    tracking = next(
+        (i for i in issues if i["title"] == tracks.TRACKING_TITLES[track]), None
+    )
     since = (
         datetime.fromisoformat(ns.since).replace(tzinfo=timezone.utc)
         if ns.since
@@ -594,9 +744,12 @@ def main() -> int:
         "--search",
         f"closed:>={since:%Y-%m-%d}",
         "--json",
-        "number,title,comments",
+        "number,title,comments,labels",
     )
     complete(repo, closed, "issue")
+    # `files` and `changedFiles` say whose paths a PR touches (a `files` shorter than
+    # `changedFiles` is a cut listing, read as the stand's, FM-256); `headRefName` finds
+    # the issue of a PR that says `Refs #N` on purpose (#658).
     prs = gh_json(
         "pr",
         "list",
@@ -604,7 +757,7 @@ def main() -> int:
         "open",
         "--json",
         "number,title,mergeStateStatus,statusCheckRollup,reviews,comments,isDraft,"
-        "closingIssuesReferences",
+        "closingIssuesReferences,files,changedFiles,headRefName",
     )
     complete(repo, prs, "pr")
     merged = gh_json(
@@ -617,7 +770,7 @@ def main() -> int:
         "--search",
         f"merged:>={since:%Y-%m-%d}",
         "--json",
-        "number,title,mergedAt,reviews,comments",
+        "number,title,mergedAt,reviews,comments,files,changedFiles",
     )
     complete(repo, merged, "pr")
     runs = gh_json(
@@ -634,9 +787,12 @@ def main() -> int:
     )
 
     out = [
-        f"# Point facts ({datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC, since {stamp})",
+        f"# Point facts ({track} track, {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC,"
+        f" since {stamp})",
         "",
     ]
+    # A PR is the track's by its paths; a PR of the other track's issue says so (crossing).
+    mine = [p for p in prs if tracks.pr_track(p, rules) == track]
 
     # First, above everything: a red main and a red nightly stop the merges (ADR-0009).
     out.append("## CI that stops the merges")
@@ -644,13 +800,16 @@ def main() -> int:
     out.append("")
 
     out.append("## Open pull requests")
-    for pr in prs:
-        out.append(
+    for pr in mine:
+        line = (
             f"- #{pr['number']} {clip(pr['title'], 90)} | checks {checks(pr.get('statusCheckRollup') or [])}"
             f" | merge {pr['mergeStateStatus']} | {verdict(review_texts(pr))}"
             f" | {closes(pr)}"
         )
-    if not prs:
+        if crossing(pr, track, by_number):
+            line += f" | crossing: its issue is the {other} track's"
+        out.append(line)
+    if not mine:
         out.append("- none")
     out.append("")
 
@@ -670,7 +829,11 @@ def main() -> int:
     out.append("")
 
     out.append("## Merged since the last point")
-    recent = [p for p in merged if str(p.get("mergedAt", "")) >= stamp]
+    recent = [
+        p
+        for p in merged
+        if str(p.get("mergedAt", "")) >= stamp and tracks.pr_track(p, rules) == track
+    ]
     for pr in sorted(recent, key=lambda p: int(p["number"])):
         out.extend(merged_lines(pr))
     if not recent:
@@ -678,7 +841,7 @@ def main() -> int:
     out.append("")
 
     # The nightly's issue is listed above, and is not a piece of work to plan or review.
-    work = work_issues(issues)
+    work = [i for i in work_issues(issues) if tracks.issue_track(i) == track]
     groups = status_groups(work)
     out.append("## Open issues by status")
     for name in (
@@ -698,18 +861,15 @@ def main() -> int:
     for issue in (i for i in work if status_of(i) == "blocked"):
         deps = dependencies(issue)
         states = {n: ref_state(repo, n) for n in deps}
-        ready = bool(deps) and all(s in {"merged", "closed"} for s in states.values())
-        listed = (
-            ", ".join(f"#{n} {s}" for n, s in states.items()) or "no Depends-on line"
-        )
-        out.append(
-            f"- #{issue['number']}: {listed}{'  -> ALL MERGED, can be unblocked' if ready else ''}"
-        )
+        out.append(blocked_line(issue, states, track, by_number))
     out.append("")
 
     out.append("## Since the last point: reports, deviations, reviews, notes")
     seen = False
-    for issue in [*work, *(i for i in closed if not is_nightly_issue(i))]:
+    closed_here = [
+        i for i in closed if not is_nightly_issue(i) and tracks.issue_track(i) == track
+    ]
+    for issue in [*work, *closed_here]:
         for c in issue.get("comments", []):
             if str(c.get("createdAt", "")) < stamp:
                 continue
@@ -749,17 +909,23 @@ def main() -> int:
         out.append("- nothing new")
     out.append("")
 
-    out.append("## Survey folders (local/surveys)")
-    surveys = ROOT / "local" / "surveys"
-    folders = (
-        sorted(p for p in surveys.iterdir() if p.is_dir()) if surveys.is_dir() else []
-    )
-    for folder in folders:
-        curated = (ROOT / "docs" / "hardware" / f"{folder.name}.md").is_file()
-        out.append(f"- {folder.name}: {'curated' if curated else 'NOT CURATED YET'}")
-    if not folders:
-        out.append("- none")
-    out.append("")
+    # Field feedback is the stand's: the analysis track reads data, not a microscope.
+    if track == tracks.STAND:
+        out.append("## Survey folders (local/surveys)")
+        surveys = ROOT / "local" / "surveys"
+        folders = (
+            sorted(p for p in surveys.iterdir() if p.is_dir())
+            if surveys.is_dir()
+            else []
+        )
+        for folder in folders:
+            curated = (ROOT / "docs" / "hardware" / f"{folder.name}.md").is_file()
+            out.append(
+                f"- {folder.name}: {'curated' if curated else 'NOT CURATED YET'}"
+            )
+        if not folders:
+            out.append("- none")
+        out.append("")
 
     out.append("## ADRs not accepted")
     for path in sorted((ROOT / "docs" / "adr").glob("0*.md")):
@@ -774,6 +940,11 @@ def main() -> int:
         out.append(
             f"- {ms['title']}: {ms['closed_issues']} closed, {ms['open_issues']} open"
         )
+    out.append("")
+
+    # Last, by rule 5 of ADR-0010: the other track's issues are named here and nowhere above.
+    out.append("## Asks to the other track")
+    out.extend(asks(track, issues, prs, rules))
     # One pass over the whole report: a Report, a review or a note is written by a
     # subagent or a person, who use arrows freely, and a redirected stdout on Windows is cp1252 with
     # strict errors, so one arrow in any of them would lose the whole report (FM-20, #591).
