@@ -74,6 +74,7 @@ __all__ = [
     "CALIBRATE_REUSE_ROUTED",
     "CALIBRATIONS_FOLDER",
     "CALIBRATION_HOW_WINDOWS_NOTE",
+    "CALIBRATION_LINE_CHARS",
     "CAMERA_NOT_CALIBRATED_NOTE",
     "CAPTURE_FAR",
     "CAPTURE_SAME_PLACE",
@@ -92,6 +93,7 @@ __all__ = [
     "FRAME_SATURATED",
     "GOTO_ESTIMATED",
     "GOTO_NOT_DURING_LIVE",
+    "GOTO_REFUSED_DURING_LIVE",
     "GOTO_ROW_AT",
     "GOTO_ROW_AT_ESTIMATE",
     "GOTO_ROW_GOING",
@@ -166,6 +168,7 @@ __all__ = [
     "WALLS_MIN_CENTRES",
     "WALLS_NEED_CALIBRATION",
     "CalibrationNote",
+    "CalibrationNumbers",
     "CentreRow",
     "GotoAnswer",
     "NextStep",
@@ -194,6 +197,7 @@ __all__ = [
     "calibration_light",
     "calibration_missing_line",
     "calibration_note_line",
+    "calibration_numbers_text",
     "calibration_paths",
     "calibration_read_line",
     "calibrations_held_heading",
@@ -801,6 +805,17 @@ def continue_label(step: StepName) -> str | None:
 #: the arrows, Capture, End live, and nothing ends Live on its own.
 GOTO_NOT_DURING_LIVE = "End live to go to another well; Capture works during Live"
 
+#: What a drive click on the map says while Live runs (m5 §23.2 D6, #627): ``goto-well`` is a
+#: plugin run and Live is its own worker (§5.2), so the click goes nowhere; the text says why the
+#: stage did not move and what to press. The click spends Drive (the view's rule since #514: an
+#: armed stage that stays armed after a click is the danger), so Drive is switched on again. The
+#: arrows are a drive action of one capability call and do work during Live (§6.3). The words are
+#: the design's and the tests quote them whole; the *End live* part is the page's own label.
+GOTO_REFUSED_DURING_LIVE = (
+    f"live is running, so the stage did not move: press {END_LIVE_LABEL}, switch Drive on "
+    "and click the well again. The arrows work during Live."
+)
+
 #: What the Plate screen says of the two other ways to register (m5 §17.2 D3, §17.4.2): the
 #: guided path offers three centres by eye only, and these two are run from the expert view.
 OTHER_WAYS_TO_REGISTER = (
@@ -808,6 +823,24 @@ OTHER_WAYS_TO_REGISTER = (
     "wells' size too) or automatically (surveys the plate, about 7 minutes): in the "
     "expert view."
 )
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationNumbers:
+    """The numbers of a camera calibration the Stand screen says, as its document holds them (m5 §23.2 D3, D4).
+
+    The ones the operator reads against the image: the pixel size (``sqrt(|det M|)``), the
+    rotation and the mirror (the orientation), the residual of the correlation and the probe
+    step it is read against. ``response``, ``return_error_um`` and the frame stay in the
+    document. Device-native values, never converted here (CLAUDE.md): the page rounds them
+    for the line and keeps these as they are.
+    """
+
+    pixel_size_um: float
+    rotation_deg: float
+    mirrored: bool
+    residual_um: float
+    step_um: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -821,11 +854,20 @@ class CalibrationNote:
     same time in the PC's local zone to the minute (``local_time``), which the guided
     screens say; ``""`` for a note built without it, and then ``when_utc`` is said
     (m5 §17.12 D20).
+
+    ``numbers``, ``notes`` and ``where`` are what the pane under the known block adds (m5
+    §23.2 D4): the calibration's numbers, its own ``assumed`` lines (each on one line, as the
+    cards cut them) and the file it is in, as the page spells it and never resolved (FM-24).
+    They are read by ``calibration_numbers_text`` only: ``known_text`` reads the first three
+    fields and is unchanged. ``None``, ``()`` and ``""`` for a note built without them.
     """
 
     objective: str | None
     when_utc: str
     when_local: str = ""
+    numbers: CalibrationNumbers | None = None
+    notes: tuple[str, ...] = ()
+    where: str = ""
 
 
 def needs_calibration(
@@ -907,6 +949,64 @@ def known_text(
     if stand is not None:
         lines.append(DISCONNECT_RELEASES.format(stand=stand))
     return "\n".join(lines)
+
+
+#: The longest a line of the calibration pane is, in characters before its ``…`` (m5 §23.2
+#: D5): the result card's bound for a sentence (``controller._CARD_TEXT_CHARS``, which a test
+#: pins this equal to). The fixed text of the pane is far shorter, so the bound cuts only a
+#: value nobody wrote, a label, a path or a note (FM-125, FM-205).
+CALIBRATION_LINE_CHARS = 600
+
+
+def _calibration_line(text: str) -> str:
+    """``text`` on one line, cut at ``CALIBRATION_LINE_CHARS`` with a ``…`` when it was longer."""
+    flat = _flat(text)
+    if len(flat) <= CALIBRATION_LINE_CHARS:
+        return flat
+    return flat[:CALIBRATION_LINE_CHARS] + "…"
+
+
+def calibration_numbers_text(note: CalibrationNote) -> str:
+    """The Stand screen's pane under the known block: which calibration, its numbers and where it is, then the tool's own words (m5 §23.2 D3).
+
+    Three lines and the calibration's ``assumed`` lines::
+
+        Camera calibration at <objective>, measured <when>.
+        Pixel size <p> µm, rotation <r>°, <mirrored | not mirrored>, residual <e> µm, probe step <s> µm.
+        Written to <where>.
+        assumed: <note>
+
+    ``<when>`` is the PC's time to the minute, ``<when_utc> UTC`` for a note with no local
+    one, as the known block says it. The pixel size has four decimals, the rotation one, the
+    residual two and the step is ``:g``; a rotation that rounds to zero is ``0.0`` and never
+    ``-0.0``, which the operator would read as an angle. The third line is left out for a
+    note with no ``where``. Plain text, never markup (FM-139): the label, the path and the
+    notes are the stand's and a document's. Each line is on one line and cut at
+    ``CALIBRATION_LINE_CHARS`` (FM-125: a value nobody wrote, ``1e300`` in a hand-edited
+    file, must not give an unbounded line). ``""`` for a note without numbers: a pane that
+    says nothing takes no height.
+    """
+    numbers = note.numbers
+    if numbers is None:
+        return ""
+    when = note.when_local if note.when_local else f"{note.when_utc} UTC"
+    at = (
+        "(objective not recorded)"
+        if note.objective is None
+        else f"at {_flat(note.objective)}"
+    )
+    # ``+ 0.0`` turns a negative zero into zero, after the rounding that can make one.
+    rotation = round(numbers.rotation_deg, 1) + 0.0
+    mirror = "mirrored" if numbers.mirrored else "not mirrored"
+    lines = [
+        f"Camera calibration {at}, measured {when}.",
+        f"Pixel size {numbers.pixel_size_um:.4f} µm, rotation {rotation:.1f}°, {mirror}, "
+        f"residual {numbers.residual_um:.2f} µm, probe step {numbers.step_um:g} µm.",
+    ]
+    if note.where:
+        lines.append(f"Written to {note.where}.")
+    lines.extend(f"assumed: {' '.join(line.split())}" for line in note.notes)
+    return "\n".join(_calibration_line(line) for line in lines)
 
 
 #: Why the rows are not the plate's far corners, when the stand's soft limits cut them
