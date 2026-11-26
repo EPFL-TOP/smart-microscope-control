@@ -2,13 +2,14 @@
 
 - **Status**: design for issue #684 (2026-11-26), the first step of
   [ADR-0011](../adr/0011-where-the-models-run.md), and for #685 (the served
-  detector, §8). #635 (cells on the fly) and #600 (several models by name) are
-  planned on top of both.
+  detector, §8), and for #635 (detection while the scan goes, §10). #600
+  (several models by name) is planned on top of them.
 - **Owner**: the design session. **Executors**: `/develop` sessions.
 - **Rule**: as in M1 to M5, names, module paths and signatures below are
   fixed; an executor who needs to change one stops and comments on its issue
   (`## Plan deviation`). §2 and §6 **amend m3 §9.1 and §9.3**: the detector
-  module moves, and `cells` takes a model by name.
+  module moves, and `cells` takes a model by name. §10.4 amends m3 §9.3
+  again: `cells` uses the detections a worker made while the scan went.
 
 Read first: ADR-0011, then m3 §9 (the detector, the plugin, the measurement
 of #342) and ADR-0010 (the two tracks: `smc.inference` is a stand path, its
@@ -24,7 +25,7 @@ ran**. There is no server in §2 to §7: #685 adds the served implementation
 behind the same `load_model` (§8).
 
 Out of scope: the served client, the `serve` extra, `SMC_MODEL_SERVER`
-(#685); detection during a scan (#635); several models' detections side by
+(#685, §8); detection during a scan (#635, §10); several models' detections side by
 side, the page's choice of a model, the evaluation (#600); the tracker's
 protocol (#32); a second architecture than Faster R-CNN (§9).
 
@@ -843,9 +844,6 @@ it answers with is the one its models carry (`stub_model` computes it from the r
 - **A sized rule on the server** (a card with `model_um_per_px`): the input size depends
   on the frame, so it needs a detector per size and a bound on how many (§8.6). The first
   such card brings its design change.
-- **What #635 does with the check and the kinds** (how many failures in a row stop the
-  detection of a scan, what is named as missed): `ServedCheck` and `ServedError.kind` are
-  what it reads (§8.4, §8.5).
 - **A token or TLS** for the server: a machine setting too, when the lab needs one; the
   address already accepts `https://`.
 - **What a frame costs on the lab's network**: the frame goes as an uncompressed TIFF
@@ -855,3 +853,386 @@ it answers with is the one its models carry (`stub_model` computes it from the r
   kit's wheels on Windows with Python 3.14 are not measured.
 - **`cells_check.py` and the place**: it records name, SHA-256 and identity, and not where
   the model ran; with a server set it measures the served model.
+
+## 10. Detection while the scan goes (#635)
+
+Today `cells` runs after the scan, over every frame (0.5 to 0.8 s a frame on the Ti2-E's PC,
+15 to 25 minutes for a whole well at the 40×). Here a worker beside the scan detects each
+frame as it is written, the scan never waits for it, and the `cells` stage that follows uses
+what the worker found and detects only the rest. The model is the one §5 and §8 resolve,
+local or served; nothing of §2 to §8 changes. **The scan does not change** either: the worker
+listens on the frame channel that m3 §25 gave the page (`run_plugin(..., on_frame=)`,
+`ShownFrame`), which hands every frame the scan writes, after its write, in order (§25.4).
+§10.4 amends m3 §9.3 (`cells`).
+
+### 10.1 Measured (2026-11-26, planning #635)
+
+On the worktree's code with the main checkout's `.venv` (Python 3.13.0, macOS arm64), the
+`demo-sample` stand of `tests/plate_check_stand.py` (`build_documents`, `opened(profile())`),
+`scan-plan wells=B2,B3 rows=5 columns=5` (50 fields) and `rows=10 columns=10` (176 fields),
+`scan check_plate=false` through `run_plugin`:
+
+- **What the channel hands is what the TIFF holds.** For each of 50 frames, the `ShownFrame`'s
+  `image` and `load_frame` of the written TIFF have the same SHA-256 over shape, `dtype.str`
+  and bytes (both `<u2`, 512 × 512, C-contiguous), and `label` is the frame's `name`. The
+  names are the well's and the field's (`B3_0000`), unique in a plan.
+- **A worker beside the scan does not slow it**: the blob detector on a thread fed from
+  `on_frame`, three runs each, alternating: 50 fields in 1.67, 1.69, 1.70 s without it and
+  1.71, 1.71, 1.67 s with it; 176 fields in 5.93, 5.96, 5.95 s and 6.02, 5.96, 5.96 s. The
+  worker kept up (5.5 ms a frame, the first 24 to 41 ms) and had nothing left when the scan
+  ended.
+- **The digest of a frame** (SHA-256 of `f"{h}x{w}|{dtype.str}|"` and the bytes): 0.17 ms at
+  512 × 512 and 1.25 ms at 1412 × 1412 `uint16`. `load_frame` of a 512 × 512 TIFF: 0.20 ms.
+- `cells detector=blobs` on those 50 frames: 0.24 s for the stage, 4.5 ms a frame.
+- **A read-only view** (`view.flags.writeable = False`) goes through `BlobDetector.detect`
+  (the same detections as the writable array) and through `served.encode_frame`. The local
+  model converts it with `normalize_plane`, which makes a new `float32` array before
+  `torch.from_numpy` (read in `local.py`, not run).
+- **The store's line** (§10.3, prototyped): `LiveRecord` dumped as below and read back with
+  `model_validate_json` is equal to itself, `score_threshold` 0.5 included; a line cut short is
+  `json_invalid`, another `schema_version` `literal_error`. Under the repository's mypy, a
+  field written `Field(None, ge=0.0)` is required at the constructor; `Field(default=None,
+  ge=0.0)` is not.
+- **Not measured**: the stand PC (a Prime 95B frame every 2 to 3 s, the model at 0.5 to 0.8 s
+  a frame on its CPU, or served over the lab's network, #686); a store appended on Windows
+  while `cells` reads it.
+
+### 10.2 Decisions
+
+- **D1 A listener, not a scan parameter.** The worker is `LiveCells`, a callable for
+  `on_frame`, built by whoever runs the scan (the page, a test, a script) from the scan plan
+  and the `CellsParams` the `cells` stage will run with. The scan, its parameters, its result
+  and its checkpoint do not change, and a scan run without it is the scan of today. A scan
+  with no listener (`smc run scan`) detects nothing while it goes.
+- **D2 The scan never waits.** `put` takes a lock for a few appends and returns: no digest, no
+  copy, no file, no model on the scan's thread. Every frame waits in a backlog held in memory,
+  bounded by `LIVE_MAX_BACKLOG_BYTES`; a frame that would pass the bound is not held, and is
+  named missed (`full`). `put` never raises (m3 §25 D3 would drop the listener for the rest
+  of the run).
+- **D3 What the worker finds is a memo, keyed by the pixels.** Each frame's detections go to a
+  **store** in the run folder, one line per frame, with the frame's **digest**, the model's
+  identity and the score threshold. `cells` reads every frame from its TIFF as it does today,
+  digests it, and uses a line whose digest, identity and threshold are its own; any other
+  frame is detected by the stage. The same pixels, the same model and the same threshold give
+  the same detections, so the stage's result is the result it would have computed: the same
+  suppression, the same merge, the same file, by construction. A name is not the key: a scan
+  resumed in the middle of a well scans the well again whole and writes **new pixels under the
+  same file names** (m3 §8), and a memo keyed by the name would give the old frame's cells to
+  the new one.
+- **D4 Failures are findings, and none ends the scan.** A frame whose call fails is named
+  missed with its kind (`ServedError.kind` for the served model, §8.4) and the next frame is
+  tried. After `LIVE_MAX_FAILED_IN_ROW` failures in a row the worker stops calling (ADR-0011:
+  the loop must not pay a timeout on every frame), says so, and names every later frame
+  missed. A model that cannot be resolved names every frame missed. `cells` detects every
+  missed frame after the scan: it finds no line for it.
+- **D5 The backlog is finished after the scan.** `finish()` stops taking frames and waits for
+  the backlog, up to a timeout or a stop that its caller gives; the frames it did not reach
+  are named missed (`unfinished`) and nothing is written for them afterwards, even when a call
+  in flight comes back. Who runs the scan runs `finish()` when the scan's stage has ended, then
+  `cells`.
+- **D6 A resumed scan resumes its detections** through D3: the lines of the first attempt's
+  store stay in the run folder, the resumed attempt's listener writes its own store, and
+  `cells` reads them all; a frame scanned again has a new digest and is detected again.
+- **D7 The detector gets a read-only view** of the scan's array (m3 §25 D2: the listener does
+  not write into it, and the page may be drawing it): a detector that writes into its input
+  fails that frame, and never changes a frame another reader holds.
+- **D8 Nothing of the page here.** The counts and the cells as they come are given by
+  `snapshot()` and `cells_since()`; the page (the Scan screen, the plate view, STOP during
+  `finish()`) is #716's. No command of `smc` runs a scan with the listener here.
+
+### 10.3 The store — `src/smc/plugins/cells/store.py` (new)
+
+```python
+#: The folder of the stores, relative to the run folder.
+LIVE_FOLDER = "cells/live"
+#: The one version of a store line this smc writes and reads.
+LIVE_SCHEMA = 1
+
+LiveMissKind = Literal[
+    "unreachable",  # §8.4's kinds, for a served model
+    "timeout",
+    "error",  # §8.4's error, and a ModelError of a local model
+    "identity",
+    "malformed",
+    "failed",  # another Exception from detect (a frame it refused, a bug)
+    "label",  # a label the detector does not declare
+    "no-model",  # the model could not be resolved
+    "stopped",  # after LIVE_MAX_FAILED_IN_ROW failures in a row
+    "full",  # the backlog was full when the frame came
+    "store",  # the store could not be written
+    "unfinished",  # not detected when finish() returned
+]
+```
+
+```python
+def frame_digest(pixels: npt.NDArray[Any]) -> str:
+    """SHA-256 hex of f"{h}x{w}|{dtype.str}|" and the C-contiguous bytes of a 2-D frame."""
+```
+
+```python
+class LiveRecord(BaseModel):
+    """One line of a store: a frame's detections, or why the frame was missed."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+    schema_version: Literal[1] = 1
+    frame: str
+    digest: str | None = None
+    model: str | None = None
+    identity: str | None = None
+    runs_on: str | None = None
+    device: str | None = None
+    score_threshold: float | None = None
+    seconds: float | None = Field(default=None, ge=0.0)
+    detections: tuple[tuple[float, float, float, float, str, float], ...] | None = None
+    missed: LiveMissKind | None = None
+    message: str = ""
+```
+
+- A line is a **hit** (`detections` set, `missed` None, and `digest`, `identity`,
+  `score_threshold`, `seconds`, `runs_on`, `device` set) or a **miss** (`missed` set,
+  `detections` None); a validator refuses anything else. A detection is `(row0, col0, row1,
+  col1, label, score)` as `Detection`'s fields, the detector's output as it came (the score
+  threshold applied by the detector, nothing suppressed). A miss carries the digest when it
+  was computed (a frame that failed its call), never for `full`, which the scan's thread does
+  not hash.
+- **A store** is `<run folder>/cells/live/<new_token()>.jsonl`, one per `LiveCells`, written
+  only by it (§10.5): one JSON object a line, `json.dumps(record.model_dump(mode="json"),
+  ensure_ascii=True, allow_nan=False, separators=(",", ":"))` and `"\n"`, appended and flushed
+  line by line (opened `"a"`, `encoding="ascii"`, `newline="\n"`). No `fsync`: a line lost in
+  a crash is a frame `cells` detects again. smc never removes a store; a new scan in the same
+  run folder leaves the old ones, whose digests no new frame has.
+- **`read_live(run_dir, *, identity, score_threshold, classes) -> LiveIndex`**: every
+  `cells/live/*.jsonl` in name order (none, or no folder: an empty index), each read whole with
+  `retry_on_permission_error`, `utf-8` decoded, split on `"\n"`; each line validated alone. A
+  line that does not parse, does not validate, or is of another `schema_version` is skipped,
+  and the lines before and after it still count (FM-194: a store cut by a crash ends with half
+  a line). A hit is kept when its `identity` and `score_threshold` are the ones asked for
+  (`==`: both come from the same parameter, through JSON's `repr`) and every label is in
+  `classes`; a later hit of the same digest replaces an earlier one. A file that cannot be
+  read (`OSError`, `UnicodeDecodeError`) is skipped. Every file skipped or with a line skipped
+  is named, relative to the run folder, in `LiveIndex.unreadable`.
+
+```python
+@dataclass(frozen=True, slots=True)
+class LiveHit:
+    """A frame's detections from a store, with where and how long they took."""
+
+    frame: str
+    detections: tuple[Detection, ...]
+    seconds: float
+    runs_on: str
+    device: str
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class LiveIndex:
+    """The hits of every store of a run folder for one model and threshold, by digest."""
+
+    hits: Mapping[str, LiveHit]
+    unreadable: tuple[str, ...]
+```
+
+`store.py` imports nothing of `plugin.py` or `live.py` (both import it).
+
+### 10.4 `cells` uses the store (amends m3 §9.3 and §8.7)
+
+- **Resolution is shared.** `_resolve(params, scan)` becomes **`resolve_model(params, *,
+  frame_shape_px, frame_um_per_px) -> ResolvedModel`**, public in `plugin.py`, with the same
+  body and the same `PluginRunError`; `cells` calls it with `scan.image_shape_px` and
+  `scan.pixel_size_um`, `LiveCells` with the plan's. It still calls `load_model`,
+  `model_card` and `blob_model` through `plugin.py`'s names, so a test that replaces
+  `plugin_mod.load_model` replaces it for both.
+- **The stage always resolves the model**, as today, even when every frame has a hit: the
+  identity it compares is the resolved one, and a stage whose model cannot be resolved fails
+  as today.
+- After `_resume`: `live = read_live(ctx.run_dir, identity=resolved.identity,
+  score_threshold=params.score_threshold, classes=detector.classes)`; each name of
+  `live.unreadable` is one WARNING on the plugin's logger, `<file> could not be read whole:
+  its frames are detected again`.
+- **In the loop**, after `_read_frame`: when `live.hits` is not empty, `hit =
+  live.hits.get(frame_digest(pixels))`. A hit's detections are used as `detector.detect`'s
+  would be (the label check, `suppress_in_frame`, `to_cells`, the progress); no call is made
+  and its `seconds` go to a list of their own; `places = _places(places, hit.runs_on)`. A
+  frame with no hit is detected as today. With no hit at all the stage digests nothing.
+- **The result**:
+  - `seconds_per_frame`: the mean over the stage's calls **and** the hits used (`None` when
+    neither).
+  - `model_runs_on`: `resolved.runs_on` when no hit was used; the hits' places in order of
+    first use, joined by `+` with `_places`, then `resolved.runs_on` when the stage called
+    the detector at least once.
+  - `device`: `detector.device` when the stage called the detector at least once, else the
+    last hit's `device`.
+  - **`assumed`** gains, after §8.7's served line, when at least one hit was used: `{k} of {n}
+    frames were detected during the scan, as they were written ({places}: {mean:.2f} s a
+    frame on average, the first {first:.2f} s); this stage detected the other {n - k}`, with
+    `{places}` the hits' places joined by ` and `, the first being the first hit used in the
+    scan's order, and `the other 0` written `none`. With one hit: `({places}: {first:.2f}
+    s)`. The served line keeps counting the stage's own calls only.
+- The checkpoint, the resume, the identity's refusal, the partial file: unchanged. A resumed
+  `cells` reads the stores again; their hits are a memo, not a state the checkpoint carries.
+
+### 10.5 The worker — `src/smc/plugins/cells/live.py` (new)
+
+```python
+#: Assumed: 256 MiB of frames waiting is 64 Prime 95B frames, minutes of a 40x scan.
+LIVE_MAX_BACKLOG_BYTES = 256 * 1024 * 1024
+#: ADR-0011's "a few failures in a row": chosen, not measured.
+LIVE_MAX_FAILED_IN_ROW = 3
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class LiveMiss:
+    """A frame the worker did not detect: its name, why (a kind), and the diagnosis."""
+
+    frame: str
+    kind: LiveMissKind
+    message: str
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class LiveSnapshot:
+    """What the worker has done so far, for a page's counts and a test."""
+
+    state: Literal["starting", "running", "stopped", "failed", "finished"]
+    message: str
+    handed: int
+    detected: int
+    cells: int
+    waiting: int
+    missed: tuple[LiveMiss, ...]
+    seconds_per_frame: float | None
+    model: str | None
+    runs_on: str | None
+    device: str | None
+```
+
+```python
+class LiveCells:
+    """Detects a scan's frames as the scan hands them, beside it, and stores what it finds."""
+
+    def __init__(
+        self, run_dir: Path, plan: ScanPlanResult, params: CellsParams
+    ) -> None: ...
+    def start(self) -> LiveCells: ...
+    def put(self, shown: ShownFrame) -> None: ...
+    def snapshot(self) -> LiveSnapshot: ...
+    def cells_since(self, index: int) -> tuple[tuple[Cell, ...], int]: ...
+    def finish(
+        self,
+        *,
+        timeout_s: float | None = None,
+        stop: threading.Event | None = None,
+    ) -> LiveSnapshot: ...
+    def wait_ended(self, timeout_s: float) -> bool: ...
+```
+
+- **The constructor** keeps the plan's fields by name (`name -> PlannedField`), its
+  `matrix_um_per_px`, `image_shape_px` and `pixel_size_um`, the run folder, and the params; it
+  starts nothing and writes nothing.
+- **`start()`** starts one daemon thread, `smc-live-cells`, and returns `self`; a second call
+  is a `RuntimeError`. The thread first resolves the model, `resolve_model(params,
+  frame_shape_px=plan.image_shape_px, frame_um_per_px=plan.pixel_size_um)` (a served model's
+  check, or torch and the weights: seconds, off the scan's thread). A `PluginRunError` there
+  is state `failed` with its reason as `message`, one WARNING, and every frame handed, before
+  or after, missed `no-model`. A served model's `check.message` is the `message` while
+  `running`, logged as `cells` does it (INFO, or WARNING when the check is not ok).
+- **`put(shown)`**, on the scan's thread, never raises (its body is in a `try` that catches
+  `Exception`; the first one is logged once at WARNING, by its text, FM-98), takes the lock
+  for appends only (FM-70), and:
+  - ignores a frame whose `plugin` is not `scan`, whose `label` is not a field of the plan, or
+    whose `xy_um` is `None` (counted nowhere: not the scan's, or not placeable), and every
+    frame after `finish()` was called (one WARNING, the first time);
+  - otherwise counts it `handed` and, when the backlog's bytes plus `image.nbytes` exceed
+    `LIVE_MAX_BACKLOG_BYTES`, names it missed `full` (`the backlog held {n} frames ({m} MiB)
+    waiting for the detector`); else appends it to the backlog and notifies the thread.
+- **The thread**, oldest frame first: takes a frame under the lock, then outside it makes the
+  read-only view (D7), its digest, the call timed with `perf_counter`, and the outcome:
+  - detections whose labels are all in `detector.classes`: a hit line, the frame's cells
+    (`suppress_in_frame` with `params.max_overlap`, then `to_cells` with a `ScanFrame` built
+    from the planned field's well, index and name, `shown.xy_um` as `x_um, y_um`, `file=""`,
+    and `frame` the order in which this worker detected it), the in-a-row count reset;
+  - a `ServedError`: missed with its `kind`; another `ModelError`: `error`; another label:
+    `label`, naming it; another `Exception`: `failed`, `<Type>: <first line>`. Each adds one
+    to the in-a-row count; at `LIVE_MAX_FAILED_IN_ROW` the state is `stopped`, `message` is
+    `the detection stopped after {n} failures in a row, the last on {frame}: {message}; cells
+    detects the frames it missed after the scan`, one WARNING, and every frame waiting or to
+    come is missed `stopped` without a call. A `BaseException` that is not an `Exception`
+    ends the thread (the process is going away).
+  - **The store** is opened at the thread's first line (`mkdir(parents=True,
+    exist_ok=True)`). An `OSError` opening or writing it is state `failed`, `cannot write
+    {relative path} ({strerror}): cells detects the frames after the scan`, one WARNING; that
+    frame and every later one are missed `store`, and nothing more is written.
+  - Writing a line and the `finished` check happen under a second lock, `_write_lock`, that
+    `finish()` also takes, so no line is written after `finish()` returned.
+- **`finish(*, timeout_s=None, stop=None)`**, on the caller's thread: no more frames are taken;
+  it waits, in slices of at most 0.1 s, until nothing is waiting or in flight, or `timeout_s`
+  has passed, or `stop` is set (a `ValueError` for a `timeout_s` that is negative or not
+  finite). Then, under `_write_lock`: the state becomes `finished` (the `message` of a
+  `stopped` or `failed` worker is kept), every frame still waiting or in flight is missed
+  `unfinished` (`not detected when the detection was finished`, and `, {t:g} s after the
+  scan` when the timeout ended the wait, `: stopped` when `stop` did) and written to the store
+  when it is open, and the store is closed. It logs one line, INFO when nothing was missed,
+  WARNING otherwise: `cells during the scan: {detected} of {handed} frames detected, {cells}
+  cells; missed {m}: {kind} {count}, ... (the first {frame}: {message})`. It returns the
+  snapshot, and a second call returns the same snapshot at once. A thread still inside a call
+  is left to end on its own; what it returns is dropped.
+- **`snapshot()`**: the counts under the lock; `waiting` is the backlog plus the frame in
+  flight; `cells` the number of cells of the hits; `seconds_per_frame` the mean of the hits'
+  seconds.
+- **`cells_since(index)`**: the cells of the frames detected from the `index`-th on, in the
+  order they were detected, and the index to ask from next time. They are in stage µm,
+  suppressed within their frame and **not merged across fields**: a cell two fields saw is
+  there twice until `cells` merges it. `Cell.frame` is the worker's own order, not a position
+  in `ScanResult.frames`.
+- **`wait_ended(timeout_s)`**: joins the thread for at most `timeout_s`, and says whether it
+  has ended (a test's check, FM-44).
+- **Never**: a digest, a copy, a file or a model call on the scan's thread; a lock held across
+  a call, a write or a log line; a frame written into; an address in a line or a message
+  (§8.4's messages hold none, FM-50).
+
+### 10.6 Tests
+
+- **`tests/unit/test_cells_store.py`**: the digest (shape, dtype and one pixel change it; a
+  TIFF written by `encode_frame` of the scan and read back by `load_frame` keeps it); a hit
+  and a miss round-trip; the validator's refusals; `read_live` keeps the identity and the
+  threshold asked for, drops a hit with an undeclared label, lets a later hit of a digest
+  replace an earlier one, skips a torn last line and a line of another schema while the
+  others count, and names an unreadable file.
+- **`tests/unit/test_cells_live.py`**: `LiveCells` fed `ShownFrame`s by hand, with no stand,
+  the model a `StubDetector` through `plugin_mod.load_model` replaced (§7), and threads that
+  meet on `threading.Event` (FM-44): `put` returns at once while the detector is blocked; the
+  order; frames that are ignored; each kind of miss; the stop after the failures in a row
+  (the detector called exactly that many times); a model that cannot be resolved; a full
+  backlog (`LIVE_MAX_BACKLOG_BYTES` set small); `finish` after the backlog, at its timeout and
+  at a stop, and no line written after it; the read-only view; a store that cannot be
+  written; `cells_since`'s stage µm; a served model's check as the `message`
+  (`FakeModelServer`).
+- **`tests/test_cells_demo.py`** (amended): `cells` uses a hit and calls the detector for the
+  rest; a hit of another identity, another threshold or another digest (a frame rewritten
+  since) is not used; the `assumed` line, `seconds_per_frame`, `model_runs_on` and `device`
+  of §10.4.
+- **`tests/test_cells_live_demo.py`** (new, `demo-sample` through `run_plugin`, the helpers
+  of `tests/plate_check_stand.py`): a scan with `LiveCells(detector=blobs)` as `on_frame`,
+  then `finish()`, then `cells`, gives the cells file, the counts and `merged` of the same
+  stage run again with the stores removed, and the first `cells` made no detector call; a
+  detector that raises on one frame, and one that never answers, leave the scan `done` and
+  the missed frames named; a scan stopped in its second well and resumed with a second
+  `LiveCells` leaves `cells` no frame to detect. **The bound** (`@pytest.mark.wallclock`):
+  three scans with the listener and three without, alternating, of §10.1's 50 fields; the
+  median with it is at most 1.15 times the median without (measured: 2 %).
+
+### 10.7 Not decided here
+
+- **The page** (#716): the toggle, `finish()` and `cells` after a scan, STOP during
+  `finish()`, the counts and the cells on the plate view.
+- **A command** that scans with the listener (`smc run` runs one stage).
+- **A store's frames that a resumed scan holds but no listener saw** (a first attempt run
+  without one): `cells` detects them; nothing feeds them to the second listener.
+- **Removing old stores** of a run folder.
+- **A deadline for the whole served call** (#711): until then a slow trickle can hold the
+  worker longer than `DETECT_TIMEOUT_S`; the scan does not wait for it, and `finish()`'s
+  timeout bounds the wait after it.
