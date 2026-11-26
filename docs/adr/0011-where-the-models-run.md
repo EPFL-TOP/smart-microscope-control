@@ -1,6 +1,6 @@
 # 0011 — Where the models run: one detector interface, local or served by imaging-server-kit
 
-- **Status**: proposed
+- **Status**: **accepted** 2026-11-26 by the owner (merge of #683)
 - **Date**: 2026-11-25
 - **Issue**: #599
 
