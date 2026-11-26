@@ -13,7 +13,7 @@ import math
 from collections import defaultdict
 from collections.abc import Sequence
 
-from smc.plugins.cells.detector import Detection
+from smc.inference.detector import Detection
 from smc.plugins.cells.overlap import (
     DEFAULT_MAX_OVERLAP,
     OverlapCandidate,

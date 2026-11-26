@@ -19,13 +19,13 @@ from hypothesis import given
 from hypothesis import strategies as st
 from skimage import measure
 
+from smc.inference.detector import Detection
 from smc.plugins.cells.algorithm import (
     edge_distance_px,
     merge_across_fields,
     suppress_in_frame,
     to_cells,
 )
-from smc.plugins.cells.detector import Detection
 from smc.plugins.geometry import Matrix2, pixel_matrix
 from smc.plugins.slots import Cell, ScanFrame
 from smc.testing.synthetic import Blob, PlateSample

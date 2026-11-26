@@ -58,11 +58,18 @@ class CellsResult(PluginResult):
 
     ``file`` is ``cells/<token>.json`` relative to the run folder. ``counts``
     maps well to label to count with every label of ``classes`` present, zeros
-    included. ``model`` is the weights' file name, never its full path (run
-    documents are attached to issues: FM-50), or ``blobs`` for the blob
-    detector of the synthetic plate (m3 §9.1); ``model_sha256`` its SHA-256
-    (of the detector's identity string for ``blobs``) and ``classes`` the
-    detector's, background excluded.
+    included. ``model`` is the model's name, the one of its card in
+    ``smc.inference`` (never a path: run documents are attached to issues,
+    FM-50), or ``blobs`` for the blob detector of the synthetic plate (m3 §9.1);
+    ``model_sha256`` its weights' SHA-256 (of the detector's identity string for
+    ``blobs``) and ``classes`` the detector's, background excluded.
+
+    ``model_identity`` is the weights' SHA-256 and the digest of the
+    pre-processing the run applied, joined by ``+``: the model as it was run, so
+    that two results with the same weights and another rule are told apart.
+    ``model_runs_on`` is where it ran, ``local:<device>``. Both are ``None`` in a
+    result recorded before #684, which a run document or a dataset on a share
+    still holds, and which must keep loading.
     """
 
     # ``model`` and ``model_sha256`` are this result's field names; pydantic's
@@ -73,6 +80,8 @@ class CellsResult(PluginResult):
     file: str
     model: str
     model_sha256: str
+    model_identity: str | None = None
+    model_runs_on: str | None = None
     classes: tuple[str, ...]
     device: str
     score_threshold: float
