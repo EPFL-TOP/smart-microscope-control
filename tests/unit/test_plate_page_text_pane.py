@@ -222,35 +222,38 @@ def _pane_uses(tree: ast.AST) -> list[tuple[str, ast.AST | None]]:
 def test_the_page_builds_its_panes_from_text_pane_bokeh_and_the_one_html_pane() -> None:
     """A ``Str`` built anywhere in the UI package would leak: only the figures and the file links are not text.
 
-    ``plate_page.py`` is the one module that imports Panel (as ``pn``); what it takes from
-    ``pn.pane`` is exactly the two Bokeh figures, ``files_text`` (the one HTML pane, m5 §17.12
-    D21, whose every text ``files_html`` escapes) and ``Str`` as the base class of
-    ``TextPane``. Any other use of ``pn.pane`` (a variable, ``getattr``, ``pn.pane.markup``) is
-    a different list, no module of the package imports a Panel name another way
-    (``from panel.pane import Str``, ``import panel as p``), ``Str`` is not a name anywhere
-    else, and none builds a ``StaticText`` widget (Panel renders that one's value as HTML too).
+    ``plate_page.py`` imports Panel (as ``pn``); what it takes from ``pn.pane`` is exactly the
+    map's Bokeh figure, ``files_text`` (the one HTML pane, m5 §17.12 D21, whose every text
+    ``files_html`` escapes) and ``Str`` as the base class of ``TextPane``. ``image_view.py``
+    (m5 §24.3, #631) is the one other module that imports Panel, and what it takes is the image's
+    Bokeh figure: it builds no text pane (a box's text is canvas text, FM-139). Any other use of
+    ``pn.pane`` (a variable, ``getattr``, ``pn.pane.markup``) is a different list, no module of
+    the package imports a Panel name another way (``from panel.pane import Str``, ``import panel
+    as p``), ``Str`` is not a name anywhere else, and none builds a ``StaticText`` widget (Panel
+    renders that one's value as HTML too).
     """
     modules = sorted(UI_FOLDER.glob("*.py"))
     assert UI_FOLDER / "plate_page.py" in modules
+    assert UI_FOLDER / "image_view.py" in modules
+    allowed = {
+        "plate_page.py": ["pn.pane.Bokeh", "pn.pane.HTML", "pn.pane.Str"],
+        "image_view.py": ["pn.pane.Bokeh"],
+    }
     for module in modules:
         source = module.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(module))
         uses = _pane_uses(tree)
-        if module.name == "plate_page.py":
-            assert sorted(name for name, _ in uses) == [
-                "pn.pane.Bokeh",
-                "pn.pane.Bokeh",
-                "pn.pane.HTML",
-                "pn.pane.Str",
-            ], (
+        if module.name in allowed:
+            assert sorted(name for name, _ in uses) == allowed[module.name], (
                 f"{module.name} uses pn.pane as {[name for name, _ in uses]}: a text goes "
                 "in TextPane, which escapes it (FM-271)"
             )
+        else:
+            assert not uses, f"{module.name} uses {[name for name, _ in uses]}"
+        if module.name == "plate_page.py":
             (base,) = [parent for name, parent in uses if name == "pn.pane.Str"]
             assert isinstance(base, ast.ClassDef)
             assert base.name == "TextPane"
-        else:
-            assert not uses, f"{module.name} uses {[name for name, _ in uses]}"
         panel_imports = [
             alias.name
             for node in ast.walk(tree)

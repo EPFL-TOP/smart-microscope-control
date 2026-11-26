@@ -41,7 +41,6 @@ from bokeh.models import (
 )
 from bokeh.palettes import Greys256
 from bokeh.plotting import figure
-from panel.viewable import Viewable
 
 from smc.ui.frames import Box, display_image
 
@@ -276,7 +275,10 @@ class ImageView:
         self._callbacks.append(callback)
 
     def panel(
-        self, *, toolbar: Sequence[Viewable] = (), below: Sequence[Viewable] = ()
+        self,
+        *,
+        toolbar: Sequence[pn.viewable.Viewable] = (),
+        below: Sequence[pn.viewable.Viewable] = (),
     ) -> pn.viewable.Viewable:
         """The view's root: ``toolbar`` and the *Enlarge* toggle, the figure, then ``below``.
 
