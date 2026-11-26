@@ -257,6 +257,23 @@ def test_a_selection_on_another_registration_of_the_plate_is_refused(
     )
 
 
+def test_a_selection_whose_plan_read_no_registration_is_refused(
+    stands: list[Microscope], here: Path
+) -> None:
+    # Unknown is not the same: a plan that names no plate it read cannot be said to
+    # rest on this run's registration (§21.12.5's check 2).
+    ours = _raw(Path("run.json"))["stages"]["plate-walls"]["attempt"]
+    plan = RunDocument.load(SELECTION).stages["scan-plan"].model_dump(mode="json")
+    plan["reads"] = {}
+    write_stage(SELECTION, StageRecord.model_validate(plan))
+    stand = _stand(stands)
+
+    assert _refused(stand) == (
+        f"the selection in run-10x.json was chosen on another registration of the "
+        f"plate (none against this run's {ours})"
+    )
+
+
 def test_a_selection_of_another_objectives_fields_is_refused_naming_both(
     stands: list[Microscope], here: Path
 ) -> None:
