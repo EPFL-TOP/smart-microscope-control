@@ -9,9 +9,11 @@ browser: the look of the enlarged view is ``/ui-check``'s ``enlarged`` state.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -25,7 +27,8 @@ if os.environ.get("SMC_REQUIRE_UI"):
 else:
     pn = pytest.importorskip("panel")
 
-from bokeh.models import LabelSet
+from bokeh.models import LabelSet, MetricLength
+from bokeh.palettes import Greys256
 
 from smc.ui.frames import Box as FramesBox
 from smc.ui.image_view import (
@@ -64,6 +67,16 @@ def test_the_box_is_the_one_of_the_frames_module() -> None:
     # One class, imported from either module: #677 adds `smc.ui.image_view` alone to its
     # allowed imports and still builds the page's boxes from `smc.ui.frames`.
     assert Box is FramesBox
+
+
+def test_a_box_is_frozen_and_slotted_with_an_empty_text_by_default() -> None:
+    # Plan step 1: a box is a value that is handed to a view and kept by the caller, so it
+    # cannot change under the view, and it carries no `__dict__`.
+    box = Box(1, 2, 3, 4, GOLD)
+    assert box.text == ""
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        box.row0 = 9.0  # type: ignore[misc]
+    assert not hasattr(box, "__dict__")
 
 
 def test_a_known_pixel_size_draws_micrometres_and_shows_the_scale_bar() -> None:
@@ -347,6 +360,82 @@ def test_the_figures_box_has_the_class_the_enlarged_rule_names() -> None:
     stylesheet = "".join(str(s) for s in root.stylesheets)
     assert ".smc-image-box" in stylesheet
     assert ":host(.smc-image-enlarged)" in stylesheet
+
+
+def test_the_enlarged_rule_covers_the_window_over_the_pages_sticky_header() -> None:
+    # The browser is what shows the look (`/ui-check`'s `enlarged` state), but two words of the
+    # rule are a promise the tests can keep: the overlay is fixed over the window, and it is
+    # above the page's header, whose z-index the page states (`_STICKY_STRIP`, m5 §24, risk 2).
+    from smc.ui.plate_page import _STICKY_STRIP
+
+    stylesheet = "".join(str(s) for s in ImageView().panel().stylesheets)
+    assert "position: fixed" in stylesheet
+    assert "flex: 1 1 auto" in stylesheet
+    z_index = re.search(r"z-index:\s*(\d+)", stylesheet)
+    assert z_index is not None
+    assert int(z_index.group(1)) > int(_STICKY_STRIP["z-index"])
+
+
+def test_the_figure_is_drawn_as_the_design_says() -> None:
+    # What a browser draws is read from the models: every one of these was a mutant that no
+    # other test noticed (a bar in metres, boxes filled over the cells, a picture whitewashed,
+    # a frame stretched out of square). `/ui-check` photographs the picture, not these fields.
+    view = ImageView()
+    renderers = {type(r.glyph).__name__: r for r in view.figure.renderers}
+    image = renderers["Image"]
+    assert image.data_source is view.source
+    glyph = image.glyph
+    assert (glyph.image, glyph.dw, glyph.dh) == ("image", "dw", "dh")
+    assert (glyph.x, glyph.y) == (0, 0)
+    mapper = glyph.color_mapper
+    assert (mapper.low, mapper.high) == (0, 255)
+    assert list(mapper.palette) == list(Greys256)
+    quad = renderers["Quad"]
+    assert quad.data_source is view.boxes_source
+    glyph = quad.glyph
+    assert (glyph.left, glyph.right, glyph.top, glyph.bottom) == (
+        "left",
+        "right",
+        "top",
+        "bottom",
+    )
+    # An outline, never a fill: a filled box would hide the cell it names.
+    assert glyph.fill_alpha == 0
+    assert glyph.line_color == "colour"
+    (labels,) = [o for o in view.figure.center if isinstance(o, LabelSet)]
+    assert (labels.x, labels.y) == ("left", "top")
+    assert labels.text_color == "colour"
+    assert labels.text_baseline == "bottom"
+    bar = view.scale_bar
+    assert bar.unit == "µm"
+    assert bar.range is view.figure.x_range
+    assert isinstance(bar.dimensional, MetricLength)
+    assert bar.location == "bottom_right"
+    assert view.figure.match_aspect is True
+
+
+def _tree_ids(view: ImageView) -> set[str]:
+    return {model.id for model in view.panel().get_root().references()}
+
+
+def test_enlarging_never_takes_the_figure_out_of_the_model_tree() -> None:
+    # FM-174: a figure that leaves the model tree has its view destroyed in the browser, and
+    # a DataRange1d keeps the bounds of every view it has had. *Enlarge* is a class on the root
+    # and nothing else: the figure, its pane and its box are the very objects they were.
+    view = _shown(ImageView(enlargeable=True))
+    root = view.panel()
+    pane = next(o for o in root.select(pn.pane.Bokeh) if o.object is view.figure)
+    box = next(o for o in root.select(pn.Column) if "smc-image-box" in o.css_classes)
+    assert view.figure.id in _tree_ids(view)
+    for enlarged in (True, False, True, False):
+        view.enlarge_toggle.value = enlarged
+        assert view.figure.id in _tree_ids(view)
+        assert pane in root.select(pn.pane.Bokeh)
+        assert box in root.select(pn.Column)
+        assert [o.object for o in box.objects] == [view.figure]
+        # A frame drawn while enlarged lands in the same figure.
+        _shown(view, title=f"enlarged {enlarged}")
+        assert view.figure.title.text == f"enlarged {enlarged}"
 
 
 _SRC = Path(__file__).resolve().parents[2] / "src" / "smc" / "ui" / "image_view.py"

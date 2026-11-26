@@ -1567,7 +1567,10 @@ def test_a_state_that_failed_while_enlarged_leaves_the_page_reduced(
 
 def test_the_enlarged_labels_are_the_image_views(snap) -> None:
     # This script imports nothing of smc at import, so its copies are pinned here.
-    pytest.importorskip("panel")
+    if os.environ.get("SMC_REQUIRE_UI"):
+        import panel  # noqa: F401  # CI must fail, not skip, when the extra is missing
+    else:
+        pytest.importorskip("panel")
     from smc.ui.image_view import ENLARGE_LABEL, REDUCE_LABEL
 
     assert (snap.ENLARGE_LABEL, snap.REDUCE_LABEL) == (ENLARGE_LABEL, REDUCE_LABEL)
@@ -2481,6 +2484,71 @@ def test_on_screen_reads_the_results_parts_of_results_all_and_only_there(
         "STOP: yes (y 142 to 159 of 800, x 10 to 380 of 1280)",
         "offsets block: not on this screen",
     ]
+
+
+def test_the_enlarged_parts_are_the_bars_own_stop_the_image_and_the_drive_bar(
+    snap,
+) -> None:
+    page = MagicMock()
+    parts = dict(snap._enlarged_parts(page))
+    assert list(parts) == ["second STOP", "image", "drive bar"]
+    # The strip's STOP is in the header and always in the window: the one to look for is the
+    # LAST button of that name (the bar's own, after the header in the DOM), and the image is
+    # the last figure (the map's is the first).
+    assert parts["second STOP"] is page.get_by_role.return_value.last
+    page.get_by_role.assert_any_call("button", name="STOP")
+    assert parts["image"] is page.locator.return_value.last
+    page.locator.assert_any_call(".bk-Figure")
+    page.get_by_role.assert_any_call("button", name=snap._DRIVE_TOGGLE)
+
+
+def test_on_screen_reads_the_enlarged_parts_of_enlarged_and_only_there(
+    snap, monkeypatch
+) -> None:
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 800}
+    page.get_by_role.return_value.count.return_value = 0
+    stop = MagicMock()
+    stop.count.return_value = 1
+    stop.first.bounding_box.return_value = _box(10, 5, 58, 31)
+    # The bar's STOP past the page's top, as an overlay that scrolled would put it: NO.
+    away = MagicMock()
+    away.count.return_value = 1
+    away.first.bounding_box.return_value = _box(0, -40, 1280, 433)
+    monkeypatch.setattr(
+        snap, "_enlarged_parts", lambda page: [("second STOP", stop), ("image", away)]
+    )
+    assert snap._on_screen(page, "enlarged") == [
+        "second STOP: yes (y 5 to 36 of 800, x 10 to 68 of 1280)",
+        "image: NO (y -40 to 393 of 800, x 0 to 1280 of 1280)",
+        "offsets block: not on this screen",
+    ]
+    # Another state reads the frame's parts, as before.
+    monkeypatch.setattr(snap, "_frame_parts", lambda page: [("STOP", stop)])
+    assert snap._on_screen(page, "snap") == [
+        "STOP: yes (y 5 to 36 of 800, x 10 to 68 of 1280)",
+        "offsets block: not on this screen",
+    ]
+
+
+def test_the_enlarged_state_looks_for_the_figure_and_the_pressed_class_by_these_selectors(
+    snap,
+) -> None:
+    # A fake page accepts any selector, so a mistyped one passes every other test: the strings
+    # the real page is read by are pinned (measured on Panel 1.11.1: `bk-Figure` is the figure's
+    # host, a pressed Toggle's button has `bk-active`).
+    page = _boxes_page(_BEFORE_BOX)
+    assert snap._image_box(page) == _BEFORE_BOX
+    page.locator.assert_called_once_with(".bk-Figure")
+    acting = _boxes_page(_BEFORE_BOX)
+    snap._act_enlarged(acting, _no_chain())
+    acting.locator.assert_any_call("button.bk-active")
+    after = _boxes_page(_BEFORE_BOX, _ENLARGED_BOX, _BEFORE_BOX)
+    stand = _no_chain()
+    snap._act_enlarged(after, stand)
+    snap._after_enlarged(after, stand)
+    selectors = {call.args[0] for call in after.locator.call_args_list}
+    assert selectors == {".bk-Figure", "button.bk-active"}
 
 
 def test_results_facts_say_the_rows_the_chain_line_and_the_files_or_that_they_are_not_on_the_page(

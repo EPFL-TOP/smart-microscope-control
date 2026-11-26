@@ -10,6 +10,7 @@ not need to see.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -105,6 +106,15 @@ def test_the_example_shows_no_box_for_a_scan_with_no_cells_stage(
     # The frame is still shown, and its title has no note about boxes.
     assert list(view.source.data["dw"]) == pytest.approx([SHAPE[1] * PIXEL_UM])
     assert NO_SCALE_TEXT not in view.figure.title.text
+
+
+def test_the_examples_last_line_is_the_panel_object_a_cell_displays() -> None:
+    # Jupyter shows the value of a cell's last expression: the page says so, and an example
+    # that ended on an assignment would show nothing (`exec` in the test above would not mind).
+    tree = ast.parse(_example(Path("run.json")))
+    last = tree.body[-1]
+    assert isinstance(last, ast.Expr)
+    assert ast.unparse(last.value) == "view.panel()"
 
 
 def test_the_pages_first_block_is_the_two_lines_the_test_replaces() -> None:

@@ -521,6 +521,14 @@ def test_both_figures_stay_in_the_model_tree_whatever_the_screen(
     both_in_tree()
     view.show_step("wells")
     both_in_tree()
+    # *Enlarge* is a class on the image's root: the figure never leaves the tree while the
+    # image covers the window, on any screen (m5 §24.1, FM-174).
+    view.image_view.enlarge_toggle.value = True
+    both_in_tree()
+    view.show_step("scan")
+    both_in_tree()
+    view.image_view.enlarge_toggle.value = False
+    both_in_tree()
     # No tab exists to hide one, in any screen (the accordion's panels included), and
     # no figure is in a screen's list.
     assert not view.layout.select(pn.Tabs)
