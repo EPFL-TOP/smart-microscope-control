@@ -83,6 +83,7 @@ from smc.ui.guide import (
     CAPTURE_FAR,
     CAPTURE_SAME_PLACE,
     CAPTURE_WELLS,
+    CELL_FOCUS_WORDS,
     CENTRES_CUT_NOTE,
     CENTRES_UNREACHABLE_NOTE,
     COVERAGE_WORDS,
@@ -90,6 +91,7 @@ from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
     FILES_HEADING,
+    FOCUS_MAP_NONE,
     FRAME_DARK,
     FRAME_SATURATED,
     GOTO_NOT_DURING_LIVE,
@@ -125,6 +127,7 @@ from smc.ui.guide import (
     SCAN_CONTINUE,
     SCAN_FIRST,
     SCAN_HALTED,
+    SCAN_MAP_RESUME_NOTE,
     SCAN_NEEDS_A_LOCK,
     SCAN_REPLACES,
     SCAN_START_AGAIN,
@@ -146,6 +149,7 @@ from smc.ui.guide import (
     WALLS_NEED_CALIBRATION,
     CalibrationNote,
     GotoAnswer,
+    KeptMap,
     NextStep,
     ResultRow,
     StepName,
@@ -193,6 +197,8 @@ from smc.ui.guide import (
     field_source_line,
     files_html,
     files_lines,
+    focus_map_file,
+    focus_map_lines,
     forget_label,
     frame_hint,
     goto_row_text,
@@ -2874,6 +2880,206 @@ def test_the_if_engaged_clause_is_left_out_when_the_two_durations_read_the_same(
     # `off` and `required` say their own figure, whatever the other reads.
     assert time_line(plan, "off") == "Time: about 42 s, with the autofocus not used"
     assert time_line(plan, "required") == f"Time: about 42 s, {LOCKED_EACH_WELL}"
+
+
+@pytest.mark.parametrize(
+    ("plan", "autofocus", "line"),
+    [
+        # Every form of today's line takes the tail, `Time: not known` included.
+        (_plan(estimate_s=None), "", TIME_NOT_KNOWN),
+        (_plan(estimate_s=42.16), "off", "Time: about 42 s"),
+        (
+            _plan(estimate_s=90.4, estimate_without_autofocus_s=88.4),
+            "off",
+            "Time: about 1 min 28 s, with the autofocus not used",
+        ),
+        (
+            _plan(estimate_s=90.4, estimate_without_autofocus_s=88.4),
+            "required",
+            f"Time: about 1 min 30 s, {LOCKED_EACH_WELL}",
+        ),
+        (
+            _plan(estimate_s=90.4, estimate_without_autofocus_s=88.4),
+            "",
+            f"Time: about 1 min 30 s, {LOCKED_EACH_WELL}; "
+            "about 1 min 28 s if it is off at the start",
+        ),
+    ],
+)
+def test_the_time_line_says_the_focus_on_the_cells_is_not_counted(
+    plan: PlanLayer, autofocus: str, line: str
+) -> None:
+    for mode in ("map", "per-field", "per-well"):
+        assert time_line(plan, autofocus, mode) == (
+            f"{line}; the focus on the cells (cell_focus={mode}) is not counted"
+        )
+    # The text is read stripped, and what the operator typed is what is named (the tool
+    # refuses a mistyped value with its own words when it runs).
+    assert time_line(plan, autofocus, " map ") == (
+        f"{line}; the focus on the cells (cell_focus=map) is not counted"
+    )
+    # `off`, the empty field and no argument add nothing.
+    for mode in ("off", " off ", ""):
+        assert time_line(plan, autofocus, mode) == line
+    assert time_line(plan, autofocus) == line
+    # The Wells screen's block carries the same line, in its place after the fields.
+    lines = wells_known_lines(
+        objective="Nikon 10X S Fluor",
+        plan=plan,
+        out_of_date=None,
+        assumed=("the offset between the objectives is not measured",),
+        autofocus=autofocus,
+        cell_focus="map",
+    )
+    assert lines[2] == (
+        f"{line}; the focus on the cells (cell_focus=map) is not counted"
+    )
+    assert lines[3] == "assumed: the offset between the objectives is not measured"
+
+
+def test_the_focus_texts_are_pinned_as_written() -> None:
+    assert CELL_FOCUS_WORDS == "How the scan focuses on the cells"
+    assert FOCUS_MAP_NONE == (
+        "No focus map kept yet: scan the wells with the autofocus locked first; "
+        "the page keeps that scan as the map."
+    )
+    assert SCAN_MAP_RESUME_NOTE == (
+        "Continue the scan keeps the focus this scan started with: focusing again now "
+        "changes nothing. Start again takes the focus as it is now."
+    )
+
+
+ANCHOR_AT_B2 = (
+    "Before you start: with Live, focus by eye on the cells near the centre of B2. "
+    "That focus is the scan's starting point; each well is then anchored near its centre."
+)
+
+
+def _kept(**changes: Any) -> KeptMap:
+    kept = KeptMap(
+        file="run.focus-map.json",
+        wells=("B2",),
+        objective="Nikon 10X S Fluor",
+        scanned_utc=datetime(2026, 11, 26, 9, 5, 41, tzinfo=timezone.utc),
+        problem=None,
+    )
+    return dataclasses.replace(kept, **changes)
+
+
+def test_focus_map_lines_name_the_kept_scan_its_wells_objective_and_time() -> None:
+    lines = focus_map_lines(
+        cell_focus="map", typed_map="", kept=_kept(), first_well="B2"
+    )
+    assert lines == (
+        "Focus map: the scan of B2 at Nikon 10X S Fluor, 2026-11-26 09:05 UTC, "
+        "kept by the page in run.focus-map.json.",
+        ANCHOR_AT_B2,
+    )
+    # Wells as every screen says them, in plate order, counted from four; the time is UTC
+    # whatever zone the record carries.
+    many = focus_map_lines(
+        cell_focus="map",
+        typed_map="",
+        kept=_kept(
+            wells=("B11", "B2"),
+            scanned_utc=datetime(
+                2026, 11, 26, 11, 5, tzinfo=timezone(timedelta(hours=2))
+            ),
+        ),
+        first_well="B11",
+    )
+    assert many[0] == (
+        "Focus map: the scan of B2 and B11 at Nikon 10X S Fluor, 2026-11-26 09:05 UTC, "
+        "kept by the page in run.focus-map.json."
+    )
+    assert (
+        "4 wells at"
+        in focus_map_lines(
+            cell_focus="map",
+            typed_map="",
+            kept=_kept(wells=("A1", "A2", "A3", "A4")),
+            first_well="A1",
+        )[0]
+    )
+    # What the copy does not say is said as such, never invented.
+    bare = focus_map_lines(
+        cell_focus="map",
+        typed_map="",
+        kept=_kept(objective=None, scanned_utc=None, wells=()),
+        first_well=None,
+    )
+    assert bare == (
+        "Focus map: the scan at objective not recorded, kept by the page in "
+        "run.focus-map.json.",
+        "Before you start: with Live, focus by eye on the cells near the centre of the "
+        "first well. That focus is the scan's starting point; each well is then "
+        "anchored near its centre.",
+    )
+
+
+def test_focus_map_lines_say_none_kept_and_how_to_get_one() -> None:
+    lines = focus_map_lines(cell_focus="map", typed_map="", kept=None, first_well="B2")
+    assert lines == (FOCUS_MAP_NONE, ANCHOR_AT_B2)
+    # A blank field is no field: the tool's default is none.
+    assert (
+        focus_map_lines(cell_focus="map", typed_map="  ", kept=None, first_well="B2")
+        == lines
+    )
+
+
+def test_focus_map_lines_name_a_typed_map_as_typed_on_this_page() -> None:
+    # A typed `focus_map` wins over the kept file, and is said as the operator typed it.
+    for kept in (None, _kept(), _kept(problem="it is not a run document")):
+        assert focus_map_lines(
+            cell_focus="map", typed_map=" D:/runs/ten.json ", kept=kept, first_well="B2"
+        ) == ("Focus map: D:/runs/ten.json, typed on this page.", ANCHOR_AT_B2)
+    # `null` reads as none, as the parser reads it: the kept file is what the click gives.
+    assert (
+        focus_map_lines(cell_focus="map", typed_map="null", kept=None, first_well="B2")[
+            0
+        ]
+        == FOCUS_MAP_NONE
+    )
+
+
+def test_focus_map_lines_name_a_kept_file_that_cannot_be_read() -> None:
+    kept = _kept(
+        wells=(),
+        objective=None,
+        scanned_utc=None,
+        problem="run.focus-map.json is not valid JSON",
+    )
+    assert focus_map_lines(
+        cell_focus="map", typed_map="", kept=kept, first_well="B2"
+    ) == (
+        "The kept focus map run.focus-map.json cannot be read "
+        "(run.focus-map.json is not valid JSON).",
+        ANCHOR_AT_B2,
+    )
+
+
+@pytest.mark.parametrize("cell_focus", ["", "off", "per-field", "per-well", "banana"])
+def test_focus_map_lines_are_empty_unless_cell_focus_is_map(cell_focus: str) -> None:
+    assert (
+        focus_map_lines(
+            cell_focus=cell_focus, typed_map="x.json", kept=_kept(), first_well="B2"
+        )
+        == ()
+    )
+    # The field is read stripped.
+    assert focus_map_lines(cell_focus=" map ", typed_map="", kept=None, first_well="B2")
+
+
+def test_focus_map_file_is_the_stem_dot_focus_map_json_beside_the_run_document(
+    tmp_path: Path,
+) -> None:
+    assert focus_map_file(tmp_path / "run.json") == tmp_path / "run.focus-map.json"
+    assert (
+        focus_map_file(tmp_path / "session 6" / "B2 scan.json")
+        == tmp_path / "session 6" / "B2 scan.focus-map.json"
+    )
+    # The same folder as the run document, so the run folder stays the one place.
+    assert focus_map_file(Path("run.json")) == Path("run.focus-map.json")
 
 
 def test_plan_selection_note_is_empty_when_the_wells_agree_and_names_both_otherwise() -> (

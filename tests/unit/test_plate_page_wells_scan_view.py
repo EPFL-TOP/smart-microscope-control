@@ -72,6 +72,7 @@ from smc.ui.guide import (
     SCREEN_LEADS,
     SCREEN_TITLES,
     SELECT_WELLS,
+    KeptMap,
     busy_note,
     checkpoint_note,
     plain_default,
@@ -593,6 +594,8 @@ def test_the_wells_screen_lists_the_wells_box_the_two_fields_and_the_action_befo
         view.scan_continue_button,
         view.scan_again_button,
         view.scan_actions_text,
+        # For a stopped map scan: which of the two actions keeps its focus (m5 §25 D4).
+        view.scan_map_note,
         view.scan_dry_note,
         view.scan_progress,
         view.scan_progress_text,
@@ -3498,3 +3501,461 @@ def test_the_scan_screen_says_nothing_of_a_lock_before_the_first_status_and_when
     assert "scan" not in unloaded_view.tool_runs
     assert unloaded_view.scan_lock_text.object == ""
     assert unloaded_view.scan_lock_text.visible is False
+
+
+# --- m5 §25: how the scan focuses on the cells, the focus map and a map scan's checkpoint (#634) -----
+
+ANCHOR_AT_B11 = (
+    "Before you start: with Live, focus by eye on the cells near the centre of B11. "
+    "That focus is the scan's starting point; each well is then anchored near its centre."
+)
+FOCUS_MAP_NONE_TEXT = (
+    "No focus map kept yet: scan the wells with the autofocus locked first; "
+    "the page keeps that scan as the map."
+)
+MAP_RESUME_NOTE = (
+    "Continue the scan keeps the focus this scan started with: focusing again now "
+    "changes nothing. Start again takes the focus as it is now."
+)
+
+
+def _seed_kept_map(page: PlatePage) -> Path:
+    """The file the page keeps as the focus map: a run document holding the 10x's plan and its scan."""
+    path = page.focus_map_path
+    plan = _scan_plan_result()
+    _seed(path, "scan-plan", plan, minute=1)
+    _seed_scan(path, plan, minute=2)
+    return path
+
+
+def _focus_view(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> tuple[PlatePage, PlatePageView]:
+    """The Scan screen over the real ``scan`` (its own ``cell_focus`` field) and a plan of B11, B2 and A1."""
+    page = make_page(real=("scan-plan", "scan"), stubs=(Slow,))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    view = PlatePageView(page)
+    view.show_step("scan")
+    view.refresh()
+    view.tick()
+    return page, view
+
+
+def test_the_scan_screen_shows_cell_focus_and_with_map_the_focus_map_and_anchor_lines(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page, view = _focus_view(make_page, run_doc)
+    field = view.tool_fields["scan"]["cell_focus"]
+    shown = view.screens["scan"]
+    # Above the action: the words, the tool's own field (the one instance), its "from" line and
+    # the focus map pane, in that order (m5 §25 D2).
+    assert shown[2:7] == [
+        view.cell_focus_words,
+        field,
+        view.cell_focus_from_text,
+        view.focus_map_text,
+        view.scan_button,
+    ]
+    assert view.cell_focus_words.object == "How the scan focuses on the cells"
+    assert view.cell_focus_from_text.object == "the tool's default: off"
+    # The field is the one the expert view's section holds too (§17.2 D5).
+    assert field in _objects(list(view.accordion.objects))
+    # `off` (the default) says nothing more, and the pane takes no height.
+    assert view.focus_map_text.object == ""
+    assert view.focus_map_text.visible is False
+
+    # Typed `map`, with nothing kept: how to get a map, and where the focus goes first. The
+    # first well is the plan's visiting order (B11), which is not the plate order the title says.
+    field.value = "map"
+    assert view.scan_title_text.object == "Scan A1, B2 and B11"
+    assert view.cell_focus_from_text.object == "typed on this page"
+    assert view.focus_map_text.visible is True
+    assert view.focus_map_text.object.split("\n") == [
+        FOCUS_MAP_NONE_TEXT,
+        ANCHOR_AT_B11,
+    ]
+
+    # The page keeps a map: the next redraw names the scan it is, in UTC (T0 + 2 minutes).
+    _seed_kept_map(page)
+    view.refresh()
+    assert view.focus_map_text.object.split("\n") == [
+        "Focus map: the scan of A1, B2 and B11 at Nikon 10X S Fluor, 2026-11-12 09:02 UTC, "
+        "kept by the page in run.focus-map.json.",
+        ANCHOR_AT_B11,
+    ]
+
+    # A typed `focus_map` is said as typed, and wins over the kept file.
+    view.tool_fields["scan"]["focus_map"].value = "D:/runs/ten.json"
+    assert view.focus_map_text.object.split("\n")[0] == (
+        "Focus map: D:/runs/ten.json, typed on this page."
+    )
+    view.tool_fields["scan"]["focus_map"].value = ""
+
+    # A kept file that cannot be read is said, with its reason, and never raises into the screen.
+    page.focus_map_path.write_text("not json", encoding="utf-8")
+    view.refresh()
+    assert view.focus_map_text.object.split("\n")[0] == (
+        "The kept focus map run.focus-map.json cannot be read (is not valid JSON: "
+        "Expecting value (line 1, column 1); it was left as it is, restore it from a copy)."
+    )
+
+    # Any other mode is no map: the lines go and the pane takes no height.
+    field.value = "per-field"
+    assert view.focus_map_text.object == ""
+    assert view.focus_map_text.visible is False
+    assert view.cell_focus_from_text.object == "typed on this page"
+
+
+def test_the_focus_map_file_is_read_by_a_redraw_and_never_by_a_tick_or_a_typed_field(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # FM-145: the file is read once by ``refresh()`` and kept on the view; a tick and a typed
+    # character read nothing, so a file that changed meanwhile is seen by the next redraw only.
+    page, view = _focus_view(make_page, run_doc)
+    reads: list[int] = []
+    original = page.kept_focus_map
+
+    def counting() -> Any:
+        reads.append(1)
+        return original()
+
+    page.kept_focus_map = counting  # type: ignore[method-assign]
+    try:
+        view.tool_fields["scan"]["cell_focus"].value = "map"
+        for _ in range(3):
+            view.tick()
+        assert reads == []
+        _seed_kept_map(page)
+        view.tick()
+        assert view.focus_map_text.object.split("\n")[0] == FOCUS_MAP_NONE_TEXT
+        view.refresh()
+        assert reads == [1]
+        assert "kept by the page in run.focus-map.json" in view.focus_map_text.object
+    finally:
+        del page.kept_focus_map
+
+
+def test_the_wells_screens_time_line_says_the_focus_on_the_cells_is_not_counted(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(real=("scan-plan", "scan"), stubs=(Slow,))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(estimate_s=42.16))
+    view = PlatePageView(page)
+    view.refresh()
+    view.tick()
+    assert view.wells_known_block.object.split("\n")[2] == "Time: about 42 s"
+    field = view.tool_fields["scan"]["cell_focus"]
+    # Typed, without a refresh: the Time line follows the field as it follows the autofocus.
+    field.value = "map"
+    assert view.wells_known_block.object.split("\n")[2] == (
+        "Time: about 42 s; the focus on the cells (cell_focus=map) is not counted"
+    )
+    field.value = "off"
+    assert view.wells_known_block.object.split("\n")[2] == "Time: about 42 s"
+    # A plan with no timing is still not counted, and still not a number (FM-170).
+    _seed_plan(run_doc, _scan_plan_result(estimate_s=None))
+    view.refresh()
+    field.value = "per-well"
+    assert view.wells_known_block.object.split("\n")[2] == (
+        "Time: not known (no timing measured yet); the focus on the cells "
+        "(cell_focus=per-well) is not counted"
+    )
+
+
+def _seed_stopped_scan(
+    run_doc: Path, params: dict[str, Any], *, checkpoint: dict[str, Any] | None = None
+) -> None:
+    """A ``scan`` record STOPped, whose ``params`` are the start's (``runner.py`` writes them in the ``running`` record); with a checkpoint it can be continued."""
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="scan",
+            provides="scan",
+            attempt="a2",
+            status=StageStatus.stopped,
+            started_utc=T0 + timedelta(minutes=2),
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params=params,
+            checkpoint={"taken": 4} if checkpoint is None else checkpoint,
+            reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
+        ),
+    )
+
+
+def test_a_stopped_map_scan_says_continue_keeps_its_focus(
+    page: PlatePage, run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    _seed_stopped_scan(
+        run_doc,
+        {
+            "cell_focus": "map",
+            "focus_map": "/runs/run.focus-map.json",
+            "autofocus": "off",
+        },
+    )
+    view = PlatePageView(page)
+    view.show_step("scan")
+    view.refresh()
+    view.tick()
+    # The two actions are offered, and under them the line that says which keeps the focus.
+    assert view.scan_continue_button.visible is True
+    assert view.scan_again_button.visible is True
+    assert view.scan_map_note.visible is True
+    assert view.scan_map_note.object == MAP_RESUME_NOTE
+    scan = view.screens["scan"]
+    assert scan.index(view.scan_map_note) == scan.index(view.scan_actions_text) + 1
+    # It stays under the confirmation *Start again* asks (that line is another pane).
+    _click(view.scan_again_button)
+    assert view.scan_actions_text.visible is True
+    assert view.scan_map_note.object == MAP_RESUME_NOTE
+
+    # A scan of another focus says nothing of it: `per-field`, `off` and a record that holds no
+    # such key are not a map.
+    for params in ({"cell_focus": "per-field"}, {"cell_focus": "off"}, {}):
+        _seed_stopped_scan(run_doc, params)
+        view.refresh()
+        assert view.scan_continue_button.visible is True
+        assert view.scan_map_note.visible is False, params
+        assert view.scan_map_note.object == ""
+
+
+def test_a_stopped_map_scan_with_no_checkpoint_offers_no_actions_and_no_note(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # The note is about the record the two actions are offered for. A STOP in the first well keeps
+    # no checkpoint (the record's own ``checkpoint`` is ``None``): there is nothing to continue.
+    _seed_plate(run_doc)
+    _seed_plan(run_doc)
+    _seed_stopped_scan(run_doc, {"cell_focus": "map", "focus_map": "x.json"})
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="scan",
+            provides="scan",
+            attempt="a3",
+            status=StageStatus.stopped,
+            started_utc=T0 + timedelta(minutes=3),
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={"cell_focus": "map", "focus_map": "x.json"},
+            reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
+        ),
+    )
+    view = PlatePageView(page)
+    view.show_step("scan")
+    view.refresh()
+    view.tick()
+    assert view.scan_continue_button.visible is False
+    assert view.scan_map_note.visible is False
+
+
+def test_the_focus_lines_are_plain_text_whatever_the_field_and_the_file_say(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    browser_text: Callable[[Any], str],
+) -> None:
+    # FM-139: what the operator typed, and a file name from outside, reach the screen as text.
+    _page, view = _focus_view(make_page, run_doc)
+    view.tool_fields["scan"]["cell_focus"].value = "map"
+    view.tool_fields["scan"]["focus_map"].value = HOSTILE
+    assert view.focus_map_text.object.split("\n")[0] == (
+        f"Focus map: {HOSTILE}, typed on this page."
+    )
+    for pane in (
+        view.cell_focus_words,
+        view.cell_focus_from_text,
+        view.focus_map_text,
+        view.scan_map_note,
+    ):
+        assert type(pane) is TextPane
+        assert browser_text(pane) == (pane.object or " ")
+
+
+def test_the_kept_focus_map_is_what_its_run_document_says_and_never_raises(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # No file, no map: the Scan screen says so (FOCUS_MAP_NONE) and the click gives nothing.
+    assert page.kept_focus_map() is None
+    # A folder of that name is no file.
+    page.focus_map_path.mkdir()
+    assert page.kept_focus_map() is None
+    page.focus_map_path.rmdir()
+
+    # The copy of a 10x scan: its plan's wells and objective, and when its scan ended (T0 + 2 min).
+    _seed_kept_map(page)
+    kept = page.kept_focus_map()
+    assert kept == KeptMap(
+        file="run.focus-map.json",
+        wells=("B11", "B2", "A1"),
+        objective="Nikon 10X S Fluor",
+        scanned_utc=T0 + timedelta(minutes=2),
+        problem=None,
+    )
+
+    # A plan that does not say its objective is not guessed.
+    plan = _scan_plan_result().model_copy(update={"objective": None})
+    page.focus_map_path.unlink()
+    _seed(page.focus_map_path, "scan-plan", plan, minute=1)
+    _seed_scan(page.focus_map_path, plan, minute=2)
+    assert page.kept_focus_map() == dataclasses.replace(kept, objective=None)
+
+    # A copy with a plan and no scan, one that is not JSON and one that is not a run document are
+    # each a line and no exception: the screen is drawn from them.
+    page.focus_map_path.unlink()
+    _seed(page.focus_map_path, "scan-plan", _scan_plan_result(), minute=1)
+    held = page.kept_focus_map()
+    assert held is not None
+    assert held.problem == "it holds no scan"
+    assert (held.wells, held.objective, held.scanned_utc) == ((), None, None)
+    for text, why in (
+        ("not json", "is not valid JSON: Expecting value (line 1, column 1)"),
+        ("[1, 2]", "holds a JSON list, not an object"),
+    ):
+        page.focus_map_path.write_text(text, encoding="utf-8")
+        unread = page.kept_focus_map()
+        assert unread is not None
+        assert unread.problem is not None
+        assert unread.problem.startswith(why), unread.problem
+        assert (unread.wells, unread.objective, unread.scanned_utc) == ((), None, None)
+
+
+def _scan_record(result: dict[str, Any] | None) -> StageRecord:
+    return StageRecord(
+        plugin="scan",
+        provides="scan",
+        attempt="a2",
+        status=StageStatus.done,
+        started_utc=T0,
+        finished_utc=T0,
+        profile="demo",
+        dry_run=False,
+        smc_version="0",
+        params={},
+        result=result,
+    )
+
+
+def _frames(*foci: str | tuple[str, Any]) -> dict[str, Any]:
+    """A scan result of frames of those ``focus`` states; a pair is a state and the frame's ``cell_focus`` record."""
+    frames = []
+    for item in foci:
+        focus, cell_focus = item if isinstance(item, tuple) else (item, None)
+        frame: dict[str, Any] = {"focus": focus}
+        if cell_focus is not None:
+            frame["cell_focus"] = cell_focus
+        frames.append(frame)
+    return {"frames": frames}
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        # Only the word `locked` names the plate's bottom (FM-154): an `unlocked` frame's Z is
+        # where a search left it, `off` and `none` were never locked.
+        (_frames("locked"), True),
+        (_frames("unlocked", "none", "off"), False),
+        (_frames("unlocked", "locked"), True),
+        (_frames("off", "off", "locked"), True),
+        # A frame locked and then swept (`cell_focus` per-field or per-well) has the sweep's Z:
+        # it is no point of the map, and a scan made of such frames keeps nothing.
+        (_frames(("locked", {"source": "swept", "dz_um": -0.02})), False),
+        (_frames(("locked", {"source": "swept"}), "locked"), True),
+        # What is not the shape of a scan's result is no frame, never an exception (FM-125).
+        (None, False),
+        ({}, False),
+        ({"frames": []}, False),
+        ({"frames": "locked"}, False),
+        ({"frames": None}, False),
+        ({"frames": ["locked", 3, None, ["locked"]]}, False),
+        ({"frames": [{"focus": ["locked"]}, {}, {"focus": "locked"}]}, True),
+    ],
+)
+def test_a_scan_is_kept_as_the_map_only_for_a_frame_the_autofocus_held_and_no_sweep_moved(
+    result: dict[str, Any] | None, expected: bool
+) -> None:
+    holds = controller_module._holds_a_locked_frame
+    assert holds(_scan_record(result)) is expected
+
+
+def test_the_kept_map_names_when_its_scan_ended_and_not_when_it_began(
+    page: PlatePage,
+) -> None:
+    # A scan of several wells lasts tens of minutes: the line says the end (the plan's map is the
+    # scan as it stands then), in another minute than the start.
+    _seed_kept_map(page)
+    record = RunDocument.load(page.focus_map_path).stages["scan"]
+    ended = T0 + timedelta(minutes=17)
+    write_stage(page.focus_map_path, record.model_copy(update={"finished_utc": ended}))
+    kept = page.kept_focus_map()
+    assert kept is not None
+    assert kept.scanned_utc == ended
+    assert record.started_utc != ended
+
+
+def test_a_kept_file_the_page_cannot_hold_is_a_line_and_not_an_exception(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-98, FM-125: a hand-copied file nested past the parser's recursion limit, one with an
+    # integer past its digit limit and a stat that is refused each end in the screen's line, and
+    # never in ``refresh()``, which every run's end calls.
+    page, view = _focus_view(make_page, run_doc)
+    view.tool_fields["scan"]["cell_focus"].value = "map"
+    for text in ("[" * 100_000, '{"schema_version": ' + "9" * 6000 + "}"):
+        page.focus_map_path.write_text(text, encoding="utf-8")
+        kept = page.kept_focus_map()
+        assert kept is not None
+        assert kept.problem
+        assert (kept.wells, kept.objective, kept.scanned_utc) == ((), None, None)
+        view.refresh()
+        assert view.focus_map_text.object.split("\n")[0].startswith(
+            "The kept focus map run.focus-map.json cannot be read ("
+        )
+
+    real_is_file = Path.is_file
+
+    def refused(self: Path) -> bool:
+        if self.name.endswith(".focus-map.json"):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", refused)
+    # The click and the command read the same stat, and neither raises: the call goes as typed.
+    pairs = ["cell_focus=map", "autofocus=off"]
+    page.run("scan", pairs)
+    assert page.join(BOUND_S)
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("scan: ParamsError: ")
+    assert "set focus_map to a run document" in outcome
+    assert "focus_map=" not in page.command_for("scan", pairs)
+    view.refresh()
+    assert view.focus_map_text.object.split("\n")[0].startswith(
+        "The kept focus map run.focus-map.json cannot be read ("
+    )
+
+
+def test_a_scan_with_no_cell_focus_field_has_no_focus_block(page: PlatePage) -> None:
+    # The stub scan of these tests takes no ``cell_focus``: its field is not on the screen, and the
+    # lines that are about it are left out with it, as the Wells screen leaves out a tool that did
+    # not load.
+    view = PlatePageView(page)
+    assert "cell_focus" not in view.tool_fields["scan"]
+    shown = view.screens["scan"]
+    for pane in (
+        view.cell_focus_words,
+        view.cell_focus_from_text,
+        view.focus_map_text,
+    ):
+        assert pane not in shown
+    view.refresh()
+    view.tick()
+    assert view.focus_map_text.visible is False

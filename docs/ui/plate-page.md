@@ -683,7 +683,11 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   timings know no lock time, or the plan was written before this line existed and
   charged a refocus at every field (lay the fields out again). For a plan made with no
   timing measured it is `Time: not known (no timing measured yet)`: an unknown, never
-  `0 s`. Then what the plan assumed (`assumed: no camera calibration for ...`, and the
+  `0 s`. **The Scan screen's `cell_focus` field is read the same way**: when it is neither empty
+  nor `off`, every form of the line above, `Time: not known` included, gains `; the focus on the
+  cells (cell_focus=map) is not counted`: a sweep around each field, or the map's check of a well,
+  costs time that no estimate holds yet, and no number is guessed for it (it is measured at the
+  next visit to a stand). Then what the plan assumed (`assumed: no camera calibration for ...`, and the
   `estimate:` lines that say how many locks the figure counts and what it leaves out);
 - **Measure the time**, under what is known, only while the plan says `Time: not known`: it
   runs `timing` and then lays the fields out again (`scan-plan`, which reads the timings), as
@@ -735,6 +739,27 @@ finishes first on this stand; a long one ends at the end of its current segment 
 are named; a stand with no refusal says none of it). The strip says the same cut in the
 engineer's words (see *STOP says what it did*). From the top:
 
+- **How the scan focuses on the cells**, above the button: the words `How the scan focuses on
+  the cells`, the `scan` tool's own `cell_focus` field (the one the expert view's section holds
+  too; empty is the tool's default, `off`) and under it where its value comes from. Typed
+  `map`, two lines more are drawn, from the page's own files and never from the tick:
+  - the **focus map line**, which says where the map comes from, the first that holds: `Focus
+    map: the scan of B2 at Nikon 10X S Fluor, 2026-11-26 09:05 UTC, kept by the page in
+    run.focus-map.json.` (the wells and objective of the kept copy's plan, and when its scan
+    ended, in UTC); `Focus map: <the text typed in focus_map>, typed on this page.` (a typed
+    `focus_map` always wins, and `null` is none); `No focus map kept yet: scan the wells with
+    the autofocus locked first; the page keeps that scan as the map.`; or `The kept focus map
+    run.focus-map.json cannot be read (<why>).`;
+  - the **anchor line**: `Before you start: with Live, focus by eye on the cells near the
+    centre of B11. That focus is the scan's starting point; each well is then anchored near its
+    centre.` The well is the **first the plan visits**, which is not always the first the title
+    says (the title names the wells in plate order).
+
+  The file is read when the screen is redrawn (after a run, a click, a *Refresh*), so a map kept
+  by a scan that ended a second ago is there, and a tick reads nothing. *Start the scan* does not
+  wait for a map: with none kept, the tool's own refusal is the answer to the click
+  (`cell_focus=map takes each field's Z from a map: set focus_map to a run document whose scan
+  was taken with the autofocus locked`). See *A 40× scan, end to end*, below;
 - **Start the scan**: `scan`, with the autofocus field. It waits, the first that holds, for the
   stand, for a plan (`lay out the fields first: step 3, Wells`), for the tool's own reason, and
   says what runs while something does. Over a scan already done it says what a new one
@@ -769,6 +794,13 @@ engineer's words (see *STOP says what it did*). From the top:
     and the second would confirm what you had not read yet): nothing runs and the question
     stays. Changing screen, any other button, or a new end of the scan asks again; another tab
     does not inherit the question.
+
+  For a scan that ran with **`cell_focus` `map`**, one line under the two buttons says which of
+  them keeps your focus: `Continue the scan keeps the focus this scan started with: focusing
+  again now changes nothing. Start again takes the focus as it is now.` A resume keeps the start
+  anchor the stopped scan was given (the focus by eye at its start) and does not ask for another;
+  to anchor the scan again, focus by eye on the cells and press *Start again*. A scan of another
+  focus says nothing of it.
 
   What ended the scan is the page's own account of **that** record: a later run of the scan
   that this page did not start (`smc run scan --resume` in a terminal, which failed for another
@@ -808,7 +840,74 @@ to see them.
 
 **At 1280 x 800** the Wells screen's title, the box, the two fields and *Lay out the fields* are
 in view under the header, and what is known may be a scroll of the panel down (`ui-check`'s
-`wells-laid-out` says it). The Scan screen's title, the button and the bar are in view.
+`wells-laid-out` says it). The Scan screen's title, the `cell_focus` field with its lines, the
+button and the bar are in view (`ui-check`'s `scan-focus-map` says it: the button sits at about
+470 px with `map` typed).
+
+#### A 40× scan, end to end
+
+What the owner did from the console at the Ti2-E in session 6, a button at a time and with no
+console: a whole well at the 40× with the autofocus off, the focus taken from a 10× scan, the
+cells found, the positions chosen and exported. The page keeps the 10× scan as the **focus map**
+by itself, so no copy is made by hand. Each step names the screen it is on, so that a
+`/hardware-session` checklist can take it as it stands.
+
+1. **At the 10×, with the autofocus locked.** *Connect*. On the sample, with Live, focus, then
+   *Autofocus on* (under the image) and read the strip (`autofocus locked`). *1. Stand*:
+   *Calibrate the camera* with the 10× in place. *2. Plate*: register the plate, as that screen
+   says (by the centres of three wells, or from their walls).
+2. **Scan the wells at the 10×, locked.** *3. Wells*: the wells you will scan at the 40×,
+   *Lay out the fields*; *4. Scan*: *Start the scan* with `autofocus` empty or `required`. Every
+   frame is taken `locked`, and when the scan ends `done` **the page copies the run document
+   to `run.focus-map.json`** beside it (`<the run document's stem>.focus-map.json`), before
+   anything else can run: the 40× plan of the next step replaces the 10× one in the run
+   document, and a copy taken after it would be refused by the tool. If the strip ends
+   `; the focus map was not kept: <why>`, the scan is done and the copy is not: fix what it says
+   (a read-only folder; a file another program holds open: then the strip says where the whole
+   copy is, a `.run.focus-map.json.<hex>.smc-tmp` beside the run document, and you rename it to
+   `run.focus-map.json` once nothing holds the file) and scan again. A scan with no `locked` frame
+   (the autofocus off, a stand with none, the 40× scan itself), one whose `locked` frames took a
+   focus step of their own (`cell_focus` `per-field` or `per-well`: their Z is the plane a sweep
+   chose, not the plate's bottom), and a dry run, leave the kept file as it is. It is **one file**: a 10× scan of other wells replaces
+   the map of the first, and the 40× scan's own checks say a well is not in it.
+3. **Turn to the 40×.** *Autofocus off* (under the image: a scan with the map refuses a locked
+   autofocus). Check that the stage is clear, choose the 40× in the drive bar's *Objective*,
+   *Change objective* and *Turn the turret*. *1. Stand*: *Calibrate the camera* with the 40× in
+   place (a plate registered from its walls keeps the 10×'s calibration and the page writes the
+   40×'s into `calibrations/position-<n>.json`; one registered by eye has it replaced).
+4. **Lay out the 40× fields.** *3. Wells*: the wells, `coverage` as the plan needs (`1.0` is the
+   whole well, thousands of fields: the demo's B2 is 2544), *Lay out the fields*. The `Time` line
+   says `Time: not known` until a timing is measured, and with `cell_focus` set it adds that the
+   focus on the cells is not counted.
+5. **Say how the scan focuses.** *4. Scan*: type `map` in `cell_focus` and `off` in `autofocus`.
+   The page names the kept map (`Focus map: the scan of B2 at Nikon 10X S Fluor, <when> UTC,
+   kept by the page in run.focus-map.json.`) and gives it to the scan: *Start the scan* adds
+   `focus_map=<the kept file>` to what it sends, and the *Command* disclosure under the button
+   shows the same, so a terminal makes the same call. A `focus_map` typed in the expert view
+   wins over it. `map_check_every` keeps the tool's default (none).
+6. **Focus by eye.** The anchor line names the well (`B2`). Go to it (*2. Plate*'s *Go to*, or
+   the drive bar's *Drive to*), start *Live*, focus by eye on the cells near the **centre** of
+   that well, and end *Live*. That focus is the scan's starting point; every other well is
+   anchored near its centre from the map. A resume keeps it (see *After a STOP*, above).
+7. **Start the scan.** *Start the scan*. Under the result line, the card's `assumed:` lines say
+   that the focus came from the map and how far each well's anchor sits from it.
+8. **Results and the export.** *5. Results*: choose the selector by name on the *Route* row (and
+   its parameters), *Run all that are left*, and open the export from *Where the files are*;
+   load it in NIS-Elements and check that the stage lands on the cells.
+
+**The files the page keeps beside the run document** (`run.json` here): `calibrations/position-<n>.json`
+(the Stand screen's calibration of an objective, above), **`run.focus-map.json`** (the 10× scan
+kept as the focus map, one file, replaced by each later scan that was taken locked), and the
+folders and files the steps name in *Where the files are* (the scan's frames, the report, the
+export). The kept copy holds the 10× scan's **records**: the frames' files stay in the run
+folder, which the map does not read (it reads each record's Z and XY).
+
+**Not verified yet**: the walk at the Ti2-E (PFS locked at the 10×, the page's kept map, the 40×
+with PFS off, a whole well, the list loaded in NIS-Elements), and the Scan screen at the 40× in a
+browser ([#667](https://github.com/EPFL-TOP/smart-microscope-control/issues/667)). Detection while
+the scan goes is [#635](https://github.com/EPFL-TOP/smart-microscope-control/issues/635), and
+laying the 40× out from a selection on the Wells screen
+[#699](https://github.com/EPFL-TOP/smart-microscope-control/issues/699).
 
 ### The Results screen
 

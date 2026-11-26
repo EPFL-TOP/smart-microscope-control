@@ -132,6 +132,11 @@ from smc.plugins.slots.plate import (
     turned_well,
 )
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
+from smc.run.files import (
+    AtomicWriteError,
+    retry_on_permission_error,
+    write_atomically,
+)
 from smc.selection import SelectionError, registry
 from smc.ui.frames import Frame
 from smc.ui.guide import (
@@ -173,6 +178,7 @@ from smc.ui.guide import (
     CalibrationNote,
     CalibrationNumbers,
     GotoAnswer,
+    KeptMap,
     NextStep,
     a1_corner,
     busy_note,
@@ -191,6 +197,7 @@ from smc.ui.guide import (
     checkpoint_note,
     command_line,
     error_words,
+    focus_map_file,
     local_time,
     next_slot,
     offsets_card_lines,
@@ -597,7 +604,10 @@ class ScanEnd:
     run of ``scan`` started since); both count the plan's fields, a continued scan's too
     (``PlatePage._counted_over``). ``text`` is the record's ``error`` as written (``<Type>:
     <message>``; the guide says the message). ``resumable`` is whether ``reachable_checkpoint``
-    finds the record's checkpoint: *Continue the scan* is offered only then.
+    finds the record's checkpoint: *Continue the scan* is offered only then. ``map_focus`` is
+    whether that record's own ``params`` say ``cell_focus=map`` (a stopped scan's record holds
+    its ``params`` from the start, ``runner.py``): a resume keeps such a scan's starting focus
+    and a fresh run takes the operator's new one, which the two actions' note says (m5 §25 D4).
     """
 
     kind: Literal["stopped", "failed"]
@@ -605,6 +615,7 @@ class ScanEnd:
     total: int | None
     text: str
     resumable: bool
+    map_focus: bool = False
 
 
 #: How the map's plate was placed (m5 §15 D3): *registered* by a tool that measured it,
@@ -1397,6 +1408,30 @@ def _scan_plan_of(record: StageRecord) -> ScanPlanResult | None:
         return ScanPlanResult.model_validate(record.result)
     except ValidationError:
         return None
+
+
+def _holds_a_locked_frame(record: StageRecord) -> bool:
+    """Whether the ``scan`` record's result holds a frame whose ``focus`` is the word ``locked`` and that took no focus step of its own: the only frame that names the plate's bottom (m5 §25 D1, FM-154).
+
+    A scan locked with ``cell_focus`` ``per-field`` or ``per-well`` also writes ``locked`` frames
+    (the state is read before the sweep), but their Z is the plane the sweep chose, so the frame
+    carries a ``cell_focus`` record and is **not** a point of the map: keeping that run document
+    would replace the 10x map the page holds with swept planes, and the Scan screen would name
+    it as the map (the adversarial review of #634). The tool's own reader keeps such frames; the
+    page does not offer them as the bottom.
+
+    Read from the record's JSON as it is and not through ``ScanResult``: the page asks it once at
+    the end of a scan of thousands of frames, and a record this smc cannot validate holds no
+    map the tool would read either, which its own refusal says at the 40x. A result that is not
+    the shape of a scan's is no frame, never an exception (FM-125).
+    """
+    frames = None if record.result is None else record.result.get("frames")
+    return isinstance(frames, list) and any(
+        isinstance(frame, dict)
+        and frame.get("focus") == "locked"
+        and frame.get("cell_focus") is None
+        for frame in frames
+    )
 
 
 def _offsets_of(record: StageRecord) -> ObjectiveOffsetsResult | None:
@@ -3313,6 +3348,10 @@ class PlatePage:
             return f"{tool_title(plugin)}: {refusal}"
         profile = self._profile.microscope.name
         dry_run = self._dry_run
+        if doc_path is None:
+            # A map scan of the page's own document is given the focus map the page kept, before
+            # the pairs are parsed (m5 §25 D3): the tool refuses ``cell_focus=map`` without one.
+            params = self._with_kept_focus_map(plugin, params)
         try:
             entry = load(plugin, self._entry_points)
             try:
@@ -3927,12 +3966,158 @@ class PlatePage:
         )
         if doc_path is None:
             self._note_attempt(plugin)
+            if plugin == "scan" and ended.status == "done":
+                ended = self._keep_focus_map(ended)
         self._last_ended = ended
         if doc_path is None and entry.plugin.provides == "plate":
             with self._lock:
                 self._goto = ""
                 self._goto_answer = None
         return ended
+
+    @property
+    def focus_map_path(self) -> Path:
+        """Where the page keeps the 10x scan as the focus map: ``focus_map_file`` of its run document, absolute (m5 §25 D1)."""
+        return focus_map_file(self.run_doc)
+
+    def kept_focus_map(self) -> KeptMap | None:
+        """What the page kept as the focus map, read once; ``None`` when there is no such file (m5 §25 D3).
+
+        The wells and the objective are the copy's plan's and the time is when its ``scan`` ended:
+        the copy is a run document, read as one (``RunDocument.load``). A file that cannot be read,
+        or that holds no ``scan``, is a ``KeptMap`` with a ``problem`` and nothing else, never an
+        exception: a Scan screen is drawn from it, and a run document is data (FM-125, FM-98). It
+        reads a file, so it is for a redraw and never for a tick (FM-145).
+        """
+        path = self.focus_map_path
+        try:
+            if not path.is_file():
+                return None
+            doc = RunDocument.load(path)
+        except RunDocumentError as exc:
+            return KeptMap(
+                file=path.name,
+                wells=(),
+                objective=None,
+                scanned_utc=None,
+                problem=page_words(" ".join(exc.reason.split())),
+            )
+        except Exception as exc:
+            # A stat that fails, or a hand-copied file whose JSON the parser cannot hold (nested
+            # past the recursion limit, an integer past the digit limit): a line, never an
+            # exception into ``refresh()``, which ends every run (FM-98, FM-125).
+            return KeptMap(
+                file=path.name,
+                wells=(),
+                objective=None,
+                scanned_utc=None,
+                problem=_one_line(exc) or type(exc).__name__,
+            )
+        record = doc.provider("scan")
+        if record is None:
+            return KeptMap(
+                file=path.name,
+                wells=(),
+                objective=None,
+                scanned_utc=None,
+                problem="it holds no scan",
+            )
+        planned = doc.provider("scan-plan")
+        plan = None if planned is None else _scan_plan_of(planned)
+        return KeptMap(
+            file=path.name,
+            wells=() if plan is None else tuple(plan.wells),
+            objective=None if plan is None else plan.objective,
+            scanned_utc=record.finished_utc,
+            problem=None,
+        )
+
+    def _keep_focus_map(self, ended: _Ended) -> _Ended:
+        """After a ``done`` scan of the page's own document: keep a copy of the run document as the focus map, when the scan was taken with the autofocus locked (m5 §25 D1).
+
+        A 40x scan with ``cell_focus=map`` takes its Z from the 10x scan the fields were planned
+        from, and the run document that holds it is replaced by the 40x's ``scan-plan`` (a copy
+        taken after that is refused by the tool, #682's review): so the copy is taken **here**,
+        on the worker, before the activity ends and nothing else can run on the page. It is the
+        run document's bytes at this moment, written through ``write_atomically`` (FM-38; the
+        rename is retried on ``PermissionError``, FM-24), and the one file is replaced by the next
+        such scan. A scan with no frame ``locked`` (the 40x with the map, a stand with no
+        autofocus), and a dry run, leave what is kept as it is. A copy that cannot be made never
+        costs the scan its ``done`` (FM-98): the outcome says so, and the log has the error's
+        type. Only the tool's own word ``locked`` counts, not a guess from the Z.
+        """
+        if self._dry_run:
+            return ended
+        try:
+            record = RunDocument.load(self._run_doc).stages.get("scan")
+            if record is None or not _holds_a_locked_frame(record):
+                return ended
+            data = retry_on_permission_error(self._run_doc.read_bytes)
+            write_atomically(self.focus_map_path, data)
+        except Exception as exc:
+            # Any error of the copy: a note about the end must never cost the run its outcome.
+            log.info("scan: the focus map was not kept: %s", type(exc).__name__)
+            line = self._not_kept_line(exc)
+            return ended._replace(
+                outcome=f"{ended.outcome}; the focus map was not kept: {line}"
+            )
+        log.info("scan: the run document was kept as the focus map")
+        return ended
+
+    def _not_kept_line(self, error: Exception) -> str:
+        """The one line after ``the focus map was not kept:``: why, naming the file that is locked and where the copy is.
+
+        When only the final rename failed (Windows refuses it onto a file another program holds
+        open, FM-24) ``write_atomically`` keeps the whole copy in a temporary beside the file, and
+        its error names that **temporary**, the rename's source, which is not what is locked. The
+        line names the kept file instead, and the temporary as the copy, so that the operator can
+        rename it by hand once nothing holds the file and does not scan the wells again for it.
+        """
+        if isinstance(error, AtomicWriteError):
+            why = (error.cause.strerror or type(error.cause).__name__).strip()
+            line = f"{why} ({self.focus_map_path.name})"
+            if error.kept is not None:
+                line += (
+                    f"; the whole copy is in {error.kept.name}: rename it to "
+                    f"{self.focus_map_path.name} once nothing holds that file open"
+                )
+            return line
+        return _one_line(error) or type(error).__name__
+
+    def _with_kept_focus_map(self, plugin: str, params: Sequence[str]) -> list[str]:
+        """``params`` with ``focus_map=<the kept file>`` added when a map scan of the page's own document asks for it and has none (m5 §25 D3).
+
+        The tool's validator refuses ``cell_focus=map`` without ``focus_map``, so the pair is
+        added to the **raw** pairs, before they are parsed, unlike ``scan-plan``'s ``calibration=``
+        which is added after. One decision for the click (``_prepare``) and for the command the
+        page shows (``_command``), so that the line a terminal runs is the call the click makes
+        (FM-169, FM-247). A typed ``focus_map`` always wins, a typed ``focus_map=null`` is none as
+        the parser reads it (and is replaced, never met by a second pair), and with no kept file
+        nothing is added: the tool's own refusal says what is missing. The path is absolute and
+        never resolved (FM-24, FM-50).
+        """
+        pairs = list(params)
+        if plugin != "scan":
+            return pairs
+        split = [pair.partition("=") for pair in pairs]
+        if not any(key == "cell_focus" and value == "map" for key, _, value in split):
+            return pairs
+        if any(key == "focus_map" and value != "null" for key, _, value in split):
+            return pairs
+        path = self.focus_map_path
+        try:
+            kept = path.is_file()
+        except OSError:
+            # A stat that is refused (an unreadable folder, a share that dropped) is no kept file:
+            # the call goes on as typed and the tool's own refusal says what is missing. Neither
+            # ``run`` nor a redraw raises for it (FM-98).
+            kept = False
+        if not kept:
+            return pairs
+        return [
+            *(pair for pair in pairs if pair != "focus_map=null"),
+            f"focus_map={path}",
+        ]
 
     def _note_attempt(self, plugin: str) -> None:
         """Keep the ``attempt`` of ``plugin``'s record, the one the run that just ended wrote (m5 §17.12.11 D34).
@@ -5760,6 +5945,7 @@ class PlatePage:
             total=None if reported is None else reported.total,
             text=page_words(record.error or ""),
             resumable=kept is not None,
+            map_focus=record.params.get("cell_focus") == "map",
         )
 
     @staticmethod
@@ -5998,7 +6184,14 @@ class PlatePage:
         resume: bool = False,
         run_doc: Path | None = None,
     ) -> str:
-        """``command_for`` for the preset the caller already read: a step's pairs and its command name one preset (FM-151)."""
+        """``command_for`` for the preset the caller already read: a step's pairs and its command name one preset (FM-151).
+
+        The call of the page's own document gets the focus map the click would give a map scan,
+        so that the line shown is the call made (m5 §25 D3, FM-247); the call into another
+        document (``run_doc``) is a calibration's and gets none.
+        """
+        if run_doc is None:
+            params = self._with_kept_focus_map(plugin, params)
         return command_line(
             plugin,
             params,

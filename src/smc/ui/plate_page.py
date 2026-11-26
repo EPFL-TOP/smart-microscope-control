@@ -91,6 +91,7 @@ from smc.ui.guide import (
     AUTOFOCUS_WORDS,
     CALIBRATE_LEAD,
     CALIBRATION_HOW_WINDOWS_NOTE,
+    CELL_FOCUS_WORDS,
     COVERAGE_WORDS,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
@@ -110,6 +111,7 @@ from smc.ui.guide import (
     RESULT_TOOLS,
     RUN_ALL_LABEL,
     SCAN_CONTINUE,
+    SCAN_MAP_RESUME_NOTE,
     SCAN_REPLACES,
     SCAN_START_AGAIN,
     SCREEN_LEADS,
@@ -117,6 +119,7 @@ from smc.ui.guide import (
     STEPS,
     STOP_SEGMENT_AXES,
     CentreRow,
+    KeptMap,
     NextStep,
     ResultRow,
     StepName,
@@ -153,6 +156,7 @@ from smc.ui.guide import (
     error_words,
     field_source_line,
     files_html,
+    focus_map_lines,
     forget_label,
     frame_hint,
     goto_row_text,
@@ -372,6 +376,12 @@ _IMAGED_GREEN = "#2ca02c"
 #: view's section holds too.
 _COVERAGE_FIELD = ("scan-plan", "coverage")
 _AUTOFOCUS_FIELD = ("scan", "autofocus")
+
+#: The Scan screen's field (m5 §25 D2): how the scan focuses on the cells, the one instance the
+#: expert view's ``scan`` section holds too. ``focus_map`` is read for the line that names the
+#: map (D3) and stays in the expert view.
+_CELL_FOCUS_FIELD = ("scan", "cell_focus")
+_FOCUS_MAP_FIELD = ("scan", "focus_map")
 
 #: The width of a step's button and of the line under it in the step bar, in pixels.
 _STEP_WIDTH_PX = 170
@@ -1338,6 +1348,9 @@ class PlatePageView:
         # the JSON text they edit, so that neither direction calls the other (D4).
         self._algorithms: dict[str, _AlgorithmWidgets] = {}
         self._syncing_algorithms = False
+        # The focus map the page kept, read by ``refresh()`` and never by the tick (m5 §25 D3,
+        # FM-145): the Scan screen's focus lines are drawn from it.
+        self._kept_map: KeptMap | None = None
         # Each field's default as ``describe_params`` prints it, by ``(tool, key)``.
         self._field_defaults: dict[tuple[str, str], str] = {}
         self.tool_notes: dict[str, Any] = {}
@@ -1824,6 +1837,14 @@ class PlatePageView:
             SCREEN_TITLES["scan"], {"font-weight": "bold"}
         )
         self.scan_lead_text = _wrapped_text(SCREEN_LEADS["scan"])
+        # How the scan focuses on the cells, above the action (m5 §25 D2): the words, the scan's
+        # own ``cell_focus`` field with its "from" line, and only while the field reads ``map``
+        # the focus map line and the anchor line (D3). The field is the tool's instance (D5 of
+        # §17.2); the pane that says nothing takes no height.
+        self.cell_focus_words = _wrapped_text(CELL_FOCUS_WORDS)
+        self.cell_focus_from_text = _wrapped_text()
+        self.focus_map_text = _wrapped_text()
+        self.focus_map_text.visible = False
         self.scan_button = pn.widgets.Button(label="Start the scan", color="primary")
         self.scan_wait_text = _wrapped_text()
         self.scan_wait_text.visible = False
@@ -1847,6 +1868,10 @@ class PlatePageView:
         )
         self.scan_actions_text = _wrapped_text()
         self.scan_actions_text.visible = False
+        # Under them, for a map scan's checkpoint: a resume keeps the focus the scan started
+        # with and a fresh run takes the one the operator has now (m5 §25 D4, #682).
+        self.scan_map_note = _wrapped_text()
+        self.scan_map_note.visible = False
         self.scan_dry_note = _wrapped_text()
         self.scan_dry_note.visible = False
         self.scan_progress = pn.indicators.Progress(
@@ -2437,6 +2462,7 @@ class PlatePageView:
             ],
             "wells": self._wells_region(),
             "scan": [
+                *self._scan_focus_region(),
                 self.scan_button,
                 self.scan_wait_text,
                 self.scan_lock_text,
@@ -2445,6 +2471,7 @@ class PlatePageView:
                 self.scan_continue_button,
                 self.scan_again_button,
                 self.scan_actions_text,
+                self.scan_map_note,
                 self.scan_dry_note,
                 self.scan_progress,
                 self.scan_progress_text,
@@ -2491,6 +2518,24 @@ class PlatePageView:
             self.accordion,
             self.run_document_text,
             self.checklist_text,
+        ]
+
+    def _scan_focus_region(self) -> list[Any]:
+        """The Scan screen's focus block, above *Start the scan* (m5 §25 D2): the words, the ``cell_focus`` field, its "from" line and the focus map lines.
+
+        The field is the ``scan`` tool's own instance (§17.2 D5, ``tool_fields``), the one the
+        accordion holds too. A ``scan`` that did not load, or one with no such field (a
+        third-party tool in its place), has none, and the block is left out with it: the lines
+        under it would be about a field the screen does not show.
+        """
+        field = self.tool_fields.get(_CELL_FOCUS_FIELD[0], {}).get(_CELL_FOCUS_FIELD[1])
+        if field is None:
+            return []
+        return [
+            self.cell_focus_words,
+            field,
+            self.cell_focus_from_text,
+            self.focus_map_text,
         ]
 
     def _wells_region(self) -> list[Any]:
@@ -3548,8 +3593,11 @@ class PlatePageView:
         self._draw_calibrate_command()
         self._draw_field_lines()
         # The Wells screen's *Time* line follows the scan tool's autofocus field (m5
-        # §17.10.3, #549), so it is drawn again here, from the status last drawn.
+        # §17.10.3, #549), so it is drawn again here, from the status last drawn. The Scan
+        # screen's focus map lines follow the ``cell_focus`` and ``focus_map`` fields the same way
+        # (m5 §25 D3), and the Wells screen's *Time* line the first of them (D5).
         self._draw_wells_known(self._status)
+        self._draw_focus_map()
         self._draw_layout_command()
         self._draw_scan_command()
         self._draw_result_lines()
@@ -3920,6 +3968,8 @@ class PlatePageView:
         self._seen_state = self._shared_state()
         view = self.page.view()
         self._view = view
+        # The one place the kept focus map's file is read (m5 §25 D3): never by the tick (FM-145).
+        self._kept_map = self.page.kept_focus_map()
         self._blocked = dict(view.blocked)
         self._problems_view = view.problems
         labels = list(view.labels)
@@ -4704,6 +4754,31 @@ class PlatePageView:
         )
         self.coverage_from_text.object = self._field_line(_COVERAGE_FIELD)
         self.autofocus_from_text.object = self._field_line(_AUTOFOCUS_FIELD)
+        self.cell_focus_from_text.object = self._field_line(_CELL_FOCUS_FIELD)
+
+    def _draw_focus_map(self) -> None:
+        """The Scan screen's focus map line and anchor line, from the field as typed and the map the last redraw kept (m5 §25 D3).
+
+        Only while ``cell_focus`` reads ``map``: any other mode is no map, and the panes take no
+        height. Text only, from what is on the page: the file is read by ``refresh()`` and never
+        here, so the tick and a typed character read nothing (FM-145). The anchor line names the
+        first well of the plan's visiting order, which is where the scan starts and so where the
+        operator's focus is read (the title names the wells in plate order, which is not it).
+        """
+        fields = self.tool_fields.get(_CELL_FOCUS_FIELD[0], {})
+        cell_focus = fields.get(_CELL_FOCUS_FIELD[1])
+        typed_map = fields.get(_FOCUS_MAP_FIELD[1])
+        view = self._view
+        plan = None if view is None else view.plan
+        lines = focus_map_lines(
+            cell_focus="" if cell_focus is None else str(cell_focus.value),
+            typed_map="" if typed_map is None else str(typed_map.value),
+            kept=self._kept_map,
+            first_well=plan.well_names[0]
+            if plan is not None and plan.well_names
+            else None,
+        )
+        self._say(self.focus_map_text, "\n".join(lines))
 
     def _draw_offsets(self, status: PageStatus | None) -> None:
         """The block's two lines that follow the stand: the objective in place and, while the tool runs, its last report (m5 §18.2 D5).
@@ -5040,6 +5115,7 @@ class PlatePageView:
         card = None if view is None else view.cards.get("scan-plan")
         scan_fields = self.tool_fields.get("scan", {})
         autofocus = scan_fields.get("autofocus")
+        cell_focus = scan_fields.get("cell_focus")
         self.wells_known_block.object = "\n".join(
             wells_known_lines(
                 objective=None if status is None else (status.objective or None),
@@ -5051,6 +5127,7 @@ class PlatePageView:
                 ),
                 assumed=() if card is None else card.assumed,
                 autofocus="" if autofocus is None else str(autofocus.value),
+                cell_focus="" if cell_focus is None else str(cell_focus.value),
             )
         )
 
@@ -5077,6 +5154,8 @@ class PlatePageView:
             stop_refused=bool(status is not None and status.stop_refused),
             stop_segments_um=() if status is None else status.stop_segments_um,
         )
+        # The plan's first well is where the anchor line sends the operator (m5 §25 D3).
+        self._draw_focus_map()
         self._say(
             self.scan_dry_note,
             DRY_RUN_NO_FRAME if status is not None and status.dry_run else "",
@@ -5244,6 +5323,11 @@ class PlatePageView:
         self._draw_measure_time(busy)
         self.scan_continue_button.visible = offer
         self.scan_again_button.visible = offer
+        # A map scan's checkpoint: which of the two actions keeps the old focus (m5 §25 D4).
+        self._say(
+            self.scan_map_note,
+            SCAN_MAP_RESUME_NOTE if end is not None and offer and end.map_focus else "",
+        )
         if end is None or not offer:
             self._again_armed = None
             self._say(self.scan_actions_text, "")

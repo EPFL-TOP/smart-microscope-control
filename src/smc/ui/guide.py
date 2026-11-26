@@ -79,6 +79,7 @@ __all__ = [
     "CAPTURE_FAR",
     "CAPTURE_SAME_PLACE",
     "CAPTURE_WELLS",
+    "CELL_FOCUS_WORDS",
     "CENTRES_CUT_NOTE",
     "CENTRES_UNREACHABLE_NOTE",
     "CHAIN_ASSUMED",
@@ -89,6 +90,7 @@ __all__ = [
     "DRY_RUN_NO_FRAME",
     "END_LIVE_LABEL",
     "FILES_HEADING",
+    "FOCUS_MAP_NONE",
     "FRAME_DARK",
     "FRAME_SATURATED",
     "GOTO_ESTIMATED",
@@ -144,6 +146,7 @@ __all__ = [
     "SCAN_FAILED_UNCOUNTED",
     "SCAN_FIRST",
     "SCAN_HALTED",
+    "SCAN_MAP_RESUME_NOTE",
     "SCAN_NEEDS_A_LOCK",
     "SCAN_REPLACES",
     "SCAN_START_AGAIN",
@@ -171,6 +174,7 @@ __all__ = [
     "CalibrationNumbers",
     "CentreRow",
     "GotoAnswer",
+    "KeptMap",
     "NextStep",
     "ResultRow",
     "StepName",
@@ -218,6 +222,8 @@ __all__ = [
     "field_source_line",
     "files_html",
     "files_lines",
+    "focus_map_file",
+    "focus_map_lines",
     "forget_label",
     "frame_hint",
     "goto_row_text",
@@ -479,6 +485,20 @@ AUTOFOCUS_WORDS = (
     "Autofocus: if-engaged uses it when it is on and locked; required refuses to "
     "start unless it is; off never uses it and refuses to start when it is on. "
     "The scan never switches it on."
+)
+
+#: The Scan screen's focus block (m5 §25 D2, D3, D4, #634): the words above the scan's own
+#: ``cell_focus`` field, what the focus map line says when the page holds none, and what a
+#: map scan's two actions after a stop say about the operator's focus. ``FOCUS_MAP_NONE`` is
+#: written for the 10x scan the page keeps as the map (§25 D1), never for a terminal's copy.
+CELL_FOCUS_WORDS = "How the scan focuses on the cells"
+FOCUS_MAP_NONE = (
+    "No focus map kept yet: scan the wells with the autofocus locked first; "
+    "the page keeps that scan as the map."
+)
+SCAN_MAP_RESUME_NOTE = (
+    "Continue the scan keeps the focus this scan started with: focusing again now "
+    "changes nothing. Start again takes the focus as it is now."
 )
 
 #: Why everything that needs the stand is refused while the page holds none (m5 §7.2):
@@ -1939,8 +1959,8 @@ def scan_lock_note(
     return ""
 
 
-def time_line(plan: PlanLayer, autofocus: str) -> str:
-    """The Wells screen's ``Time`` line for the autofocus mode the field holds (m5 §17.10.3, #549).
+def time_line(plan: PlanLayer, autofocus: str, cell_focus: str = "") -> str:
+    """The Wells screen's ``Time`` line for the autofocus mode the field holds, and what it does not count (m5 §17.10.3, #549, §25 D5).
 
     The plan carries two figures, with the autofocus used and with it not used, and the
     mode is the ``scan`` tool's ``autofocus`` field, which the plan cannot know: it is
@@ -1955,7 +1975,22 @@ def time_line(plan: PlanLayer, autofocus: str) -> str:
     plain figure, and so does one whose second figure is above the first, which the result
     model refuses but a layer built from a hand-edited record could hold. An unknown
     estimate is ``TIME_NOT_KNOWN``, never ``0 s`` (FM-170).
+
+    ``cell_focus`` is the text of the ``scan`` tool's field of that name as typed. The plan
+    reads none, and a sweep around each field (or the map's check of a well) costs time no
+    estimate holds, so when it is neither empty nor ``off`` the line says the focus on the
+    cells is not counted, after every form above and ``Time: not known`` too: the figures
+    stay the plan's, and no number is guessed for what was not measured (FM-170).
     """
+    line = _autofocus_time_line(plan, autofocus)
+    mode = cell_focus.strip()
+    if mode in ("", "off"):
+        return line
+    return f"{line}; the focus on the cells (cell_focus={mode}) is not counted"
+
+
+def _autofocus_time_line(plan: PlanLayer, autofocus: str) -> str:
+    """``time_line`` without the focus on the cells: the plan's figures and the autofocus mode."""
     on = plan.estimate_s
     if on is None:
         return TIME_NOT_KNOWN
@@ -1980,6 +2015,7 @@ def wells_known_lines(
     out_of_date: str | None,
     assumed: Sequence[str],
     autofocus: str = "",
+    cell_focus: str = "",
 ) -> tuple[str, ...]:
     """The Wells screen's "known" block under *Lay out the fields*: objective, fields, time, assumptions (m5 §17.4.3, §17.10.3).
 
@@ -1987,9 +2023,9 @@ def wells_known_lines(
     plan is out of date and why (``out_of_date``: the checklist's reason for the slot) or
     that none is laid out yet. A plan made with no timing says ``Time: not known`` with
     what to run, never ``0 s`` (FM-170, CLAUDE.md: unknown beats guessed). ``assumed`` are
-    the plan card's own lines, drawn only beside a plan they are about. ``autofocus`` is the
-    text of the ``scan`` tool's ``autofocus`` field as typed, which the ``Time`` line follows
-    (``time_line``). Plain text (FM-139).
+    the plan card's own lines, drawn only beside a plan they are about. ``autofocus`` and
+    ``cell_focus`` are the text of the ``scan`` tool's fields of those names as typed, which
+    the ``Time`` line follows (``time_line``). Plain text (FM-139).
     """
     lines = [objective_line(objective)]
     if plan is None:
@@ -2004,9 +2040,84 @@ def wells_known_lines(
     # would read as a count of nothing (m5 §17.10.3).
     count = "1 field" if plan.count == 1 else str(plan.count)
     lines.append(f"Fields: {count} in {_count(plan.wells, 'well')}")
-    lines.append(time_line(plan, autofocus))
+    lines.append(time_line(plan, autofocus, cell_focus))
     lines.extend(f"assumed: {line}" for line in assumed)
     return tuple(lines)
+
+
+@dataclass(frozen=True, slots=True)
+class KeptMap:
+    """What the Scan screen says of the focus map the page kept: read on a redraw, never on a tick (m5 §25.3).
+
+    ``file`` is the kept file's name, not its path; ``wells`` and ``objective`` are the
+    copy's plan's and ``scanned_utc`` is when its ``scan`` ended, each ``None`` or empty
+    when the copy does not say. ``problem`` is one line when the file cannot be read, and
+    then the rest is empty: the line names the file and the reason, never a guess.
+    """
+
+    file: str
+    wells: tuple[str, ...]
+    objective: str | None
+    scanned_utc: datetime | None
+    problem: str | None
+
+
+def focus_map_file(run_doc: Path) -> Path:
+    """``<stem>.focus-map.json`` beside the run document: where the page keeps the 10x scan as the map (m5 §25 D1).
+
+    A name beside the document and not a folder of its own: ``run.json`` keeps
+    ``run.focus-map.json`` and the run folder stays the one place a run's files are.
+    """
+    return run_doc.with_name(f"{run_doc.stem}.focus-map.json")
+
+
+def _utc_minute(when: datetime) -> str:
+    """``when`` to the minute in UTC, or its own ISO text when the platform cannot show it (FM-125: a run document is data)."""
+    aware = when if when.tzinfo is not None else when.replace(tzinfo=timezone.utc)
+    try:
+        return aware.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return aware.isoformat(timespec="minutes")
+
+
+def focus_map_lines(
+    *, cell_focus: str, typed_map: str, kept: KeptMap | None, first_well: str | None
+) -> tuple[str, ...]:
+    """The Scan screen's focus map line and anchor line, or ``()`` when ``cell_focus`` is not ``map`` (m5 §25 D3).
+
+    The focus map line says where the scan's map comes from, the first that holds: the
+    ``focus_map`` field as typed (it always wins, and ``null`` is none, as the parser reads
+    it), the file the page kept (the wells, objective and time of the scan it is, in UTC
+    like the run document's own times), a kept file that cannot be read, or none kept and
+    how to get one. The anchor line tells the operator what a map scan asks of them before
+    the click: the focus by eye near the centre of the first well is the scan's starting
+    point, and every other well is anchored near its centre (the tool's check 5). Every word
+    from the file or the field is data and goes out as plain text (FM-139).
+    """
+    if cell_focus.strip() != "map":
+        return ()
+    typed = typed_map.strip()
+    if typed and typed != "null":
+        first = f"Focus map: {typed}, typed on this page."
+    elif kept is None:
+        first = FOCUS_MAP_NONE
+    elif kept.problem is not None:
+        first = f"The kept focus map {kept.file} cannot be read ({kept.problem})."
+    else:
+        of = f" of {wells_text(kept.wells)}" if kept.wells else ""
+        when = (
+            "" if kept.scanned_utc is None else f", {_utc_minute(kept.scanned_utc)} UTC"
+        )
+        first = (
+            f"Focus map: the scan{of} at {kept.objective or 'objective not recorded'}"
+            f"{when}, kept by the page in {kept.file}."
+        )
+    anchor = (
+        "Before you start: with Live, focus by eye on the cells near the centre of "
+        f"{first_well or 'the first well'}. That focus is the scan's starting point; "
+        "each well is then anchored near its centre."
+    )
+    return (first, anchor)
 
 
 def plan_selection_note(plan_wells: Sequence[str], selection: Sequence[str]) -> str:
