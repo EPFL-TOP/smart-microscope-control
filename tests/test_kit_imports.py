@@ -19,6 +19,8 @@ from pathlib import Path
 #: and ``route``'s plugin, which imports it, is there too: a selector is loaded
 #: inside the plugin, and the plugin must not pull the Micro-Manager bindings in
 #: by it. ``smc.data.draw`` is the drawing (algorithms §6): Pillow and numpy, no stand.
+#: ``smc.inference`` is the models' package (inference.md §2): the collaborator
+#: adds a card to it, and ``cells`` depends on it, not the reverse.
 KIT_MODULES = [
     "smc.data",
     "smc.data.cli",
@@ -31,10 +33,15 @@ KIT_MODULES = [
     "smc.selection.builtin",
     "smc.selection.testing",
     "smc.plugins.route.plugin",
+    "smc.inference",
+    "smc.inference.blobs",
+    "smc.inference.cards",
+    "smc.inference.local",
+    "smc.inference.models",
 ]
 
 #: The packages of ``src/smc/`` the walk covers.
-KIT_PACKAGES = ["data", "selection"]
+KIT_PACKAGES = ["data", "selection", "inference"]
 
 #: What no module of the kit imports, itself or a submodule of it.
 FORBIDDEN = ["smc.hardware", "smc.testing", "smc.ui", "pymmcore_plus", "pymmcore"]
@@ -116,6 +123,9 @@ def test_kit_never_imports_pymmcore_plus(tmp_path: Path) -> None:
         "smc.selection.testing",
         "smc.plugins.route.plugin",
     } <= set(KIT_MODULES)
+    assert {"smc.inference", "smc.inference.blobs", "smc.inference.models"} <= set(
+        KIT_MODULES
+    )
     assert _loaded_hardware_modules(KIT_MODULES, tmp_path) == []
 
 

@@ -3,11 +3,13 @@
 ``FakeCore`` lives in the package, not under ``tests/``, so that a plugin's
 own tests and M2's quirk tests can build a stand without Micro-Manager.
 ``PlateSample`` and ``SampleCamera`` give a stand frames that follow its
-stage, for code that looks at images to decide where to go. The pytest
+stage, for code that looks at images to decide where to go. ``StubDetector``
+is a scripted detector for a stage that asks a model for cells. The pytest
 plugin, ``smc.testing.fixtures``, is not imported here: it needs pytest,
 which is a dev dependency, and ``import smc.testing`` must work without it.
 """
 
+from smc.testing.detectors import StubDetector, stub_model
 from smc.testing.fakes import FakeCore, FakeDevice, FakeProperty
 from smc.testing.synthetic import Blob, PlateSample, SampleCamera
 
@@ -18,4 +20,6 @@ __all__ = [
     "FakeProperty",
     "PlateSample",
     "SampleCamera",
+    "StubDetector",
+    "stub_model",
 ]
