@@ -31,6 +31,7 @@ smc run scan-plan -p <profile> --run-doc run.json --param wells=B2 --param objec
 | `rows`, `columns` | derived | Fields along Y and along X, 1 to 100 each. Give both or neither. |
 | `clip_to_well` | true | Keep only the fields whose frame meets the well: see [Clipping](#clipping-to-the-well). |
 | `pixel_size_um` | none | Plan with this pixel size (rotation 0, no mirror) instead of a calibration's or the profile's. Not with `calibration`. |
+| `fields_from` | none | A run document holding a `route`: plan the fields it chose instead of a grid (a path relative to the working directory, as `from_run_doc`). Copy the document after the survey scan and give the copy. Not with `rows`, `columns`, `coverage`, `overlap` or `clip_to_well`. See [The fields a selection chose, at another objective](#the-fields-a-selection-chose-at-another-objective). |
 | `calibration` | none | A run document holding a `camera-calibration` made with the plan's objective in place, for a plate registered with another objective (a path relative to the working directory, as `from_run_doc` of `camera-calibration`): its matrix is used, rotation and mirror included. A calibration of another objective or frame in it is **refused**, never set aside. Not with `pixel_size_um`. See [A calibration from another run document](#a-calibration-from-another-run-document). Under *Advanced* on the plate page, **which gives it itself** at an objective other than the one the plate was registered with, from the position's document the Stand screen's *Calibrate the camera* made (`calibrations/position-<n>.json`: [the plate page](../ui/plate-page.md), m5 §18.6 D24); a typed value wins. |
 
 The demo has no plate, so the run document needs a `plate` stage first (here one
@@ -273,6 +274,82 @@ document: `plate-walls` still reads the one in its own run document, the 4×'s t
 registration was made with, and `route` takes its matrix from the plan, so a route follows
 the 40×'s.
 
+## The fields a selection chose, at another objective
+
+A whole well at the 40× is about 1500 fields and a quarter of an hour. A fast 10× scan says
+where it is worth going: `route`, run on it with the 40× as its imaging objective, chooses
+the 40× fields (with the selector you name), and `fields_from` plans **those fields only**
+instead of a grid. `scan` then visits them as it visits any plan (m3 §28).
+
+```text
+smc run scan-plan -p <profile> --run-doc run.json --param wells=B2:C6 --param objective="<the 10× label>"
+smc run scan -p <profile> --run-doc run.json
+smc run cells -p <profile> --run-doc run.json
+smc run route -p <profile> --run-doc run.json --param objective="<the 40× label>" --param selector=... --param fields_per_well=...
+copy run.json run-10x.json
+smc objective set "<the 40× label>" --confirm
+smc run scan-plan -p <profile> --run-doc run.json --param objective="<the 40× label>" --param wells=all --param fields_from=run-10x.json --param calibration=cal-40x.json
+smc run scan -p <profile> --run-doc run.json --param cell_focus=map --param focus_map=run-10x.json --param autofocus=off
+```
+
+**Copy the run document right after the survey** (`copy` on Windows, `cp` elsewhere), and
+name the copy. A run document holds one record per plugin: the 40× `scan-plan` run into
+`run.json` replaces the 10× plan that the route there rests on, so the route turns stale
+there, and the copy keeps it. The same copy is the focus map of `scan`'s `cell_focus=map`
+([`scan`](scan.md)); `calibration=` is the 40×'s own document, as in
+[A calibration from another run document](#a-calibration-from-another-run-document).
+
+What the plan is:
+
+- **The wells are the plan's, the order within a well the selection's.** The planned wells
+  are those `wells` names that hold at least one of the route's stops, in this plan's own
+  order (`serpentine` as for a grid); a well's fields are its stops in the route's order. A
+  well is visited in one piece even when the route's orderer went back and forth between
+  wells. A named well with no stop is **left out** of the plan and listed in
+  `selection.wells_without_fields`; a stop of a well not named is left out and counted in
+  `selection.fields_left_out`.
+- **XY only, moved by the offset between the two objectives.** Each field is its stop plus
+  the profile's offset from the objective of the selection's scan to the plan's (m2 §13),
+  by the rules of [The plate in the objective's frame](#the-plate-in-the-objectives-frame).
+  The stops' Z and PFS offset are never read: they are the 10×'s, not a focus at the 40×;
+  the Z at each field is `scan`'s. **Until the profile holds the 40×'s offset** (#548), the
+  offset is not measured: the fields are where the 10× saw the objects, **uncorrected**,
+  and `assumed` says so. At the Ti2-E on 2026-11-24 the difference between the two
+  objectives was about 180 µm, so an object could sit near a frame's edge or outside it.
+- **No grid.** `rows`, `columns` are 1 and `overlap` 0; `plate_plan` holds the wells with
+  one position at each well's centre, and `fields` is the truth, as for every plan. Each
+  field is named `<well>_<index:04d>` and keeps the name of its stop in `stop`. `rows`,
+  `columns`, `coverage`, `overlap` and `clip_to_well` given with `fields_from` are refused
+  (`fields_from plans the fields a selection chose: <names> are not read with it; leave
+  them unset`).
+
+What it refuses, before anything is written, so that `scan` never starts on a field it
+should not visit:
+
+| Case | Refusal |
+|---|---|
+| the document cannot be read, or holds no usable `route` (not there, not `done`, stale, another profile, a dry run read by a real plan) | `<where>: ...` or `in <where>: ...`, the runner's own reason |
+| its `route` or its `scan-plan` is not one this smc reads | `the route in <where> is not one this smc reads; run route again there` (or `the scan plan in ...`) |
+| the selection's plan rests on another registration of the plate | `the selection in <where> was chosen on another registration of the plate (<theirs> against this run's <ours>)` |
+| the route chose fields of another objective | `the selection in <where> chose fields of <a>, the plan is for <b>: run route there with objective=<b>, or plan for <a>` |
+| a field, moved, lies outside its well | `field <stop> of the selection lies at (<x>, <y>) µm in the plan's frame, outside well <well>: check the offsets of the profile's [objectives], or run route again` |
+| a field lies outside the stage's soft limits | `field <stop> of the selection lies at (<x>, <y>) µm, outside the stage's soft limits x [...], y [...] µm` |
+| more than 10000 fields in one well | `the selection holds <n> fields in <well>, more than 10000 a well` |
+| no field in the wells named | `the selection in <where> holds no field in the wells named (<wells>); it chose fields in <its wells>` |
+| `fields_from` names the run document this run writes | `fields_from names the run document this run writes (<path>), where this run replaces the scan-plan that its route was made from: name a copy of it or another run document (nothing was written)` |
+
+What it assumes, in this order after the plate's frame line: `the fields are the <n> that
+selector '<s>' chose in <where> (measured <when>), each well's in the selection's order`;
+the line of an offset that was not applied; the wells named that hold no field; the
+fields left out in wells not named; a selection whose field size differs from the plan's
+by more than 1 % (`neighbouring fields may overlap or leave a gap`); and `the stage
+reports no soft limits: the selection's fields were not checked against its travel` on a
+stand that has none. A camera turned from the stage axes says nothing of a grid's gaps
+here: there is no grid. The plan logs `<n> fields in <k> wells chosen by <selector>, from
+<where> measured <when>; shift <shift or 'not applied'>` at INFO. `scan` adds that the
+rest of each well was not scanned ([`scan`](scan.md)); `cells`, `density` and a later
+`route` read the frames that were taken, and a later selector reads `selection`.
+
 ## The grid
 
 `rows` and `columns` default to the number of fields that span `coverage` of the well,
@@ -355,7 +432,11 @@ stage axes), `overlap`, `rows`, `columns`, `fields` (`well`, `index`, `name`, `x
 document written before #549), `plate_objective`, `objective_shift_um`,
 `calibration_from` and `calibration_measured` (the document a `calibration` was read
 from, as typed, and when it was measured; `null` for any other source of the matrix and
-in a document written before they existed) and `assumed`. A failed run fills no slot.
+in a document written before they existed) and `assumed`. A plan from a selection also
+holds `selection` (`run_doc` as typed, `route_attempt`, `measured`, `selector`,
+`source_objective`, `shift_um`, `wells_without_fields`, `fields_left_out`) and each field
+its `stop`; a grid plan holds neither key, so an older smc still reads it. A failed run
+fills no slot.
 
 ## Not verified here
 
@@ -369,3 +450,9 @@ A plan with `calibration` was run on the demo-sample stand only. At the Ti2-E (s
 a 4× `plate-walls` registration in `run.json`, a 40× plan with `calibration=` the 40×'s own
 document, a scan, cells, and a route whose positions land on cells at the 40× (session 3's
 three calibrations agree on 177.44°, so the matrix differs from the 4×'s by its size only).
+
+A plan with `fields_from` was run on the demo-sample stand only (the camera turned and
+mirrored, the plate turned, a declared 10× → 40× offset). At the Ti2-E, after #548 has put
+the 40×'s offset in the profile: a 10× scan of two wells with PFS locked, `cells`, `route`
+at the 40×, the copy, then `scan-plan fields_from=` and `scan cell_focus=map` at the 40×:
+the objects the 10× chose are inside the 40× frames, and the time a field.

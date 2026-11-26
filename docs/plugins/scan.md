@@ -525,7 +525,12 @@ The slot `scan` holds a `ScanResult` (`smc.plugins.slots`):
   the turn and the slide. A scan that made no check has no `plate_check` key at all, so
   it is written exactly as before and still reads in an older smc; one that made it has a
   key **an older smc refuses**.
-- `assumed`.
+- `assumed`. A scan of a plan whose fields a selection chose (`scan-plan`'s
+  `fields_from`, [`scan-plan`](scan-plan.md#the-fields-a-selection-chose-at-another-objective))
+  ends with `the plan's <n> fields in <k> wells were chosen by selector '<s>' in
+  <run_doc>: the rest of each well was not scanned`: the frames are not the wells, and
+  `cells`, `density` and a later selector read them as they are. Nothing else changes:
+  the scan visits the plan's fields.
 
 Each TIFF is the frame in the camera's own dtype, with the frame's record as its JSON
 metadata, so the file alone says where the stage was and where that is in its well
