@@ -11,7 +11,8 @@
   and #422 (2026-11-11); a run's frames for whoever runs it, §25, for issue
   #447 (2026-11-11); the cells' plane in the route and the export, §26, for
   issue #392 (2026-11-13); a registered plate that was taken out and put
-  back, §27, for issue #542 (2026-11-18).
+  back, §27, for issue #542 (2026-11-18); the fields a selection chose,
+  scanned at another objective, §28, for issue #637 (2026-11-26).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -1260,6 +1261,12 @@ visiting order and the `GridRowsColumns`; `fields` are its image positions
 that survived clipping (§7), in visiting order, `index` counting from 0 in
 each well, `name` useq's (`A1_0003`, gaps included). `fov_um` is `(width,
 height)`, the footprint's extent in stage axes.
+
+*Added by #637 (§28)*: a plan made from a selection (`scan-plan`'s
+`fields_from`) holds no grid: its `fields` are the selection's, `PlannedField`
+gains `stop` (the route stop each came from) and `ScanPlanResult` gains
+`selection`; `rows`, `columns` and `overlap` are `1`, `1` and `0.0` there, and
+`plate_plan`'s points are each well's centre (§28.3).
 
 *Added by #549 (§7.4)*: `estimate_s` is the time of the scan with the
 autofocus used, and `estimate_without_autofocus_s` the same with none
@@ -3087,6 +3094,8 @@ class ScanPlanParams(PluginParams):
 ("camera-calibration", "timings")`, `provides = "scan-plan"`. `rows` and
 `columns` are both given or neither (a model validator); neither means
 `grid_size`. Nothing moves, so it runs in a dry run like any other time.
+*Added by #637 (§28)*: `fields_from`, a run document holding a `route`, plans
+the fields that route chose in place of a grid.
 
 - **The objective**: the parameter, else the turret's current one, else
   `None` (no turret). An objective that is not among `turret.labels()` is
@@ -4486,7 +4495,7 @@ New, pure.
 ```python
 class RouteParams(PluginParams):
     labels: tuple[str, ...] = ("single",)
-    fields_per_well: int = Field(10, ge=1, le=500)
+    fields_per_well: int = Field(10, ge=1, le=2000)  # le=500 until #637 (§28.6)
     min_cells: int = Field(1, ge=1)
     exclude_centre_um: float = Field(0.0, ge=0.0)
     wall_margin_um: float = Field(0.0, ge=0.0)
@@ -10923,3 +10932,389 @@ At the Ti2-E, next visit:
   §27.1's 20 s.
 - **The walls at the 40× with PFS off at the plane PFS held**: found, as
   `objective-offsets` found them at session 5.
+
+## 28. The fields a selection chose, scanned at another objective (#637)
+
+The owner, after Ti2-E session 6: use the fast 10× scan to set up the 40×
+positions. A whole well at the 40× is about 1500 fields and a quarter of an
+hour; the 10× says where it is worth going. #636 writes the selector
+(`low-mag-survey`, algorithms §5) that `route` runs on the 10× scan with the
+40× as its imaging objective; this section has `scan-plan` plan the fields
+that route chose, and `scan` visit them as it visits any plan. It is
+additive: a parameter of `scan-plan`, an optional field of `PlannedField` and
+of `ScanPlanResult`, a slot model, a function of `objectives.py`, an optional
+class attribute the runner reads, `route`'s bound on `fields_per_well`, a
+line of `scan`'s `assumed` and the plan's card on the page. No layer
+interface changes.
+
+### 28.1 What was measured (2026-11-26, planning #637)
+
+On `main` `82fdfff`, Python 3.13.0, useq-schema 0.9.2, numpy as pinned, in
+throwaway scripts (not committed):
+
+- **A plan with no grid.** `WellPlatePlan.well_points_plan` takes a
+  `GridRowsColumns`, a `GridWidthHeight`, `RandomPoints` or one
+  `RelativePosition`: no list of points per well. `plate.to_plan(selected_wells=
+  well_indices(plate.plate, ("B3", "B2")), well_points_plan=
+  useq.RelativePosition(x=0.0, y=0.0))` validates; a `ScanPlanResult` holding it,
+  with `rows=1`, `columns=1`, `overlap=0.0` and fields anywhere in the wells,
+  comes back equal from its JSON; its image positions are the wells' centres,
+  named by the well. `well_centres_um` and `wells_to_scan` (`scan/algorithm.py`)
+  read it, wells in a non-raster order included. Nothing outside `scan_plan/`
+  reads `plate_plan.image_positions` or `well_points_plan`; `rows`, `columns` and
+  `overlap` are read by the page's plan card only (`scan_plan_card_lines`).
+- **One record per plugin (§1.7).** A 40× `scan-plan` run in the document of the
+  10× scan replaces the plan the route there rests on, so the route turns stale,
+  and a plan that had read that route would turn stale in its turn the next time
+  route runs (`RunDocument._stale` follows the reads): a cycle. The selection is
+  read from another document, as §21.12's focus map is (copy the run document
+  right after the 10× scan, #688 item 5).
+- **Where a stop is.** `RouteResult.objective` is the imaging objective, whose
+  footprint the fields have; their positions are in the frame of the **scan's**
+  objective (`route/plugin.py`, `_imaging`; §18.3: `route` to another objective
+  applies no offset). The 10× scan's objective is its `scan-plan`'s `objective`.
+- **`route` at a whole 40× well.** Touching fields of 402.1 × 404.1 µm (#636's 40×
+  field) in a disc: 885 fields at 800 µm from the wall of a 15.66 mm well (#636
+  counted 885 in C4), 1101 at 0 µm, 2029 in a disc of 10.5 mm. `order_route`
+  (nearest neighbour, then 2-opt) on them in a shuffled order: 0.08 s, 0.14 s,
+  0.33 s; `first_overlap`: 0.006 s, 0.010 s, 0.021 s. `choose_fields`
+  (`most-cells`) with `n=2000` over a 40× lattice at a quarter field: 0.08 s on
+  7 000 cells, 0.17 s on 60 000; it stops near 480 fields either way (no further
+  field holds a new cell). An Apple laptop.
+- **The demo.** On `demo-sample`, `XYStage.limits_um()` is `None` and every
+  `ObjectiveTurret.offset()` has `xy_um=None` (no `[objectives]`).
+  `tests/plate_check_stand.py`'s profile puts the 10X at `(5.0, -2.5)` and the 40X
+  at `(-32.5, 9.75)` from the 20X, with the same shifts in `[sample]`: a shift
+  10X → 40X of `(-37.5, 12.25)`. The Ti2-E's profile holds `xy_soft_limits_um =
+  [[-49000, 49000], [-29000, 29000]]`.
+
+### 28.2 Decisions
+
+- **D1. The fields are a `route` of another run document, named by
+  `scan-plan`'s `fields_from`.** `scan` still reads one plan and is unchanged
+  but for a line (D6): the estimate, the page's map, `cells`, `density` and a
+  later `route` all read the plan's fields. The route is the selection because
+  `route` already runs the selector, checks its choices (algorithms §5.5) and
+  records its counts and measures.
+  - Not chosen: *a parameter of `scan`*: a second place that says which fields
+    are imaged, free to disagree with the plan the rest reads.
+  - Not chosen: *the route of the same document*: the cycle of 28.1.
+  - Not chosen: *`scan-plan` calling a selector itself*: a selector reads a scan
+    and its cells, which a plan of the 40× does not have, and `route` owns the
+    checks.
+- **D2. The wells are the plan's, the order within a well the selection's.**
+  The planned wells are the wells `wells` names, in `scan-plan`'s order
+  (`order_wells`, `serpentine` as today), that hold at least one stop; a well's
+  fields are its stops in the route's `order`. A well is visited in one piece:
+  the scan switches the autofocus off at each well's first field, checks the
+  plate and anchors the map per well, and an orderer may interleave wells
+  (algorithms §5.3), which the plan does not follow across wells.
+  - A named well with no stop is **left out of the plan** (`wells`,
+    `plate_plan`, `fields`) and listed in `selection.wells_without_fields`: the
+    scan never meets a planned well with no field (§21.12.5's anchor pass and its
+    check 3 index every planned well; noted at the review of PR #682). A stop of
+    a well not named is left out and counted in `selection.fields_left_out`.
+- **D3. XY only, moved by the offset between the two objectives.** Each stop's
+  `x_um`, `y_um` plus `shift_between(source, objective, turret)` (28.4), where
+  `source` is the objective of the selection's scan plan: the profile's offsets
+  (m2 §13), by §18.2's rules. The stops' `z_um` and `pfs_offset` are never read:
+  they are the 10× scan's (#604 item 2, #636); the Z at each field is `scan`'s,
+  `cell_focus=map` with the same document as `focus_map` being the one meant
+  (§21.12). A shift measured as the difference of two scans (#636: `(+64.9,
+  +167.3)` µm on 2026-11-24) is never applied (FM-207).
+- **D4. Everything is checked before the plan is written**, so that `scan` never
+  starts on a field it should not visit: the route and the plan it rests on are
+  usable; they were made on this document's registration of the plate; the
+  route's fields are of the plan's objective; every centre, moved, is inside its
+  well and inside the stage's soft limits; at most `MAX_FIELDS_PER_WELL` fields a
+  well; at least one field. The camera matrix is the plan's own (§7.3, §23),
+  unchanged.
+- **D5. `route` chooses up to 2000 fields a well** (was 500): a whole 24-well
+  well at the 40× is 1544 fields (§21.12), 885 inside an 800 µm margin (#636).
+  The cost is measured (28.1). A plan from a selection holds at most
+  `MAX_FIELDS_PER_WELL = 10_000` fields a well, the grid's own most (100 × 100,
+  §7.3).
+- **D6. What the records say.** The plan carries `selection` (where, when, which
+  selector, the shift, the wells it left out) and each field its `stop`; `scan`'s
+  `assumed` gains one line saying the rest of each well was not scanned. `cells`,
+  `density` and `route` read the plan and the frames as they are: `density`'s
+  area is the union of the frames taken (§10), so it is the density of what was
+  scanned; a later selector reads `scan.plan.selection`.
+- **D7. `fields_from` naming the document the run writes is refused before
+  anything is written** (FM-272): the stage's `running` record replaces the plan
+  the route rests on, the route turns stale and the plan is lost. `scan-plan`
+  declares it in `reuses_from`, and a new optional class attribute names the slot
+  read there (28.7), so the refusal's text says what it is.
+- **D8. The page** draws a plan from a selection as any plan (its fields); its
+  card names the selector instead of a grid (28.9). Choosing `fields_from` on the
+  page is #634's.
+
+### 28.3 The slot — `slots/scan_plan.py`
+
+`PlannedField` gains, last:
+
+```python
+class PlannedField(SlotValue):  # gains
+    stop: str | None = None  # the route stop it came from (D6)
+```
+
+```python
+class PlanSelection(SlotValue):
+    run_doc: str  # fields_from as typed, forward slashes, never resolved (FM-24, FM-50)
+    route_attempt: str  # the attempt of the route record read
+    measured: str  # its finished_utc to the second, or "at an unknown time"
+    selector: str  # the record's params' selector; "most-cells" when it has none
+    source_objective: str | None  # the objective of the selection's scan plan
+    shift_um: tuple[float, float] | None  # added to every stop; None: not applied
+    wells_without_fields: tuple[str, ...]  # named wells with no stop, plan order
+    fields_left_out: int = Field(ge=0)  # stops of wells not named
+```
+
+`ScanPlanResult` gains, last, `selection: PlanSelection | None = None`.
+`PlanSelection` is exported from `slots/__init__.py`. A wrap serializer on
+`PlannedField` drops `stop` when `None`, and one on `ScanPlanResult` drops
+`selection` when `None` (as `RoutePosition` and `ScanResult` do): a grid plan is
+written byte for byte as before, so an older smc still reads it (FM-107). A plan
+from a selection has `rows=1`, `columns=1`, `overlap=0.0`, and `plate_plan`
+holds the planned wells with `well_points_plan=useq.RelativePosition(x=0.0,
+y=0.0)`: `fields` is the truth, as for every plan. A field's `name` is
+`<well>_<index:04d>`, `index` from 0 in each well in visiting order, so the
+frames' files follow §8's rule.
+
+### 28.4 Pure functions — `scan_plan/selection.py` (new), `objectives.py`
+
+```python
+MAX_FIELDS_PER_WELL = 10_000
+
+
+@dataclass(frozen=True, slots=True)
+class ChosenFields:
+    wells: tuple[str, ...]  # the planned wells, in the given order
+    fields: tuple[PlannedField, ...]  # in visiting order
+    wells_without_fields: tuple[str, ...]  # given wells with no stop, given order
+    fields_left_out: int  # stops of wells not given
+    wells_left_out: tuple[str, ...]  # their wells, in the order first met
+
+
+def chosen_fields(
+    positions: Sequence[RoutePosition],
+    wells: Sequence[str],
+    *,
+    shift_um: tuple[float, float],
+    geometry_of: Callable[[str], WellGeometry],
+    xy_limits_um: tuple[tuple[float, float], tuple[float, float]] | None,
+) -> ChosenFields: ...
+```
+
+- The stops sorted by `order`; for each given well, its stops in that order;
+  each centre is `(x_um + shift_um[0], y_um + shift_um[1])` (`(0.0, 0.0)` when
+  the shift is not applied: the caller says so); `geometry_of(well).contains`
+  (§3.2) of the centre, else `ValueError`: `field <stop> of the selection lies at
+  (<x>, <y>) µm in the plan's frame, outside well <well>: check the offsets of
+  the profile's [objectives], or run route again` (one decimal); with limits
+  `((x_lo, x_hi), (y_lo, y_hi))`, `lo <= v <= hi` on both axes (the layer's own
+  test), else `field <stop> of the selection lies at (<x>, <y>) µm, outside the
+  stage's soft limits x [<x_lo>, <x_hi>], y [<y_lo>, <y_hi>] µm` (`:g`); more
+  than `MAX_FIELDS_PER_WELL` stops in a given well: `the selection holds <n>
+  fields in <well>, more than 10000 a well`. The first offending stop in visiting
+  order is named. No stop at all in the given wells returns empty `wells` and
+  `fields`: the plugin's refusal names the document.
+
+```python
+def shift_between(
+    origin: str | None, target: str | None, turret: ObjectiveTurret | None
+) -> tuple[tuple[float, float] | None, str | None]: ...
+```
+
+In `objectives.py`, beside `plate_for_objective` and by its rules, for
+positions rather than a plate; the shift and the line, in this order:
+1. `origin == target` (both `None` included): `((0.0, 0.0), None)`;
+2. `origin is None`: `None`, `the selection's scan did not record its
+   objective: no offset between objectives is applied for <target>`;
+3. `target is None`: `None`, `the objective in use is unknown: the selection's
+   positions are <origin>'s, and no offset between objectives is applied`;
+4. `turret is None` or `objective_shift_um(turret.offset(origin),
+   turret.offset(target))` is `None`: `None`, `the offset between <origin> and
+   <target> is not measured (the profile's [objectives]): the selection's
+   positions are <origin>'s, not corrected`;
+5. otherwise `(shift, None)`.
+
+### 28.5 The plugin — `scan_plan/plugin.py`
+
+```python
+class ScanPlanParams(PluginParams):  # gains, after calibration
+    fields_from: Path | None = Field(
+        None,
+        description=(
+            "A run document holding a route: plan the fields it chose instead of "
+            "a grid (relative to the working directory, as from_run_doc). Copy "
+            "the document after the survey scan and give the copy."
+        ),
+    )
+```
+
+A third model validator: with `fields_from`, `rows` or `columns` given, or
+`coverage`, `overlap` or `clip_to_well` other than its default, is a
+`ValueError`: `fields_from plans the fields a selection chose: <names> are not
+read with it; leave them unset` (the names in field order, `, `-joined).
+`ScanPlanPlugin.reuses_from = ("fields_from",)` and `reuse_slots =
+{"fields_from": "route"}` (28.7).
+
+**The run.** Unchanged up to the camera basis and `fov_um` (the wells, the
+objective, the frame's plate, the shape, the matrix); with no `fields_from`,
+unchanged to the end. With it, before the grid would be laid, a helper
+`_selection_given(name, path, ctx, microscope, framed, wells, objective, fov_um)`,
+each refusal a `PluginRunError` of `scan-plan` raised outside any handler (FM-98),
+`where = path.as_posix()`, in this order:
+1. **The route**, read as `calibration_from` reads a calibration (§20.3):
+   `RunDocument.load` (`<where>: <reason>`), `unusable("route", profile=...,
+   dry_run=ctx.dry_run)` (`in <where>: <reason or 'it holds no result'>`), the
+   result validated as `RouteResult` (`the route in <where> is not one this smc
+   reads; run route again there`).
+2. **The selection's plan**, the same way with `scan-plan` and `ScanPlanResult`
+   (`the scan plan in <where> is not one this smc reads; run scan-plan again
+   there`).
+3. **The registration**: that plan record's `reads["plate"]` attempt against
+   `ctx.document.provider("plate")`'s: `the selection in <where> was chosen on
+   another registration of the plate (<a or none> against this run's <b or
+   none>)`, as §21.12.5's check 2.
+4. **The footprint**: `route.objective` against the plan's `objective`: `the
+   selection in <where> chose fields of <a>, the plan is for <b>: run route
+   there with objective=<b>, or plan for <a>` (`an unknown objective` for
+   `None`).
+5. `shift_between(source_plan.objective, objective, turret)`; the limits from
+   `microscope.get(XYStage)` (`None` for no stage or no limits);
+   `chosen_fields(route.positions, wells, shift_um=shift or (0.0, 0.0),
+   geometry_of=lambda w: well_geometry(framed.to_plan(), w), xy_limits_um=...)`,
+   its `ValueError` the refusal's text.
+6. No field: `the selection in <where> holds no field in the wells named
+   (<params.wells>); it chose fields in <its wells, at most 8, then "… <m> more">`.
+
+Then `plate_plan = framed.to_plan(selected_wells=well_indices(plate.plate,
+chosen.wells), well_points_plan=useq.RelativePosition(x=0.0, y=0.0))`, the
+estimate on `chosen.fields` as §7.4, `wells=chosen.wells`, `rows=1`,
+`columns=1`, `overlap=0.0`, and `selection` filled. INFO: `<n> fields in <k> wells
+chosen by <selector>, from <where> measured <when>; shift <shift or 'not
+applied'>`.
+
+**`assumed`**, in this order: the frame's lines (§18), the selection's, the
+basis's, the timings', the estimate's. The selection's:
+- always: `the fields are the <n> that selector '<s>' chose in <where>
+  (measured <when>), each well's in the selection's order`;
+- the line of `shift_between`, when it has one;
+- when `wells_without_fields`: `no field was chosen in <k> of the wells named:
+  <first 8>` and `, … <m> more` beyond eight;
+- when `fields_left_out`: `<n> fields of the selection lie in wells not named
+  and were left out: <first 8 of wells_left_out>` and `, … <m> more`;
+- when `route.fov_um` differs from the plan's `fov_um` by more than
+  `FOV_TOLERANCE = 0.01` (chosen) of the plan's on either axis: `the selection
+  sized its fields <w> × <h> µm, the plan's are <w'> × <h'> µm: neighbouring
+  fields may overlap or leave a gap` (`:.1f`);
+- when no limits were read: `the stage reports no soft limits: the selection's
+  fields were not checked against its travel`.
+
+The lines that hold no path are at most `ASSUMED_LINE_CHARS` (160) with wells
+of three characters (FM-205); those that hold a path are as long as it is, as
+§21.12.5's.
+
+### 28.6 `route` — `route/plugin.py`, `route/algorithm.py`
+
+`RouteParams.fields_per_well` is `Field(10, ge=1, le=2000)`. The comment of
+`_OVERLAP_BLOCK` says 2000 fields a well (4 000 000 pairs, four blocks). Nothing
+else changes.
+
+### 28.7 The runner — `runner.py`, `api.py`
+
+A plugin may declare the optional class attribute `reuse_slots: Mapping[str,
+str]` (read with `getattr`, as `reuses_from`), field to the slot it reads in
+that document; a field of `reuses_from` absent from it reads the plugin's own
+slot. `check_run_doc`'s refusal is unchanged for its own slot; for another
+slot: `<field> names the run document this run writes (<path>), where this run
+replaces the <provides> that its <slot> was made from: name a copy of it or
+another run document (nothing was written)`. A `reuse_slots` key that is not in
+`reuses_from` raises `AttributeError`, as a misspelt `reuses_from` name does.
+`api.py`'s docstring names the attribute.
+
+### 28.8 The scan — `scan/plugin.py`
+
+When `plan.selection` is not `None`, `assumed` gains, last: `the plan's <n>
+fields in <k> wells were chosen by selector '<s>' in <run_doc>: the rest of each
+well was not scanned`. Nothing else changes: the scan visits `plan.fields`.
+
+### 28.9 The page — `ui/guide.py`
+
+`scan_plan_card_lines` of a plan with `selection`: the fields line is `fields:
+<n>, chosen by selector '<s>' in <run_doc>`, with `; none in <k> of the wells
+named` when `wells_without_fields`; the field line has no overlap (`field: <w> ×
+<h> µm at <objective>`). The wells and the estimate lines are unchanged; still
+four lines.
+
+### 28.10 Docs
+
+`docs/plugins/scan-plan.md`: the parameter's row, and a section *The fields a
+selection chose, at another objective*: the 10× scan, `cells`, `route
+--param objective=<40×> --param selector=... --param fields_per_well=...`, copy
+the run document (`run-10x.json`), turn the 40× in (`smc objective set ...
+--confirm`), `scan-plan --param objective=<40×> --param wells=all --param
+fields_from=run-10x.json` (with `calibration=` as §23), `scan --param
+cell_focus=map --param focus_map=run-10x.json --param autofocus=off`; what is
+refused, what is assumed, and that until the profile holds the 40×'s offset
+(#548) the fields land where the 10× saw the objects, uncorrected.
+`docs/plugins/route.md`: the bound. `docs/plugins/scan.md`: the line of 28.8.
+
+### 28.11 Tests
+
+- `tests/unit/test_scan_plan_selection.py` (new, pure; stops built as
+  `RoutePosition`s, a 96-well plate turned 1.5°, the shift `(-37.5, 12.25)`):
+  the order within a well is the route's and the wells' the given one, with the
+  route's order interleaving two wells; a named well with no stop listed and
+  left out; stops of a well not named counted, their wells listed; every centre
+  is the stop plus the shift, written from the numbers (FM-203); a centre outside
+  its well after the shift refused by its stop, one inside before the shift; a
+  centre outside the limits refused by its stop and one on the limit kept; no
+  limits checks nothing; 10 001 stops in a well refused and 10 000 kept; names
+  `<well>_<index:04d>` with their `stop`; the params' third validator, each
+  field from both sides.
+- `tests/unit/test_objective_offsets.py`: `shift_between`'s five rules and their
+  exact lines.
+- `tests/unit/test_slots.py`: `SAMPLES` gain `PlanSelection` and a plan with
+  `selection` and a field with `stop`; a grid plan dumps neither key; a dump
+  without them loads.
+- `tests/unit/test_plugin_runner.py`: a reuse of another slot is refused with its
+  text and the document byte-identical; a `reuse_slots` key not in
+  `reuses_from` raises.
+- `tests/unit/test_route_params.py`: 2000 allowed, 2001 refused, `le=2000`
+  described.
+- `tests/unit/test_preset_from_document.py`: a `scan-plan` case with
+  `fields_from` (a path with a backslash and a space, FM-190).
+- `tests/unit/test_ui_guide.py`: the card of a plan from a selection.
+- `tests/test_scan_plan_selection_demo.py` (new, `pytest.mark.demo`;
+  `plate_check_stand`'s profile, so the shift is non-zero and anisotropic and
+  the camera turned and mirrored): the acceptance walk (registration, a 10× plan
+  of two wells, `scan`, `cells detector=blobs`, `route objective=<40X>
+  fields_per_well=3`, the copy, the 40X turned in, `scan-plan fields_from=`,
+  `scan`): the frames are the stops, well by well in the route's order, each at
+  its stop plus `(-37.5, 12.25)` within the landing tolerance, and the plan's
+  `selection` names the copy as typed and the route's attempt read from its raw
+  JSON (FM-124); the refusals of 28.5's steps 3, 4, 5 (a well, the limits, from a
+  profile with `xy_soft_limits_um` that leaves one stop out) and 6, each with the
+  stage where it was; `fields_from` naming the document refused with the
+  document byte-identical (FM-272); a dry-run route refused for a real plan;
+  `plate_check_stand.profile(forty=False)`: the positions unshifted and the line.
+- `tests/test_scan_demo.py`: a `cell_focus=map` scan of a plan whose selection
+  left one of two named wells without a field: the plan lists one well, the scan
+  ends `done`, only that well is anchored, `assumed` holds 28.8's line (the
+  review of PR #682).
+
+**Failure modes**: FM-24, FM-50, FM-73, FM-98, FM-107, FM-124, FM-125, FM-190,
+FM-203, FM-205, FM-207, FM-216, FM-229, FM-272 (whose *check* gains the reader
+of another slot that rests on the one the stage replaces).
+
+### 28.12 Not verified (for the owner)
+
+At the Ti2-E, after #548 has put the 40×'s offset in the profile: a 10× scan of
+two wells with PFS locked, `cells`, `route` with `low-mag-survey` (#636) at the
+40×, the copy, then `scan-plan fields_from=` and `scan cell_focus=map` at the
+40×: the objects the 10× chose are inside the 40× frames (at 2026-11-24's
+difference of about 180 µm they would sit near a frame's edge without it), and
+the time a field against §21.12.2's 0.4–0.75 s.
