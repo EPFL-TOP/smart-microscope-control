@@ -23,7 +23,11 @@ import numpy as np
 import pytest
 
 from smc.inference import served
+from smc.inference.cards import ModelCard
+from smc.inference.detector import Detection
 from smc.inference.errors import ModelError
+from smc.inference.models import load_model
+from smc.inference.preprocessing import ModelPreprocessing
 from smc.inference.served import (
     HttpWire,
     ServedError,
@@ -31,6 +35,8 @@ from smc.inference.served import (
     encode_frame,
     open_wire,
 )
+from smc.inference.server import ModelServer
+from smc.testing import StubDetector, stub_model
 
 NO_ADDRESS = "SMC_MODEL_SERVER is not an address like http://host:8000"
 LISTING_TEXT = json.dumps({"schema": 1, "models": []})
@@ -314,3 +320,66 @@ def test_the_wires_repr_does_not_show_the_address() -> None:
 
     assert "lab-gpu-7" not in repr(wire)
     assert "48151" not in repr(wire)
+
+
+def test_a_model_asked_for_by_name_runs_through_a_real_socket(
+    server: _Server, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The whole path of a served model on a loopback socket: `load_model` opens an
+    # `HttpWire`, checks the listing of a real `ModelServer`, and a frame goes to its
+    # stub and back. Only the HTTP layer is the standard library's here.
+    sha = "a" * 64
+    rule = ModelPreprocessing(percentiles=(0.5, 99.5), model_um_per_px=None)
+    card = ModelCard(
+        name="socket-stub",
+        weights="w.pth",
+        weights_sha256=sha,
+        classes=("single",),
+        trained_um_per_px=None,
+        preprocessing=rule,
+    )
+    found = Detection(1.0, 2.0, 3.0, 4.0, "single", 0.9)
+    stub = StubDetector({7: [found]}, classes=("single",), device="cuda")
+    model_server = ModelServer(
+        {
+            card.name: stub_model(
+                stub, name=card.name, weights_sha256=sha, preprocessing=rule
+            )
+        }
+    )
+
+    def reply(handler: BaseHTTPRequestHandler) -> None:
+        path, raw = server.requests[-1]
+        if path == "/models/process":
+            text, name = model_server.listing(), "models"
+        else:
+            sent = json.loads(raw)
+            text = model_server.detect(
+                sent["model"], decode_frame(sent["image"]), sent["pixel_size_um"]
+            )
+            name = "detections"
+        result = [{"type": "text", "data": text, "data_params": {"name": name}}]
+        _answer(201, json.dumps(result).encode("ascii"))(handler)
+
+    server.reply = reply
+    host, port = server.server_address[:2]
+    monkeypatch.setenv(served.SERVER_ENV, f"http://{host}:{port}")
+
+    resolved = load_model(
+        card,
+        preprocessing=rule,
+        frame_shape_px=(6, 9),
+        frame_um_per_px=0.275,
+        device="auto",
+        score_threshold=0.5,
+    )
+    detections = resolved.detector.detect(np.full((6, 9), 7, dtype=np.uint16))
+
+    assert resolved.runs_on == "served"
+    assert detections == [found]
+    assert resolved.detector.device == "cuda"
+    check_path, detect_path = [path for path, _ in server.requests]
+    assert (check_path, detect_path) == ("/models/process", "/detect/process")
+    # On the wire, not only on the fake: the keys of what a detect call sends.
+    assert set(json.loads(server.requests[0][1])) == set()
+    assert set(json.loads(server.requests[1][1])) == {"model", "image", "pixel_size_um"}

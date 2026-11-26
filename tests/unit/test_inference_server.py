@@ -22,6 +22,7 @@ import pytest
 
 import smc
 from smc.inference import models as models_mod
+from smc.inference import served as served_mod
 from smc.inference import server as server_mod
 from smc.inference.cards import ModelCard, model_card
 from smc.inference.detector import Detection
@@ -367,6 +368,30 @@ def test_no_model_at_all_is_a_model_error(monkeypatch: pytest.MonkeyPatch) -> No
     _cards(monkeypatch)
     with pytest.raises(ModelError, match="there is no model card"):
         prepare(None, device="cpu", load=loader)
+
+
+def test_prepare_never_goes_through_load_model_even_with_a_server_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A server started in an environment that has SMC_MODEL_SERVER (the PC's own, or
+    # a copy of the acquisition PC's) must not become a client of itself: `prepare`
+    # loads with `load_local_model`, so no wire is ever opened.
+    opened: list[str] = []
+
+    def open_wire(address: str) -> object:
+        opened.append(address)
+        raise AssertionError("the server went looking for a model server")
+
+    monkeypatch.setattr(served_mod, "open_wire", open_wire)
+    monkeypatch.setenv(served_mod.SERVER_ENV, "http://127.0.0.1:9")
+    monkeypatch.setenv("SMC_MODELS", str(tmp_path))
+
+    with pytest.raises(ModelError) as caught:
+        prepare(["cell-classes-v2"], device="cpu")
+
+    # The local loader's own words: it looked for the weights on this PC.
+    assert "no model at" in str(caught.value)
+    assert opened == []
 
 
 def test_the_default_loader_runs_the_model_here_and_names_the_missing_weights(

@@ -25,11 +25,14 @@ import base64
 import http.client
 import io
 import json
+import logging
 import math
+import os
 import socket
 import ssl
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, NoReturn, Protocol
 from urllib.parse import urlsplit
 
@@ -37,8 +40,11 @@ import numpy as np
 import numpy.typing as npt
 import tifffile
 
+from smc.inference.cards import ModelCard
 from smc.inference.detector import Detection
 from smc.inference.errors import ModelError
+from smc.inference.models import ResolvedModel, model_identity
+from smc.inference.preprocessing import ModelPreprocessing
 
 __all__ = [
     "CHECK_TIMEOUT_S",
@@ -51,9 +57,12 @@ __all__ = [
     "HttpWire",
     "ModelWire",
     "ServedAnswer",
+    "ServedCheck",
+    "ServedDetector",
     "ServedError",
     "ServedKind",
     "ServedModel",
+    "check_served",
     "decode_answer",
     "decode_frame",
     "decode_listing",
@@ -61,6 +70,7 @@ __all__ = [
     "encode_frame",
     "encode_listing",
     "error_from_status",
+    "load_served",
     "open_wire",
     "result_text",
     "timed_out",
@@ -87,7 +97,13 @@ SCHEMA = 1
 
 #: The server's own text is kept to a line of this many characters.
 _SERVER_TEXT_CHARS = 200
+#: A name or an identity the server sent is repeated in a message at this many characters.
+_ECHO_CHARS = 64
+#: The characters of each half of an identity a message shows: enough to tell two apart.
+_HALF_CHARS = 12
 _BAD_ADDRESS = f"{SERVER_ENV} is not an address like http://host:8000"
+
+log = logging.getLogger("smc.inference.served")
 
 ServedKind = Literal["unreachable", "timeout", "error", "identity", "malformed"]
 
@@ -579,3 +595,289 @@ def open_wire(address: str) -> ModelWire:
         ModelError: ``address`` is not ``http://host:port`` (the message does not hold it).
     """
     return HttpWire(address)
+
+
+# --- the check --------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ServedCheck:
+    """What the check found; ``ok`` says whether a call can be expected to work.
+
+    ``kind`` is ``None`` when ``ok``, else a ``ServedError`` kind or ``not_served``
+    (the server answered and does not serve the card's name). ``device`` is what
+    the server said of the model, when it answered.
+    """
+
+    ok: bool
+    kind: str | None
+    message: str
+    device: str | None
+
+
+def _echo(text: str) -> str:
+    """Something the server said, to be repeated in a message: printable, short."""
+    return "".join(c if c.isprintable() else " " for c in text)[:_ECHO_CHARS]
+
+
+def _identity_differs(expected: str, got: str) -> str:
+    """Which half of a model's identity the server's differs in: the weights, the pre-processing, or both.
+
+    An identity is the weights' SHA-256 and the pre-processing's digest joined by
+    ``+``; telling the halves apart says which cure it is: other weights on the
+    server, or another checkout's rule.
+    """
+    expected_weights, _, expected_rule = expected.partition("+")
+    got_weights, _, got_rule = got.partition("+")
+    weights = expected_weights != got_weights
+    rule = expected_rule != got_rule
+    if weights and rule:
+        return "the weights and the pre-processing differ"
+    if weights:
+        return "the weights differ"
+    if rule:
+        return "the pre-processing differs"
+    return "the identity differs in form"
+
+
+def _short_identity(identity: str) -> str:
+    """The first characters of each half of an identity: readable, and enough to tell two apart."""
+    weights, _, rule = identity.partition("+")
+    return f"{_echo(weights)[:_HALF_CHARS]}+{_echo(rule)[:_HALF_CHARS]}"
+
+
+def check_served(
+    wire: ModelWire, card: ModelCard, *, timeout_s: float = CHECK_TIMEOUT_S
+) -> ServedCheck:
+    """Ask the server what it serves, and say whether it serves this card's model: a finding, never an exception.
+
+    The server's identity for the card's name is compared with the one worked out
+    from the card (the weights' SHA-256 and the rule the card names). A server that
+    is not there, is slow, serves other weights or is another version of this code
+    is told here, at the start of the stage, and the check **does not refuse**: it is
+    reported, and every call checks again by its own answer (§8.5).
+
+    Args:
+        wire: The way to the server.
+        card: The model asked for.
+        timeout_s: The read timeout of the listing.
+    """
+    try:
+        result = wire.post("/models/process", {}, read_timeout_s=timeout_s)
+        listed = decode_listing(result_text(result, "listing"))
+    except ServedError as exc:
+        return ServedCheck(False, exc.kind, f"model server: {exc}", None)
+    found = next((m for m in listed if m.name == card.name), None)
+    if found is None:
+        names = ", ".join(_echo(m.name) for m in listed)
+        serves = f"it serves: {names}" if listed else "it serves no model"
+        return ServedCheck(
+            False,
+            "not_served",
+            f"model server: the server does not serve {card.name} ({serves})",
+            None,
+        )
+    device = _echo(found.device)
+    expected = model_identity(card.weights_sha256, card.preprocessing)
+    if found.identity != expected:
+        return ServedCheck(
+            False,
+            "identity",
+            f"model server: {card.name} is served with another identity than the "
+            f"card's: {_identity_differs(expected, found.identity)}",
+            device,
+        )
+    return ServedCheck(
+        True,
+        None,
+        f"model server: {card.name} is served on {device}, identity "
+        f"{_short_identity(expected)}",
+        device,
+    )
+
+
+# --- the detector -----------------------------------------------------------------
+
+
+class ServedDetector:
+    """The ``Detector`` protocol over a model server: the frame goes out, the detections come back.
+
+    What is sent is the frame's pixels and its pixel size, and the model's name: three
+    keys and nothing else (never a path, a run document, a host, an account, or the
+    score threshold). The **score threshold stays here**: the server keeps every
+    detection and the client keeps ``score >= threshold``, the predicate of
+    ``detections_from_output``, so that a served run and a local one on the same
+    weights give the same detections.
+
+    A failed call is an exception and never an empty list: "no cell" and "the server
+    did not answer" are different findings. Nothing is retried, and there is no
+    fallback to a model on this PC.
+
+    ``classes`` are the card's. ``device`` is the last answer's, else the check's,
+    else ``unknown``, and never ``auto``; it is a plain attribute rebound after each
+    answer, because a read-only property does not satisfy the protocol's settable
+    ``device``. ``check`` is the ``ServedCheck`` made when the model was loaded.
+    """
+
+    classes: tuple[str, ...]
+    device: str
+    check: ServedCheck
+
+    def __init__(
+        self,
+        wire: ModelWire,
+        *,
+        model: str,
+        identity: str,
+        classes: tuple[str, ...],
+        pixel_size_um: float,
+        score_threshold: float,
+        timeout_s: float,
+        check: ServedCheck,
+    ) -> None:
+        self._wire = wire
+        self._model = model
+        self._identity = identity
+        self._pixel_size_um = pixel_size_um
+        self._score_threshold = score_threshold
+        self._timeout_s = timeout_s
+        self.classes = classes
+        self.check = check
+        self.device = check.device or "unknown"
+
+    def detect(self, frame: npt.NDArray[Any]) -> list[Detection]:
+        """The detections of one 2-D frame whose score is at least the threshold.
+
+        Raises:
+            ValueError: ``frame`` is not a 2-D array with at least one pixel; nothing
+                is sent.
+            ServedError: The call failed (``unreachable``, ``timeout``, ``error``,
+                ``malformed``), or the answer is for another model or carries another
+                identity (``identity``).
+        """
+        array = np.asarray(frame)
+        if array.ndim != 2 or array.size == 0:
+            raise ValueError(
+                f"detect takes one 2-D frame, got an array of shape {array.shape}"
+            )
+        body: dict[str, object] = {
+            "model": self._model,
+            "image": encode_frame(array),
+            "pixel_size_um": self._pixel_size_um,
+        }
+        try:
+            result = self._wire.post(
+                "/detect/process", body, read_timeout_s=self._timeout_s
+            )
+        except ServedError as exc:
+            if exc.kind == "timeout":
+                raise ServedError(
+                    "timeout", f"{exc}; {TIMEOUT_ENV} sets the limit of a detect call"
+                ) from None
+            raise
+        answer = decode_answer(result_text(result, "answer"))
+        if answer.model != self._model:
+            raise ServedError(
+                "identity",
+                f"the server answered for the model {_echo(answer.model)!r}, and "
+                f"{self._model!r} was asked for",
+            )
+        if answer.identity != self._identity:
+            raise ServedError(
+                "identity",
+                "the server answered with another model identity: "
+                f"{_identity_differs(self._identity, answer.identity)}; it is not "
+                "running the card's model (its weights, or this checkout's "
+                "pre-processing)",
+            )
+        self.device = _echo(answer.device)
+        return [d for d in answer.detections if d.score >= self._score_threshold]
+
+
+# --- load_model's second place ----------------------------------------------------
+
+
+def _detect_timeout_s() -> float:
+    """The read timeout of a detect call: ``SMC_MODEL_TIMEOUT_S``, or ``DETECT_TIMEOUT_S``; blank is unset (FM-78)."""
+    text = os.environ.get(TIMEOUT_ENV, "").strip()
+    if not text:
+        return DETECT_TIMEOUT_S
+    refusal = f"{TIMEOUT_ENV} must be a number of seconds above 0"
+    try:
+        seconds = float(text)
+    except ValueError:
+        raise ModelError(refusal) from None
+    if not (math.isfinite(seconds) and seconds > 0.0):
+        raise ModelError(refusal)
+    return seconds
+
+
+def load_served(
+    card: ModelCard,
+    *,
+    preprocessing: ModelPreprocessing,
+    frame_um_per_px: float,
+    device: str,
+    score_threshold: float,
+    weights: Path | None,
+    address: str,
+) -> ResolvedModel:
+    """The model a card names, running on the server at ``address``: what ``load_model`` returns with ``SMC_MODEL_SERVER`` set.
+
+    Refuses, before any call, what a served model cannot honour: a weights file on
+    this PC, a device (the server chooses its own), a pre-processing other than the
+    card's (the server runs the card's), a pixel size that is negative or not finite,
+    an address that is not ``http://host:port``, a bad ``SMC_MODEL_TIMEOUT_S``. Then
+    it checks the server and **reports** what it found (INFO, WARNING when the check
+    is not ok): a failed check does not refuse, because a scan that goes on without
+    detection is the caller's decision and ``cells`` ends ``failed`` at its first
+    frame with the check's own diagnosis.
+
+    Raises:
+        ModelError: One of the refusals above; each message says what to remove.
+    """
+    if weights is not None:
+        raise ModelError(
+            "model_path names a file on this PC, and the model runs on the server: "
+            f"remove model_path, or unset {SERVER_ENV} to run it here"
+        )
+    if device != "auto":
+        raise ModelError(
+            f"device={device} is for a model that runs on this PC; the server "
+            f"chooses its own: remove device, or unset {SERVER_ENV}"
+        )
+    if preprocessing != card.preprocessing:
+        raise ModelError(
+            "the server runs the card's pre-processing, and low_percentile, "
+            "high_percentile or model_um_per_px change it: remove them, or unset "
+            f"{SERVER_ENV} to run the model here"
+        )
+    if not (math.isfinite(frame_um_per_px) and frame_um_per_px >= 0.0):
+        raise ModelError(
+            "the frames' pixel size must be a number of at least 0 um (0 is "
+            f"unknown), got {frame_um_per_px}"
+        )
+    wire = open_wire(address)
+    timeout_s = _detect_timeout_s()
+    identity = model_identity(card.weights_sha256, card.preprocessing)
+    check = check_served(wire, card)
+    if check.ok:
+        log.info("%s", check.message)
+    else:
+        log.warning("%s", check.message)
+    return ResolvedModel(
+        name=card.name,
+        identity=identity,
+        weights_sha256=card.weights_sha256,
+        runs_on="served",
+        detector=ServedDetector(
+            wire,
+            model=card.name,
+            identity=identity,
+            classes=card.classes,
+            pixel_size_um=frame_um_per_px,
+            score_threshold=score_threshold,
+            timeout_s=timeout_s,
+            check=check,
+        ),
+    )

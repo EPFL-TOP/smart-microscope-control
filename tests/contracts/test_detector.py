@@ -1,9 +1,9 @@
 """The ``Detector`` contract, on every implementation (inference.md §7).
 
 What a stage may rely on from any detector, whatever runs behind it: the stub of
-the tests, the blob detector, the trained Faster R-CNN (a random-initialised one,
-built once per module, so that no real weights are needed). #685 adds the served
-client to the cases. The frame is 120 x 160, which is not square, so that a box
+the tests, the blob detector, the served client on a fake model server (#685), the
+trained Faster R-CNN (a random-initialised one, built once per module, so that no
+real weights are needed). The frame is 120 x 160, which is not square, so that a box
 whose axes are exchanged is outside it (FM-73), and it has three round spots.
 
 A random model finds boxes on any frame (100 on noise, measured): "nothing on a
@@ -21,8 +21,11 @@ import numpy.typing as npt
 import pytest
 
 from smc.inference.blobs import BlobDetector
+from smc.inference.cards import ModelCard
 from smc.inference.detector import Detection, Detector
-from smc.testing import StubDetector
+from smc.inference.models import load_model
+from smc.inference.preprocessing import ModelPreprocessing
+from smc.testing import FakeModelServer, StubDetector, stub_model
 
 HEIGHT, WIDTH = 120, 160
 #: Rows and columns of the three discs, radius 4 px, at 3000 counts over N(1000, 30).
@@ -70,13 +73,54 @@ def torch_weights(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return path
 
 
-@pytest.fixture(params=["stub", "blobs", "torch"])
+def _served(monkeypatch: pytest.MonkeyPatch) -> Detector:
+    """A ``ServedDetector`` on a ``FakeModelServer`` around the stub's three detections.
+
+    Through ``load_model``, the way ``cells`` gets one: the variable is set, the card
+    is a model in memory, and the frame goes through TIFF and JSON and comes back.
+    """
+    rule = ModelPreprocessing(percentiles=(0.5, 99.5), model_um_per_px=None)
+    stub = _stub()
+    card = ModelCard(
+        name="served-stub",
+        weights="stub.pth",
+        weights_sha256="0" * 64,
+        classes=stub.classes,
+        trained_um_per_px=None,
+        preprocessing=rule,
+    )
+    fake = FakeModelServer(
+        {
+            card.name: stub_model(
+                stub,
+                name=card.name,
+                weights_sha256=card.weights_sha256,
+                preprocessing=rule,
+            )
+        }
+    )
+    fake.install(monkeypatch)
+    resolved = load_model(
+        card,
+        preprocessing=rule,
+        frame_shape_px=(HEIGHT, WIDTH),
+        frame_um_per_px=0.5,
+        device="auto",
+        score_threshold=0.05,
+    )
+    assert resolved.runs_on == "served"
+    return resolved.detector
+
+
+@pytest.fixture(params=["stub", "blobs", "served", "torch"])
 def detector(request: pytest.FixtureRequest) -> Detector:
     """Each implementation of the protocol; the torch case is skipped with its reason."""
     if request.param == "stub":
         return _stub()
     if request.param == "blobs":
         return BlobDetector()
+    if request.param == "served":
+        return _served(request.getfixturevalue("monkeypatch"))
     from smc.inference.local import TorchDetector
     from smc.inference.preprocessing import Preprocessing
 

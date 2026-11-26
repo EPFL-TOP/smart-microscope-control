@@ -3,9 +3,11 @@
 A model's identity is the SHA-256 of its weights and the digest of the
 pre-processing the run applies, so that a change of either is another model
 (ADR-0011): a resume refuses it and a result records it. ``load_model`` is the
-one place a card becomes a ``Detector``: it looks for the weights, checks them
-against the card before torch is imported, and says in plain words what to do
-about each way it can fail.
+one place a card becomes a ``Detector``, and where the place is chosen: the model
+server when ``SMC_MODEL_SERVER`` is set (``smc.inference.served``), else this PC
+(``load_local_model``), which looks for the weights, checks them against the card
+before torch is imported, and says in plain words what to do about each way it can
+fail.
 """
 
 from __future__ import annotations
@@ -124,11 +126,39 @@ def load_model(
     score_threshold: float,
     weights: Path | None = None,
 ) -> ResolvedModel:
-    """The model a card names: on the model server, or on this PC (it dispatches).
+    """The model a card names: on the model server when ``SMC_MODEL_SERVER`` is set, else on this PC.
 
-    The one place a card becomes a ``Detector``. ``load_local_model`` is the body
-    this function had; it runs the model here. Nothing else changes for a caller.
+    The one place a card becomes a ``Detector``, and where the place is chosen: with
+    the variable set and not blank (FM-78) the model is the server's (``runs_on``
+    ``served``), otherwise ``load_local_model``'s. **There is no fallback in either
+    direction**: a server that does not answer is a ``ServedError`` at the first
+    frame, never a model quietly loaded here, and a PC without the variable never
+    makes a call. What a served model cannot honour (``weights``, a ``device`` other
+    than ``auto``, a pre-processing other than the card's) is refused by its words
+    before any call, not ignored.
+
+    Raises:
+        ModelError: Whatever ``load_local_model`` or ``load_served`` raises.
     """
+    # What both places need first (inference.md §5 step 1): the cheap refusal of a
+    # pixel size the model is never given, before a file is looked for or a server asked.
+    _shown_to_the_model(
+        preprocessing, frame_shape_px=frame_shape_px, frame_um_per_px=frame_um_per_px
+    )
+    # Imported here, not at module level: `served` imports this module.
+    from smc.inference import served
+
+    address = os.environ.get(served.SERVER_ENV, "").strip()
+    if address:
+        return served.load_served(
+            card,
+            preprocessing=preprocessing,
+            frame_um_per_px=frame_um_per_px,
+            device=device,
+            score_threshold=score_threshold,
+            weights=weights,
+            address=address,
+        )
     return load_local_model(
         card,
         preprocessing=preprocessing,
