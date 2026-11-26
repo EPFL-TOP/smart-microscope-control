@@ -21,7 +21,8 @@ import pytest
 
 from select_fields_seed import CENTRES, matrix_of, seed_run
 from smc.data import load_scan
-from smc.plugins.geometry import Matrix2, pixel_of_stage
+from smc.plugins.geometry import Matrix2, pixel_of_stage, stage_of_pixel
+from smc.plugins.route.algorithm import _inverse_of
 from smc.plugins.slots import ScanFrame
 from smc.selection import SelectionError, SelectionInput, check_choices
 from smc.selection.low_mag_survey import (
@@ -29,6 +30,7 @@ from smc.selection.low_mag_survey import (
     LowMagSurvey,
     LowMagSurveyParams,
     WellSurvey,
+    _held,
     _merged,
     candidates_of,
     frame_scale_um_per_px,
@@ -575,6 +577,51 @@ def test_two_objects_of_one_frame_closer_than_the_merge_radius_are_both_kept() -
     )
     kept = _merged(objects, 5.0)
     assert sorted(kept[:, 0].tolist()) == [0.0, 3.0]
+
+
+def test_a_merge_radius_of_zero_keeps_every_frames_sighting() -> None:
+    # Two frames see one object at the same stage point. A radius of 0 (allowed by
+    # the params, ge=0) means no merging: both sightings stay, and nothing divides
+    # by the radius.
+    objects = np.array(
+        [
+            [120.0, -40.0, 9.0, -0.2, 0.0, 1.0],
+            [120.0, -40.0, 9.0, -0.2, 1.0, 2.0],
+        ]
+    )
+    kept = _merged(objects, 0.0)
+    assert kept.shape == (2, 6)
+
+
+def test_a_field_holds_its_width_along_its_columns_and_its_height_along_its_rows() -> (
+    None
+):
+    # FM-73: the 40x frame is not square (300 rows x 400 columns) and the camera is
+    # turned by 178.3 degrees. A point 180 px from the centre along the columns lies
+    # inside (180 < 400 / 2); the same distance along the rows lies outside
+    # (180 > 300 / 2). Swapping width and height swaps both answers.
+    height, width = 300, 400
+    centre_col, centre_row = (width - 1) / 2.0, (height - 1) / 2.0
+    along_cols = stage_of_pixel(
+        0.0,
+        0.0,
+        centre_col + 180.0,
+        centre_row,
+        matrix=IMAGING_MATRIX,
+        image_shape_px=(height, width),
+    )
+    along_rows = stage_of_pixel(
+        0.0,
+        0.0,
+        centre_col,
+        centre_row + 180.0,
+        matrix=IMAGING_MATRIX,
+        image_shape_px=(height, width),
+    )
+    dx = np.array([along_cols[0], along_rows[0]])
+    dy = np.array([along_cols[1], along_rows[1]])
+    held = _held(dx, dy, _inverse_of(IMAGING_MATRIX), width, height)
+    assert held.tolist() == [True, False]
 
 
 def test_the_selector_is_registered_by_name() -> None:
