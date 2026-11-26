@@ -11,8 +11,10 @@ read timeout of 0.3 s, and what is asserted is the kind.
 
 from __future__ import annotations
 
+import http.client
 import json
 import socket
+import ssl
 import threading
 import traceback
 from collections.abc import Callable, Iterator
@@ -383,3 +385,154 @@ def test_a_model_asked_for_by_name_runs_through_a_real_socket(
     # On the wire, not only on the fake: the keys of what a detect call sends.
     assert set(json.loads(server.requests[0][1])) == set()
     assert set(json.loads(server.requests[1][1])) == {"model", "image", "pixel_size_um"}
+
+
+# --- the connection, with `http.client` replaced: what no loopback server can show ---
+
+
+def _stub_connections(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    connect: BaseException | None = None,
+    request: BaseException | None = None,
+) -> list[dict[str, Any]]:
+    """Replace both connection classes by one that records how it was built and fails as told.
+
+    A refused loopback connection never reaches the connect timeout, and a plain loopback
+    server cannot speak TLS: what is checked here is how the wire builds a connection (the
+    class for the scheme, the timeout of the connect) and what it says of each failure.
+    """
+    built: list[dict[str, Any]] = []
+
+    def connection(tls: bool) -> type:
+        class Connection:
+            sock = None
+
+            def __init__(self, host: str, port: int, timeout: float) -> None:
+                built.append(
+                    {"tls": tls, "host": host, "port": port, "timeout": timeout}
+                )
+
+            def connect(self) -> None:
+                if connect is not None:
+                    raise connect
+
+            def request(self, *args: object, **kwargs: object) -> None:
+                if request is not None:
+                    raise request
+
+            def getresponse(self) -> object:
+                raise AssertionError("a response was asked for")
+
+            def close(self) -> None:
+                pass
+
+        return Connection
+
+    monkeypatch.setattr(http.client, "HTTPConnection", connection(False))
+    monkeypatch.setattr(http.client, "HTTPSConnection", connection(True))
+    return built
+
+
+@pytest.mark.parametrize(
+    ("address", "tls"),
+    [
+        ("http://gpu-box.lab.test:48151", False),
+        ("https://gpu-box.lab.test:48151", True),
+    ],
+)
+def test_the_scheme_picks_the_connection_and_the_connect_has_its_own_timeout(
+    monkeypatch: pytest.MonkeyPatch, address: str, tls: bool
+) -> None:
+    built = _stub_connections(monkeypatch, connect=TimeoutError("timed out"))
+
+    with pytest.raises(ServedError) as caught:
+        HttpWire(address).post("/models/process", {}, read_timeout_s=7.0)
+
+    # TLS for https and never for http; the host and port as written, the connect
+    # timeout and not the call's read timeout and not none (FM-31).
+    assert built == [
+        {
+            "tls": tls,
+            "host": "gpu-box.lab.test",
+            "port": 48151,
+            "timeout": served.CONNECT_TIMEOUT_S,
+        }
+    ]
+    # No answer within the connect timeout is "unreachable" (nobody is there), not the
+    # read timeout's "timeout".
+    assert caught.value.kind == "unreachable"
+    assert "no connection within 3 s" in str(caught.value)
+    shown = "".join(traceback.format_exception(caught.value))
+    assert "gpu-box" not in shown
+    assert "48151" not in shown
+
+
+def test_a_host_name_that_cannot_be_encoded_is_unreachable_and_not_a_raw_error() -> (
+    None
+):
+    # A label of more than 63 characters is a `UnicodeError` out of `getaddrinfo`,
+    # before any name is looked up: no network is touched.
+    wire = HttpWire("http://" + "a" * 64 + ".example:8000")
+
+    error = _error(wire)
+
+    assert error.kind == "unreachable"
+    assert "aaaa" not in str(error)
+
+
+def test_a_tls_failure_says_what_to_check_for_tls_and_not_to_start_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refusal = ssl.SSLCertVerificationError(
+        1,
+        "certificate verify failed: Hostname mismatch, not valid for 'gpu-box.lab.test'",
+    )
+    _stub_connections(monkeypatch, connect=refusal)
+
+    with pytest.raises(ServedError) as caught:
+        HttpWire("https://gpu-box.lab.test:48151").post(
+            "/models/process", {}, read_timeout_s=5.0
+        )
+
+    text = str(caught.value)
+    assert caught.value.kind == "unreachable"
+    assert "the TLS handshake failed" in text
+    assert "use http:// unless the server serves TLS" in text
+    # The server is running: the advice for a server that is not is the wrong one (FM-263).
+    assert "is smc serve-models running" not in text
+    # The certificate's own text names the host.
+    assert "gpu-box" not in text
+    # And not through the chain either: the original is dropped, not kept as the cause.
+    assert caught.value.__cause__ is None
+    assert caught.value.__suppress_context__
+
+
+def test_a_connection_that_breaks_says_the_server_was_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_connections(monkeypatch, request=BrokenPipeError(32, "Broken pipe"))
+
+    with pytest.raises(ServedError) as caught:
+        HttpWire("http://gpu-box.lab.test:48151").post(
+            "/models/process", {}, read_timeout_s=5.0
+        )
+
+    assert caught.value.kind == "unreachable"
+    assert "the connection broke" in str(caught.value)
+    assert "look at its console" in str(caught.value)
+    assert "is smc serve-models running" not in str(caught.value)
+
+
+def test_the_servers_own_text_is_printable_and_short(server: _Server) -> None:
+    server.reply = _answer(
+        500,
+        json.dumps({"message": "\x1b[31mred\x00\x07 and more"}).encode("ascii"),
+    )
+
+    text = str(_error(_wire(server)))
+
+    assert "\x1b" not in text
+    assert "\x00" not in text
+    assert "\x07" not in text
+    assert text.endswith("the server said:  [31mred   and more")

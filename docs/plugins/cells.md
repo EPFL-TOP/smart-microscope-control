@@ -186,10 +186,18 @@ local:cpu`).
 
 **Timeouts.** Every call has one: 3 s to connect, 10 s for the check, 60 s for a detect
 call (a CPU takes 0.5 to 0.8 s a frame, and a cold first call loads kernels).
-`SMC_MODEL_TIMEOUT_S` sets the last, in seconds above 0 (blank is unset; anything else
-is refused). A proxy in the environment is never used. The 60 s is an assumption: the
-cost of a call on the lab's network is measured by the deployment note (#686), which
-sets it for good.
+`SMC_MODEL_TIMEOUT_S` sets the last, in seconds above 0 and at most a day (blank is
+unset; anything else is refused). A proxy in the environment is never used. The 60 s is
+an assumption: the cost of a call on the lab's network is measured by the deployment note
+(#686), which sets it for good. Each timeout bounds **one wait on the socket**, not the
+whole call, and the connect's does not cover looking the name up: **write the address with
+an IP** (`http://192.0.2.10:8000`), not a short host name (a Windows PC may take seconds to
+fail to resolve it) and not `localhost` for a server on the same PC (it resolves to `::1`
+first, the server listens on `127.0.0.1`, and a refused connection on Windows takes about
+2 s, paid at every call). Do not put quotes in the variable (`set SMC_MODEL_SERVER=http://...`
+in cmd.exe, `$env:SMC_MODEL_SERVER = "http://..."` in PowerShell, which keeps no quotes in
+the value): cmd.exe keeps them, and the address is then refused. While a call waits,
+Ctrl-C and STOP wait for it, up to the timeout (a hung server holds the stage for 60 s).
 
 **What the result records.** `model_runs_on` is `served` (and `model_identity` the
 card's), `device` is the server's, as it said it (`unknown` for a run that never got an

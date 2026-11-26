@@ -1970,8 +1970,9 @@ def test_a_served_run_says_its_timings_in_assumed(
     demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed_scan(tmp_path)
-    # Four detects: the first lasts 2.31 s, the next three 0.12 s each.
-    ticks = iter([0.0, 2.31, 10.0, 10.12, 20.0, 20.12, 30.0, 30.12])
+    # Four detects: the first lasts 2.31 s, the next three 0.10, 0.20 and 0.30 s: their
+    # mean is 0.20, which the maximum (0.30), the minimum (0.10) and the last (0.30) are not.
+    ticks = iter([0.0, 2.31, 10.0, 10.10, 20.0, 20.20, 30.0, 30.30])
     monkeypatch.setattr(
         plugin_mod, "time", SimpleNamespace(perf_counter=lambda: next(ticks))
     )
@@ -1980,7 +1981,7 @@ def test_a_served_run_says_its_timings_in_assumed(
 
     assert (
         "the model ran on the server: the first frame took 2.31 s and the next 3 "
-        "frames 0.12 s on average, network included (the first can carry the "
+        "frames 0.20 s on average, network included (the first can carry the "
         "server's start-up work); the server's device was cuda"
     ) in _result(record).assumed
 

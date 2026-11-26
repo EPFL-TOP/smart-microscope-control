@@ -883,3 +883,95 @@ def test_the_check_is_logged_without_the_address(
     assert "does not answer" in bad.getMessage()
     for part in HOST_AND_PORT:
         assert part not in caplog.text
+
+
+# --- what review of #685 found: a size no model is given, what the server says, huge numbers ---
+
+
+def test_a_pixel_size_the_model_is_never_given_is_refused_before_the_server_is_asked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The shared first step of `load_model` (inference.md §5 step 1): a sized rule on a
+    # frame whose pixel size is unknown cannot be shown to the model, whichever place
+    # would run it, and is refused before a call is made.
+    sized = ModelPreprocessing(percentiles=(0.5, 99.5), model_um_per_px=0.5)
+    card = CARD.model_copy(update={"preprocessing": sized})
+    fake = FakeModelServer(
+        {
+            card.name: stub_model(
+                _stub(), name=card.name, weights_sha256=SHA, preprocessing=sized
+            )
+        }
+    )
+    fake.install(monkeypatch)
+
+    with pytest.raises(ModelError) as caught:
+        load_model(
+            card,
+            preprocessing=sized,
+            frame_shape_px=SHAPE,
+            frame_um_per_px=0.0,
+            device="auto",
+            score_threshold=0.5,
+        )
+
+    assert "model_um_per_px=0.5 cannot be used" in str(caught.value)
+    assert fake.calls == []
+
+
+def test_what_the_server_says_of_itself_is_printable_and_short_in_a_message() -> None:
+    # A name, a device and an identity are the server's words, and reach the console and
+    # the run folder: an escape sequence or a very long name is cleaned and cut.
+    noisy = "\x1b[31m" + "n" * 200
+    wire = _Doctored(
+        encode_listing(
+            [
+                ServedModel(noisy, IDENTITY, CARD.classes, "cuda"),
+                ServedModel(CARD.name, IDENTITY, CARD.classes, "cu\x1b[0mda\x00"),
+            ]
+        )
+    )
+
+    good = check_served(wire, CARD)
+    other = check_served(
+        _Doctored(encode_listing([ServedModel(noisy, IDENTITY, CARD.classes, "cuda")])),
+        CARD,
+    )
+
+    assert good.ok
+    assert "\x1b" not in good.message
+    assert "\x00" not in good.message
+    assert "\x1b" not in (good.device or "")
+    assert "\x1b" not in other.message
+    # Cut at 64 characters, the escape's own replaced by a space.
+    assert "n" * 64 not in other.message
+    assert "n" * 40 in other.message
+
+
+def test_an_integer_too_large_for_a_float_is_malformed_not_an_overflow() -> None:
+    text = (
+        '{"schema": 1, "model": "m", "identity": "i", "device": "d", '
+        '"detections": [[1, 2, 3, 4, "single", 1' + "0" * 400 + "]]}"
+    )
+
+    with pytest.raises(ServedError) as caught:
+        decode_answer(text)
+
+    assert caught.value.kind == "malformed"
+
+
+def test_a_timeout_longer_than_a_day_is_refused_with_its_own_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `sock.settimeout(1e10)` raises OverflowError at the first call, with a text that
+    # names no variable; a day is the longest wait accepted.
+    fake = _fake()
+    monkeypatch.setenv(TIMEOUT_ENV, "86400")
+    assert _detector(fake, monkeypatch).detect(_frame())
+    assert _detect_calls(fake)[-1].read_timeout_s == 86400.0
+
+    for too_long in ("86401", "1e10", "1e300"):
+        monkeypatch.setenv(TIMEOUT_ENV, too_long)
+        with pytest.raises(ModelError) as caught:
+            _load(fake, monkeypatch)
+        assert str(caught.value) == f"{TIMEOUT_ENV} is longer than a day (86400 s)"

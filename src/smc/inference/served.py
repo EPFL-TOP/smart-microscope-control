@@ -92,6 +92,9 @@ CHECK_TIMEOUT_S = 10.0
 DETECT_TIMEOUT_S = 60.0
 #: A listing or an answer is a few kB; more than this is not the server's.
 MAX_ANSWER_BYTES = 4 * 1024 * 1024
+#: The longest ``SMC_MODEL_TIMEOUT_S`` accepted: a day. A larger one overflows the socket's
+#: own timeout on some platforms, and no call is waited for that long.
+_MAX_TIMEOUT_S = 24 * 3600.0
 #: The version of the two documents below; a server of another one is "malformed".
 SCHEMA = 1
 
@@ -165,12 +168,28 @@ class ModelWire(Protocol):
 # --- the errors, worded once so that the client and the fake cannot drift ---------
 
 
-def unreachable(reason: str) -> ServedError:
-    """The server cannot be reached: ``reason`` is the stack's own words, never the address."""
+#: What to check when nobody answers: the server is not running, or the address is wrong.
+_ADVICE_NO_ANSWER = (
+    f"is smc serve-models running there, and is {SERVER_ENV} its address?"
+)
+#: A TLS failure with a server that is running: the cure is the scheme or the certificate.
+_ADVICE_TLS = (
+    "use http:// unless the server serves TLS, and https:// only with a "
+    "certificate this PC trusts"
+)
+#: A connection that was made and then broke: the server is there, and probably restarted.
+_ADVICE_BROKE = "the server was reached and ended the call: look at its console"
+
+
+def unreachable(reason: str, *, advice: str = _ADVICE_NO_ANSWER) -> ServedError:
+    """The server cannot be reached: ``reason`` is the stack's own words, never the address.
+
+    ``advice`` is the cure for that reason: the same sentence for a TLS handshake that
+    failed against a server that is running, and for a connection that was refused,
+    would send the operator to the wrong place (FM-263).
+    """
     return ServedError(
-        "unreachable",
-        f"the model server does not answer ({reason}); is smc serve-models "
-        f"running there, and is {SERVER_ENV} its address?",
+        "unreachable", f"the model server does not answer ({reason}); {advice}"
     )
 
 
@@ -347,7 +366,11 @@ def _number(value: object, what: str, key: str) -> float:
     """A finite number: a ``bool`` is not one, and ``1e999`` reads as infinity."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise _malformed(what, f"{key} is not a number")
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        # An integer of more than 308 digits: JSON allows it, a float cannot hold it.
+        raise _malformed(what, f"{key} is not finite") from None
     if not math.isfinite(number):
         raise _malformed(what, f"{key} is not finite")
     return number
@@ -547,7 +570,12 @@ class HttpWire:
         except (OSError, ValueError) as exc:
             # A ValueError is a host name that cannot be encoded (a label over 63
             # characters is a `UnicodeError`).
-            raise unreachable(_os_reason(exc)) from None
+            raise unreachable(
+                _os_reason(exc),
+                advice=_ADVICE_TLS
+                if isinstance(exc, ssl.SSLError)
+                else _ADVICE_NO_ANSWER,
+            ) from None
         if connection.sock is not None:
             connection.sock.settimeout(read_timeout_s)
         try:
@@ -565,9 +593,11 @@ class HttpWire:
         except TimeoutError:
             raise timed_out(read_timeout_s) from None
         except http.client.RemoteDisconnected:
-            raise unreachable("the server closed the connection") from None
+            raise unreachable(
+                "the server closed the connection", advice=_ADVICE_BROKE
+            ) from None
         except (OSError, http.client.HTTPException):
-            raise unreachable("the connection broke") from None
+            raise unreachable("the connection broke", advice=_ADVICE_BROKE) from None
         if response.status != 201:
             # Whatever the body is: a body over the limit is not parsed for its text.
             parsed: object = None
@@ -809,6 +839,10 @@ def _detect_timeout_s() -> float:
         raise ModelError(refusal) from None
     if not (math.isfinite(seconds) and seconds > 0.0):
         raise ModelError(refusal)
+    if seconds > _MAX_TIMEOUT_S:
+        # `sock.settimeout(1e10)` raises OverflowError on a call, with a text that
+        # names no variable: refused here, with the one that does.
+        raise ModelError(f"{TIMEOUT_ENV} is longer than a day ({_MAX_TIMEOUT_S:g} s)")
     return seconds
 
 

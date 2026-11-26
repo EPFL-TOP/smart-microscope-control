@@ -3147,8 +3147,14 @@ def serve_models_command(
             raise typer.Exit(code=_EXIT_REFUSED) from None
         # Before a model is loaded: a model is seconds of torch and 166 MB, and a
         # server that cannot bind is found out after all of it (FM-144, FM-150).
-        if _port_is_taken_on(host, port):
+        taken, bindable = _probe_port(host, port)
+        if taken:
             _fail(f"port {port} is in use; choose another with --port")
+            raise typer.Exit(code=_EXIT_REFUSED)
+        if bindable == 0:
+            # The host resolves, and no address of it is this PC's: another machine's
+            # address, or a typo. uvicorn would find out after the models were loaded.
+            _fail(f"{host} is not an address of this PC; choose another with --host")
             raise typer.Exit(code=_EXIT_REFUSED)
         try:
             server, notes = serving.prepare(model or None, device=device)
@@ -3193,6 +3199,18 @@ def _port_is_taken_on(host: str, port: int) -> bool:
     other holds. A host that does not resolve holds nothing (the command says so before
     it asks); ``localhost`` that does not resolve is the IPv4 loopback.
     """
+    return _probe_port(host, port)[0]
+
+
+def _probe_port(host: str, port: int) -> tuple[bool, int]:
+    """Whether ``<host>:<port>`` is held, and how many of its addresses this PC could bind.
+
+    The second number tells a host that is not an address of this PC (every address of it
+    cannot be bound here: ``EADDRNOTAVAIL``, or ``EAFNOSUPPORT`` for IPv6 on a PC with
+    none) from a free port: the first is skipped as no taken port (FM-150), and a server
+    that cannot bind any address would load its models and then fail (FM-144).
+    """
+    bindable = 0
     try:
         found = socket.getaddrinfo(
             host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
@@ -3210,8 +3228,9 @@ def _port_is_taken_on(host: str, port: int) -> bool:
         except OSError as exc:
             if exc.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
                 continue
-            return True
-    return False
+            return True, bindable
+        bindable += 1
+    return False, bindable
 
 
 def main() -> None:

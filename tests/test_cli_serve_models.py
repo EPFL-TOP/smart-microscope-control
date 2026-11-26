@@ -117,19 +117,80 @@ def test_a_held_port_is_refused_before_any_model_is_loaded(stand: _Stand) -> Non
     assert "serve" not in stand.calls
 
 
-def test_a_port_held_on_ipv6_only_is_refused_for_localhost(stand: _Stand) -> None:
-    # `localhost` is two addresses on most hosts (FM-150): a probe of one passes it.
+def _two_addresses(port: int, order: str) -> list[tuple[Any, ...]]:
+    """What ``getaddrinfo("localhost")`` answers on a host that has both loopbacks, in either order."""
+    v6 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0))
+    v4 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))
+    return [v6, v4] if order == "v6-first" else [v4, v6]
+
+
+@pytest.mark.parametrize("order", ["v6-first", "v4-first"])
+@pytest.mark.parametrize(
+    "family", [socket.AF_INET, socket.AF_INET6], ids=["held-on-v4", "held-on-v6"]
+)
+def test_a_port_held_on_any_address_of_the_host_is_refused_whichever_comes_first(
+    monkeypatch: pytest.MonkeyPatch, stand: _Stand, family: int, order: str
+) -> None:
+    # `localhost` is two addresses on most hosts (FM-150): a probe of one passes a
+    # port the other holds. The answer of the resolver is the test's own, so that
+    # neither the order a host lists its loopbacks in nor its having IPv6 decides.
     try:
-        held = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        held.bind(("::1", 0))
+        held = socket.socket(family, socket.SOCK_STREAM)
+        held.bind(("127.0.0.1" if family == socket.AF_INET else "::1", 0))
     except OSError:
-        pytest.skip("this host has no IPv6 loopback")
+        pytest.skip("this host cannot bind that loopback")
     with held:
         port = held.getsockname()[1]
+        monkeypatch.setattr(
+            socket, "getaddrinfo", lambda *a, **k: _two_addresses(port, order)
+        )
+        assert cli._port_is_taken_on("localhost", port)
         result = _serve("--host", "localhost", "--port", str(port))
 
     assert result.exit_code == 2, result.output
+    assert f"✗ port {port} is in use; choose another with --port" in result.output
     assert "prepare" not in stand.calls
+
+
+def test_a_host_that_is_not_an_address_of_this_pc_is_refused_before_any_model_is_loaded(
+    monkeypatch: pytest.MonkeyPatch, stand: _Stand
+) -> None:
+    # It resolves (it is somebody's address), and no address of it can be bound here:
+    # uvicorn would say so after 166 MB of weights were loaded.
+    def make(
+        family: int = -1, kind: int = -1, proto: int = -1, fileno: Any = None
+    ) -> Any:
+        raise OSError(errno.EADDRNOTAVAIL, "Cannot assign requested address")
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *a, **k: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", 8000))
+        ],
+    )
+    monkeypatch.setattr(socket, "socket", make)
+
+    result = _serve("--host", "192.0.2.1", "--port", "8000")
+
+    assert result.exit_code == 2, result.output
+    assert (
+        "✗ 192.0.2.1 is not an address of this PC; choose another with --host"
+        in result.output.splitlines()
+    )
+    assert "prepare" not in stand.calls
+
+
+def test_a_free_port_counts_the_addresses_that_could_be_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _free_port()
+    v4 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [v4, v4])
+
+    assert cli._probe_port("localhost", port) == (False, 2)
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [])
+    assert cli._probe_port("localhost", port) == (False, 0)
 
 
 def test_an_address_this_host_cannot_bind_is_not_a_taken_port(
@@ -238,7 +299,7 @@ def test_a_host_that_is_not_loopback_warns(
     # The resolver and the probe are not the test's subject here: an address that
     # cannot be bound, or a name that does not resolve, must not decide whether the
     # warning is printed.
-    monkeypatch.setattr(cli, "_port_is_taken_on", lambda host, port: False)
+    monkeypatch.setattr(cli, "_probe_port", lambda host, port: (False, 1))
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [])
 
     result = _serve("--host", host, "--port", "8000")
