@@ -9139,7 +9139,7 @@ do), on a stand that is **not** in dry run, the demo stage's `Velocity` raised t
 - **D6 `fields_from` stays in the expert view.** #637 (PR #697) lists `scan-plan`'s `fields_from` under
   *Advanced*, as it lists `calibration`. The guided Wells screen does not offer it here: a selection
   worth planning the 40× from is #636's work, and the Wells screen's choice between the whole wells
-  and a selection's fields is an issue of its own, filed with this plan.
+  and a selection's fields is #699, filed with this plan.
 - **D7 The walk is a test, and a page at the stand.** `tests/test_plate_page_forty_walk_demo.py` walks
   §25.1's first item through the view's handlers, not in dry run, with a throwaway selector registered
   in place of the installed ones (as `test_plate_page_algorithms_demo.py` does) and one of its
@@ -9221,7 +9221,8 @@ whatever the objective: the tool's checks decide).
 
 - It does not run detection while the scan goes (#635), draw 2544 fields at working size (#680),
   choose the channel (#633) or a condenser (#628), or measure the offset between the objectives (#548).
-- It does not lay out the 40× from a selection on the guided screens (D6), nor time a map scan (D5).
+- It does not lay out the 40× from a selection on the guided screens (D6, #699), nor time a map scan
+  (D5).
 - It does not decide #667: until then `/ui-check` photographs the new Scan-screen lines at the 10×
   (`cell_focus` typed `map` on a dry-run page: `FOCUS_MAP_NONE`), not the 40×.
 - It keeps one focus map: a 10× scan of other wells replaces the map of the first, and the scan's
