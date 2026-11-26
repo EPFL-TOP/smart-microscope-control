@@ -61,7 +61,7 @@ from smc.plugins.slots.scan import (
     ScanResult,
     load_frame,
 )
-from smc.plugins.slots.scan_plan import PlannedField, ScanPlanResult
+from smc.plugins.slots.scan_plan import PlannedField, PlanSelection, ScanPlanResult
 from smc.plugins.slots.timings import TimingsResult
 
 __all__ = [
@@ -88,6 +88,7 @@ __all__ = [
     "ObjectiveOffsetsResult",
     "OffsetFromFocus",
     "OffsetWell",
+    "PlanSelection",
     "PlannedField",
     "PlateCheck",
     "PlateCheckResult",

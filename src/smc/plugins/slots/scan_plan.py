@@ -12,8 +12,10 @@ from typing import Any, Literal
 import useq
 from pydantic import (
     Field,
+    SerializerFunctionWrapHandler,
     ValidatorFunctionWrapHandler,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -21,17 +23,62 @@ from smc.plugins.api import PluginResult
 from smc.plugins.geometry import Matrix2
 from smc.plugins.slots.base import SlotValue, refuse_dropped_keys, refuse_non_finite
 
-__all__ = ["PlannedField", "ScanPlanResult"]
+__all__ = ["PlanSelection", "PlannedField", "ScanPlanResult"]
 
 
 class PlannedField(SlotValue):
-    """One image position to take: a field of a well, by useq's name (``A1_0003``)."""
+    """One image position to take: a field of a well, by useq's name (``A1_0003``).
+
+    ``stop`` is the name of the route stop the field came from when the plan is a
+    selection's (m3 §28.3): what a later reader follows back to the choice that
+    put the field there. ``None`` for a field of a grid.
+    """
 
     well: str
     index: int = Field(ge=0)
     name: str
     x_um: float
     y_um: float
+    stop: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _leave_out_a_stop_not_given(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # A field of a grid is written exactly as before ``stop`` existed, so an
+        # older smc still reads the plan: its model refuses a key it does not
+        # know (FM-107), as ``RoutePosition``'s optional fields are left out.
+        data: dict[str, Any] = handler(self)
+        if self.stop is None:
+            data.pop("stop", None)
+        return data
+
+
+class PlanSelection(SlotValue):
+    """Where the fields of a plan from a selection came from (m3 §28.3).
+
+    The fields are the stops of a ``route`` read from another run document,
+    each moved by ``shift_um`` from the frame of ``source_objective`` (the
+    objective of the scan the selection was made on) to the plan's. ``run_doc``
+    is ``fields_from`` as typed, with forward slashes and never resolved (FM-24,
+    FM-50), so the plan reads the same on every machine; ``measured`` is the
+    route record's ``finished_utc`` to the second, or ``at an unknown time``.
+    ``shift_um`` is ``None`` when no offset between the objectives could be
+    applied: the fields are then the selection's positions, uncorrected, and
+    ``assumed`` says so. ``wells_without_fields`` are named wells the selection
+    left without a stop (left out of the plan, so the scan never meets a planned
+    well with no field), and ``fields_left_out`` counts the stops of wells the
+    plan did not name.
+    """
+
+    run_doc: str
+    route_attempt: str
+    measured: str
+    selector: str
+    source_objective: str | None
+    shift_um: tuple[float, float] | None
+    wells_without_fields: tuple[str, ...]
+    fields_left_out: int = Field(ge=0)
 
 
 class ScanPlanResult(PluginResult):
@@ -74,6 +121,13 @@ class ScanPlanResult(PluginResult):
     when the matrix is not from another document (the document's own
     calibration, the profile's size or a parameter), and in every document
     written before they existed.
+
+    ``selection`` says where the fields came from when they are the stops a
+    ``route`` of another run document chose (``scan-plan``'s ``fields_from``, m3
+    §28): the plan then has no grid (``rows`` and ``columns`` are 1, ``overlap``
+    is 0, ``plate_plan`` holds one ``RelativePosition`` at each well's centre)
+    and ``fields`` is the truth, as for every plan. ``None`` for a grid plan,
+    which is written as before the field existed.
     """
 
     plate_plan: useq.WellPlatePlan
@@ -94,6 +148,19 @@ class ScanPlanResult(PluginResult):
     objective_shift_um: tuple[float, float] | None = None
     calibration_from: str | None = None
     calibration_measured: str | None = None
+    selection: PlanSelection | None = None
+
+    @model_serializer(mode="wrap")
+    def _leave_out_a_selection_not_given(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # A grid plan is written byte for byte as before ``selection`` existed,
+        # so an older smc still reads it (FM-107), as ``ScanResult`` leaves out
+        # a check it did not make.
+        data: dict[str, Any] = handler(self)
+        if self.selection is None:
+            data.pop("selection", None)
+        return data
 
     @model_validator(mode="after")
     def _the_figure_without_the_autofocus_is_not_above_the_figure_with_it(

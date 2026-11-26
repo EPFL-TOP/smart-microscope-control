@@ -47,6 +47,7 @@ from smc.plugins.slots import (
     OffsetFromFocus,
     OffsetWell,
     PlannedField,
+    PlanSelection,
     PlateCheck,
     PlateCheckResult,
     PlateResult,
@@ -152,6 +153,17 @@ _PLANNED = {
     "name": "A1_0003",
     "x_um": 1100.5,
     "y_um": -990.25,
+}
+_PLANNED_STOP = {**_PLANNED, "stop": "A1-07"}
+_SELECTION: dict[str, Any] = {
+    "run_doc": "runs/run-10x.json",
+    "route_attempt": "0123456789ab",
+    "measured": "2026-11-26T08:15:02+00:00",
+    "selector": "low-mag-survey",
+    "source_objective": "Nikon 10X Plan Fluor",
+    "shift_um": [-37.5, 12.25],
+    "wells_without_fields": ["C4"],
+    "fields_left_out": 3,
 }
 _PLATE_PLAN = useq.WellPlatePlan(
     plate=useq.WellPlate.from_str("96-well"),
@@ -524,9 +536,19 @@ SAMPLES: dict[type[BaseModel], Sample] = {
             "reused_from": None,
         },
     ),
-    PlannedField: (_PLANNED, _PLANNED),
+    PlannedField: (_PLANNED_STOP, _PLANNED),
+    PlanSelection: (
+        _SELECTION,
+        {
+            **_SELECTION,
+            "source_objective": None,
+            "shift_um": None,
+            "wells_without_fields": [],
+            "fields_left_out": 0,
+        },
+    ),
     ScanPlanResult: (
-        _SCAN_PLAN,
+        {**_SCAN_PLAN, "fields": [_PLANNED_STOP], "selection": _SELECTION},
         {
             **_SCAN_PLAN,
             "objective": None,
@@ -818,6 +840,7 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (CameraCalibration, ("return_error_um",), [-0.1], [0.0]),
     (CameraCalibration, ("step_um",), [0.0, -1.0], [1e-6]),
     (PlannedField, ("index",), [-1], [0]),
+    (PlanSelection, ("fields_left_out",), [-1], [0]),
     (ScanPlanResult, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
     (ScanPlanResult, ("overlap",), [-0.1, 1.0, 1.5], [0.0, 0.999]),
     (ScanPlanResult, ("rows",), [0, -1], [1]),
@@ -931,6 +954,8 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (CameraCalibration, ("return_error_um",)),
     (ScanPlanResult, ("objective",)),
     (ScanPlanResult, ("estimate_s",)),
+    (PlanSelection, ("source_objective",)),
+    (PlanSelection, ("shift_um",)),
     (ScanFrame, ("z_um",)),
     (ScanFrame, ("pfs_offset",)),
     (ScanResult, ("objective",)),
@@ -1740,6 +1765,7 @@ SLOTS_MAP = {
     "ObjectiveOffsetsResult",
     "OffsetFromFocus",
     "OffsetWell",
+    "PlanSelection",
     "PlannedField",
     "PlateCheck",
     "PlateCheckResult",
@@ -1820,3 +1846,30 @@ def test_a_plate_given_by_name_is_not_a_dropped_key() -> None:
     sample["plate_plan"]["plate"] = "96-well"
     loaded = ScanPlanResult.model_validate(sample)
     assert loaded.plate_plan.plate.name == "96-well"
+
+
+# --- a plan from a selection (m3 §28.3) ---------------------------------------------
+
+
+def test_a_grid_plan_dumps_no_selection_and_no_stop_key() -> None:
+    # FM-107: an older smc refuses a key it does not know, so a grid plan must be
+    # written exactly as before the two fields existed.
+    dumped = ScanPlanResult.model_validate(_SCAN_PLAN).model_dump(mode="json")
+    assert "selection" not in dumped
+    assert [sorted(field) for field in dumped["fields"]] == [sorted(_PLANNED)]
+    assert "stop" not in dumped["fields"][0]
+    # And the JSON text is the one written before: the keys in the same order.
+    assert list(dumped) == list(_SCAN_PLAN)
+
+
+def test_a_plan_dump_without_selection_or_stop_loads() -> None:
+    loaded = ScanPlanResult.model_validate(_SCAN_PLAN)
+    assert loaded.selection is None
+    assert loaded.fields[0].stop is None
+    chosen = ScanPlanResult.model_validate(
+        {**_SCAN_PLAN, "fields": [_PLANNED_STOP], "selection": _SELECTION}
+    )
+    dumped = chosen.model_dump(mode="json")
+    assert dumped["selection"] == _SELECTION
+    assert dumped["fields"][0]["stop"] == "A1-07"
+    assert ScanPlanResult.model_validate(dumped) == chosen
