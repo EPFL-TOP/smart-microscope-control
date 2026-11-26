@@ -5484,6 +5484,8 @@ def test_tools_follow_the_workflow_order_and_hide_what_the_page_fills(
         "clip_to_well",
         "pixel_size_um",
         "calibration",
+        # A typed path, as calibration; choosing it on the page is #634.
+        "fields_from",
     ]
     registration = by_name["plate-registration"]
     registration_rows = {row[0] for row in (*registration.key, *registration.advanced)}

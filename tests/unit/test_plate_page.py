@@ -345,6 +345,7 @@ def test_the_page_builds_every_tool_the_registry_holds_in_workflow_order(
         "clip_to_well",
         "pixel_size_um",
         "calibration",
+        "fields_from",
     ]
     assert "wells" not in view.tool_fields["scan-plan"]
     # `orientation` is the page's *Plate lies* choice (m5 §16 D5), never a field.
