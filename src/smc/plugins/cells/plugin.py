@@ -1,21 +1,25 @@
 """``cells`` detects single and doublet cells on a scan's frames and counts each once (m3 §9.3).
 
 The pure part (suppression, pixels to stage µm, the merge across fields) is
-``algorithm.py`` and the model is ``detector.py``. This is the loop around them,
-and the decisions in it that keep a long run from losing or faking its work:
+``algorithm.py`` and the model is ``smc.inference``'s: a name that a card gives
+the weights, the classes and the pre-processing of (inference.md §6). This is
+the loop around them, and the decisions in it that keep a long run from losing
+or faking its work:
 
 * **A well is the unit of work.** The cells of the wells done go to a partial
   file *before* the checkpoint names the well, so a crash between the two leaves
   a file that has more than the checkpoint says, never less. A resume keeps the
   cells of the wells the checkpoint names and drops the rest.
-* **The weights are part of the result.** Their SHA-256 is in the checkpoint
-  and in the result, and a resume with other weights is refused: cells of two
-  models are not one result (FM-111). The result names the weights' file, never
-  its path, since run documents are attached to issues (FM-50). The parameter
-  ``model_path`` is the one place a path is recorded, as given, like every
-  parameter: ``SMC_MODELS`` is not recorded anywhere. ``detector=blobs`` (#260)
-  has no file: the SHA-256 of its identity string stands for it, and the result
-  says that its counts are spots, not cells.
+* **The model is part of the result.** Its identity, the weights' SHA-256 and a
+  digest of the pre-processing the run applied, is in the checkpoint and in the
+  result, and a resume with another identity is refused, naming the half that
+  changed: cells of two models are not one result (FM-111). The result names the
+  model by its card's name, never a path, since run documents are attached to
+  issues (FM-50). The parameter ``model_path`` is the one place a path is
+  recorded, as given, like every parameter: ``SMC_MODELS`` is not recorded
+  anywhere. ``detector=blobs`` (#260) has no file: the SHA-256 of its identity
+  string stands for it, and the result says that its counts are spots, not
+  cells.
 * **A frame is checked before it is detected on.** The matrix of the scan is
   only right on the scan's own frame shape (FM-73), and a missing, corrupt or
   foreign frame is told by its file name with what to do.
@@ -27,7 +31,6 @@ and the decisions in it that keep a long run from losing or faking its work:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -38,22 +41,22 @@ import numpy.typing as npt
 import tifffile
 from pydantic import BaseModel, Field, model_validator
 
+from smc.inference import (
+    DEFAULT_MODEL_NAME,
+    ModelCard,
+    ModelError,
+    ModelPreprocessing,
+    ResolvedModel,
+    load_model,
+    model_card,
+)
+from smc.inference.blobs import blob_model
+from smc.inference.preprocessing import DEFAULT_PREPROCESSING
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.cells.algorithm import (
     merge_across_fields,
     suppress_in_frame,
     to_cells,
-)
-from smc.plugins.cells.detector import (
-    BLOB_DETECTOR,
-    BLOB_DETECTOR_IDENTITY,
-    DEFAULT_PREPROCESSING,
-    BlobDetector,
-    Detector,
-    Preprocessing,
-    default_model_path,
-    load_detector,
-    model_input_size_px,
 )
 from smc.plugins.errors import PluginRunError
 from smc.plugins.slots import (
@@ -78,8 +81,6 @@ if TYPE_CHECKING:
 __all__ = ["CellsCheckpoint", "CellsParams", "CellsPlugin"]
 
 _NAME = "cells"
-#: The weights are hashed in pieces of this size: 166 MB are not read at once.
-_HASH_CHUNK_BYTES = 1 << 20
 #: What the result says of a run of the blob detector: a count of spots is not a
 #: count of cells, and a report that quotes it must say where it came from.
 _BLOB_ASSUMED = (
@@ -87,8 +88,9 @@ _BLOB_ASSUMED = (
     "round spots for the synthetic plate of the demo-sample profile; on a real "
     "sample its counts are not cells",
 )
-#: What the model was trained with (``normalize_plane``'s defaults), as the parameters'
-#: defaults: a stand that sets none of them gets the model as it was trained.
+#: What the model was trained with (``normalize_plane``'s defaults): the one pair of
+#: percentiles a run of the blob detector may write out, since it has none of its own
+#: and a run document recorded before #684 holds them for every run.
 _TRAINED_LOW_PERCENTILE = DEFAULT_PREPROCESSING.percentiles[0]
 _TRAINED_HIGH_PERCENTILE = DEFAULT_PREPROCESSING.percentiles[1]
 #: A scan whose pixel size is further than this, relative to the checked one, from the
@@ -107,11 +109,19 @@ class CellsParams(PluginParams):
             "sample its counts are not cells."
         ),
     )
+    model: str | None = Field(
+        None,
+        description=(
+            "The model, by the name of its card in src/smc/inference/cards/ "
+            f"(unset is {DEFAULT_MODEL_NAME}): its weights, classes and "
+            "pre-processing. Refused with detector=blobs."
+        ),
+    )
     model_path: Path | None = Field(
         None,
         description=(
-            "The weights; default local/models/cell_classes_model-cat-v2.pth of "
-            "the checkout, or that file in $SMC_MODELS."
+            "The weights, in place of the card's file in $SMC_MODELS (or in "
+            "local/models of the checkout); its SHA-256 must be the card's."
         ),
     )
     device: Literal["auto", "cpu", "cuda", "mps"] = Field(
@@ -144,26 +154,29 @@ class CellsParams(PluginParams):
         le=10.0,
         description=(
             "The pixel size the model sees, in µm: each frame is resized to it (the "
-            "frame's pixel size over this one). Unset keeps the model's own resize "
-            "(800 px). Refused with detector=blobs."
+            "frame's pixel size over this one). Unset is the card's, which keeps "
+            "the model's own resize (800 px) for cell-classes-v2. Refused with "
+            "detector=blobs."
         ),
     )
-    low_percentile: float = Field(
-        _TRAINED_LOW_PERCENTILE,
+    low_percentile: float | None = Field(
+        None,
         ge=0.0,
         lt=50.0,
         description=(
-            "The intensity at this percentile of a frame is black for the model, as "
-            "it was trained (0.5). Refused with detector=blobs unless it is 0.5."
+            "The intensity at this percentile of a frame is black for the model. "
+            "Unset is the card's (0.5 for cell-classes-v2, as it was trained). "
+            "Refused with detector=blobs unless it is 0.5."
         ),
     )
-    high_percentile: float = Field(
-        _TRAINED_HIGH_PERCENTILE,
+    high_percentile: float | None = Field(
+        None,
         gt=50.0,
         le=100.0,
         description=(
-            "The intensity at this percentile of a frame is white for the model, as "
-            "it was trained (99.5). Refused with detector=blobs unless it is 99.5."
+            "The intensity at this percentile of a frame is white for the model. "
+            "Unset is the card's (99.5 for cell-classes-v2, as it was trained). "
+            "Refused with detector=blobs unless it is 99.5."
         ),
     )
     checked_um_per_px: float | None = Field(
@@ -186,6 +199,11 @@ class CellsParams(PluginParams):
         # The same goes for what only the model has: a resize, percentiles that
         # scale its input, and a pixel size it was checked at.
         if self.detector == "blobs":
+            if self.model is not None:
+                raise ValueError(
+                    "model is for detector=model: the blob detector is not a named "
+                    "model; remove model, or use detector=model"
+                )
             if self.model_path is not None:
                 raise ValueError(
                     "model_path is for detector=model: the blob detector has no "
@@ -208,13 +226,22 @@ class CellsParams(PluginParams):
                     "not a trained model that was checked; remove "
                     "checked_um_per_px, or use detector=model"
                 )
-            if self.low_percentile != _TRAINED_LOW_PERCENTILE:
+            # A percentile written out as the trained one passes: a run document
+            # recorded before #684 holds 0.5 and 99.5 for a blobs run, and a page
+            # that re-validates it must not fail.
+            if (
+                self.low_percentile is not None
+                and self.low_percentile != _TRAINED_LOW_PERCENTILE
+            ):
                 raise ValueError(
                     "low_percentile is for detector=model: the blob detector does "
                     "not scale its input by percentiles; remove low_percentile, or "
                     "use detector=model"
                 )
-            if self.high_percentile != _TRAINED_HIGH_PERCENTILE:
+            if (
+                self.high_percentile is not None
+                and self.high_percentile != _TRAINED_HIGH_PERCENTILE
+            ):
                 raise ValueError(
                     "high_percentile is for detector=model: the blob detector does "
                     "not scale its input by percentiles; remove high_percentile, "
@@ -224,15 +251,19 @@ class CellsParams(PluginParams):
 
 
 class CellsCheckpoint(BaseModel):
-    """What a resume needs: the files' token, the wells whose cells are in the partial file, the weights.
+    """What a resume needs: the files' token, the wells whose cells are in the partial file, the model's identity.
 
-    ``merged`` is the number of cells removed so far, so the result of a
-    resumed run counts the wells it did not redo.
+    ``identity`` is the weights' SHA-256 and the digest of the pre-processing,
+    joined by ``+`` (``smc.inference.model_identity``), so that a resume can say
+    which half changed. ``merged`` is the number of cells removed so far, so the
+    result of a resumed run counts the wells it did not redo. A checkpoint saved
+    before #684 has ``model_sha256`` and no ``identity``: it is refused as one
+    that is not what ``cells`` expects.
     """
 
     token: str
     wells_done: tuple[str, ...]
-    model_sha256: str
+    identity: str
     merged: int = Field(ge=0)
 
 
@@ -279,34 +310,13 @@ class CellsPlugin:
                 "failed); run scan again without --dry-run",
             )
 
-        detector: Detector
-        if params.detector == "blobs":
-            # No file to look for or to hash: the identity string stands for the
-            # detector, so a resume across a change of its rules is refused like
-            # a change of weights (FM-111). Neither torch nor the weights are touched.
-            detector = BlobDetector()
-            model = BLOB_DETECTOR
-            sha256 = hashlib.sha256(BLOB_DETECTOR_IDENTITY.encode("utf-8")).hexdigest()
-        else:
-            weights = (
-                params.model_path
-                if params.model_path is not None
-                else default_model_path()
-            )
-            # The input size is worked out first: a size the model is never given is
-            # refused before 166 MB of weights are read for it.
-            preprocessing = _preprocessing(params, scan)
-            detector = load_detector(
-                weights,
-                device=params.device,
-                score_threshold=params.score_threshold,
-                preprocessing=preprocessing,
-            )
-            model = weights.name
-            sha256 = _sha256(weights)
+        resolved = _resolve(params, scan)
+        detector = resolved.detector
 
         index = scan.frame_index()
-        token, cells, wells_done, merged = _resume(ctx, scan, sha256, detector.classes)
+        token, cells, wells_done, merged = _resume(
+            ctx, scan, resolved.identity, detector.classes
+        )
         partial = ctx.run_dir / "cells" / f"{token}.partial.json"
         done = sum(len(index[well]) for well in wells_done)
 
@@ -354,7 +364,7 @@ class CellsPlugin:
                 CellsCheckpoint(
                     token=token,
                     wells_done=tuple(wells_done),
-                    model_sha256=sha256,
+                    identity=resolved.identity,
                     merged=merged,
                 )
             )
@@ -369,8 +379,10 @@ class CellsPlugin:
         radius = params.merge_radius_um
         return CellsResult(
             file=relative_to_run(ctx.run_dir, final),
-            model=model,
-            model_sha256=sha256,
+            model=resolved.name,
+            model_sha256=resolved.weights_sha256,
+            model_identity=resolved.identity,
+            model_runs_on=resolved.runs_on,
             classes=detector.classes,
             device=detector.device,
             score_threshold=params.score_threshold,
@@ -397,30 +409,55 @@ class CellsPlugin:
         )
 
 
-def _preprocessing(params: CellsParams, scan: ScanResult) -> Preprocessing:
-    """What is done to a frame before the model: its percentiles and, if asked, its input size.
+def _resolve(params: CellsParams, scan: ScanResult) -> ResolvedModel:
+    """The model the run uses: the blob detector, or a card's model with this run's rule.
 
     The frame's pixel size is ``scan.pixel_size_um``, the scan plan's, and not one
-    derived from the matrix; the frame is shown to the model at ``model_um_per_px``.
-    Without it the model keeps its own resize.
+    derived from the matrix. ``load_model`` and ``model_card`` are called through
+    this module's names, which is where a test replaces them.
 
     Raises:
-        PluginRunError: The size is outside what the model is given. The message
-            names ``model_um_per_px`` and the size it would have been.
+        PluginRunError: The model name is unknown, its card or its weights are
+            refused, or torch cannot be used: ``smc.inference``'s message, as it
+            is, since it already says what to do.
     """
-    size: tuple[int, int] | None = None
-    if params.model_um_per_px is not None:
-        try:
-            size = model_input_size_px(
-                scan.image_shape_px, scan.pixel_size_um, params.model_um_per_px
-            )
-        except ValueError as exc:
-            raise PluginRunError(
-                _NAME,
-                f"model_um_per_px={params.model_um_per_px:g} cannot be used: {exc}",
-            ) from exc
-    return Preprocessing(
-        percentiles=(params.low_percentile, params.high_percentile), input_size_px=size
+    if params.detector == "blobs":
+        # No file to look for or to hash: the identity string stands for the
+        # detector, so a resume across a change of its rules is refused like
+        # a change of weights (FM-111). Neither torch nor the weights are touched.
+        return blob_model()
+    try:
+        card = model_card(DEFAULT_MODEL_NAME if params.model is None else params.model)
+        return load_model(
+            card,
+            preprocessing=_rule(card, params),
+            frame_shape_px=scan.image_shape_px,
+            frame_um_per_px=scan.pixel_size_um,
+            device=params.device,
+            score_threshold=params.score_threshold,
+            weights=params.model_path,
+        )
+    except ModelError as exc:
+        raise PluginRunError(_NAME, str(exc)) from exc
+
+
+def _rule(card: ModelCard, params: CellsParams) -> ModelPreprocessing:
+    """The card's pre-processing, with each parameter that is set in place of its own part.
+
+    Unset is the card's: a stand that sets none of the three gets the model as it
+    was trained. The card's bounds are the parameters', so the pair that comes out
+    is always a valid one (``ModelPreprocessing`` checks it anyway).
+    """
+    low, high = card.preprocessing.percentiles
+    size = card.preprocessing.model_um_per_px
+    return ModelPreprocessing(
+        percentiles=(
+            low if params.low_percentile is None else params.low_percentile,
+            high if params.high_percentile is None else params.high_percentile,
+        ),
+        model_um_per_px=size
+        if params.model_um_per_px is None
+        else params.model_um_per_px,
     )
 
 
@@ -449,34 +486,32 @@ def _unchecked(params: CellsParams, scan: ScanResult) -> tuple[str, ...]:
     return ()
 
 
-def _sha256(path: Path) -> str:
-    """The SHA-256 of the weights, read in pieces: which model made these cells.
+def _identity_changed(was: str, now: str) -> str:
+    """What a resume says when the model is not the one that made the run: which half changed.
 
-    Raises:
-        PluginRunError: The file cannot be read, which the detector could a
-            moment ago: it was replaced or locked meanwhile.
+    An identity is the weights' SHA-256 and the pre-processing's digest joined by
+    ``+``, so the weights are told apart from the rule the frames were shown
+    through: another file is one cure (put the weights back), another rule the
+    other (set the parameters as they were).
     """
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            while chunk := handle.read(_HASH_CHUNK_BYTES):
-                digest.update(chunk)
-    except OSError as exc:
-        raise PluginRunError(
-            _NAME,
-            f"{path.name} cannot be read to hash it ({exc.strerror or exc}); "
-            f"is another program using it?",
-        ) from exc
-    return digest.hexdigest()
+    if was.partition("+")[0] != now.partition("+")[0]:
+        return (
+            "the weights changed since the run being resumed; run cells "
+            "without --resume"
+        )
+    return (
+        "the pre-processing changed since the run being resumed; run cells "
+        "without --resume"
+    )
 
 
 def _resume(
-    ctx: RunContext, scan: ScanResult, sha256: str, classes: tuple[str, ...]
+    ctx: RunContext, scan: ScanResult, identity: str, classes: tuple[str, ...]
 ) -> tuple[str, list[Cell], list[str], int]:
     """The token, the cells of the wells done, those wells and their ``merged``; or a fresh start.
 
     Without a checkpoint the token is new and nothing is done. With one, the
-    weights must be the ones that made it, and its token is kept so that the
+    model's identity must be the one that made it, and its token is kept so that the
     final file is the one the partial file leads to. A missing or invalid
     partial file means no well is done: every well is detected again under the
     same token, which is slower and never wrong (``_redo_every_well`` resets the
@@ -490,12 +525,8 @@ def _resume(
     checkpoint = ctx.checkpoint(CellsCheckpoint)
     if checkpoint is None:
         return new_token(), [], [], 0
-    if checkpoint.model_sha256 != sha256:
-        raise PluginRunError(
-            _NAME,
-            "the weights changed since the run being resumed; run cells "
-            "without --resume",
-        )
+    if checkpoint.identity != identity:
+        raise PluginRunError(_NAME, _identity_changed(checkpoint.identity, identity))
     partial = ctx.run_dir / "cells" / f"{checkpoint.token}.partial.json"
     where = relative_to_run(ctx.run_dir, partial)
     try:
@@ -508,7 +539,7 @@ def _resume(
             where,
             _why(exc),
         )
-        return _redo_every_well(ctx, checkpoint.token, sha256)
+        return _redo_every_well(ctx, checkpoint.token, identity)
     index = scan.frame_index()
     done = [well for well in checkpoint.wells_done if well in index]
     kept = [cell for cell in loaded.cells if cell.well in done]
@@ -520,12 +551,12 @@ def _resume(
                 where,
                 cell.label,
             )
-            return _redo_every_well(ctx, checkpoint.token, sha256)
+            return _redo_every_well(ctx, checkpoint.token, identity)
     return checkpoint.token, kept, done, checkpoint.merged
 
 
 def _redo_every_well(
-    ctx: RunContext, token: str, sha256: str
+    ctx: RunContext, token: str, identity: str
 ) -> tuple[str, list[Cell], list[str], int]:
     """Nothing is done, and the stored checkpoint says so before the first well is redone.
 
@@ -536,7 +567,7 @@ def _redo_every_well(
     counts for them are zero (FM-111).
     """
     ctx.save_checkpoint(
-        CellsCheckpoint(token=token, wells_done=(), model_sha256=sha256, merged=0)
+        CellsCheckpoint(token=token, wells_done=(), identity=identity, merged=0)
     )
     return token, [], [], 0
 

@@ -1,11 +1,11 @@
-"""The cell detector: where the weights are, what is refused, and what torch's absence says (m3 §9.1).
+"""The local detector: the pre-processing, the model's output as detections, and what a bad checkpoint says (m3 §9.1, §9.4).
 
 Unless a test is marked *torch*, it runs without torch, so CI runs it: the
-plugin must import and list on a PC that never installed the ``detect`` extra,
-and a missing torch, a torch that does not load and a bad checkpoint must each
-say what to do. The *torch* tests build a checkpoint of a few tensors with
-``torch.save`` and are skipped without torch. The one test of the trained model
-is skipped unless the weights are on the PC; CI never has them.
+plugin must import and list on a PC that never installed the ``detect`` extra.
+The *torch* tests build a checkpoint of a few tensors with ``torch.save`` and
+are skipped without torch. The one test of the trained model is skipped unless
+the weights are on the PC; CI never has them. Where the weights are looked for,
+and what a missing torch says, is ``test_inference_models.py``'s.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import math
 import subprocess
 import sys
 import textwrap
-from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -23,45 +22,43 @@ from typing import Any
 import numpy as np
 import pytest
 
-import smc
-from smc.plugins import PluginRunError
-from smc.plugins.cells import detector as detector_mod
-from smc.plugins.cells.detector import (
-    BLOB_DETECTOR,
-    BLOB_DETECTOR_IDENTITY,
-    DEFAULT_MODEL,
+from smc.inference import local as local_mod
+from smc.inference.cards import DEFAULT_MODEL_NAME, model_card
+from smc.inference.detector import Detection, Detector
+from smc.inference.errors import ModelError
+from smc.inference.local import detections_from_output, load_local
+from smc.inference.models import weights_folder
+from smc.inference.preprocessing import (
+    DEFAULT_PREPROCESSING,
     MAX_INPUT_PX,
     MIN_INPUT_PX,
-    BlobDetector,
-    Detection,
-    Detector,
     Preprocessing,
-    default_model_path,
-    detections_from_output,
-    load_detector,
     model_input_size_px,
     normalize_plane,
 )
-from smc.testing import Blob, PlateSample
 
-CHECKOUT = Path(smc.__file__).resolve().parents[2]
 PREDICTOR = "roi_heads.box_predictor.cls_score.weight"
 
 
-def _load(path: Path, **kwargs: Any) -> Detector:
-    return load_detector(path, device="cpu", score_threshold=0.5, **kwargs)
-
-
-def _weights(tmp_path: Path) -> Path:
-    path = tmp_path / "w.pth"
-    path.write_bytes(b"not a checkpoint")
-    return path
+def _load(
+    path: Path,
+    *,
+    preprocessing: Preprocessing = DEFAULT_PREPROCESSING,
+    device: str = "cpu",
+    score_threshold: float = 0.5,
+) -> Detector:
+    return load_local(
+        path,
+        device=device,
+        score_threshold=score_threshold,
+        preprocessing=preprocessing,
+    )
 
 
 def _reason(path: Path) -> str:
-    with pytest.raises(PluginRunError) as caught:
+    with pytest.raises(ModelError) as caught:
         _load(path)
-    return caught.value.reason
+    return str(caught.value)
 
 
 # --- importing without torch --------------------------------------------------
@@ -90,162 +87,6 @@ def test_the_plugin_imports_without_torch() -> None:
 
     assert run.returncode == 0, run.stderr
     assert "cells" in run.stdout
-
-
-# --- load_detector: what each failure says ------------------------------------
-
-
-def test_a_missing_model_says_where_it_looked(tmp_path: Path) -> None:
-    missing = tmp_path / "nope.pth"
-
-    reason = _reason(missing)
-
-    assert str(missing) in reason
-    assert "SMC_MODELS" in reason
-    assert DEFAULT_MODEL in reason
-
-
-def test_a_missing_torch_says_to_install_the_detect_extra(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setitem(sys.modules, "torch", None)
-
-    reason = _reason(_weights(tmp_path))
-
-    assert "torch is not installed" in reason
-    assert "pip install -e .[detect]" in reason
-
-
-def test_a_torch_that_does_not_load_is_told_apart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Windows raises ``OSError`` for a DLL that does not load: reinstalling is the cure."""
-
-    class BrokenTorch:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise OSError("[WinError 126] The specified module could not be found")
-
-    monkeypatch.setattr(detector_mod, "TorchDetector", BrokenTorch)
-
-    reason = _reason(_weights(tmp_path))
-
-    assert "did not load" in reason
-    assert "WinError 126" in reason
-    assert "not installed" not in reason
-    # torch is imported in the process that already holds the stand's DLLs (FM-95):
-    # a fresh console tells that conflict from a broken install.
-    assert "import torch" in reason
-
-
-def test_a_refused_checkpoint_is_a_plugin_run_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class Refusing:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise ValueError("w.pth has no classes")
-
-    monkeypatch.setattr(detector_mod, "TorchDetector", Refusing)
-
-    assert _reason(_weights(tmp_path)) == "w.pth has no classes"
-
-
-def test_a_model_path_the_os_refuses_to_stat_is_a_plugin_run_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A folder the user cannot enter, a share that dropped: ``is_file`` raises, it does not say no (FM-116)."""
-    weights = tmp_path / DEFAULT_MODEL
-    real = Path.is_file
-
-    def refused(self: Path) -> bool:
-        if self == weights:
-            raise PermissionError(13, "Permission denied")
-        return real(self)
-
-    monkeypatch.setattr(Path, "is_file", refused)
-
-    reason = _reason(weights)
-
-    assert "Permission denied" in reason
-    assert str(weights) in reason
-    assert "SMC_MODELS" in reason
-
-
-def test_an_import_error_that_is_not_a_missing_module_is_not_told_as_not_installed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``DLL load failed while importing _imaging`` is an ``ImportError`` too."""
-
-    class BrokenImport:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise ImportError("DLL load failed while importing _imaging")
-
-    monkeypatch.setattr(detector_mod, "TorchDetector", BrokenImport)
-
-    reason = _reason(_weights(tmp_path))
-
-    assert "DLL load failed while importing _imaging" in reason
-    assert "could not be imported" in reason
-    assert "not installed" not in reason
-    assert "pip install -e .[detect]" in reason
-
-
-def test_a_runtime_error_while_importing_torch_is_told_as_not_loading(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A torch and a torchvision of versions that do not go together raise ``RuntimeError``."""
-
-    class Mismatched:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise RuntimeError("operator torchvision::nms does not exist")
-
-    monkeypatch.setattr(detector_mod, "TorchDetector", Mismatched)
-
-    reason = _reason(_weights(tmp_path))
-
-    assert "did not load" in reason
-    assert "torchvision::nms" in reason
-
-
-def test_the_cause_is_chained(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    class Refusing:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise ValueError("why")
-
-    monkeypatch.setattr(detector_mod, "TorchDetector", Refusing)
-
-    with pytest.raises(PluginRunError) as caught:
-        _load(_weights(tmp_path))
-
-    assert isinstance(caught.value.__cause__, ValueError)
-
-
-# --- where the weights are ----------------------------------------------------
-
-
-def test_smc_models_sets_the_folder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("SMC_MODELS", str(tmp_path))
-
-    assert default_model_path() == tmp_path / DEFAULT_MODEL
-
-
-@pytest.mark.parametrize("value", ["", "  "])
-def test_an_empty_or_blank_smc_models_is_not_the_working_directory(
-    value: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``Path("")`` is ``.``: an empty variable must not make the cwd the models folder (FM-78)."""
-    monkeypatch.setenv("SMC_MODELS", value)
-
-    assert default_model_path() == CHECKOUT / "local" / "models" / DEFAULT_MODEL
-
-
-def test_without_smc_models_the_weights_are_in_the_checkouts_local_folder(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("SMC_MODELS", raising=False)
-
-    assert default_model_path() == CHECKOUT / "local" / "models" / DEFAULT_MODEL
 
 
 # --- normalize_plane ----------------------------------------------------------
@@ -525,10 +366,10 @@ def test_an_unavailable_device_is_refused(tmp_path: Path) -> None:
         },
     )
 
-    with pytest.raises(PluginRunError) as caught:
-        load_detector(path, device="cuda", score_threshold=0.5)
+    with pytest.raises(ModelError) as caught:
+        _load(path, device="cuda")
 
-    assert caught.value.reason == (
+    assert str(caught.value) == (
         "device cuda is not available on this PC; use device=auto or cpu"
     )
 
@@ -647,7 +488,7 @@ def _fake_detector(
     score_threshold: float = 0.2,
     preprocessing: Preprocessing | None = None,
 ) -> Detector:
-    """A ``TorchDetector`` built by ``load_detector`` around ``model``, on a real small checkpoint."""
+    """A ``TorchDetector`` built by ``load_local`` around ``model``, on a real small checkpoint."""
     import torchvision.models.detection as detection
 
     def build(**kwargs: Any) -> _FakeModel:
@@ -656,13 +497,11 @@ def _fake_detector(
 
     monkeypatch.setattr(detection, "fasterrcnn_resnet50_fpn", build)
     path = _checkpoint(tmp_path, {"model_state_dict": _state(4), "classes": CLASSES})
-    if preprocessing is None:
-        return load_detector(path, device=device, score_threshold=score_threshold)
-    return load_detector(
+    return _load(
         path,
         device=device,
         score_threshold=score_threshold,
-        preprocessing=preprocessing,
+        preprocessing=DEFAULT_PREPROCESSING if preprocessing is None else preprocessing,
     )
 
 
@@ -707,12 +546,12 @@ def test_a_device_the_model_cannot_move_to_says_to_use_the_cpu(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     model = _FakeModel([], [], [], fail_to="cuda")
 
-    with pytest.raises(PluginRunError) as caught:
+    with pytest.raises(ModelError) as caught:
         _fake_detector(tmp_path, monkeypatch, model, device="auto")
 
-    assert "no kernel image" in caught.value.reason
-    assert "ckpt.pth" in caught.value.reason
-    assert "device=cpu" in caught.value.reason
+    assert "no kernel image" in str(caught.value)
+    assert "ckpt.pth" in str(caught.value)
+    assert "device=cpu" in str(caught.value)
 
 
 def test_a_frame_that_fills_the_models_box_limit_is_a_warning(
@@ -729,11 +568,13 @@ def test_a_frame_that_fills_the_models_box_limit_is_a_warning(
     )
     detector = _fake_detector(tmp_path, monkeypatch, model)
 
-    with caplog.at_level(logging.WARNING, logger="smc.plugins.cells"):
+    with caplog.at_level(logging.WARNING, logger="smc.inference.local"):
         found = detector.detect(np.zeros((20, 30), np.uint16))
 
     assert len(found) == 2
-    messages = [r.getMessage() for r in caplog.records if r.name == "smc.plugins.cells"]
+    messages = [
+        r.getMessage() for r in caplog.records if r.name == "smc.inference.local"
+    ]
     assert len(messages) == 1
     assert "2" in messages[0]
     assert "undercounted" in messages[0]
@@ -747,10 +588,10 @@ def test_a_frame_below_the_models_box_limit_is_no_warning(
     model = _FakeModel(boxes=[[1, 1, 2, 2]], scores=[0.9], labels=[1], cap=2)
     detector = _fake_detector(tmp_path, monkeypatch, model)
 
-    with caplog.at_level(logging.WARNING, logger="smc.plugins.cells"):
+    with caplog.at_level(logging.WARNING, logger="smc.inference.local"):
         detector.detect(np.zeros((20, 30), np.uint16))
 
-    assert not [r for r in caplog.records if r.name == "smc.plugins.cells"]
+    assert not [r for r in caplog.records if r.name == "smc.inference.local"]
 
 
 def test_without_an_input_size_the_model_keeps_its_own_resize(
@@ -784,12 +625,7 @@ def test_the_model_input_size_reaches_the_resize(
     monkeypatch.setattr(detection, "fasterrcnn_resnet50_fpn", build)
     path = _checkpoint(tmp_path, {"model_state_dict": _state(4), "classes": CLASSES})
 
-    load_detector(
-        path,
-        device="cpu",
-        score_threshold=0.5,
-        preprocessing=Preprocessing(input_size_px=(300, 400)),
-    )
+    _load(path, preprocessing=Preprocessing(input_size_px=(300, 400)))
 
     (model,) = built
     assert model.transform.min_size == (300,)
@@ -801,7 +637,7 @@ def test_the_percentiles_reach_normalize_plane(
 ) -> None:
     """The seam between the parameter and the plane the model sees (FM-124): a spy on the module's function."""
     seen: list[tuple[float, float]] = []
-    real = detector_mod.normalize_plane
+    real = local_mod.normalize_plane
 
     def spy(
         plane: np.ndarray[Any, Any], percentiles: tuple[float, float] = (0.5, 99.5)
@@ -809,7 +645,7 @@ def test_the_percentiles_reach_normalize_plane(
         seen.append(percentiles)
         return real(plane, percentiles)
 
-    monkeypatch.setattr(detector_mod, "normalize_plane", spy)
+    monkeypatch.setattr(local_mod, "normalize_plane", spy)
     detector = _fake_detector(
         tmp_path,
         monkeypatch,
@@ -826,7 +662,7 @@ def test_the_default_percentiles_are_the_trained_ones(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     seen: list[tuple[float, float]] = []
-    real = detector_mod.normalize_plane
+    real = local_mod.normalize_plane
 
     def spy(
         plane: np.ndarray[Any, Any], percentiles: tuple[float, float] = (0.0, 0.0)
@@ -834,7 +670,7 @@ def test_the_default_percentiles_are_the_trained_ones(
         seen.append(percentiles)
         return real(plane, percentiles)
 
-    monkeypatch.setattr(detector_mod, "normalize_plane", spy)
+    monkeypatch.setattr(local_mod, "normalize_plane", spy)
     detector = _fake_detector(tmp_path, monkeypatch, _FakeModel([], [], []))
 
     detector.detect(np.arange(60 * 80, dtype=np.uint16).reshape(60, 80))
@@ -847,10 +683,10 @@ def test_the_default_percentiles_are_the_trained_ones(
 
 def _trained() -> Detector:
     _torch()
-    weights = default_model_path()
+    weights = weights_folder() / model_card(DEFAULT_MODEL_NAME).weights
     if not weights.is_file():
         pytest.skip(f"no weights at {weights} (set SMC_MODELS to their folder)")
-    return load_detector(None, device="auto", score_threshold=0.5)
+    return _load(weights, device="auto")
 
 
 def test_the_trained_model_loads_and_finds_nothing_on_noise() -> None:
@@ -867,186 +703,3 @@ def test_the_trained_model_refuses_a_frame_that_is_not_two_dimensional() -> None
 
     with pytest.raises(ValueError, match="2-D"):
         detector.detect(np.zeros((40, 50, 3), np.uint8))
-
-
-# --- the blob detector, for the synthetic plate (m3 §9.1, #260) ----------------------
-
-PIXEL_SIZES_UM = [0.1625, 0.25, 0.5, 1.0, 2.0]
-#: The well's radius on the 96-well plate A1 sits at the stage origin of.
-WELL_RADIUS_UM = 3200.0
-
-
-def _spots(centres: list[tuple[float, float]]) -> list[Blob]:
-    """Radius 5 um, 3000 counts: what ``smc.testing.sample_stand`` draws for a cell."""
-    return [Blob(x, y, 5.0, 3000.0) for x, y in centres]
-
-
-def _frame_with(blobs: list[Blob], pixel_size_um: float) -> np.ndarray[Any, Any]:
-    sample = PlateSample(blobs=blobs, seed=3)
-    return sample.render(0.0, 0.0, 0.0, shape=(512, 512), pixel_size_um=pixel_size_um)
-
-
-def _labels(found: list[Detection]) -> Counter[str]:
-    return Counter(d.label for d in found)
-
-
-@pytest.mark.parametrize("pixel_size_um", PIXEL_SIZES_UM)
-def test_the_blob_detector_finds_singles_and_doublets_at_every_pixel_size(
-    pixel_size_um: float,
-) -> None:
-    w = 512 * pixel_size_um
-    singles = [(-0.3 * w, -0.3 * w), (0.3 * w, -0.3 * w), (-0.3 * w, 0.3 * w)]
-    singles += [(0.3 * w, 0.3 * w), (0.0, 0.0)]
-    blobs = _spots(singles)
-    # Three pairs along three angles, the two spots 4 um either side of a centre.
-    for (cx, cy), angle in zip(
-        [(0.0, 0.3 * w), (0.0, -0.3 * w), (-0.3 * w, 0.0)], [0.0, 1.0, 2.0], strict=True
-    ):
-        dx, dy = 4.0 * math.cos(angle), 4.0 * math.sin(angle)
-        blobs += _spots([(cx - dx, cy - dy), (cx + dx, cy + dy)])
-
-    found = BlobDetector().detect(_frame_with(blobs, pixel_size_um))
-
-    assert _labels(found) == {"single": 5, "doublet": 3}
-    assert {d.score for d in found} == {1.0}
-
-
-@pytest.mark.parametrize("pixel_size_um", PIXEL_SIZES_UM)
-def test_the_blob_detector_sees_nothing_across_a_well_wall(
-    pixel_size_um: float,
-) -> None:
-    # A well wall is a step the background must not be mistaken for a cell by:
-    # the frame is centred from half a frame inside the well to half outside, and
-    # at the diagonal where the wall meets a corner.
-    w = 512 * pixel_size_um
-    centres = [
-        (x, 0.0)
-        for x in np.linspace(
-            WELL_RADIUS_UM - 256 * pixel_size_um,
-            WELL_RADIUS_UM + 256 * pixel_size_um,
-            21,
-        )
-    ]
-    centres.append((0.707 * WELL_RADIUS_UM + 0.2 * w, 0.707 * WELL_RADIUS_UM))
-    sample = PlateSample(seed=3)
-
-    for x, y in centres:
-        frame = sample.render(x, y, 0.0, shape=(512, 512), pixel_size_um=pixel_size_um)
-        assert BlobDetector().detect(frame) == [], (x, y)
-
-
-@pytest.mark.parametrize("pixel_size_um", PIXEL_SIZES_UM)
-def test_a_cell_in_the_sliver_of_well_beside_a_wall_is_still_found(
-    pixel_size_um: float,
-) -> None:
-    # 40 % of the frame is well and 60 % plastic. The 75th percentile is then a
-    # well pixel, so the sliver is background and the cell stands out of it; a
-    # median would sit on the plastic, the whole sliver would be one bright
-    # component (over 5 % of the frame, dropped) and the cell in it with it.
-    w = 512 * pixel_size_um
-    frame_x = WELL_RADIUS_UM + 0.1 * w
-    cell = Blob(WELL_RADIUS_UM - 0.2 * w, 0.0, 5.0, 3000.0)
-    sample = PlateSample(blobs=[cell], seed=3)
-    frame = sample.render(
-        frame_x, 0.0, 0.0, shape=(512, 512), pixel_size_um=pixel_size_um
-    )
-
-    found = BlobDetector().detect(frame)
-
-    assert _labels(found) == {"single": 1}
-
-
-def test_a_strip_is_not_a_cell() -> None:
-    # A 3 x 60 px bar is bright, 180 px (inside the area limits), and not round:
-    # only the axis ratio drops it.
-    frame = np.random.default_rng(0).normal(1000, 20, (200, 200))
-    frame[100:103, 70:130] += 3000
-
-    assert BlobDetector().detect(frame) == []
-
-
-def test_a_round_spot_is_a_single_and_an_elongated_one_a_doublet() -> None:
-    rows, cols = np.mgrid[0:200, 0:300]
-    frame = np.random.default_rng(1).normal(1000, 20, (200, 300))
-    frame += 3000 * (((rows - 60) / 8.0) ** 2 + ((cols - 70) / 8.0) ** 2 <= 1)
-    # Semi-axes 14 and 7: the minor/major ratio is 0.5, between 0.3 and 0.75.
-    frame += 3000 * (((rows - 140) / 7.0) ** 2 + ((cols - 200) / 14.0) ** 2 <= 1)
-
-    found = BlobDetector().detect(frame)
-
-    assert sorted((round((d.row0_px + d.row1_px) / 2), d.label) for d in found) == [
-        (60, "single"),
-        (140, "doublet"),
-    ]
-
-
-def test_the_box_is_rows_then_columns_of_the_component() -> None:
-    # A frame that is not square, and a blob that is not a square: a box with
-    # the axes exchanged is wrong here and invisible on a square one (FM-73).
-    frame = np.random.default_rng(2).normal(1000, 20, (100, 160))
-    frame[20:30, 40:52] += 3000
-
-    (box,) = BlobDetector().detect(frame)
-
-    assert (box.row0_px, box.col0_px, box.row1_px, box.col1_px) == (20, 40, 30, 52)
-    assert box.label == "single"
-
-
-@pytest.mark.parametrize(
-    ("side", "kept"), [(2, False), (3, True), (4, True)], ids=["4px", "9px", "16px"]
-)
-def test_a_component_under_nine_pixels_is_dropped(side: int, kept: bool) -> None:
-    frame = np.random.default_rng(3).normal(1000, 20, (100, 100))
-    frame[40 : 40 + side, 40 : 40 + side] += 3000
-
-    assert (len(BlobDetector().detect(frame)) == 1) is kept
-
-
-def test_a_component_over_five_percent_of_the_frame_is_dropped() -> None:
-    # 100 x 100 is 10 000 px: a 22 x 22 blob (484 px) is under 5 % (500 px), a
-    # 23 x 23 one (529 px) over it.
-    frame = np.random.default_rng(4).normal(1000, 20, (100, 100))
-    small = frame.copy()
-    small[10:32, 10:32] += 3000
-    large = frame.copy()
-    large[10:33, 10:33] += 3000
-
-    assert len(BlobDetector().detect(small)) == 1
-    assert BlobDetector().detect(large) == []
-
-
-def test_the_blob_detector_refuses_a_frame_that_is_not_2d() -> None:
-    with pytest.raises(ValueError, match="2-D"):
-        BlobDetector().detect(np.zeros((40, 50, 3), np.uint8))
-    with pytest.raises(ValueError, match="2-D"):
-        BlobDetector().detect(np.zeros(40, np.uint8))
-
-
-@pytest.mark.parametrize("shape", [(0, 0), (5, 0), (0, 5), (5, 1), (1, 1)])
-def test_a_frame_too_small_to_measure_gives_no_detection(
-    shape: tuple[int, int],
-) -> None:
-    assert BlobDetector().detect(np.zeros(shape, np.uint16)) == []
-
-
-@pytest.mark.parametrize("level", [0, 800, 65535])
-def test_a_constant_frame_gives_no_detection(level: int) -> None:
-    assert BlobDetector().detect(np.full((64, 80), level, np.uint16)) == []
-
-
-def test_the_blob_detector_declares_its_classes_and_its_device() -> None:
-    detector = BlobDetector()
-
-    assert isinstance(detector, Detector)
-    assert detector.classes == ("single", "doublet")
-    assert detector.device == "cpu"
-
-
-def test_the_blob_detectors_identity_is_the_one_the_design_names() -> None:
-    # The resume compares the SHA-256 of this string: a change of a rule must
-    # change it, and the string is part of the record, so it is pinned.
-    assert BLOB_DETECTOR == "blobs"
-    assert BLOB_DETECTOR_IDENTITY == (
-        "smc BlobDetector 1: p75 + 8 sigma, 9 px to 5 % of the frame, "
-        "axis ratio >= 0.3, single from 0.75"
-    )

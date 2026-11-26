@@ -16,3 +16,7 @@
 /docs/algorithms/
 /tests/**/test_selector_*.py
 /tests/analysis/
+
+# The model cards: a model is added by a pull request that adds its card (ADR-0011).
+# The rest of smc.inference, which loads a model and says where it ran, is the stand's.
+/src/smc/inference/cards/

@@ -337,8 +337,10 @@ _CELLS_FILE = {"schema_version": 1, "cells": [_CELL]}
 _CELLS: dict[str, Any] = {
     "assumed": [],
     "file": "cells/0123456789ab.json",
-    "model": "cell_classes_model-cat-v2.pth",
+    "model": "cell-classes-v2",
     "model_sha256": "0" * 64,
+    "model_identity": "0" * 64 + "+" + "1" * 64,
+    "model_runs_on": "local:cpu",
     "classes": ["single", "doublet", "debris"],
     "device": "cpu",
     "score_threshold": 0.5,
@@ -592,7 +594,14 @@ SAMPLES: dict[type[BaseModel], Sample] = {
     CellsFile: (_CELLS_FILE, {"cells": []}),
     CellsResult: (
         _CELLS,
-        {**_CELLS, "counts": {}, "seconds_per_frame": None},
+        # The sparse one is also a result recorded before #684: no identity, no place.
+        {
+            **_CELLS,
+            "counts": {},
+            "seconds_per_frame": None,
+            "model_identity": None,
+            "model_runs_on": None,
+        },
     ),
     DensityWell: (
         _DENSITY_WELL,

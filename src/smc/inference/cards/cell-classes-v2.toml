@@ -1,0 +1,12 @@
+# The single / doublet / debris Faster R-CNN that nikon-control trained (m3 §9.4).
+name = "cell-classes-v2"
+weights = "cell_classes_model-cat-v2.pth"
+weights_sha256 = "b1160edae7dd2e8e1897f959fd55b77481bbfa92d236aaa1202cd94101b2cb7e"
+classes = ["single", "doublet", "debris"]
+# The checkpoint records no pixel size, and nikon-control's one ND2 (a Prime 95B
+# frame at 0.27555 um) does not say the training frames came from that camera.
+trained_um_per_px = "unknown"
+
+[preprocessing]
+percentiles = [0.5, 99.5]
+model_um_per_px = "native"

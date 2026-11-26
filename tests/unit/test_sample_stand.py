@@ -29,7 +29,7 @@ from smc.hardware.capabilities import Camera, ObjectiveTurret, XYStage, ZStage
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError, ProfileError
 from smc.hardware.microscope import Microscope
 from smc.hardware.profile import Profile, SampleSection
-from smc.plugins.cells.detector import BlobDetector
+from smc.inference.blobs import BlobDetector
 from smc.plugins.plate_registration.algorithm import calibrate, suggested_refs
 from smc.testing import FakeCore, FakeDevice
 from smc.testing.sample_stand import (
