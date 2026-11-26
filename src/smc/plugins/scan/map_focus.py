@@ -111,6 +111,11 @@ _NAME = "scan"
 _LOG = logging.getLogger(f"smc.plugins.{_NAME}")
 #: What a refusal of the start's place tells the operator.
 _FOCUS_INSIDE = "focus by eye on the cells inside a mapped well, then start the scan"
+#: The two errors of an anchor try that D19's bounds refused before its sweep: Z
+#: did not move, and the same plan meets the same refusal again. ``_anchor_try``
+#: builds them and ``_failed_by_stand`` reads them back, so both share these.
+_OUTSIDE = "SweepOutsideLimits"
+_BEYOND = "SweepBeyondJog"
 
 
 @dataclass
@@ -163,11 +168,8 @@ class MapFocus:
         found = self.anchored(well)
         if found is None or found.source != "none":
             return None
-        return (
-            f"MapNotAnchored: no sweep near the centre of {well} found a peak "
-            f"({len(found.tries)} tried), and {_operator_focus(self.use.start_well)}: "
-            "the well was not scanned"
-        )
+        why = _why(found, f"the centre of {well}")
+        return f"MapNotAnchored: {why}{_not_scanned_tail(self.use.start_well)}"
 
     def beyond_line(self) -> str | None:
         """D22's line, for ``assumed`` and the WARNING; ``None`` when no field lies beyond the bound."""
@@ -176,9 +178,9 @@ class MapFocus:
         return (
             f"{self.beyond} of {self.planned} fields lie more than "
             f"{self.fov_side_um:.1f} µm from every locked frame of their well, the "
-            f"farthest {self.farthest_name} at {self.farthest_um:.1f} µm: their Z is "
-            "read from frames that far (the bound, the map scan's larger field side, "
-            "is assumed, not measured)"
+            f"farthest {self.farthest_name} at {self.farthest_um:.1f} µm: where they "
+            "are scanned, their Z is read from frames that far (the bound, the map "
+            "scan's larger field side, is assumed, not measured)"
         )
 
     def record(self) -> FocusMapUse:
@@ -220,6 +222,12 @@ class MapFocus:
         ]
         if beyond is not None:
             lines.append(beyond)
+        # The wells an earlier attempt anchored come first, in the checkpoint's
+        # order: this attempt did not measure them, and its time line below does
+        # not count them (#712).
+        for anchor in self.resumed:
+            line = _anchor_line(anchor, self.use.start_well)
+            lines.append(f"{line} (an earlier attempt)")
         for anchor in self.anchors.values():
             lines.append(_anchor_line(anchor, self.use.start_well))
         anchor_s = sum(a.duration_s for a in self.anchors.values())
@@ -262,16 +270,37 @@ def _operator_focus(start_well: str | None) -> str:
     return f"the operator focused in {start_well}"
 
 
+def _not_scanned_tail(start_well: str | None) -> str:
+    """What ends the text of a well anchored ``none``, a field's error and the well's line alike (D23)."""
+    return f", and {_operator_focus(start_well)}: the well was not scanned"
+
+
+def _why(anchor: FocusAnchor, place: str) -> str:
+    """Why no peak anchored the well: that no sweep found one, or that no sweep could run (#712).
+
+    A try that ended before its sweep (a refusal of D19's bounds, a landing off
+    target, a drive or a stage that failed) is not a flat try: saying that "no
+    sweep found a peak" when none ran sent the operator to look at the sample
+    when it was the stage, or the plan, that stopped them. ``place`` is where
+    the sweeps were centred, in the words of the line it goes into.
+    """
+    tried = len(anchor.tries)
+    if not anchor.tries or any(t.sweep is not None for t in anchor.tries):
+        return f"no sweep near {place} found a peak ({tried} tried)"
+    return (
+        f"no sweep near {place} could run ({tried} tried, the first: "
+        f"{anchor.tries[0].error})"
+    )
+
+
 def _anchor_line(anchor: FocusAnchor, start_well: str | None) -> str:
     """A well's line in ``assumed``, the same text as its WARNING when no peak came."""
     tried = len(anchor.tries)
     offset = anchor.anchor_um
     if offset is None:
         # D23: no peak in a well the operator did not focus in.
-        return (
-            f"{anchor.well}: no sweep near its centre found a peak ({tried} tried), "
-            f"and {_operator_focus(start_well)}: the well was not scanned"
-        )
+        why = _why(anchor, "its centre")
+        return f"{anchor.well}: {why}{_not_scanned_tail(start_well)}"
     if anchor.source == "swept":
         peaks = sum(
             t.sweep is not None and t.sweep.outcome == "peak" for t in anchor.tries
@@ -281,8 +310,8 @@ def _anchor_line(anchor: FocusAnchor, start_well: str | None) -> str:
             f"{peaks} peaks of {tried} sweeps near its centre"
         )
     return (
-        f"{anchor.well}: no sweep near its centre found a peak ({tried} tried): the "
-        f"operator's focus anchors it, {offset:.2f} µm from the map"
+        f"{anchor.well}: {_why(anchor, 'its centre')}: the operator's focus anchors "
+        f"it, {offset:.2f} µm from the map"
     )
 
 
@@ -604,14 +633,16 @@ def anchor_well(
     from the map. When none does, the operator's anchor in the well the operator
     focused in (``source="start"``), and none in any other well
     (``source="none"``, D23: the well is not scanned), unless no try ran a
-    sweep at all: that is a stand that failed, not a well without a peak.
-    ``ctx.progress`` keeps the fields' count. The tries' frames are neither
-    written nor shown.
+    sweep and one of them failed by the stand: that is a stand that failed, not
+    a well without a peak. A try that D19's bounds refused did not fail by the
+    stand (#712). ``ctx.progress`` keeps the fields' count. The tries' frames
+    are neither written nor shown.
 
     Raises:
         PluginRunError: No try ran a sweep in a well the operator did not focus
-            in (every try ended in an error): the scan ends, and a resume anchors
-            the well again.
+            in, and at least one ended in a failure of the stand (a refusal of
+            D19's bounds is not one): the scan ends, and a resume anchors the
+            well again.
         MicroscopeHaltedError, MotionStoppedError, StopRequested: Passed (FM-64);
             Z stays where it was read last (FM-88).
     """
@@ -649,17 +680,22 @@ def anchor_well(
         # The operator's focus is a measurement in this well (D23).
         source, anchor_um = "start", state.use.start_anchor_um
     else:
-        if tries and all(t.sweep is None for t in tries):
-            # No sweep ran at all: the stage, the camera or the Z drive failed in
-            # every try, which is not "no peak". Not scanning the well would turn a
-            # dead stage into a scan that ends ``done`` (the backstop of
-            # ``max_failed_in_row`` does not count these fields), so the scan ends
-            # and a resume anchors the well again (#688's review, FM-277).
+        failures = [t for t in tries if _failed_by_stand(t)]
+        if failures and all(t.sweep is None for t in tries):
+            # No sweep ran, and the stand failed in at least one try: the stage,
+            # the camera or the Z drive, which is not "no peak". Not scanning the
+            # well would turn a dead stage into a scan that ends ``done`` (the
+            # backstop of ``max_failed_in_row`` does not count these fields), so
+            # the scan ends and a resume anchors the well again (#688's review,
+            # FM-277). Tries that D19's bounds refused are not failures of the
+            # stand: Z did not move, a resume would meet the same refusal, and a
+            # well where every try was refused is ``none`` like a flat one (#712).
             raise PluginRunError(
                 _NAME,
                 f"the anchor of {well} could not be measured: none of its "
-                f"{len(tries)} tries ran a sweep (the first: {tries[0].error}): check "
-                "the stage and the camera, then run scan --resume",
+                f"{len(tries)} tries ran a sweep and {len(failures)} of them failed "
+                f"(the first: {failures[0].error}): check the stage and the camera, "
+                "then run scan --resume",
             )
         # Not in this one: the 10x -> 40x difference is not known here.
         source, anchor_um = "none", None
@@ -717,14 +753,16 @@ def _anchor_try(
             centre = map_z + state.use.start_anchor_um
             planes = plan_planes(centre, params.focus_range_um, params.focus_step_um)
             refusal = outside_limits(centre, planes, state.limits)
-            # D19 (#688): the plane's distance from the Z the scan started at, as
-            # the field's target is bounded; the moves are absolute, and this
-            # centre is the map at the readback, not at the planned XY check 6 read.
-            beyond = _beyond_jog(state, "the anchor sweep", centre, planes)
             if refusal is not None:
-                error = f"SweepOutsideLimits: {refusal}"
-            elif beyond is not None:
-                error = f"SweepBeyondJog: {beyond}"
+                error = f"{_OUTSIDE}: {refusal}"
+            elif (
+                # D19 (#688): the plane's distance from the Z the scan started at,
+                # as the field's target is bounded; the moves are absolute, and
+                # this centre is the map at the readback, not at the planned XY
+                # check 6 read. Asked only when the limits did not refuse (#712).
+                beyond := _beyond_jog(state, "the anchor sweep", centre, planes)
+            ) is not None:
+                error = f"{_BEYOND}: {beyond}"
             else:
                 readbacks, scores = sweep(
                     z,
@@ -872,6 +910,18 @@ def _beyond_jog(
                 f"limit of {state.jog_um:g} µm"
             )
     return None
+
+
+def _failed_by_stand(tried: AnchorTry) -> bool:
+    """Whether an anchor try ended in a failure of the stand, not in a refusal of D19's bounds (#712).
+
+    The error carries its type (``<Type>: <message>``), so a later reader of
+    ``focus_map.anchors`` classifies a try the same way: ``StageOffTarget``,
+    ``FocusDriveOffTarget`` and every ``HardwareError`` are the stand's; a try
+    that swept has no error.
+    """
+    error = tried.error
+    return error is not None and not error.startswith((f"{_OUTSIDE}:", f"{_BEYOND}:"))
 
 
 def _one_line(exc: BaseException) -> str:

@@ -20,15 +20,18 @@ import pytest
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XY, Camera, Limits, XYStage, ZStage
+from smc.hardware.errors import HardwareError
 from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM
 from smc.plugins.api import RunContext
 from smc.plugins.cell_focus.focus_map import FocusMap, MapPoint
 from smc.plugins.cell_focus.loop import z_jog_limit_um
+from smc.plugins.errors import PluginRunError
 from smc.plugins.scan.map_focus import (
     MapFocus,
     MapStep,
     _anchor_try,
     _check_reach,
+    anchor_well,
     focus_field,
 )
 from smc.plugins.scan.plugin import ScanParams
@@ -114,6 +117,21 @@ class _LandsOffXY:
         return self._inner.limits_um()
 
 
+class _FailsXY(_LandsOffXY):
+    """The demo's XY stage whose moves raise ``HardwareError("stage lost")``: the numbered ones, or every one."""
+
+    def __init__(self, inner: XYStage, on_moves: frozenset[int] | None = None) -> None:
+        super().__init__(inner, 0.0)
+        self._on_moves = on_moves
+        self._moves = 0
+
+    def move_to_um(self, x_um: float, y_um: float) -> XY:
+        self._moves += 1
+        if self._on_moves is None or self._moves in self._on_moves:
+            raise HardwareError("stage lost")
+        return super().move_to_um(x_um, y_um)
+
+
 def _ctx() -> RunContext:
     """What the map's steps read of a context: the wait, the stop check and the progress."""
     stand_in: Callable[..., None] = lambda *args, **kwargs: None  # noqa: E731
@@ -142,15 +160,19 @@ def _state(
     jog_um: float = 100.0,
     anchors: tuple[FocusAnchor, ...] = (),
     map_z_um: float = 0.0,
+    start_well: str | None = "A1",
 ) -> MapFocus:
-    """The attempt's state with the map at ``map_z_um`` over A1, the start anchor 0, and ``anchors`` kept."""
+    """The attempt's state with the map at ``map_z_um`` over A1, the start anchor 0, and ``anchors`` kept.
+
+    ``start_well`` is the well the operator focused in (D23).
+    """
     use = FocusMapUse(
         run_doc="run-10x.json",
         scan_attempt="m1",
         measured="at an unknown time",
         start_anchor_um=0.0,
         anchors=(),
-        start_well="A1",
+        start_well=start_well,
     )
     return MapFocus(
         focus_map=FocusMap(
@@ -484,3 +506,117 @@ def test_a_field_target_at_the_jog_limit_moves(demo_microscope: Microscope) -> N
     assert (stepped.map_z_um, stepped.anchor_um, stepped.sweep) == (0.0, 5.0, None)
     assert z.moves == 1
     assert z.position_um() == pytest.approx(5.0, abs=0.01)
+
+
+# ---------------------------------- a try that did not sweep (m3 §21.12.2 D23, #712)
+
+#: The four fields of A1 the anchor tries use, around the well's centre (50, 50).
+_A1_FIELDS = (
+    _planned(0, 40.0, 40.0),
+    _planned(1, 60.0, 40.0),
+    _planned(2, 40.0, 60.0),
+    _planned(3, 60.0, 60.0),
+)
+
+
+def _anchor_a1(
+    microscope: Microscope, state: MapFocus, xy: XYStage, z: ZStage
+) -> FocusAnchor:
+    """``anchor_well`` for A1's four fields, on the demo's camera and ``z``."""
+    return anchor_well(
+        "A1",
+        _A1_FIELDS,
+        (50.0, 50.0),
+        xy=xy,
+        z=z,
+        camera=microscope.require(Camera),
+        state=state,
+        params=_params(),
+        tolerance_um=5.0,
+        ctx=_ctx(),
+        done=0,
+        total=4,
+    )
+
+
+def test_a_well_whose_every_try_the_jog_bound_refuses_is_not_scanned_and_names_the_refusal(
+    demo_microscope: Microscope,
+) -> None:
+    # A well at the edge of the jog bound refuses every try before its sweep: Z did
+    # not move, and a resume would meet the same refusal, so the scan must not end
+    # with "check the stage" (#712). The operator focused in B1.
+    z = _CountingZ(demo_microscope.require(ZStage))
+    state = _state(jog_um=5.0, start_well="B1")
+
+    anchor = _anchor_a1(demo_microscope, state, demo_microscope.require(XYStage), z)
+
+    assert anchor.source == "none"
+    assert anchor.anchor_um is None
+    assert len(anchor.tries) == 4
+    assert all(t.error is not None for t in anchor.tries)
+    assert z.moves == 0
+    assert state.not_scanned("A1") == (
+        "MapNotAnchored: no sweep near the centre of A1 could run (4 tried, the "
+        "first: SweepBeyondJog: the anchor sweep around 0.00 µm would reach "
+        "-10.00 µm, 10.00 µm from the Z the scan starts at, beyond the Z jog limit "
+        "of 5 µm), and the operator focused in B1: the well was not scanned"
+    )
+
+
+def test_a_well_whose_every_try_the_soft_limits_refuse_is_not_scanned_either(
+    demo_microscope: Microscope,
+) -> None:
+    # The other refusal of D19: a plane outside the soft limits, before any sweep.
+    z = _CountingZ(demo_microscope.require(ZStage))
+    state = _state(limits=Limits(-5.0, 5.0), start_well="B1")
+
+    anchor = _anchor_a1(demo_microscope, state, demo_microscope.require(XYStage), z)
+
+    assert (anchor.source, anchor.anchor_um, len(anchor.tries)) == ("none", None, 4)
+    assert z.moves == 0
+    assert state.not_scanned("A1") == (
+        "MapNotAnchored: no sweep near the centre of A1 could run (4 tried, the "
+        "first: SweepOutsideLimits: the focus sweep around 0 µm would reach -10 µm, "
+        "outside the soft limits [-5, 5] µm), and the operator focused in B1: the "
+        "well was not scanned"
+    )
+
+
+def test_a_well_where_one_try_failed_by_the_stand_and_the_others_were_refused_ends_the_scan(
+    demo_microscope: Microscope,
+) -> None:
+    # The same refusals, and the stage lost on the second try: the raise names that
+    # failure, not the first try's refusal (the mutant is ``tries[0]``).
+    z = _CountingZ(demo_microscope.require(ZStage))
+    state = _state(jog_um=5.0, start_well="B1")
+    xy = _FailsXY(demo_microscope.require(XYStage), frozenset({2}))
+
+    with pytest.raises(PluginRunError) as raised:
+        _anchor_a1(demo_microscope, state, xy, z)
+
+    assert raised.value.reason == (
+        "the anchor of A1 could not be measured: none of its 4 tries ran a sweep "
+        "and 1 of them failed (the first: HardwareError: stage lost): check the "
+        "stage and the camera, then run scan --resume"
+    )
+    assert z.moves == 0
+    assert "A1" not in state.anchors
+
+
+def test_the_operators_well_whose_tries_all_failed_keeps_the_start_anchor_and_says_no_sweep_ran(
+    demo_microscope: Microscope, caplog: pytest.LogCaptureFixture
+) -> None:
+    # No sweep ran, so no sweep "found a peak"; the start anchor is kept, as before.
+    z = _CountingZ(demo_microscope.require(ZStage))
+    state = _state()
+    xy = _FailsXY(demo_microscope.require(XYStage))
+
+    with caplog.at_level("WARNING", logger="smc.plugins.scan"):
+        anchor = _anchor_a1(demo_microscope, state, xy, z)
+
+    assert anchor.source == "start"
+    assert anchor.anchor_um == 0.0
+    assert [r.getMessage() for r in caplog.records].count(
+        "A1: no sweep near its centre could run (4 tried, the first: HardwareError: "
+        "stage lost): the operator's focus anchors it, 0.00 µm from the map"
+    ) == 1

@@ -1096,6 +1096,23 @@ class ScanPlugin:
             # A scan of nothing is not ``done``: ``cells`` refuses it hours
             # later. The checkpoint keeps every well, so a resume meets this
             # again: the way out is a scan without it.
+            if mapping is not None and all(
+                mapping.not_scanned(f.well) is not None for f in failed
+            ):
+                # Every field lies in a well no sweep anchored (m3 §21.12.5,
+                # #712): the stage did not fail, the sample gave no peak where the
+                # operator did not focus, and "check the stage" would send them
+                # to the wrong place. A mix with a field the stage failed keeps
+                # the stage's text below.
+                wells = ", ".join(dict.fromkeys(f.well for f in failed))
+                first = failed[0].well
+                raise PluginRunError(
+                    _NAME,
+                    f"no well was scanned: no sweep anchored {wells} (the first "
+                    f"field {failed[0].name}: {failed[0].error}): in a copy of the "
+                    "run document, plan one of these wells alone (scan-plan with "
+                    f"wells={first}), focus by eye on its cells, and scan it there",
+                )
             raise PluginRunError(
                 _NAME,
                 f"every field failed ({len(failed)}), the first {failed[0].name}: "
