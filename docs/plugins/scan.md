@@ -374,7 +374,10 @@ visit measures it.
    after the 10× scan, before planning the 40×** (`run-10x.json`): the 40× scan replaces
    the `scan` of the document it writes, and a copy taken after the 40× `scan-plan`
    replaced the 10× plan is refused (`the focus map in <path>: scan read its inputs from an
-   earlier run; run it again`).
+   earlier run; run it again`). **The plate page keeps this copy by itself**: when a `scan` of
+   its run document ends `done` with a frame taken `locked`, it writes the copy beside the
+   run document as `<run document's stem>.focus-map.json` (`run.json` gives
+   `run.focus-map.json`; m5 §25 D1), and the copy by hand is for the console.
 2. At the 40×, PFS off, focus by eye on cells near the first well's centre, then:
 
    ```text
@@ -408,21 +411,35 @@ operator focused in**: `start_well`, the well of the map's locked frame nearest 
 at the start (check 5). The operator's focus is a measurement in that well alone, and the
 10× → 40× difference is not a constant (it moved by 48 µm between two wells of one plate).
 In any other well the scan has no anchor to give: the well is **not scanned**. Each of its
-planned fields is a failed field with nothing moved for it (`MapNotAnchored: no sweep near
-the centre of <well> found a peak (<t> tried), and the operator focused in <start_well>:
-the well was not scanned`), they do not count toward `max_failed_in_row` (it is one
-decision about one well, not a stage failing field after field), and the scan goes on with
-the next well. A WARNING and `assumed` say so, for the operator's well too. **What to do
-with such a well**: in a copy of the run document, plan that well alone (`scan-plan` with
-`wells=<well>`), focus by eye on its cells there, and scan it with the same
-`cell_focus=map` command. If every field of the scan fails this way, the scan ends
-`failed` as any scan where every field failed. **A well whose tries did not sweep at all**
-(every one ended in an error: the stage, the camera or the Z drive failed) is not "no
-peak": the scan ends with `the anchor of <well> could not be measured: none of its <t>
-tries ran a sweep (the first: <error>): check the stage and the camera, then run scan
---resume`, the checkpoint keeps the wells done, and a resume anchors that well again. In
-the operator's well the start anchor is kept as before, and its fields' own failures end
-the scan after `max_failed_in_row`.
+planned fields is a failed field with nothing moved for it (`MapNotAnchored: <why>, and the
+operator focused in <start_well>: the well was not scanned`), they do not count toward
+`max_failed_in_row` (it is one decision about one well, not a stage failing field after
+field), and the scan goes on with the next well. A WARNING and `assumed` say so, for the
+operator's well too. `<why>` is `no sweep near the centre of <well> found a peak (<t>
+tried)` when at least one try swept, and `no sweep near the centre of <well> could run (<t>
+tried, the first: <error>)` when none did (`<error>` is the first try's: in a well not
+scanned, a refusal such as `SweepBeyondJog: …`); in a line that starts with the well's
+name, `its centre` stands for `the centre of <well>`. **What to do with such a well**: in a
+copy of the run document, plan that well alone (`scan-plan` with `wells=<well>`), focus by
+eye on its cells there, and scan it with the same `cell_focus=map` command. If every field
+of the scan lies in such a well, the scan ends `failed` and its text names the sample, not
+the stage: `no well was scanned: no sweep anchored A1, A2, B2 (the first field A1_0000:
+MapNotAnchored: …): in a copy of the run document, plan one of these wells alone
+(scan-plan with wells=A1), focus by eye on its cells, and scan it there`. A scan where
+other fields failed by the stage too keeps the text of any scan where every field failed.
+
+**A try that did not sweep is not a try that found no peak.** It ends in one of two ways.
+D19's bounds refused it before its sweep (`SweepOutsideLimits`, `SweepBeyondJog`): Z did
+not move, and the same plan would meet the same refusal on a resume, so a well where
+**every try was refused** is anchored `none` like a flat one, and its texts name the first
+refusal. Or the stand failed (`StageOffTarget`, `FocusDriveOffTarget`, a device error). In
+a well other than the operator's, **when no try swept and at least one failed by the
+stand**, the scan ends with `the anchor of <well> could not be measured: none of its <t>
+tries ran a sweep and <f> of them failed (the first: <error>): check the stage and the
+camera, then run scan --resume`, `<error>` the first failure's, not the first try's. The
+checkpoint keeps the wells done, and a resume anchors that well again. In the operator's
+well the start anchor is kept either way, its texts say that no sweep ran, and its
+fields' own failures end the scan after `max_failed_in_row`.
 
 **At each field**, after the stage has landed: the target is the map at the readback plus
 the well's anchor; one Z move there. A target outside the soft limits fails the field with
@@ -502,14 +519,17 @@ anchor.
 A scan without the map has neither `focus_map` nor the two keys of a frame, so it is
 written as before; one with them is refused by an older smc. `assumed` says where the
 map came from, the fields far from every locked frame (`<k> of <n> fields lie more than
-<b> µm from every locked frame of their well, the farthest <field> at <d> µm: their Z is
-read from frames that far (the bound, the map scan's larger field side, is assumed, not
-measured)`, only when `k` is above 0), each well's anchor (`<well>: anchored <a> µm from
-the map by <p> peaks of <t> sweeps near its centre`; or, with no peak, `<well>: no sweep
-near its centre found a peak (<t> tried): the operator's focus anchors it, <a0> µm from
-the map` in the operator's well and `<well>: no sweep near its centre found a peak (<t>
-tried), and the operator focused in <start_well>: the well was not scanned` in another),
-the time (`the focus from the map added <x> s per field (<n>
+<b> µm from every locked frame of their well, the farthest <field> at <d> µm: where they
+are scanned, their Z is read from frames that far (the bound, the map scan's larger field
+side, is assumed, not measured)`, only when `k` is above 0; the count is made before
+anything moves, so it includes the fields of a well that is then not scanned), each well's
+anchor (`<well>: anchored <a> µm from the map by <p> peaks of <t> sweeps near its centre`;
+or, with no peak, `<well>: <why>: the operator's focus anchors it, <a0> µm from the map` in
+the operator's well and `<well>: <why>, and the operator focused in <start_well>: the well
+was not scanned` in another, `<why>` as above with `its centre`). On a `--resume`, the
+anchors of the wells an earlier attempt measured come first, in the checkpoint's order,
+each line ending in `(an earlier attempt)` after a space; the time line counts this
+attempt's wells only. Then the time (`the focus from the map added <x> s per field (<n>
 fields), and the anchors <y> s (<w> wells)`) and the checks (`the map's Z was checked on
 <c> fields: a peak on <p>, within 1 µm of the map's Z on <q1> and within 2 µm on <q2>, the
 median distance <m> µm`, or `the map's Z was not checked against a sweep
