@@ -1159,8 +1159,9 @@ class ScanPlugin:
                 )
             )
         if not ctx.dry_run:
-            # What the frames' places in their wells rest on: last, after every
-            # line the scan already writes. A dry run takes no frame.
+            # What the frames' places in their wells rest on: after every line the
+            # scan already writes, but for a selection's, which follows (below,
+            # m3 §28.8). A dry run takes no frame.
             assumed.extend(
                 offset_lines(
                     plan,

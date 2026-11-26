@@ -172,9 +172,15 @@ def _stops(path: Path) -> list[dict[str, Any]]:
 
 
 def _measured(path: Path) -> str:
-    """The route record's ``finished_utc`` of the raw JSON, to the second (FM-124)."""
+    """The route record's ``finished_utc`` of the raw JSON, to the second (FM-124).
+
+    The JSON ends in ``Z``, which ``datetime.fromisoformat`` reads only from
+    Python 3.11 (the floor is 3.10): the suffix is written as the offset it means.
+    """
     raw = _raw(path)["stages"]["route"]["finished_utc"]
-    return datetime.fromisoformat(raw).isoformat(timespec="seconds")
+    return datetime.fromisoformat(raw.replace("Z", "+00:00")).isoformat(
+        timespec="seconds"
+    )
 
 
 def _rewrite_route(path: Path, **record: Any) -> dict[str, Any]:
