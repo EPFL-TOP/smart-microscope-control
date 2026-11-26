@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import json
 import math
 import shutil
@@ -39,19 +38,22 @@ from typing import Any, TextIO
 import numpy as np
 import numpy.typing as npt
 import tifffile
+from pydantic import ValidationError
 
-from smc.plugins.cells.algorithm import suppress_in_frame
-from smc.plugins.cells.detector import (
-    BLOB_DETECTOR,
-    BLOB_DETECTOR_IDENTITY,
-    BlobDetector,
+from smc.inference import (
+    DEFAULT_MODEL_NAME,
     Detection,
     Detector,
-    Preprocessing,
-    default_model_path,
-    load_detector,
-    model_input_size_px,
+    ModelCard,
+    ModelError,
+    ModelPreprocessing,
+    ResolvedModel,
+    load_model,
+    model_card,
 )
+from smc.inference.blobs import BlobDetector, blob_model
+from smc.inference.preprocessing import preprocessing_for
+from smc.plugins.cells.algorithm import suppress_in_frame
 from smc.plugins.cells.evaluate import (
     DEFAULT_MATCH_IOU,
     NO_BOX,
@@ -60,7 +62,6 @@ from smc.plugins.cells.evaluate import (
     class_scores,
     confusion,
 )
-from smc.plugins.errors import PluginRunError
 from smc.plugins.slots import ScanFrame, ScanResult, load_frame
 from smc.run import RunDocument, RunDocumentError, StageStatus
 from smc.run.files import resolve_in_run, retry_on_permission_error
@@ -72,9 +73,9 @@ DEFAULT_MAX_OVERLAP = 0.7
 _PROG = "cells_check"
 _SPLITS = ("train", "val")
 _NATIVE = "native"
-_HASH_CHUNK_BYTES = 1 << 20
 #: The largest ``model_um_per_px`` the plugin accepts.
 _MAX_UM_PER_PX = 10.0
+#: The blob detector's rows say these percentiles in no result; a model's are its card's.
 _TRAINED_PERCENTILES = (0.5, 99.5)
 
 
@@ -100,17 +101,41 @@ def _dumps(value: Any) -> str:
     return json.dumps(value, indent=1, ensure_ascii=True, allow_nan=False) + "\n"
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
+def _card(name: str | None) -> ModelCard:
+    """The card of ``--model`` (``cell-classes-v2`` when unset), or what is wrong with it in a line."""
     try:
-        with path.open("rb") as handle:
-            while chunk := handle.read(_HASH_CHUNK_BYTES):
-                digest.update(chunk)
-    except OSError as exc:
-        raise CheckError(
-            f"cannot read {path.name} to hash it ({exc.strerror or exc})"
-        ) from exc
-    return digest.hexdigest()
+        return model_card(DEFAULT_MODEL_NAME if name is None else name)
+    except ModelError as exc:
+        raise CheckError(str(exc)) from exc
+
+
+def _resolve_model(
+    card: ModelCard,
+    rule: ModelPreprocessing,
+    *,
+    shape_px: tuple[int, int],
+    pixel_size_um: float,
+    args: argparse.Namespace,
+    score_threshold: float,
+) -> ResolvedModel:
+    """The model of ``card`` run with ``rule`` on this PC, or the reason it cannot be, in a line.
+
+    ``load_model`` is called through this module's name, which is where a test
+    replaces it. The weights are looked for as ``cells`` looks for them
+    (``$SMC_MODELS``, or ``--model-path``) and checked against the card's SHA-256.
+    """
+    try:
+        return load_model(
+            card,
+            preprocessing=rule,
+            frame_shape_px=shape_px,
+            frame_um_per_px=pixel_size_um,
+            device=args.device or "auto",
+            score_threshold=score_threshold,
+            weights=args.model_path,
+        )
+    except ModelError as exc:
+        raise CheckError(str(exc)) from exc
 
 
 # ------------------------------------------------------------------ arguments
@@ -168,7 +193,12 @@ def _percentile_pairs(text: str) -> list[tuple[float, float]]:
             if not colon:
                 raise ValueError("write each pair as low:high")
             pair = (float(low_text), float(high_text))
-            Preprocessing(percentiles=pair)
+            # The bounds of a card and of cells' parameters, so that a pair measured
+            # here is one that cells can be given.
+            ModelPreprocessing(percentiles=pair, model_um_per_px=None)
+        except ValidationError as exc:
+            reason = str(exc.errors()[0]["msg"]).removeprefix("Value error, ")
+            raise argparse.ArgumentTypeError(f"{part.strip()!r}: {reason}") from None
         except ValueError as exc:
             raise argparse.ArgumentTypeError(f"{part.strip()!r}: {exc}") from None
         out.append(pair)
@@ -207,14 +237,23 @@ def _parser() -> argparse.ArgumentParser:
         default=0.3,
         help="the lowest score the draft keeps (default 0.3)",
     )
-    export.add_argument("--model-path", type=Path, help="the weights (--prefill model)")
+    export.add_argument(
+        "--model",
+        metavar="NAME",
+        help=f"the model, by the name of its card (--prefill model; default {DEFAULT_MODEL_NAME})",
+    )
+    export.add_argument(
+        "--model-path",
+        type=Path,
+        help="the weights, in place of the card's file in $SMC_MODELS (--prefill model)",
+    )
     export.add_argument(
         "--device", choices=("auto", "cpu", "cuda", "mps"), help="(--prefill model)"
     )
     export.add_argument(
         "--model-um-per-px",
         type=_float_in("--model-um-per-px", 0.0, _MAX_UM_PER_PX, open_low=True),
-        help="the pixel size the model sees (--prefill model; default its own resize)",
+        help="the pixel size the model sees (--prefill model; default the card's)",
     )
 
     measure = commands.add_parser(
@@ -228,14 +267,19 @@ def _parser() -> argparse.ArgumentParser:
         help="repeat for both (default: blobs and model)",
     )
     measure.add_argument(
+        "--model",
+        metavar="NAME",
+        help=f"the model, by the name of its card (default {DEFAULT_MODEL_NAME})",
+    )
+    measure.add_argument(
         "--model-um-per-px",
         type=_sizes,
-        help="comma-separated pixel sizes the model sees; native is its own resize (default native)",
+        help="comma-separated pixel sizes the model sees; native is its own resize (default the card's)",
     )
     measure.add_argument(
         "--percentiles",
         type=_percentile_pairs,
-        help="comma-separated low:high pairs (default 0.5:99.5)",
+        help="comma-separated low:high pairs (default the card's)",
     )
     measure.add_argument(
         "--score-threshold",
@@ -252,7 +296,11 @@ def _parser() -> argparse.ArgumentParser:
         type=_float_in("--match-iou", 0.0, 1.0, open_low=True),
         default=DEFAULT_MATCH_IOU,
     )
-    measure.add_argument("--model-path", type=Path, help="the weights")
+    measure.add_argument(
+        "--model-path",
+        type=Path,
+        help="the weights, in place of the card's file in $SMC_MODELS",
+    )
     measure.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"))
     measure.add_argument("--json", type=Path, help="also write the numbers here")
     return parser
@@ -351,11 +399,13 @@ def _prefill_detector(
         "detector": args.prefill,
         "model": None,
         "model_sha256": None,
+        "model_identity": None,
         "score": args.prefill_score,
         "model_um_per_px": args.model_um_per_px,
     }
     if args.prefill != "model":
         for given, flag in (
+            (args.model, "--model"),
             (args.model_path, "--model-path"),
             (args.device, "--device"),
             (args.model_um_per_px, "--model-um-per-px"),
@@ -363,35 +413,45 @@ def _prefill_detector(
             if given is not None:
                 raise CheckError(f"{flag} is for --prefill model")
         if args.prefill == "blobs":
-            info["model"] = BLOB_DETECTOR
-            info["model_sha256"] = hashlib.sha256(
-                BLOB_DETECTOR_IDENTITY.encode("utf-8")
-            ).hexdigest()
-            return BlobDetector(), info
+            blobs = blob_model()
+            info["model"] = blobs.name
+            info["model_sha256"] = blobs.weights_sha256
+            info["model_identity"] = blobs.identity
+            return blobs.detector, info
         return None, info
-    size = None
-    if args.model_um_per_px is not None:
+    card = _card(args.model)
+    # The card's rule, with the size asked for in place of its own: a draft is made
+    # as the model was trained unless the owner says otherwise.
+    rule = ModelPreprocessing(
+        percentiles=card.preprocessing.percentiles,
+        model_um_per_px=(
+            card.preprocessing.model_um_per_px
+            if args.model_um_per_px is None
+            else args.model_um_per_px
+        ),
+    )
+    shape, pixel = scan.image_shape_px, scan.pixel_size_um
+    if rule.model_um_per_px is not None:
+        # Worked out here as well, so that a size the model is never given stops the
+        # export before the weights are looked for (and says which flag it was).
         try:
-            size = model_input_size_px(
-                scan.image_shape_px, scan.pixel_size_um, args.model_um_per_px
-            )
+            preprocessing_for(rule, frame_shape_px=shape, frame_um_per_px=pixel)
         except ValueError as exc:
             raise CheckError(
-                f"--model-um-per-px {args.model_um_per_px:g}: {exc}"
+                f"--model-um-per-px {rule.model_um_per_px:g}: {exc}"
             ) from exc
-    weights = args.model_path if args.model_path is not None else default_model_path()
-    try:
-        detector = load_detector(
-            weights,
-            device=args.device or "auto",
-            score_threshold=args.prefill_score,
-            preprocessing=Preprocessing(input_size_px=size),
-        )
-    except PluginRunError as exc:
-        raise CheckError(exc.reason) from exc
-    info["model"] = weights.name
-    info["model_sha256"] = _sha256(weights)
-    return detector, info
+    resolved = _resolve_model(
+        card,
+        rule,
+        shape_px=shape,
+        pixel_size_um=pixel,
+        args=args,
+        score_threshold=args.prefill_score,
+    )
+    info["model"] = resolved.name
+    info["model_sha256"] = resolved.weights_sha256
+    info["model_identity"] = resolved.identity
+    return resolved.detector, info
 
 
 def _coco_annotation(
@@ -711,7 +771,8 @@ class Outcome:
     heading: str
     error: str | None = None
     model: str | None = None
-    model_sha256_12: str | None = None
+    model_sha256: str | None = None
+    model_identity: str | None = None
     input_size_px: tuple[int, int] | None = None
     frames: int = 0
     first_s: float | None = None
@@ -725,12 +786,19 @@ def _ratio(value: float | None) -> str:
     return "-" if value is None else f"{value:.3f}"
 
 
+def _shape_of(image: ReviewedImage) -> tuple[int, int]:
+    """An image's ``(rows, columns)``, for a model that is shown the frame at its own size."""
+    rows, columns = image.pixels.shape
+    return int(rows), int(columns)
+
+
 def _run_configuration(
     configuration: Configuration,
     args: argparse.Namespace,
     images: Sequence[ReviewedImage],
     classes: Sequence[str],
     frames: tuple[float, tuple[int, int]] | None,
+    card: ModelCard | None,
 ) -> Outcome:
     """Run one detector over the reviewed images as ``cells`` does and score it against the reference."""
     outcome = Outcome(configuration, f"=== {configuration.detector} ===")
@@ -738,49 +806,51 @@ def _run_configuration(
     if configuration.detector == "blobs":
         detector = BlobDetector()
     else:
+        assert card is not None  # `_measure` reads it whenever the model is measured
         low, high = configuration.percentiles
-        weights = (
-            args.model_path if args.model_path is not None else default_model_path()
-        )
         shown = (
             "own resize (800 px)"
             if configuration.model_um_per_px is None
             else f"{configuration.model_um_per_px:g} um per pixel"
         )
         outcome.heading = (
-            f"=== model: {weights.name}, {shown}, percentiles {low:g}:{high:g} ==="
+            f"=== model: {card.name}, {shown}, percentiles {low:g}:{high:g} ==="
         )
+        # The manifest's frames, or the first image's shape when there is none: a size
+        # without a manifest was refused before the first configuration, so the pixel
+        # size that is unknown there (nan) is never read by a native rule.
+        shape_px = frames[1] if frames is not None else _shape_of(images[0])
+        pixel_um = frames[0] if frames is not None else math.nan
         size: tuple[int, int] | None = None
         try:
-            if configuration.model_um_per_px is not None:
-                assert frames is not None  # checked before the first configuration
-                size = model_input_size_px(
-                    frames[1], frames[0], configuration.model_um_per_px
-                )
+            rule = ModelPreprocessing(
+                percentiles=(low, high), model_um_per_px=configuration.model_um_per_px
+            )
+            size = preprocessing_for(
+                rule, frame_shape_px=shape_px, frame_um_per_px=pixel_um
+            ).input_size_px
             outcome.input_size_px = size
-            detector = load_detector(
-                weights,
-                device=args.device or "auto",
+            resolved = _resolve_model(
+                card,
+                rule,
+                shape_px=shape_px,
+                pixel_size_um=pixel_um,
+                args=args,
                 score_threshold=args.score_threshold,
-                preprocessing=Preprocessing(
-                    percentiles=(low, high), input_size_px=size
-                ),
             )
-            outcome.model = weights.name
-            outcome.model_sha256_12 = _sha256(weights)[:12]
-        except (PluginRunError, ValueError, CheckError) as exc:
-            outcome.error = exc.reason if isinstance(exc, PluginRunError) else str(exc)
+            detector = resolved.detector
+            outcome.model = resolved.name
+            outcome.model_sha256 = resolved.weights_sha256
+            outcome.model_identity = resolved.identity
+        except (ValueError, CheckError) as exc:
+            outcome.error = str(exc)
             return outcome
-        if size is not None:
-            outcome.heading = (
-                f"=== model: {weights.name} (sha256 {outcome.model_sha256_12}), "
-                f"{shown} (input {size[0]}x{size[1]} px), percentiles {low:g}:{high:g} ==="
-            )
-        else:
-            outcome.heading = (
-                f"=== model: {weights.name} (sha256 {outcome.model_sha256_12}), "
-                f"{shown}, percentiles {low:g}:{high:g} ==="
-            )
+        digits = resolved.weights_sha256[:12]
+        where = f" (input {size[0]}x{size[1]} px)" if size is not None else ""
+        outcome.heading = (
+            f"=== model: {card.name} (sha256 {digits}), {shown}{where}, "
+            f"percentiles {low:g}:{high:g} ==="
+        )
     counts: Counter[tuple[str, str]] = Counter()
     seconds: list[float] = []
     try:
@@ -871,7 +941,11 @@ def _outcome_json(outcome: Outcome) -> dict[str, Any]:
     return {
         "detector": configuration.detector,
         "model": outcome.model,
-        "model_sha256_12": outcome.model_sha256_12,
+        "model_sha256": outcome.model_sha256,
+        "model_sha256_12": (
+            outcome.model_sha256[:12] if outcome.model_sha256 is not None else None
+        ),
+        "model_identity": outcome.model_identity,
         "model_um_per_px": configuration.model_um_per_px,
         "input_size_px": list(outcome.input_size_px) if outcome.input_size_px else None,
         "percentiles": list(configuration.percentiles) if is_model else None,
@@ -899,6 +973,7 @@ def _measure(args: argparse.Namespace) -> int:
     detectors = list(dict.fromkeys(args.detector or ["blobs", "model"]))
     if "model" not in detectors:
         for given, flag in (
+            (args.model, "--model"),
             (args.model_um_per_px, "--model-um-per-px"),
             (args.percentiles, "--percentiles"),
             (args.model_path, "--model-path"),
@@ -906,8 +981,14 @@ def _measure(args: argparse.Namespace) -> int:
         ):
             if given is not None:
                 raise CheckError(f"{flag} is for --detector model")
-    sizes: list[float | None] = args.model_um_per_px or [None]
-    pairs: list[tuple[float, float]] = args.percentiles or [_TRAINED_PERCENTILES]
+    # What is measured of the model is the card's, unless a sweep says otherwise.
+    card = _card(args.model) if "model" in detectors else None
+    sizes: list[float | None] = args.model_um_per_px or [
+        card.preprocessing.model_um_per_px if card is not None else None
+    ]
+    pairs: list[tuple[float, float]] = args.percentiles or [
+        card.preprocessing.percentiles if card is not None else _TRAINED_PERCENTILES
+    ]
     dataset: Path = args.dataset_dir
     images, total, classes = _reviewed_images(dataset)
     frames = _frames_pixel_size(dataset)
@@ -933,7 +1014,7 @@ def _measure(args: argparse.Namespace) -> int:
             ]
     outcomes = []
     for configuration in configurations:
-        outcome = _run_configuration(configuration, args, images, classes, frames)
+        outcome = _run_configuration(configuration, args, images, classes, frames, card)
         _print_outcome(outcome, classes, args, len(images), total)
         outcomes.append(outcome)
     if args.json is not None:

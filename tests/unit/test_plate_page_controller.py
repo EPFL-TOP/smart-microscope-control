@@ -5505,6 +5505,9 @@ def test_cells_offers_the_detector_as_a_key_parameter(
     assert cells.name == "cells"
     assert [row[0] for row in cells.key] == ["detector", "score_threshold"]
     assert {row[0] for row in cells.advanced} == {
+        # The model by the name of its card (#684): the page's own choice of a
+        # model is #600's, this is the parameter every plugin parameter gets.
+        "model",
         "model_path",
         "device",
         "max_overlap",

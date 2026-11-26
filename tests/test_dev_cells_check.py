@@ -3,7 +3,7 @@
 The script is loaded from its file, as ``scripts/dev/loc.py`` is. The frames are
 ``PlateSample`` frames of 200 x 320 pixels at 0.5 um (not square, FM-73) with
 three single spots and a pair, which the blob detector finds exactly (m3 §9.1), so
-no test needs torch: where the model matters, ``load_detector`` of the script is
+no test needs torch: where the model matters, ``load_model`` of the script is
 replaced by a stub that returns what the test scripts.
 
 Spots are 25 um apart or more and 30 um from the frame's edges, so that no
@@ -25,11 +25,18 @@ import numpy.typing as npt
 import pytest
 import tifffile
 
-from smc.plugins.cells.detector import Detection, Preprocessing
-from smc.plugins.errors import PluginRunError
+from smc.inference.cards import ModelCard
+from smc.inference.detector import Detection
+from smc.inference.errors import ModelError
+from smc.inference.models import ResolvedModel, file_sha256, model_identity
+from smc.inference.preprocessing import (
+    ModelPreprocessing,
+    Preprocessing,
+    preprocessing_for,
+)
 from smc.plugins.slots import ScanFrame, ScanResult
 from smc.run import StageRecord, StageStatus, write_stage
-from smc.testing import Blob, PlateSample
+from smc.testing import Blob, PlateSample, StubDetector, stub_model
 
 ROOT = Path(__file__).resolve().parents[1]
 SHAPE = (200, 320)  # (rows, columns)
@@ -143,43 +150,53 @@ def _save_val(dataset: Path, payload: dict[str, Any]) -> None:
     )
 
 
-class _Scripted:
-    """A detector that returns what the test scripted, whatever the frame."""
-
-    classes = ("single", "doublet", "debris")
-    device = "cpu"
-
-    def __init__(self, found: list[Detection]) -> None:
-        self._found = found
-
-    def detect(self, frame: npt.NDArray[Any]) -> list[Detection]:
-        return list(self._found)
-
-
 def _stub_loader(
     monkeypatch: pytest.MonkeyPatch, check: ModuleType, found: list[Detection]
 ) -> list[dict[str, Any]]:
-    """``cells_check.load_detector`` gives a scripted detector; its calls are returned."""
+    """``cells_check.load_model`` gives a scripted detector whatever the frame; its calls are returned.
+
+    The stand-in works out what the real one would show the model, from the
+    arguments the script passed it (``preprocessing_for``, which is the real
+    one's first step), and its identity from the rule and the weights it was
+    given, so that what the script computes of them is seen (FM-124, FM-260).
+    """
     calls: list[dict[str, Any]] = []
 
     def fake(
-        model_path: Path | None,
+        card: ModelCard,
         *,
+        preprocessing: ModelPreprocessing,
+        frame_shape_px: tuple[int, int],
+        frame_um_per_px: float,
         device: str,
         score_threshold: float,
-        preprocessing: Preprocessing,
-    ) -> _Scripted:
+        weights: Path | None = None,
+    ) -> ResolvedModel:
+        shown = preprocessing_for(
+            preprocessing,
+            frame_shape_px=frame_shape_px,
+            frame_um_per_px=frame_um_per_px,
+        )
         calls.append(
             {
-                "path": model_path,
+                "card": card,
+                "weights": weights,
                 "device": device,
                 "score": score_threshold,
-                "preprocessing": preprocessing,
+                "rule": preprocessing,
+                "preprocessing": shown,
+                "frame_shape_px": frame_shape_px,
             }
         )
-        return _Scripted(found)
+        sha = file_sha256(weights) if weights is not None else "0" * 64
+        return stub_model(
+            StubDetector(default=found),
+            name=card.name,
+            weights_sha256=sha,
+            preprocessing=preprocessing,
+        )
 
-    monkeypatch.setattr(check, "load_detector", fake)
+    monkeypatch.setattr(check, "load_model", fake)
     return calls
 
 
@@ -187,7 +204,7 @@ def _refusing_loader(monkeypatch: pytest.MonkeyPatch, check: ModuleType) -> None
     def refused(*args: object, **kwargs: object) -> object:
         raise AssertionError("the model must not be loaded here")
 
-    monkeypatch.setattr(check, "load_detector", refused)
+    monkeypatch.setattr(check, "load_model", refused)
 
 
 def _weights(tmp_path: Path) -> Path:
@@ -335,7 +352,8 @@ def test_export_writes_coco_boxes_columns_first(
     # The prefill asked for what the plan says: the score 0.3 and the model as trained.
     assert calls[0]["score"] == 0.3
     assert calls[0]["preprocessing"] == Preprocessing()
-    assert calls[0]["path"] == weights
+    assert calls[0]["weights"] == weights
+    assert calls[0]["card"].name == "cell-classes-v2"
 
 
 def test_the_prefill_keeps_the_better_label_of_one_object_and_drops_the_weak_boxes(
@@ -459,9 +477,9 @@ def test_a_model_that_will_not_load_leaves_no_folder(
     run_json = _seed_run(tmp_path, [("A1", _frame(0))])
 
     def refused(*args: object, **kwargs: object) -> object:
-        raise PluginRunError("cells", "no model at x.pth; put it there")
+        raise ModelError("no model at x.pth; put it there")
 
-    monkeypatch.setattr(check, "load_detector", refused)
+    monkeypatch.setattr(check, "load_model", refused)
     out = tmp_path / "ref"
 
     assert _export(check, run_json, out, prefill="model") == 1
@@ -568,9 +586,122 @@ def test_the_manifest_names_the_models_file_and_hash(
     )
 
     prefill = json.loads((out / "manifest.json").read_text("utf-8"))["prefill"]
-    assert prefill["model"] == "w.pth"
-    assert prefill["model_sha256"] == hashlib.sha256(weights.read_bytes()).hexdigest()
+    sha = hashlib.sha256(weights.read_bytes()).hexdigest()
+    assert prefill["model"] == "cell-classes-v2"
+    assert prefill["model_sha256"] == sha
+    # The identity is the weights and the rule the draft was made with: the card's.
+    assert prefill["model_identity"] == model_identity(
+        sha, ModelPreprocessing(percentiles=(0.5, 99.5), model_um_per_px=None)
+    )
     assert str(tmp_path) not in json.dumps(prefill)
+
+
+def test_check_takes_a_model_by_name(
+    check: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--model`` names a card, on ``export`` and on ``measure``; the default is ``cell-classes-v2``."""
+    dataset = _reviewed_dataset(tmp_path, check)
+    run_json = tmp_path / "run" / "run.json"
+    weights = _weights(tmp_path)
+    calls = _stub_loader(monkeypatch, check, [])
+
+    assert (
+        _export(
+            check,
+            run_json,
+            tmp_path / "second",
+            "--model",
+            "cell-classes-v2",
+            "--model-path",
+            str(weights),
+            prefill="model",
+        )
+        == 0
+    )
+    code = check.main(
+        [
+            "measure",
+            str(dataset),
+            "--detector",
+            "model",
+            "--model",
+            "cell-classes-v2",
+            "--model-path",
+            str(weights),
+        ]
+    )
+
+    assert code == 0
+    assert [c["card"].name for c in calls] == ["cell-classes-v2", "cell-classes-v2"]
+    assert "cell-classes-v2" in capsys.readouterr().out
+
+
+def test_an_unknown_model_name_is_a_check_error_that_lists_the_names(
+    check: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dataset = _reviewed_dataset(tmp_path, check)
+    run_json = tmp_path / "run" / "run.json"
+    _refusing_loader(monkeypatch, check)
+
+    code = _export(
+        check,
+        run_json,
+        tmp_path / "second",
+        "--model",
+        "cell-classes-v9",
+        prefill="model",
+    )
+
+    assert code == 1
+    error = capsys.readouterr().err
+    assert "no model named 'cell-classes-v9'" in error
+    assert "cell-classes-v2" in error
+    assert not (tmp_path / "second").exists()
+    assert check.main(["measure", str(dataset), "--model", "nope"]) == 1
+    assert "no model named 'nope'" in capsys.readouterr().err
+
+
+def test_the_measure_json_records_the_models_name_hash_and_identity(
+    check: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+
+    dataset = _reviewed_dataset(tmp_path, check)
+    weights = _weights(tmp_path)
+    _stub_loader(monkeypatch, check, [])
+    out = tmp_path / "numbers.json"
+
+    code = check.main(
+        [
+            "measure",
+            str(dataset),
+            "--detector",
+            "model",
+            "--model-path",
+            str(weights),
+            "--percentiles",
+            "1:99",
+            "--json",
+            str(out),
+        ]
+    )
+
+    assert code == 0
+    (configuration,) = json.loads(out.read_text("utf-8"))["configurations"]
+    sha = hashlib.sha256(weights.read_bytes()).hexdigest()
+    assert configuration["model"] == "cell-classes-v2"
+    assert configuration["model_sha256"] == sha
+    assert configuration["model_sha256_12"] == sha[:12]
+    # The rule that was measured, not the card's: the percentiles of the sweep.
+    assert configuration["model_identity"] == model_identity(
+        sha, ModelPreprocessing(percentiles=(1.0, 99.0), model_um_per_px=None)
+    )
 
 
 # -------------------------------------------------------------------- measure
@@ -732,7 +863,7 @@ def test_measure_sweeps_the_model_preprocessing(
         ((333, 534), (1.0, 99.0)),
     ]
     assert {c["score"] for c in calls} == {0.6}
-    assert {c["path"] for c in calls} == {weights}
+    assert {c["weights"] for c in calls} == {weights}
 
 
 def test_measure_native_keeps_the_models_own_resize(
@@ -789,7 +920,7 @@ def test_measure_puts_the_models_file_and_hash_in_the_header(
     out = capsys.readouterr().out
     digits = hashlib.sha256(weights.read_bytes()).hexdigest()[:12]
     header = next(line for line in out.splitlines() if line.startswith("=== model"))
-    assert "w.pth" in header
+    assert "cell-classes-v2" in header
     assert digits in header
     assert "0.25 um per pixel" in header
     assert "400x640" in header
@@ -907,9 +1038,9 @@ def test_a_model_that_will_not_load_is_a_finding_and_blobs_still_runs(
     dataset = _reviewed_dataset(tmp_path, check)
 
     def refused(*args: object, **kwargs: object) -> object:
-        raise PluginRunError("cells", "no model at x.pth; put it there")
+        raise ModelError("no model at x.pth; put it there")
 
-    monkeypatch.setattr(check, "load_detector", refused)
+    monkeypatch.setattr(check, "load_model", refused)
     capsys.readouterr()
 
     code = check.main(["measure", str(dataset)])
@@ -1072,7 +1203,7 @@ def test_the_json_of_a_sweep_names_each_configuration(
         (c["detector"], c["model_um_per_px"], c["input_size_px"])
         for c in configurations
     ] == [("blobs", None, None), ("model", None, None), ("model", 0.25, [400, 640])]
-    assert configurations[1]["model"] == "w.pth"
+    assert configurations[1]["model"] == "cell-classes-v2"
     assert len(configurations[1]["model_sha256_12"]) == 12
     assert configurations[0]["model"] is None
 
@@ -1138,7 +1269,7 @@ def _three_frames(tmp_path: Path) -> Path:
 
 def _boxes_of(frame: npt.NDArray[Any]) -> list[list[float]]:
     """What the blob detector finds on ``frame``, as COCO boxes: an oracle that reads nothing of the script."""
-    from smc.plugins.cells.detector import BlobDetector
+    from smc.inference.blobs import BlobDetector
 
     return sorted(
         [d.col0_px, d.row0_px, d.col1_px - d.col0_px, d.row1_px - d.row0_px]
@@ -1284,7 +1415,7 @@ def test_measure_reads_a_dataset_that_has_only_a_train_split(
 def test_the_device_reaches_the_model_in_both_commands(
     check: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A timing taken on the wrong device is the wrong timing: ``--device cpu`` must reach ``load_detector``, and ``auto`` is the default."""
+    """A timing taken on the wrong device is the wrong timing: ``--device cpu`` must reach ``load_model``, and ``auto`` is the default."""
     dataset = _reviewed_dataset(tmp_path, check)
     weights = _weights(tmp_path)
     calls = _stub_loader(monkeypatch, check, [])

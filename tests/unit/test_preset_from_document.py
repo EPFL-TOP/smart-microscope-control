@@ -438,6 +438,7 @@ CASES: dict[str, list[dict[str, Any]]] = {
         },
         {
             "detector": "model",
+            "model": "cell-classes-v2",
             "model_path": "/x/w.pt",
             "device": "cpu",
             "model_um_per_px": 0.49,
