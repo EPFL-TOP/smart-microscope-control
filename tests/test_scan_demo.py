@@ -73,6 +73,8 @@ from smc.plugins.slots import (
     CameraCalibration,
     PlannedField,
     PlateResult,
+    RoutePosition,
+    RouteResult,
     ScanFrame,
     ScanPlanResult,
     ScanResult,
@@ -4071,6 +4073,101 @@ def test_a_well_whose_anchor_sweeps_are_flat_keeps_the_operators_anchor_and_says
     # The other wells find their own.
     assert [a.source for a in result.focus_map.anchors[1:]] == ["swept", "swept"]
     assert len(result.frames) == 27
+
+
+def _seed_route(path: Path, stops: dict[str, list[tuple[float, float]]]) -> None:
+    """A ``route`` record in the map's document, its stops in the wells given, usable there.
+
+    Its reads name the document's ``scan-plan`` and ``scan`` attempts, so that
+    ``unusable("route", ...)`` is ``None`` (the route rests on that scan); its
+    fields are the rig's objective's, of the rig's footprint.
+    """
+    doc = RunDocument.load(path)
+    plan = doc.stages["scan-plan"]
+    scan = doc.stages["scan"]
+    positions = [
+        RoutePosition(
+            order=order,
+            well=well,
+            name=f"{well}_r{k:03d}",
+            x_um=CENTRES_UM[well][0] + dx,
+            y_um=CENTRES_UM[well][1] + dy,
+            z_um=MAP_BASE_UM,
+            pfs_offset=4242.0,
+            counts={"single": 1},
+        )
+        for order, (well, k, (dx, dy)) in enumerate(
+            (well, k, place)
+            for well, places in stops.items()
+            for k, place in enumerate(places)
+        )
+    ]
+    then = datetime(2026, 11, 24, 13, 45, 0, tzinfo=timezone.utc)
+    write_stage(
+        path,
+        StageRecord(
+            plugin="route",
+            provides="route",
+            attempt="r1",
+            status=StageStatus.done,
+            started_utc=then,
+            finished_utc=then,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={"selector": "most-cells"},
+            result=RouteResult(
+                objective=IN_PLACE,
+                matrix_um_per_px=pixel_matrix(PIXEL_UM),
+                image_shape_px=SHAPE,
+                fov_um=(SHAPE[1] * PIXEL_UM, SHAPE[0] * PIXEL_UM),
+                labels=("single",),
+                positions=tuple(positions),
+                uncovered={well: 0 for well in stops},
+                distance_um=0.0,
+                travel_s=None,
+            ).model_dump(mode="json"),
+            reads={
+                "scan-plan": ReadRecord(plugin="scan-plan", attempt=plan.attempt),
+                "scan": ReadRecord(plugin="scan", attempt=scan.attempt),
+            },
+        ),
+    )
+
+
+def test_a_map_scan_of_a_selection_that_left_a_named_well_empty_anchors_only_the_planned_well(
+    rig: _Rig,
+) -> None:
+    # The review of PR #682: the anchor pass and check 3 index every planned well,
+    # so a named well that a selection left without a field must not be planned
+    # (m3 §28.2 D2). A1 and A2 are named; the route's two stops lie in A1.
+    path = _seed_map(rig)
+    _seed_route(path, {"A1": [(-50.0, 30.0), (60.0, -40.0)]})
+    record = run_plugin(
+        ScanPlanPlugin(),
+        rig.microscope,
+        ScanPlanParams(wells="A1,A2", fields_from=path),
+        rig.run_doc,
+    )
+    assert record.status is StageStatus.done, record.error
+    assert record.result is not None
+    plan = ScanPlanResult.model_validate(record.result)
+    assert plan.wells == ("A1",)
+    assert plan.selection is not None
+    assert plan.selection.wells_without_fields == ("A2",)
+    assert [(f.x_um, f.y_um) for f in plan.fields] == [(-50.0, 30.0), (60.0, -40.0)]
+    _focused_at_a1(rig)
+
+    result = _result(_map_scan(rig, path))
+
+    assert result.failed == ()
+    assert [frame.well for frame in result.frames] == ["A1", "A1"]
+    assert result.focus_map is not None
+    assert [anchor.well for anchor in result.focus_map.anchors] == ["A1"]
+    assert result.assumed[-1] == (
+        f"the plan's 2 fields in 1 wells were chosen by selector 'most-cells' in "
+        f"{path.as_posix()}: the rest of each well was not scanned"
+    )
 
 
 def test_map_focus_is_refused_with_the_autofocus_locked(rig: _Rig) -> None:

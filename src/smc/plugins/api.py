@@ -114,6 +114,13 @@ class Plugin(Protocol[P, R]):
     ``from_run_doc``). ``check_run_doc`` refuses one that names the document the run
     writes, before anything is written: the stage's ``running`` record would replace
     the very record the reuse copies (F15, #626).
+
+    ``reuse_slots`` is a third optional class attribute read with ``getattr``: a
+    mapping of a ``reuses_from`` field to the slot the plugin reads in that
+    document, for a reader of **another** slot whose record rests on the one the
+    stage replaces (``scan-plan``'s ``fields_from`` reads a ``route`` made from the
+    plan it replaces, m3 §28.7). A field absent from it reads the plugin's own
+    slot; a key that ``reuses_from`` does not declare raises ``AttributeError``.
     """
 
     name: str

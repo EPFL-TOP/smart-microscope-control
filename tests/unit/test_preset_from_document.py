@@ -582,6 +582,8 @@ CASES: dict[str, list[dict[str, Any]]] = {
         # `pixel_size_um` and `calibration` are refused together, so a case each; a
         # path with a backslash and a space is the one a reader may take for an escape (FM-190).
         {"wells": "B2", "calibration": "C:\\runs\\a b\\cal-40x.json"},
+        # A selection's fields (m3 §28.5): no grid parameter goes with it.
+        {"wells": "all", "fields_from": "C:\\runs\\a b\\run-10x.json"},
     ],
     "stage-report": [{"samples": 5, "interval_ms": 100.0, "include_z": False}],
     "timing": [

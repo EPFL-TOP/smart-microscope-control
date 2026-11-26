@@ -40,14 +40,15 @@ rest on it:
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 import useq
-from pydantic import Field, model_validator
+from pydantic import Field, ValidationError, model_validator
 
-from smc.hardware.capabilities import Autofocus, Camera, ObjectiveTurret
+from smc.hardware.capabilities import Autofocus, Camera, ObjectiveTurret, XYStage
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.camera_calibration.plugin import calibration_from
 from smc.plugins.errors import PluginRunError
@@ -58,7 +59,12 @@ from smc.plugins.geometry import (
     pixel_matrix,
     pixel_of_stage,
 )
-from smc.plugins.objectives import log_frame, objective_for, plate_for_objective
+from smc.plugins.objectives import (
+    log_frame,
+    objective_for,
+    plate_for_objective,
+    shift_between,
+)
 from smc.plugins.scan_plan.algorithm import (
     estimate_assumed,
     estimate_s,
@@ -68,20 +74,34 @@ from smc.plugins.scan_plan.algorithm import (
     refocus_count,
     turn_from_axes_deg,
 )
-from smc.plugins.scan_plan.wells import order_wells, parse_wells
+from smc.plugins.scan_plan.selection import ChosenFields, chosen_fields
+from smc.plugins.scan_plan.wells import order_wells, parse_wells, well_indices
 from smc.plugins.slots import (
     CameraCalibration,
     PlannedField,
+    PlanSelection,
     PlateResult,
+    RouteResult,
     ScanPlanResult,
     TimingsResult,
     well_geometry,
 )
+from smc.run.document import RunDocument, RunDocumentError, StageRecord
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
 
-__all__ = ["ScanPlanParams", "ScanPlanPlugin"]
+__all__ = ["FOV_TOLERANCE", "ScanPlanParams", "ScanPlanPlugin"]
+
+#: A selection's field size that differs from the plan's by more than this fraction
+#: of the plan's, on either axis, is said in ``assumed``: the route chose fields of
+#: one footprint and the scan takes another, so neighbours may overlap or leave a
+#: gap (m3 §28.5). Chosen, not measured: 1 % is 4 µm of a 40x field.
+FOV_TOLERANCE = 0.01
+#: The selector a route that records none ran (algorithms §5.6).
+_DEFAULT_SELECTOR = "most-cells"
+#: The wells a line of ``assumed`` names before it says how many more (FM-205).
+_WELLS_SHOWN = 8
 
 #: The largest grid per axis, given or derived. The derived default comes from
 #: the camera's pixel size, which a wrong profile entry can make 1000 times too
@@ -153,6 +173,14 @@ class ScanPlanParams(PluginParams):
             "is used, rotation and mirror included."
         ),
     )
+    fields_from: Path | None = Field(
+        None,
+        description=(
+            "A run document holding a route: plan the fields it chose instead of "
+            "a grid (relative to the working directory, as from_run_doc). Copy "
+            "the document after the survey scan and give the copy."
+        ),
+    )
 
     @model_validator(mode="after")
     def _rows_and_columns_come_together(self) -> ScanPlanParams:
@@ -166,6 +194,28 @@ class ScanPlanParams(PluginParams):
         """A bare size says rotation 0 and no mirror, a calibration says what was measured: asked for both, one would be dropped without a word."""
         if self.pixel_size_um is not None and self.calibration is not None:
             raise ValueError("give pixel_size_um or calibration, not both")
+        return self
+
+    @model_validator(mode="after")
+    def _a_selection_lays_no_grid(self) -> ScanPlanParams:
+        """The grid's parameters given with a selection would be dropped without a word (m3 §28.5).
+
+        A value equal to its default is not refused: it says nothing a plan from a
+        selection would ignore, and the page or a preset may send it.
+        """
+        if self.fields_from is None:
+            return self
+        defaults = type(self).model_fields
+        names = [
+            name
+            for name in ("rows", "columns", "coverage", "overlap", "clip_to_well")
+            if getattr(self, name) != defaults[name].default
+        ]
+        if names:
+            raise ValueError(
+                f"fields_from plans the fields a selection chose: {', '.join(names)} "
+                "are not read with it; leave them unset"
+            )
         return self
 
 
@@ -190,6 +240,10 @@ class ScanPlanPlugin:
     provides = "scan-plan"
     reads: tuple[str, ...] = ("plate",)
     reads_optional: tuple[str, ...] = ("camera-calibration", "timings")
+    #: ``fields_from`` read in the document this run writes would read a route made
+    #: from the very plan the stage's ``running`` record replaces (FM-272, m3 §28.7).
+    reuses_from: tuple[str, ...] = ("fields_from",)
+    reuse_slots: ClassVar[Mapping[str, str]] = {"fields_from": "route"}
 
     def run(
         self,
@@ -246,6 +300,105 @@ class ScanPlanPlugin:
         _require_invertible(self.name, basis.matrix, shape)
         fov_um = fov_of(basis.matrix, shape)
 
+        chosen: _Selection | None = None
+        if params.fields_from is not None:
+            # The fields a selection chose, at this plan's objective (m3 §28.5): every
+            # check is made here, before the plan is written, so that `scan` never
+            # starts on a field it should not visit.
+            chosen = _selection_given(
+                self.name,
+                params.fields_from,
+                ctx,
+                microscope,
+                framed,
+                wells,
+                objective,
+                fov_um,
+                params.wells,
+            )
+            rows, columns, overlap = 1, 1, 0.0
+            plate_plan = framed.to_plan(
+                selected_wells=well_indices(plate.plate, chosen.fields.wells),
+                well_points_plan=useq.RelativePosition(x=0.0, y=0.0),
+            )
+            fields = chosen.fields.fields
+            wells = chosen.fields.wells
+        else:
+            rows, columns, overlap, plate_plan, fields = self._grid(
+                params, framed, wells, fov_um, basis, shape
+            )
+
+        timings = ctx.upstream_or_none("timings", TimingsResult)
+        estimate: float | None = None
+        without: float | None = None
+        estimate_lines: tuple[str, ...] = ()
+        if timings is not None:
+            # A lock is the scan's, one in each well (m3 §7.4 D1): charged only on a
+            # stand that has an autofocus and a lock time that was measured, so that
+            # an unknown cost is left out and nothing is said about a lock.
+            locks = (
+                refocus_count(fields)
+                if microscope.get(Autofocus) is not None
+                and timings.refocus_ms is not None
+                else 0
+            )
+            estimate = estimate_s(fields, timings, refocuses=locks)
+            without = estimate_s(fields, timings, refocuses=0)
+            estimate_lines = estimate_assumed(locks)
+        # The frame's line first: the positions are what the rest rests on; then the
+        # selection's, which the positions come from (m3 §28.5). An estimate whose
+        # refocus was assumed must not read as measured, and its own lines, what it
+        # counted and what it leaves out, come last.
+        selection_lines = chosen.assumed if chosen is not None else ()
+        assumed = (
+            (*frame.assumed, *selection_lines, *basis.assumed)
+            if timings is None
+            else (
+                *frame.assumed,
+                *selection_lines,
+                *basis.assumed,
+                *(f"timings: {line}" for line in timings.assumed),
+                *estimate_lines,
+            )
+        )
+        return ScanPlanResult(
+            plate_plan=plate_plan,
+            wells=wells,
+            objective=objective,
+            pixel_size_um=basis.pixel_size_um,
+            matrix_um_per_px=basis.matrix,
+            matrix_source=basis.source,
+            image_shape_px=shape,
+            fov_um=fov_um,
+            overlap=overlap,
+            rows=rows,
+            columns=columns,
+            fields=fields,
+            estimate_s=estimate,
+            estimate_without_autofocus_s=without,
+            plate_objective=plate.objective,
+            objective_shift_um=frame.shift_um,
+            calibration_from=given[0] if given is not None else None,
+            calibration_measured=given[1] if given is not None else None,
+            selection=chosen.selection if chosen is not None else None,
+            assumed=assumed,
+        )
+
+    def _grid(
+        self,
+        params: ScanPlanParams,
+        framed: PlateResult,
+        wells: tuple[str, ...],
+        fov_um: tuple[float, float],
+        basis: _Basis,
+        shape: tuple[int, int],
+    ) -> tuple[int, int, float, useq.WellPlatePlan, tuple[PlannedField, ...]]:
+        """The grid laid in each well: rows, columns, overlap, the useq plan and the fields (m3 §7.2).
+
+        Raises:
+            PluginRunError: The derived grid is over 100 fields per axis, or a
+                well has no field that touches it.
+        """
         if params.rows is not None and params.columns is not None:
             rows, columns = params.rows, params.columns
         else:
@@ -283,58 +436,7 @@ class ScanPlanPlugin:
             # Raised outside the handler: nothing here keeps the grid's error.
             raise PluginRunError(self.name, problem)
         plate_plan, fields = built
-
-        timings = ctx.upstream_or_none("timings", TimingsResult)
-        estimate: float | None = None
-        without: float | None = None
-        estimate_lines: tuple[str, ...] = ()
-        if timings is not None:
-            # A lock is the scan's, one in each well (m3 §7.4 D1): charged only on a
-            # stand that has an autofocus and a lock time that was measured, so that
-            # an unknown cost is left out and nothing is said about a lock.
-            locks = (
-                refocus_count(fields)
-                if microscope.get(Autofocus) is not None
-                and timings.refocus_ms is not None
-                else 0
-            )
-            estimate = estimate_s(fields, timings, refocuses=locks)
-            without = estimate_s(fields, timings, refocuses=0)
-            estimate_lines = estimate_assumed(locks)
-        # The frame's line first: the positions are what the rest rests on. An
-        # estimate whose refocus was assumed must not read as measured, and its own
-        # lines, what it counted and what it leaves out, come last.
-        assumed = (
-            (*frame.assumed, *basis.assumed)
-            if timings is None
-            else (
-                *frame.assumed,
-                *basis.assumed,
-                *(f"timings: {line}" for line in timings.assumed),
-                *estimate_lines,
-            )
-        )
-        return ScanPlanResult(
-            plate_plan=plate_plan,
-            wells=wells,
-            objective=objective,
-            pixel_size_um=basis.pixel_size_um,
-            matrix_um_per_px=basis.matrix,
-            matrix_source=basis.source,
-            image_shape_px=shape,
-            fov_um=fov_um,
-            overlap=params.overlap,
-            rows=rows,
-            columns=columns,
-            fields=fields,
-            estimate_s=estimate,
-            estimate_without_autofocus_s=without,
-            plate_objective=plate.objective,
-            objective_shift_um=frame.shift_um,
-            calibration_from=given[0] if given is not None else None,
-            calibration_measured=given[1] if given is not None else None,
-            assumed=assumed,
-        )
+        return rows, columns, params.overlap, plate_plan, fields
 
 
 def _wells_in_order(
@@ -411,7 +513,7 @@ def _camera_basis(
             profile,
             objective,
             shape,
-            params.overlap,
+            _grid_overlap(params),
         )
         return basis, (where, when)
 
@@ -420,7 +522,7 @@ def _camera_basis(
     if calibration is not None:
         why = _why_not_used(calibration, objective, shape)
         if why is None:
-            return _calibrated(calibration, params.overlap), None
+            return _calibrated(calibration, _grid_overlap(params)), None
         # A calibration of another objective is what the plate's own registration
         # leaves behind (a run document keeps one per plugin): say how to get the
         # one of this objective. A plan with no objective has none to ask for.
@@ -453,13 +555,21 @@ def _camera_basis(
     return _Basis(pixel_matrix(size_um), size_um, "profile", tuple(assumed)), None
 
 
-def _calibrated(calibration: CameraCalibration, overlap: float) -> _Basis:
+def _grid_overlap(params: ScanPlanParams) -> float | None:
+    """The overlap of the grid the plan lays, or ``None`` when it lays none (``fields_from``)."""
+    return None if params.fields_from is not None else params.overlap
+
+
+def _calibrated(calibration: CameraCalibration, overlap: float | None) -> _Basis:
     """The basis of a calibration that was measured: its matrix, and only the line about the gaps it leaves.
 
     What the calibration itself assumed is not copied: it is the calibration's
-    to say, and the plan assumed nothing about the camera.
+    to say, and the plan assumed nothing about the camera. ``overlap`` is
+    ``None`` for a plan with no grid (a selection's, m3 §28): the gaps are
+    between a grid's fields, and the advice to raise ``overlap`` is one
+    ``fields_from`` refuses.
     """
-    gaps = _gap_line(calibration.rotation_deg, overlap)
+    gaps = None if overlap is None else _gap_line(calibration.rotation_deg, overlap)
     return _Basis(
         calibration.matrix_um_per_px,
         calibration.pixel_size_um,
@@ -475,7 +585,7 @@ def _calibration_given(
     profile: str,
     objective: str | None,
     shape: tuple[int, int],
-    overlap: float,
+    overlap: float | None,
 ) -> tuple[_Basis, str, str]:
     """The basis of the calibration in another run document, where it is (as typed) and when it was measured.
 
@@ -510,6 +620,231 @@ def _calibration_given(
             "run camera-calibration into it again with this camera setting",
         )
     return _calibrated(found, overlap), where, when
+
+
+@dataclass(frozen=True)
+class _Selection:
+    """A selection's fields for the plan, the record of where they came from, and its lines."""
+
+    fields: ChosenFields
+    selection: PlanSelection
+    assumed: tuple[str, ...]
+
+
+def _selection_given(
+    name: str,
+    path: Path,
+    ctx: RunContext,
+    microscope: Microscope,
+    framed: PlateResult,
+    wells: tuple[str, ...],
+    objective: str | None,
+    fov_um: tuple[float, float],
+    wells_text: str,
+) -> _Selection:
+    """The fields the route of another run document chose, in this plan's frame, checked (m3 §28.5).
+
+    The route is read from a document of its own, never this one: a plan run
+    into the selection's document replaces the plan the route rests on (m3
+    §28.1). Each refusal is a ``PluginRunError`` of ``name`` raised outside any
+    handler (FM-98), in §28.5's order: the route, its plan, the registration,
+    the objective of the route's fields, a field outside its well or the soft
+    limits, no field. ``path`` is named as typed, with forward slashes (FM-24),
+    and never resolved (FM-50). The stops' Z and PFS offset are never read: they
+    are the selection's scan's, not a focus at this objective (D3).
+
+    Raises:
+        PluginRunError: The selection cannot be planned; nothing was written.
+    """
+    where = path.as_posix()
+    profile = microscope.profile.microscope.name
+    problem: str | None = None
+    other: RunDocument | None = None
+    try:
+        other = RunDocument.load(path)
+    except RunDocumentError as exc:
+        problem = f"{where}: {exc.reason}"
+    if problem is not None or other is None:
+        # Raised outside the handler: nothing here keeps the load's error.
+        raise PluginRunError(name, problem or where)
+
+    # 1. The route, as `calibration_from` reads a calibration (m3 §20.3).
+    route_record = _usable_record(other, "route", where, profile, ctx.dry_run, name)
+    route: RouteResult | None = None
+    try:
+        route = RouteResult.model_validate(route_record.result)
+    except ValidationError:
+        route = None
+    selector = route_record.params.get("selector", _DEFAULT_SELECTOR)
+    if route is None or not isinstance(selector, str):
+        raise PluginRunError(
+            name,
+            f"the route in {where} is not one this smc reads; run route again there",
+        )
+
+    # 2. The plan the selection's scan was made with: its objective is the frame the
+    # stops are in (m3 §28.1), and its registration is checked next.
+    plan_record = _usable_record(other, "scan-plan", where, profile, ctx.dry_run, name)
+    source_plan: ScanPlanResult | None = None
+    try:
+        source_plan = ScanPlanResult.model_validate(plan_record.result)
+    except ValidationError:
+        source_plan = None
+    if source_plan is None:
+        raise PluginRunError(
+            name,
+            f"the scan plan in {where} is not one this smc reads; run scan-plan "
+            "again there",
+        )
+
+    # 3. The registration, as §21.12.5's check 2: both sides must name one.
+    read = plan_record.reads.get("plate")
+    theirs = read.attempt if read is not None else None
+    provider = ctx.document.provider("plate")
+    ours = provider.attempt if provider is not None else None
+    if theirs is None or ours is None or theirs != ours:
+        raise PluginRunError(
+            name,
+            f"the selection in {where} was chosen on another registration of the "
+            f"plate ({theirs or 'none'} against this run's {ours or 'none'})",
+        )
+
+    # 4. The footprint the route chose its fields for.
+    if route.objective != objective:
+        raise PluginRunError(
+            name,
+            f"the selection in {where} chose fields of "
+            f"{_objective_name(route.objective)}, the plan is for "
+            f"{_objective_name(objective)}: run route there with "
+            f"objective={_objective_name(objective)}, or plan for "
+            f"{_objective_name(route.objective)}",
+        )
+
+    # 5. Each stop moved into this plan's frame, inside its well and the limits.
+    turret = microscope.get(ObjectiveTurret)
+    shift, shift_line = shift_between(source_plan.objective, objective, turret)
+    xy = microscope.get(XYStage)
+    travel = xy.limits_um() if xy is not None else None
+    limits = (
+        None
+        if travel is None
+        else (
+            (travel[0].low_um, travel[0].high_um),
+            (travel[1].low_um, travel[1].high_um),
+        )
+    )
+    plan = framed.to_plan()
+    chosen: ChosenFields | None = None
+    try:
+        chosen = chosen_fields(
+            route.positions,
+            wells,
+            shift_um=shift if shift is not None else (0.0, 0.0),
+            geometry_of=lambda well: well_geometry(plan, well),
+            xy_limits_um=limits,
+        )
+    except ValueError as exc:
+        problem = str(exc)
+    if chosen is None:
+        # Raised outside the handler: nothing here keeps the check's error.
+        raise PluginRunError(name, problem or where)
+
+    # 6. No field in the wells named.
+    if not chosen.fields:
+        theirs_wells = tuple(dict.fromkeys(stop.well for stop in route.positions))
+        raise PluginRunError(
+            name,
+            f"the selection in {where} holds no field in the wells named "
+            f"({wells_text}); it chose fields in "
+            f"{_first_eight(theirs_wells) or 'no well'}",
+        )
+
+    measured = (
+        route_record.finished_utc.isoformat(timespec="seconds")
+        if route_record.finished_utc is not None
+        else "at an unknown time"
+    )
+    selection = PlanSelection(
+        run_doc=where,
+        route_attempt=route_record.attempt,
+        measured=measured,
+        selector=selector,
+        source_objective=source_plan.objective,
+        shift_um=shift,
+        wells_without_fields=chosen.wells_without_fields,
+        fields_left_out=chosen.fields_left_out,
+    )
+    lines = [
+        f"the fields are the {len(chosen.fields)} that selector '{selector}' chose "
+        f"in {where} (measured {measured}), each well's in the selection's order"
+    ]
+    if shift_line is not None:
+        ctx.logger.warning(shift_line)
+        lines.append(shift_line)
+    if chosen.wells_without_fields:
+        lines.append(
+            f"no field was chosen in {len(chosen.wells_without_fields)} of the wells "
+            f"named: {_first_eight(chosen.wells_without_fields)}"
+        )
+    if chosen.fields_left_out:
+        lines.append(
+            f"{chosen.fields_left_out} fields of the selection lie in wells not named "
+            f"and were left out: {_first_eight(chosen.wells_left_out)}"
+        )
+    if any(
+        abs(theirs_um - ours_um) > FOV_TOLERANCE * ours_um
+        for theirs_um, ours_um in zip(route.fov_um, fov_um, strict=True)
+    ):
+        lines.append(
+            f"the selection sized its fields {route.fov_um[0]:.1f} × "  # noqa: RUF001
+            f"{route.fov_um[1]:.1f} µm, the plan's are {fov_um[0]:.1f} × "  # noqa: RUF001
+            f"{fov_um[1]:.1f} µm: neighbouring fields may overlap or leave a gap"
+        )
+    if limits is None:
+        lines.append(
+            "the stage reports no soft limits: the selection's fields were not "
+            "checked against its travel"
+        )
+    ctx.logger.info(
+        "%d fields in %d wells chosen by %s, from %s measured %s; shift %s",
+        len(chosen.fields),
+        len(chosen.wells),
+        selector,
+        where,
+        measured,
+        f"({shift[0] + 0.0:+.2f}, {shift[1] + 0.0:+.2f}) µm"
+        if shift is not None
+        else "not applied",
+    )
+    return _Selection(chosen, selection, tuple(lines))
+
+
+def _usable_record(
+    other: RunDocument,
+    slot: str,
+    where: str,
+    profile: str,
+    dry_run: bool,
+    name: str,
+) -> StageRecord:
+    """The record of ``slot`` in another run document, if the runner's own rule lets it be read.
+
+    Raises:
+        PluginRunError: Not ``done``, stale, another profile, a dry run read by a
+            real one, or no result.
+    """
+    reason = other.unusable(slot, profile=profile, dry_run=dry_run)
+    record = other.provider(slot)
+    if reason is not None or record is None or record.result is None:
+        raise PluginRunError(name, f"in {where}: {reason or 'it holds no result'}")
+    return record
+
+
+def _first_eight(wells: Sequence[str]) -> str:
+    """The first eight wells, ``, ``-joined, and how many more: a line stays short (FM-205)."""
+    shown = ", ".join(wells[:_WELLS_SHOWN])
+    more = len(wells) - _WELLS_SHOWN
+    return f"{shown}, … {more} more" if more > 0 else shown
 
 
 def _objective_name(objective: str | None) -> str:

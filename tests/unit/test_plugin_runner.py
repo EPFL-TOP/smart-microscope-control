@@ -2094,3 +2094,67 @@ def test_run_plugin_runs_a_reuse_from_another_document(
 
     assert record.status is StageStatus.done
     assert plugin.calls == 1
+
+
+# --- a reuse of another slot that rests on the one the stage replaces (m3 §28.7) ----
+
+
+class ReusesARoute(Base):
+    """Reads a ``route`` of another document, made from the plan it provides (``scan-plan``'s ``fields_from``)."""
+
+    name = provides = "plans"
+    Params = ReuseParams
+    reuses_from = ("source",)
+    reuse_slots = {"source": "route"}  # noqa: RUF012 - read with getattr, as reuses_from
+
+    def body(self, microscope: Any, params: Any, ctx: RunContext) -> Result:
+        return Result()
+
+
+class ReuseSlotsOfAnUndeclaredField(Base):
+    name = provides = "plans"
+    Params = ReuseParams
+    reuses_from = ("source",)
+    reuse_slots = {"template": "route"}  # noqa: RUF012 - read with getattr
+
+
+def test_a_reuse_of_another_slot_is_refused_naming_that_slot_before_anything_is_written(
+    fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `scan-plan --run-doc run.json --param fields_from=run.json`: its `running` record
+    # replaces the plan the route there was made from, the route turns stale, and
+    # the plan is lost (FM-272).
+    monkeypatch.chdir(tmp_path)
+    write_stage(_path(tmp_path), _done_record("plans"))
+    write_stage(_path(tmp_path), _done_record("route"))
+    before = _path(tmp_path).read_bytes()
+    plugin = ReusesARoute()
+
+    with pytest.raises(ParamsError) as raised:
+        run_plugin(
+            plugin,
+            fake_microscope,
+            ReuseParams(source=Path("run.json")),
+            _path(tmp_path),
+        )
+
+    assert str(raised.value) == (
+        "parameters of plans: source names the run document this run writes "
+        "(run.json), where this run replaces the plans that its route was made from: "
+        "name a copy of it or another run document (nothing was written). smc run "
+        "plans --show-params lists the keys"
+    )
+    assert plugin.calls == 0
+    assert _path(tmp_path).read_bytes() == before
+    # The control: a copy is read as any other document.
+    copy = Path(shutil.copyfile(_path(tmp_path), tmp_path / "run-10x.json"))
+    check_run_doc(plugin, ReuseParams(source=copy), _path(tmp_path))
+
+
+def test_a_reuse_slot_not_in_reuses_from_raises(tmp_path: Path) -> None:
+    # A typo in `reuse_slots` would name the wrong slot, or none, without a word.
+    run_doc = _written(tmp_path / "run.json")
+    with pytest.raises(AttributeError, match="template"):
+        check_run_doc(
+            ReuseSlotsOfAnUndeclaredField(), ReuseParams(source=None), run_doc
+        )

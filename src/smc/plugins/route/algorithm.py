@@ -70,7 +70,7 @@ _WORK_CHUNK = 2**18
 #: overlapping; at exactly a frame they touch, and touching is allowed.
 _TOUCH_PX = 1e-6
 #: Pairs of fields ``first_overlap`` compares at once: 2**20 elements are a few
-#: arrays of 8 MB, and 500 fields (a well's most) are 250 000 of them.
+#: arrays of 8 MB, and 2000 fields (a well's most) are 4 000 000 of them: four blocks.
 _OVERLAP_BLOCK = 2**20
 #: A reversal that shortens the path by less than this is not made: it ends 2-opt,
 #: and a float round-off is not an improvement.

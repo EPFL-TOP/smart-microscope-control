@@ -27,7 +27,7 @@ import logging
 import os
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -151,6 +151,15 @@ def check_run_doc(
     field of ``params`` raises ``AttributeError``: a typo would switch the guard off
     without a word.
 
+    A reader of another slot whose record rests on the slot the stage replaces is
+    such a reader too (m3 §28.7): ``scan-plan``'s ``fields_from`` reads a ``route``
+    made from the very plan the stage's ``running`` record replaces, so the route
+    turns stale and the plan is lost. It declares the field in ``reuses_from`` and
+    the slot it reads in the optional class attribute ``reuse_slots`` (field to
+    slot; a field absent from it reads the plugin's own slot), and the refusal
+    names that slot. A ``reuse_slots`` key that ``reuses_from`` does not declare
+    raises ``AttributeError``, as a misspelt ``reuses_from`` name does.
+
     It writes nothing and touches no hardware; it only asks the file system whether
     two names are one file, so the CLI calls it before the stand opens (FM-30).
 
@@ -158,18 +167,34 @@ def check_run_doc(
         ParamsError: A declared field names ``run_doc``. The path is said as typed,
             never resolved (FM-50).
     """
-    for field in getattr(plugin, "reuses_from", ()):
+    reuses = tuple(getattr(plugin, "reuses_from", ()))
+    slots: Mapping[str, str] = getattr(plugin, "reuse_slots", {})
+    stray = [field for field in slots if field not in reuses]
+    if stray:
+        raise AttributeError(
+            f"{plugin.name}'s reuse_slots names {', '.join(stray)}, which its "
+            f"reuses_from does not declare"
+        )
+    for field in reuses:
         value = getattr(params, field)
-        if value is not None and _same_file(Path(value), run_doc):
-            raise ParamsError(
-                plugin.name,
-                (
-                    f"{field} names the run document this run writes "
-                    f"({Path(value).as_posix()}), where this run replaces the "
-                    f"{plugin.provides} it would copy: name a copy of it or another "
-                    f"run document (nothing was written)",
-                ),
+        if value is None or not _same_file(Path(value), run_doc):
+            continue
+        slot = slots.get(field, plugin.provides)
+        where = Path(value).as_posix()
+        if slot == plugin.provides:
+            text = (
+                f"{field} names the run document this run writes ({where}), where "
+                f"this run replaces the {plugin.provides} it would copy: name a copy "
+                f"of it or another run document (nothing was written)"
             )
+        else:
+            text = (
+                f"{field} names the run document this run writes ({where}), where "
+                f"this run replaces the {plugin.provides} that its {slot} was made "
+                f"from: name a copy of it or another run document (nothing was "
+                f"written)"
+            )
+        raise ParamsError(plugin.name, (text,))
 
 
 def _same_file(first: Path, second: Path) -> bool:

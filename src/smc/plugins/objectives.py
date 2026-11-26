@@ -41,6 +41,7 @@ __all__ = [
     "objective_for",
     "objective_shift_um",
     "plate_for_objective",
+    "shift_between",
 ]
 
 
@@ -186,6 +187,52 @@ def plate_for_objective(
             ),
         )
     return PlateInFrame(_translated(plate, objective, shift), objective, shift, ())
+
+
+def shift_between(
+    origin: str | None, target: str | None, turret: ObjectiveTurret | None
+) -> tuple[tuple[float, float] | None, str | None]:
+    """What to add to positions found with ``origin`` to have them with ``target``, and why not.
+
+    The rules of ``plate_for_objective``, for positions rather than a plate: a
+    selection's stops were placed in the frame of its scan's objective, and the
+    plan that visits them is for another one (m3 §28.4). In this order:
+
+    1. ``origin == target`` (both unknown included): ``(0.0, 0.0)``, no line.
+    2. ``origin`` is unknown: no shift, and the line that says so.
+    3. ``target`` is unknown: no shift, and the line.
+    4. No turret, or the offset between the two is not measured: no shift, and
+       the line.
+    5. Otherwise the measured shift, ``target`` minus ``origin``, with no line.
+
+    Unknown is never a shift of zero: the caller adds ``(0.0, 0.0)`` when it
+    goes on without one, and its ``assumed`` carries the line, so the positions
+    are read as uncorrected.
+    """
+    if origin == target:
+        return (0.0, 0.0), None
+    if origin is None:
+        return None, (
+            "the selection's scan did not record its objective: no offset between "
+            f"objectives is applied for {target}"
+        )
+    if target is None:
+        return None, (
+            f"the objective in use is unknown: the selection's positions are "
+            f"{origin}'s, and no offset between objectives is applied"
+        )
+    shift = (
+        None
+        if turret is None
+        else objective_shift_um(turret.offset(origin), turret.offset(target))
+    )
+    if shift is None:
+        return None, (
+            f"the offset between {origin} and {target} is not measured (the "
+            f"profile's [objectives]): the selection's positions are {origin}'s, "
+            "not corrected"
+        )
+    return shift, None
 
 
 def _translated(

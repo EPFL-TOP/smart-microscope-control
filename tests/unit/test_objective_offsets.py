@@ -21,6 +21,7 @@ from smc.plugins.objectives import (
     objective_for,
     objective_shift_um,
     plate_for_objective,
+    shift_between,
 )
 from smc.plugins.slots import PlateResult
 
@@ -305,3 +306,88 @@ def test_objective_for_refuses_an_objective_without_a_turret() -> None:
     assert str(refused.value).endswith(
         "the stand has no turret, so objective cannot be checked; leave it unset"
     )
+
+
+# -- shift_between (m3 §28.4) -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("origin", "target", "turret", "expected"),
+    [
+        # 1. the same frame, unknown on both sides included: no shift, no line.
+        (TEN, TEN, _Turret(), ((0.0, 0.0), None)),
+        (None, None, None, ((0.0, 0.0), None)),
+        # 2. the selection's scan did not record its objective.
+        (
+            None,
+            FORTY,
+            _Turret(),
+            (
+                None,
+                "the selection's scan did not record its objective: no offset "
+                f"between objectives is applied for {FORTY}",
+            ),
+        ),
+        # 3. the objective in use is unknown.
+        (
+            TEN,
+            None,
+            _Turret(),
+            (
+                None,
+                f"the objective in use is unknown: the selection's positions are "
+                f"{TEN}'s, and no offset between objectives is applied",
+            ),
+        ),
+        # 4. no turret, or an offset that was not measured.
+        (
+            TEN,
+            FORTY,
+            None,
+            (
+                None,
+                f"the offset between {TEN} and {FORTY} is not measured (the "
+                f"profile's [objectives]): the selection's positions are {TEN}'s, "
+                "not corrected",
+            ),
+        ),
+        (
+            TEN,
+            FORTY,
+            _Turret({TEN: _OFFSETS[TEN], FORTY: _unknown(FORTY)}),
+            (
+                None,
+                f"the offset between {TEN} and {FORTY} is not measured (the "
+                f"profile's [objectives]): the selection's positions are {TEN}'s, "
+                "not corrected",
+            ),
+        ),
+        # 5. measured: the 40X's (-32.5, 9.75) less the 10X's (5.0, -2.5), target
+        # minus origin, and its opposite the other way round.
+        (TEN, FORTY, _Turret(), ((-37.5, 12.25), None)),
+        (FORTY, TEN, _Turret(), ((37.5, -12.25), None)),
+    ],
+    ids=[
+        "same",
+        "both-unknown",
+        "origin-unknown",
+        "target-unknown",
+        "no-turret",
+        "not-measured",
+        "measured",
+        "measured-back",
+    ],
+)
+def test_shift_between_follows_the_five_rules_with_their_lines(
+    origin: str | None,
+    target: str | None,
+    turret: _Turret | None,
+    expected: tuple[tuple[float, float] | None, str | None],
+) -> None:
+    assert shift_between(origin, target, turret) == expected
+
+
+def test_shift_between_the_same_objective_asks_nothing_of_the_profile() -> None:
+    turret = _Turret()
+    shift_between(TEN, TEN, turret)
+    assert turret.offset_calls == []
