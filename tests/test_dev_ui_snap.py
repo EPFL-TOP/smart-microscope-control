@@ -446,12 +446,20 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         "wells-laid-out",
         "wells-timed",
         "scanned",
+        # The Scan screen with `map` typed in `cell_focus` (m5 §25, #634): after `scanned`, which
+        # it leaves the field to, since nothing after it scans.
+        "scan-focus-map",
         # The Stand screen after a calibration that failed (m5 §22.2, #625, #658): the last of
         # all, since its failed record replaces the calibration `stand-620` seeded.
         "stand-failed-620",
     ]
     assert list(snap.STATE_NAMES) == names
-    assert snap.GUIDED_STATES == ("wells-laid-out", "wells-timed", "scanned")
+    assert snap.GUIDED_STATES == (
+        "wells-laid-out",
+        "wells-timed",
+        "scanned",
+        "scan-focus-map",
+    )
     assert snap.FAILED_STATES == ("stand-failed-620",)
     assert snap.CHAIN_STATES == ("after-density", "with-route", "results-all", "turned")
     # `enlarged` and `expert` are among the first five, so that both stands reach them (m5
@@ -468,8 +476,8 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     short = [True, True]
     # The guided states register the plate from the sample themselves and need no chain
     # (`wells-timed` runs its own `timing`, and no result of the chain).
-    guided = [True, True, True]
-    no_sample = [False, False, False]
+    guided = [True, True, True, True]
+    no_sample = [False, False, False, False]
     # The failed calibration is seeded by a step that fails on both stands and reads no result
     # of the chain: reached on both, with the chain, without it and after one that failed.
     failed_seed = [True]
@@ -494,10 +502,10 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
             "the demo camera images no sample: no cells, no density; "
             "use --stand demo-sample"
         )
-    assert [p.reason for p in demo[11:14]] == [
+    assert [p.reason for p in demo[11:15]] == [
         "the demo has no sample to register from"
-    ] * 3
-    assert demo[14].reason is None
+    ] * 4
+    assert demo[15].reason is None
     assert snap.NO_SAMPLE_TO_REGISTER == "the demo has no sample to register from"
 
     # With no chain, or after a chain that failed, the guided states are still reached:
@@ -511,7 +519,7 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         *failed_seed,
     ]
     assert {p.reason for p in skipped[5:9]} == {"skipped by --no-results"}
-    assert [p.reason for p in skipped[11:]] == [None, None, None, None]
+    assert [p.reason for p in skipped[11:]] == [None, None, None, None, None]
 
     failed = snap.plan_states(
         "demo-sample", results=True, chain_failure="cells exited 1: no detector"
@@ -1079,6 +1087,7 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         ("wells-laid-out", True),
         ("wells-timed", False),
         ("scanned", True),
+        ("scan-focus-map", True),
         # The failed calibration is seeded by its own step, which fails on purpose.
         ("stand-failed-620", True),
     ]
@@ -1114,6 +1123,7 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
         True,
         True,
         True,
+        True,
     ]
     assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
     assert records[5].reason == records[2].reason
@@ -1139,6 +1149,7 @@ def test_a_step_button_that_times_out_names_the_state_and_the_next_one_runs(
         True,
         True,
         True,
+        True,
     ]
     assert records[1].reason == "Locator.click: Timeout 10000ms exceeded."
     assert records[11].reason == records[1].reason
@@ -1153,6 +1164,7 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
     # `wells-laid-out` types the wells in the same box: the same control, named. `wells-timed`
     # types in the autofocus field, and the fake page answers every label with one box.
+    # `scan-focus-map` types in the `cell_focus` field, so it fails on the same control.
     assert [r.reached for r in records] == [
         True,
         False,
@@ -1160,6 +1172,7 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
         False,
         False,
         True,
+        False,
         True,
     ]
     assert records[1].reason == "Locator.fill: Timeout 10000ms exceeded."
@@ -1767,6 +1780,8 @@ def test_the_short_page_states_name_the_screens_titles_the_guide_draws(snap) -> 
         # `wells-timed` stays on the Wells screen (m5 §17.12.12 D42).
         "wells-timed": SCREEN_TITLES["wells"],
         "scanned": scan_title(["B11", "B2"], []),
+        # `scan-focus-map` is on the Scan screen, over the same plan (m5 §25 D2).
+        "scan-focus-map": scan_title(["B11", "B2"], []),
         # The Results screen's, which `results-all` reads (m5 §17.11.4).
         "results-all": SCREEN_TITLES["results"],
     } == snap.SCREEN_TITLE_OF
@@ -2670,6 +2685,12 @@ def test_the_guided_parts_are_the_frames_and_the_screens_title_and_first_action(
     snap._guided_parts(page, "scanned")
     page.get_by_role.assert_any_call("button", name="Start the scan")
     page.locator.return_value.filter.assert_any_call(has_text="Scan B2 and B11")
+    # `scan-focus-map` is on the Scan screen too: the same title, the same first action, which the
+    # focus block now sits above.
+    page = MagicMock()
+    snap._guided_parts(page, "scan-focus-map")
+    page.get_by_role.assert_any_call("button", name="Start the scan")
+    page.locator.return_value.filter.assert_any_call(has_text="Scan B2 and B11")
 
 
 def test_on_screen_reads_the_guided_parts_of_a_guided_state_and_only_there(
@@ -2692,7 +2713,7 @@ def test_on_screen_reads_the_guided_parts_of_a_guided_state_and_only_there(
         part("first action", _box(10, 790, 120, 31)),
     ]
     monkeypatch.setattr(snap, "_guided_parts", lambda page, state: guided)
-    for state in ("wells-laid-out", "wells-timed", "scanned"):
+    for state in ("wells-laid-out", "wells-timed", "scanned", "scan-focus-map"):
         assert snap._on_screen(page, state) == [
             "STOP: yes (y 5 to 35 of 800, x 1200 to 1260 of 1280)",
             "title: yes (y 142 to 159 of 800, x 10 to 380 of 1280)",
@@ -2793,14 +2814,124 @@ def test_only_the_scanned_wells_timed_and_results_all_states_carry_facts(
         "canvas enlarged: ?",
         "canvas after Reduce: ?; same box as before: ?",
     ]
+    # `scan-focus-map` says the focus map pane, as not on the page when the page has none.
+    assert by_name["scan-focus-map"].facts == ["focus map: not on the page"]
     assert [n for n, r in by_name.items() if r.facts] == [
         "enlarged",
         "results-all",
         "stand-620",
         "wells-timed",
         "scanned",
+        "scan-focus-map",
         "stand-failed-620",
     ]
+
+
+# --- `scan-focus-map`: the Scan screen's focus map lines with `map` typed (m5 §25, #634) ---
+
+
+def test_the_focus_map_state_types_map_in_the_cell_focus_field_and_waits_for_the_pane(
+    snap,
+) -> None:
+    page = MagicMock()
+    order: list[str] = []
+
+    def role(*args: object, **kwargs: object) -> MagicMock:
+        found = MagicMock()
+        found.click.side_effect = lambda: order.append(
+            f"click:{getattr(kwargs.get('name'), 'pattern', kwargs.get('name'))}"
+        )
+        return found
+
+    box = MagicMock()
+    box.fill.side_effect = lambda text: order.append(f"fill:{text}")
+    box.press.side_effect = lambda key: order.append(f"press:{key}")
+    pane = MagicMock()
+    pane.first.wait_for.side_effect = lambda **kw: order.append("wait:the pane")
+    page.get_by_role.side_effect = role
+    page.get_by_label.return_value = box
+    page.locator.return_value.filter.return_value = pane
+
+    assert snap.ACTIONS["scan-focus-map"] is snap._act_scan_focus_map
+    assert snap._act_scan_focus_map(page, _no_chain()) is None
+
+    # The Scan screen first (the step button is idempotent), then the field, Enter, and the wait
+    # for the pane's own words: never a delay (FM-162).
+    assert order == ["click:^4\\. Scan", "fill:map", "press:Enter", "wait:the pane"]
+    page.get_by_label.assert_called_once_with(snap.CELL_FOCUS_FIELD, exact=True)
+    (wait_for,) = page.locator.return_value.filter.call_args.kwargs.values()
+    assert wait_for is snap.FOCUS_MAP_LINE
+    assert snap.CELL_FOCUS_FIELD == "cell_focus"
+    # The page is never told to sleep: the state is an act and a wait for its text.
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_the_script_pins_the_focus_map_names_to_the_page_and_the_guide(snap) -> None:
+    from smc.ui.guide import (
+        FOCUS_MAP_NONE,
+        KeptMap,
+        focus_map_lines,
+    )
+    from smc.ui.plate_page import _CELL_FOCUS_FIELD
+
+    # The script imports nothing of smc at import: its copy of the field's label is the page's.
+    assert _CELL_FOCUS_FIELD == ("scan", snap.CELL_FOCUS_FIELD)
+    # Every first line `focus_map_lines` can say starts with one of the words the script reads, and
+    # the pattern the state waits for finds each of them.
+    kept = KeptMap(
+        file="run.focus-map.json",
+        wells=("B2",),
+        objective="Nikon 10X S Fluor",
+        scanned_utc=None,
+        problem=None,
+    )
+    broken = KeptMap(
+        file="run.focus-map.json",
+        wells=(),
+        objective=None,
+        scanned_utc=None,
+        problem="it holds no scan",
+    )
+    firsts = [
+        focus_map_lines(cell_focus="map", typed_map="", kept=None, first_well="B2")[0],
+        focus_map_lines(
+            cell_focus="map", typed_map="x.json", kept=None, first_well="B2"
+        )[0],
+        focus_map_lines(cell_focus="map", typed_map="", kept=kept, first_well="B2")[0],
+        focus_map_lines(cell_focus="map", typed_map="", kept=broken, first_well="B2")[
+            0
+        ],
+    ]
+    assert firsts[0] == FOCUS_MAP_NONE
+    for first in firsts:
+        assert first.startswith(snap.FOCUS_MAP_STARTS), first
+        assert snap.FOCUS_MAP_LINE.search(first), first
+
+
+def test_focus_map_facts_say_the_pane_with_its_lines_joined_or_that_it_is_not_on_the_page(
+    snap,
+) -> None:
+    pane = (
+        "No focus map kept yet: scan the wells with the autofocus locked first; the "
+        "page keeps that scan as the map.\n"
+        "Before you start: with Live, focus by eye on the cells near the centre of B11."
+    )
+    assert snap.focus_map_facts(["Scan B2 and B11", pane, "Field 72 of 72"]) == [
+        "focus map: No focus map kept yet: scan the wells with the autofocus locked "
+        "first; the page keeps that scan as the map. | Before you start: with Live, "
+        "focus by eye on the cells near the centre of B11."
+    ]
+    assert snap.state_facts("scan-focus-map", [pane]) == snap.focus_map_facts([pane])
+    # A kept map, a typed one and a file that cannot be read are the pane too.
+    for first in (
+        "Focus map: the scan of B2 at Nikon 10X S Fluor, kept by the page in run.json.",
+        "Focus map: ten.json, typed on this page.",
+        "The kept focus map run.focus-map.json cannot be read (it holds no scan).",
+    ):
+        assert snap.focus_map_facts([first]) == [f"focus map: {first}"]
+    # A page that draws none is said so, never guessed.
+    assert snap.focus_map_facts(["Scan B2 and B11"]) == ["focus map: not on the page"]
+    assert snap.focus_map_facts([]) == ["focus map: not on the page"]
 
 
 # --- `wells-timed`: the Wells screen's Time line under the three autofocus modes (m5 §17.12.12 D42, #592) ---

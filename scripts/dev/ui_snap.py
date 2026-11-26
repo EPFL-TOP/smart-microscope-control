@@ -17,14 +17,16 @@ passed by absolute path (a name is looked up in the working directory and in
 ``$SMC_PROFILES``, and an operator's directory can shadow it). The page is always
 served with ``--dry-run``. The chain of tools that fills the run document runs
 *without* it, on the demo's simulated stage: in dry run the stage does not move,
-every frame is plastic, and no state past the first three could be reached. The three
-guided states (``wells-laid-out``, ``wells-timed``, ``scanned``) press the guided screens' own
-buttons, *Register the plate*, *Lay out the fields* and *Start the scan*, on the dry-run page,
-where each is a run that moves nothing, and so does ``results-all``, which presses the Results
-screen's *Run all that are left* over the chain's results (the report and the export, which
-move nothing); ``wells-timed`` runs one real ``timing`` beside the page, as the chain's steps
-are, and reads the Wells screen's ``Time`` line under the scan's three autofocus modes; the
-script never presses a tool's own *Run*. The two Stand states seed the calibration they are about
+every frame is plastic, and no state past the first three could be reached. The four
+guided states (``wells-laid-out``, ``wells-timed``, ``scanned``, ``scan-focus-map``) press the
+guided screens' own buttons, *Register the plate*, *Lay out the fields* and *Start the scan*, on
+the dry-run page, where each is a run that moves nothing, and so does ``results-all``, which
+presses the Results screen's *Run all that are left* over the chain's results (the report and
+the export, which move nothing); ``wells-timed`` runs one real ``timing`` beside the page, as the
+chain's steps are, and reads the Wells screen's ``Time`` line under the scan's three autofocus
+modes; ``scan-focus-map`` types ``map`` in the Scan screen's ``cell_focus`` field and reads the
+focus map lines it draws (on the dry-run page, none is kept: ``FOCUS_MAP_NONE`` and the anchor
+line, m5 §25); the script never presses a tool's own *Run*. The two Stand states seed the calibration they are about
 with a real ``camera-calibration`` beside the page, as the chain's steps are (the dry-run page
 "cannot measure the camera"): ``stand-620`` a good one, on ``demo-sample`` only, and
 ``stand-failed-620`` one that fails (a 2000 µm probe), last; each says where the first line of its
@@ -90,17 +92,19 @@ KILL_GRACE_S = 5.0
 #: same reason, m5 §17.8); the next four need the results of a real run of the workflow
 #: (``results-all`` presses *Run all that are left* over them, m5 §17.11.4); the next
 #: two are the short-page shots of D12 (m5 §17.2, §17.8), reached alone again, after them; the
-#: last three walk the Wells and Scan screens by their own buttons (m5 §17.10.4, #445), the
-#: middle one reading the Wells screen's ``Time`` line under the scan's three autofocus modes
-#: (§17.12.12 D42, #592): they need a sample to register the plate from, so ``demo-sample``
-#: only, and nothing of the chain. ``stand-failed-620`` is the last: the Stand screen after a
+#: last four walk the Wells and Scan screens by their own buttons (m5 §17.10.4, #445), the
+#: second reading the Wells screen's ``Time`` line under the scan's three autofocus modes
+#: (§17.12.12 D42, #592) and the fourth the Scan screen's focus map lines with ``map`` typed
+#: (§25 D2, D3, #634): they need a sample to register the plate from, so ``demo-sample``
+#: only, and nothing of the chain. ``scan-focus-map`` follows ``scanned`` and leaves the field
+#: as it is, since nothing after it scans. ``stand-failed-620`` is the last: the Stand screen after a
 #: calibration that failed (m5 §22.2, #625), at the short height, reached alone on both stands;
 #: its failed record replaces the calibration ``stand-620`` seeded, so nothing may come after it
 #: (#658).
 ALONE_STATES = ("empty", "wells-selected", "snap", "enlarged", "expert")
 CHAIN_STATES = ("after-density", "with-route", "results-all", "turned")
 SHORT_STATES = ("stand-620", "plate-620")
-GUIDED_STATES = ("wells-laid-out", "wells-timed", "scanned")
+GUIDED_STATES = ("wells-laid-out", "wells-timed", "scanned", "scan-focus-map")
 FAILED_STATES = ("stand-failed-620",)
 STATE_NAMES = (
     *ALONE_STATES,
@@ -139,6 +143,8 @@ SCREEN_TITLE_OF = {
     # ``wells-timed`` stays on the Wells screen (m5 §17.12.12 D42).
     "wells-timed": "Which wells?",
     "scanned": "Scan B2 and B11",
+    # ``scan-focus-map`` is on the Scan screen, with the plan's two wells (m5 §25 D2).
+    "scan-focus-map": "Scan B2 and B11",
     # The Results screen's title is the screen's own name (``guide.SCREEN_TITLES``).
     "results-all": "Results",
 }
@@ -271,6 +277,15 @@ TIME_LINE = re.compile(r"Time: about")
 #: What ``wells-timed`` types into the field for each read of the ``Time`` line: nothing (the
 #: tool's default, ``if-engaged``), then ``off`` and ``required``.
 TIME_READS = (("default", ""), ("off", "off"), ("required", "required"))
+
+#: The label of the ``scan`` tool's ``cell_focus`` field on the Scan screen (``plate_page``'s
+#: ``_CELL_FOCUS_FIELD``, which a test pins this to), and what the focus map pane of the screen
+#: starts with (``guide.focus_map_lines``: the kept map, a typed one, none, or one that cannot be
+#: read; a test pins these to ``guide`` too). ``scan-focus-map`` waits for this text, never a
+#: delay (FM-162).
+CELL_FOCUS_FIELD = "cell_focus"
+FOCUS_MAP_STARTS = ("No focus map kept yet", "Focus map:", "The kept focus map")
+FOCUS_MAP_LINE = re.compile(r"No focus map kept yet|Focus map:|The kept focus map")
 
 
 @dataclass(frozen=True)
@@ -1225,6 +1240,23 @@ def _act_scanned(page: Any, stand: Stand) -> None:
     page.locator("pre").filter(has_text="Scan done").first.wait_for()
 
 
+def _act_scan_focus_map(page: Any, stand: Stand) -> None:
+    """*4. Scan* with ``map`` typed in the scan's ``cell_focus`` field, Enter, and the wait for the focus map lines (m5 §25 D2, D3, #634).
+
+    The Scan screen is opened first (the step button is idempotent: ``scanned`` leaves the page on
+    it, and a ``scanned`` that failed leaves another). Served in dry run no scan was kept as a map,
+    so the pane says ``FOCUS_MAP_NONE`` and the anchor line follows; the photograph shows where the
+    two lines and the field sit above *Start the scan*, and ``summary.txt`` says the pane's text. The
+    wait is for the pane's own words, never a delay (FM-162). The field is left as it is: this is
+    the last state that scans, and the failed-calibration state after it goes to the Stand screen.
+    """
+    _step_button(page, 4, "Scan").click()
+    box = page.get_by_label(CELL_FOCUS_FIELD, exact=True)
+    box.fill("map")
+    box.press("Enter")
+    page.locator("pre").filter(has_text=FOCUS_MAP_LINE).first.wait_for()
+
+
 ACTIONS = {
     "empty": _act_empty,
     "wells-selected": _act_wells_selected,
@@ -1240,6 +1272,7 @@ ACTIONS = {
     "wells-laid-out": _act_wells_laid_out,
     "wells-timed": _act_wells_timed,
     "scanned": _act_scanned,
+    "scan-focus-map": _act_scan_focus_map,
     "stand-failed-620": _act_stand_failed_620,
 }
 
@@ -1309,8 +1342,10 @@ def _guided_parts(page: Any, state: str) -> list[tuple[str, Any]]:
     summary says whether its title and its first action, *Lay out the fields* or *Start the
     scan*, are inside the page, and the figures and the drive bar as for any other state.
     """
-    # The Wells screen's first action is *Lay out the fields*, for both states that stay on it.
-    action = "Start the scan" if state == "scanned" else "Lay out the fields"
+    # The Wells screen's first action is *Lay out the fields*, for both states that stay on it;
+    # the two states on the Scan screen name *Start the scan*, which the focus block now sits above.
+    on_scan = state in ("scanned", "scan-focus-map")
+    action = "Start the scan" if on_scan else "Lay out the fields"
     return [
         *_frame_parts(page),
         ("title", page.locator("pre").filter(has_text=SCREEN_TITLE_OF[state])),
@@ -1579,6 +1614,18 @@ def results_facts(texts: Sequence[str]) -> list[str]:
     return lines
 
 
+def focus_map_facts(texts: Sequence[str]) -> list[str]:
+    """What ``scan-focus-map`` is about, read from the page's texts: the focus map pane, its lines joined by `` | `` (m5 §25 D3).
+
+    The pane starts with one of ``FOCUS_MAP_STARTS`` (the kept map, a typed one, none kept, a file
+    that cannot be read) and holds the anchor line after it. A pane the page did not draw is said
+    as ``not on the page`` and never guessed.
+    """
+    found = next((t for t in texts if t.startswith(FOCUS_MAP_STARTS)), None)
+    text = "not on the page" if found is None else " | ".join(found.splitlines())
+    return [f"focus map: {text}"]
+
+
 def time_facts(readings: Sequence[tuple[str, str]]) -> list[str]:
     """What ``wells-timed`` is about: the ``Time`` line under each autofocus mode it read, as ``time (autofocus <mode>): <line>`` (m5 §17.12.12 D42)."""
     return [f"time (autofocus {mode}): {line}" for mode, line in readings]
@@ -1599,11 +1646,13 @@ def state_facts(
     texts: Sequence[str],
     readings: Sequence[tuple[str, str]] = (),
 ) -> list[str]:
-    """The facts a state is about, by name: ``scanned`` the scan's, ``results-all`` the chain's, ``wells-timed`` the three ``Time`` lines its action read (``readings``), the two Stand states their seed (``readings``), ``enlarged`` its canvas's three boxes (``readings``); none for the others."""
+    """The facts a state is about, by name: ``scanned`` the scan's, ``scan-focus-map`` the focus map pane's, ``results-all`` the chain's, ``wells-timed`` the three ``Time`` lines its action read (``readings``), the two Stand states their seed (``readings``), ``enlarged`` its canvas's three boxes (``readings``); none for the others."""
     if name in ("stand-620", "stand-failed-620"):
         return seed_facts(readings)
     if name == "scanned":
         return scan_facts(texts)
+    if name == "scan-focus-map":
+        return focus_map_facts(texts)
     if name == "results-all":
         return results_facts(texts)
     if name == "wells-timed":
