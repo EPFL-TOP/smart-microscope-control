@@ -8,6 +8,7 @@ scikit-image.
 
 from __future__ import annotations
 
+import hashlib
 import math
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -17,8 +18,9 @@ import numpy.typing as npt
 from skimage import measure
 
 from smc.inference.detector import Detection
+from smc.inference.models import ResolvedModel, model_identity
 
-__all__ = ["BLOB_DETECTOR", "BLOB_DETECTOR_IDENTITY", "BlobDetector"]
+__all__ = ["BLOB_DETECTOR", "BLOB_DETECTOR_IDENTITY", "BlobDetector", "blob_model"]
 
 #: ``CellsResult.model`` when the blob detector ran: there is no file to name.
 BLOB_DETECTOR = "blobs"
@@ -110,3 +112,23 @@ class BlobDetector:
                 )
             )
         return found
+
+
+def blob_model() -> ResolvedModel:
+    """The blob detector as a resolved model: no file, so the identity string stands for the weights.
+
+    Its ``weights_sha256`` is the SHA-256 of ``BLOB_DETECTOR_IDENTITY``, and its
+    pre-processing digest is that of no rule at all, so a resume across a change
+    of its rules (a new version in the string) is refused like a change of
+    weights (FM-111). ``BLOB_DETECTOR_IDENTITY`` is read at call time: a test
+    that changes it changes the model. Neither torch nor weights are touched.
+    """
+    digest = hashlib.sha256(BLOB_DETECTOR_IDENTITY.encode("utf-8")).hexdigest()
+    detector = BlobDetector()
+    return ResolvedModel(
+        name=BLOB_DETECTOR,
+        identity=model_identity(digest, None),
+        weights_sha256=digest,
+        runs_on=f"local:{detector.device}",
+        detector=detector,
+    )

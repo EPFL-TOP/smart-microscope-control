@@ -8,6 +8,8 @@ and the standard library only.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 from typing import Any
@@ -20,14 +22,23 @@ __all__ = [
     "DEFAULT_PREPROCESSING",
     "MAX_INPUT_PX",
     "MIN_INPUT_PX",
+    "PREPROCESSING_VERSION",
     "ModelPreprocessing",
     "Preprocessing",
     "model_input_size_px",
     "normalize_plane",
+    "preprocessing_for",
+    "preprocessing_sha256",
 ]
 
-#: The largest pixel size, in µm, a card or a parameter may name: the stand's cameras
-#: are under 1 µm per pixel at 10x and above, and a larger number is a typo.
+#: Stands for what the code does that a ``ModelPreprocessing`` does not say: the
+#: float32 scaling of ``normalize_plane`` and the plane repeated to three
+#: channels. A change of either increments it, so that a model's identity changes
+#: with what the model is shown (ADR-0011).
+PREPROCESSING_VERSION = 1
+
+#: The largest pixel size, in µm, a card may name: the bound of ``cells``'
+#: ``model_um_per_px`` (inference.md §3), so that a card and a parameter agree.
 _MAX_UM_PER_PX = 10.0
 
 
@@ -198,3 +209,46 @@ class ModelPreprocessing(BaseModel):
     @classmethod
     def _model_pixel_size_is_plausible(cls, value: float | None) -> float | None:
         return check_pixel_size(value)
+
+
+def preprocessing_sha256(rule: ModelPreprocessing | None) -> str:
+    """The SHA-256 of a pre-processing rule's canonical text: the half of a model's identity that is not its weights.
+
+    The text is the sorted, compact JSON of the rule and ``PREPROCESSING_VERSION``
+    (``null`` for a detector with no pre-processing, the blob detector), so that
+    two runs that show the model the same thing have the same digest, whichever
+    way the numbers were written (``1`` and ``1.0`` are one text: the rule's
+    values are floats).
+    """
+    payload: dict[str, Any] | None = None
+    if rule is not None:
+        payload = {
+            "version": PREPROCESSING_VERSION,
+            "percentiles": [rule.percentiles[0], rule.percentiles[1]],
+            "model_um_per_px": rule.model_um_per_px,
+        }
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
+def preprocessing_for(
+    rule: ModelPreprocessing,
+    *,
+    frame_shape_px: tuple[int, int],
+    frame_um_per_px: float,
+) -> Preprocessing:
+    """The rule worked out for one scan's frames: its percentiles and, if the rule names a scale, the input size.
+
+    A native rule keeps the model's own resize; otherwise the frame is shown at
+    ``rule.model_um_per_px``, which is the ratio of the two pixel sizes.
+
+    Raises:
+        ValueError: The size the frame would be resized to is outside what the
+            model is given (``model_input_size_px``'s message).
+    """
+    size: tuple[int, int] | None = None
+    if rule.model_um_per_px is not None:
+        size = model_input_size_px(
+            frame_shape_px, frame_um_per_px, rule.model_um_per_px
+        )
+    return Preprocessing(percentiles=rule.percentiles, input_size_px=size)

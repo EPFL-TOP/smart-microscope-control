@@ -1,11 +1,11 @@
-"""The cell detector: where the weights are, what is refused, and what torch's absence says (m3 §9.1).
+"""The local detector: the pre-processing, the model's output as detections, and what a bad checkpoint says (m3 §9.1, §9.4).
 
 Unless a test is marked *torch*, it runs without torch, so CI runs it: the
-plugin must import and list on a PC that never installed the ``detect`` extra,
-and a missing torch, a torch that does not load and a bad checkpoint must each
-say what to do. The *torch* tests build a checkpoint of a few tensors with
-``torch.save`` and are skipped without torch. The one test of the trained model
-is skipped unless the weights are on the PC; CI never has them.
+plugin must import and list on a PC that never installed the ``detect`` extra.
+The *torch* tests build a checkpoint of a few tensors with ``torch.save`` and
+are skipped without torch. The one test of the trained model is skipped unless
+the weights are on the PC; CI never has them. Where the weights are looked for,
+and what a missing torch says, is ``test_inference_models.py``'s.
 """
 
 from __future__ import annotations
@@ -22,43 +22,43 @@ from typing import Any
 import numpy as np
 import pytest
 
-import smc
 from smc.inference import local as local_mod
+from smc.inference.cards import DEFAULT_MODEL_NAME, model_card
 from smc.inference.detector import Detection, Detector
 from smc.inference.errors import ModelError
+from smc.inference.local import detections_from_output, load_local
+from smc.inference.models import weights_folder
 from smc.inference.preprocessing import (
+    DEFAULT_PREPROCESSING,
     MAX_INPUT_PX,
     MIN_INPUT_PX,
     Preprocessing,
     model_input_size_px,
     normalize_plane,
 )
-from smc.plugins import PluginRunError
-from smc.plugins.cells.detector import (
-    DEFAULT_MODEL,
-    default_model_path,
-    detections_from_output,
-    load_detector,
-)
 
-CHECKOUT = Path(smc.__file__).resolve().parents[2]
 PREDICTOR = "roi_heads.box_predictor.cls_score.weight"
 
 
-def _load(path: Path, **kwargs: Any) -> Detector:
-    return load_detector(path, device="cpu", score_threshold=0.5, **kwargs)
-
-
-def _weights(tmp_path: Path) -> Path:
-    path = tmp_path / "w.pth"
-    path.write_bytes(b"not a checkpoint")
-    return path
+def _load(
+    path: Path,
+    *,
+    preprocessing: Preprocessing = DEFAULT_PREPROCESSING,
+    device: str = "cpu",
+    score_threshold: float = 0.5,
+) -> Detector:
+    return load_local(
+        path,
+        device=device,
+        score_threshold=score_threshold,
+        preprocessing=preprocessing,
+    )
 
 
 def _reason(path: Path) -> str:
-    with pytest.raises(PluginRunError) as caught:
+    with pytest.raises(ModelError) as caught:
         _load(path)
-    return caught.value.reason
+    return str(caught.value)
 
 
 # --- importing without torch --------------------------------------------------
@@ -87,164 +87,6 @@ def test_the_plugin_imports_without_torch() -> None:
 
     assert run.returncode == 0, run.stderr
     assert "cells" in run.stdout
-
-
-# --- load_detector: what each failure says ------------------------------------
-
-
-def test_a_missing_model_says_where_it_looked(tmp_path: Path) -> None:
-    missing = tmp_path / "nope.pth"
-
-    reason = _reason(missing)
-
-    assert str(missing) in reason
-    assert "SMC_MODELS" in reason
-    assert DEFAULT_MODEL in reason
-
-
-def test_a_missing_torch_says_to_install_the_detect_extra(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setitem(sys.modules, "torch", None)
-
-    reason = _reason(_weights(tmp_path))
-
-    assert "torch is not installed" in reason
-    assert "pip install -e .[detect]" in reason
-
-
-def test_a_torch_that_does_not_load_is_told_apart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Windows raises ``OSError`` for a DLL that does not load: reinstalling is the cure."""
-
-    class BrokenTorch:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise OSError("[WinError 126] The specified module could not be found")
-
-    monkeypatch.setattr(local_mod, "TorchDetector", BrokenTorch)
-
-    reason = _reason(_weights(tmp_path))
-
-    assert "did not load" in reason
-    assert "WinError 126" in reason
-    assert "not installed" not in reason
-    # torch is imported in the process that already holds the stand's DLLs (FM-95):
-    # a fresh console tells that conflict from a broken install.
-    assert "import torch" in reason
-
-
-def test_a_refused_checkpoint_is_a_plugin_run_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class Refusing:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise ValueError("w.pth has no classes")
-
-    monkeypatch.setattr(local_mod, "TorchDetector", Refusing)
-
-    assert _reason(_weights(tmp_path)) == "w.pth has no classes"
-
-
-def test_a_model_path_the_os_refuses_to_stat_is_a_plugin_run_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A folder the user cannot enter, a share that dropped: ``is_file`` raises, it does not say no (FM-116)."""
-    weights = tmp_path / DEFAULT_MODEL
-    real = Path.is_file
-
-    def refused(self: Path) -> bool:
-        if self == weights:
-            raise PermissionError(13, "Permission denied")
-        return real(self)
-
-    monkeypatch.setattr(Path, "is_file", refused)
-
-    reason = _reason(weights)
-
-    assert "Permission denied" in reason
-    assert str(weights) in reason
-    assert "SMC_MODELS" in reason
-
-
-def test_an_import_error_that_is_not_a_missing_module_is_not_told_as_not_installed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``DLL load failed while importing _imaging`` is an ``ImportError`` too."""
-
-    class BrokenImport:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise ImportError("DLL load failed while importing _imaging")
-
-    monkeypatch.setattr(local_mod, "TorchDetector", BrokenImport)
-
-    reason = _reason(_weights(tmp_path))
-
-    assert "DLL load failed while importing _imaging" in reason
-    assert "could not be imported" in reason
-    assert "not installed" not in reason
-    assert "pip install -e .[detect]" in reason
-
-
-def test_a_runtime_error_while_importing_torch_is_told_as_not_loading(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A torch and a torchvision of versions that do not go together raise ``RuntimeError``."""
-
-    class Mismatched:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise RuntimeError("operator torchvision::nms does not exist")
-
-    monkeypatch.setattr(local_mod, "TorchDetector", Mismatched)
-
-    reason = _reason(_weights(tmp_path))
-
-    assert "did not load" in reason
-    assert "torchvision::nms" in reason
-
-
-def test_the_cause_is_chained(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    class Refusing:
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            raise ValueError("why")
-
-    monkeypatch.setattr(local_mod, "TorchDetector", Refusing)
-
-    with pytest.raises(PluginRunError) as caught:
-        _load(_weights(tmp_path))
-
-    # PluginRunError <- ModelError <- the ValueError of the checkpoint.
-    assert isinstance(caught.value.__cause__, ModelError)
-    assert isinstance(caught.value.__cause__.__cause__, ValueError)
-
-
-# --- where the weights are ----------------------------------------------------
-
-
-def test_smc_models_sets_the_folder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("SMC_MODELS", str(tmp_path))
-
-    assert default_model_path() == tmp_path / DEFAULT_MODEL
-
-
-@pytest.mark.parametrize("value", ["", "  "])
-def test_an_empty_or_blank_smc_models_is_not_the_working_directory(
-    value: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``Path("")`` is ``.``: an empty variable must not make the cwd the models folder (FM-78)."""
-    monkeypatch.setenv("SMC_MODELS", value)
-
-    assert default_model_path() == CHECKOUT / "local" / "models" / DEFAULT_MODEL
-
-
-def test_without_smc_models_the_weights_are_in_the_checkouts_local_folder(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("SMC_MODELS", raising=False)
-
-    assert default_model_path() == CHECKOUT / "local" / "models" / DEFAULT_MODEL
 
 
 # --- normalize_plane ----------------------------------------------------------
@@ -524,10 +366,10 @@ def test_an_unavailable_device_is_refused(tmp_path: Path) -> None:
         },
     )
 
-    with pytest.raises(PluginRunError) as caught:
-        load_detector(path, device="cuda", score_threshold=0.5)
+    with pytest.raises(ModelError) as caught:
+        _load(path, device="cuda")
 
-    assert caught.value.reason == (
+    assert str(caught.value) == (
         "device cuda is not available on this PC; use device=auto or cpu"
     )
 
@@ -646,7 +488,7 @@ def _fake_detector(
     score_threshold: float = 0.2,
     preprocessing: Preprocessing | None = None,
 ) -> Detector:
-    """A ``TorchDetector`` built by ``load_detector`` around ``model``, on a real small checkpoint."""
+    """A ``TorchDetector`` built by ``load_local`` around ``model``, on a real small checkpoint."""
     import torchvision.models.detection as detection
 
     def build(**kwargs: Any) -> _FakeModel:
@@ -655,13 +497,11 @@ def _fake_detector(
 
     monkeypatch.setattr(detection, "fasterrcnn_resnet50_fpn", build)
     path = _checkpoint(tmp_path, {"model_state_dict": _state(4), "classes": CLASSES})
-    if preprocessing is None:
-        return load_detector(path, device=device, score_threshold=score_threshold)
-    return load_detector(
+    return _load(
         path,
         device=device,
         score_threshold=score_threshold,
-        preprocessing=preprocessing,
+        preprocessing=DEFAULT_PREPROCESSING if preprocessing is None else preprocessing,
     )
 
 
@@ -706,12 +546,12 @@ def test_a_device_the_model_cannot_move_to_says_to_use_the_cpu(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     model = _FakeModel([], [], [], fail_to="cuda")
 
-    with pytest.raises(PluginRunError) as caught:
+    with pytest.raises(ModelError) as caught:
         _fake_detector(tmp_path, monkeypatch, model, device="auto")
 
-    assert "no kernel image" in caught.value.reason
-    assert "ckpt.pth" in caught.value.reason
-    assert "device=cpu" in caught.value.reason
+    assert "no kernel image" in str(caught.value)
+    assert "ckpt.pth" in str(caught.value)
+    assert "device=cpu" in str(caught.value)
 
 
 def test_a_frame_that_fills_the_models_box_limit_is_a_warning(
@@ -785,12 +625,7 @@ def test_the_model_input_size_reaches_the_resize(
     monkeypatch.setattr(detection, "fasterrcnn_resnet50_fpn", build)
     path = _checkpoint(tmp_path, {"model_state_dict": _state(4), "classes": CLASSES})
 
-    load_detector(
-        path,
-        device="cpu",
-        score_threshold=0.5,
-        preprocessing=Preprocessing(input_size_px=(300, 400)),
-    )
+    _load(path, preprocessing=Preprocessing(input_size_px=(300, 400)))
 
     (model,) = built
     assert model.transform.min_size == (300,)
@@ -848,10 +683,10 @@ def test_the_default_percentiles_are_the_trained_ones(
 
 def _trained() -> Detector:
     _torch()
-    weights = default_model_path()
+    weights = weights_folder() / model_card(DEFAULT_MODEL_NAME).weights
     if not weights.is_file():
         pytest.skip(f"no weights at {weights} (set SMC_MODELS to their folder)")
-    return load_detector(None, device="auto", score_threshold=0.5)
+    return _load(weights, device="auto")
 
 
 def test_the_trained_model_loads_and_finds_nothing_on_noise() -> None:
