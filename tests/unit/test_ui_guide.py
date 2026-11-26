@@ -44,6 +44,7 @@ from smc.plugins.slots import (
     MeasuredOffset,
     ObjectiveOffsetsResult,
     OffsetWell,
+    PlanSelection,
     PlateResult,
     ScanPlanResult,
     TargetMeasure,
@@ -1104,6 +1105,44 @@ def test_scan_plan_card_lines_say_the_wells_the_fields_the_field_and_the_estimat
         _scan_plan(("B2",), rows=1, columns=1, fov_um=(1331.2, 1331.2), overlap=0.15)
     )
     assert real[2] == "field: 1331.2 × 1331.2 µm at Nikon 10X S Fluor, overlap 0.15"  # noqa: RUF001
+
+
+def test_the_card_of_a_plan_from_a_selection_names_the_selector_and_no_grid() -> None:
+    # m3 §28.9: no grid was laid, so neither a grid nor an overlap is named; still
+    # four lines, the wells and the estimate as for any plan.
+    grid = _scan_plan(("B3", "B2"), rows=1, columns=3, estimate_s=42.16)
+    selection = PlanSelection(
+        run_doc="runs/run-10x.json",
+        route_attempt="0123456789ab",
+        measured="2026-11-26T08:15:02+00:00",
+        selector="low-mag-survey",
+        source_objective="Nikon 10X S Fluor",
+        shift_um=(-37.5, 12.25),
+        wells_without_fields=(),
+        fields_left_out=0,
+    )
+    chosen = grid.model_copy(
+        update={"rows": 1, "columns": 1, "overlap": 0.0, "selection": selection}
+    )
+    lines = scan_plan_card_lines(chosen)
+    assert lines == (
+        "wells: 2 (B3, B2)",
+        "fields: 6, chosen by selector 'low-mag-survey' in runs/run-10x.json",
+        "field: 512 × 512 µm at Nikon 10X S Fluor",  # noqa: RUF001
+        "estimate: about 42 s (the moves, refocus and snaps of the timings)",
+    )
+    # A selection that left named wells without a field says how many.
+    left = chosen.model_copy(
+        update={
+            "selection": selection.model_copy(
+                update={"wells_without_fields": ("A1", "C4", "H12")}
+            )
+        }
+    )
+    assert scan_plan_card_lines(left)[1] == (
+        "fields: 6, chosen by selector 'low-mag-survey' in runs/run-10x.json; none "
+        "in 3 of the wells named"
+    )
 
 
 def test_scan_plan_card_says_what_to_run_when_the_estimate_is_unknown() -> None:

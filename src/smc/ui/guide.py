@@ -1666,18 +1666,32 @@ def scan_plan_card_lines(result: ScanPlanResult) -> tuple[str, ...]:
     wells = f"wells: {len(result.wells)}"
     if names:
         wells += f" ({', '.join(names)})"
-    grid = f"a grid of {result.rows} × {result.columns} in each well"  # noqa: RUF001
-    planned = result.rows * result.columns * len(result.wells)
-    if len(result.fields) == planned:
-        fields = f"fields: {len(result.fields)}, {grid}"
-    else:
-        fields = (
-            f"fields: {len(result.fields)} of {planned}, {grid}, "
-            "the fields that miss the well left out"
-        )
     width_um, height_um = result.fov_um
     at = "" if result.objective is None else f" at {result.objective}"
-    field = f"field: {width_um:g} × {height_um:g} µm{at}, overlap {result.overlap:g}"  # noqa: RUF001
+    field = f"field: {width_um:g} × {height_um:g} µm{at}"  # noqa: RUF001
+    selection = result.selection
+    if selection is not None:
+        # A plan from a selection has no grid (m3 §28.9): the selector chose its
+        # fields, and an overlap between fields nobody laid would mean nothing.
+        fields = (
+            f"fields: {len(result.fields)}, chosen by selector "
+            f"'{selection.selector}' in {selection.run_doc}"
+        )
+        if selection.wells_without_fields:
+            fields += (
+                f"; none in {len(selection.wells_without_fields)} of the wells named"
+            )
+    else:
+        grid = f"a grid of {result.rows} × {result.columns} in each well"  # noqa: RUF001
+        planned = result.rows * result.columns * len(result.wells)
+        if len(result.fields) == planned:
+            fields = f"fields: {len(result.fields)}, {grid}"
+        else:
+            fields = (
+                f"fields: {len(result.fields)} of {planned}, {grid}, "
+                "the fields that miss the well left out"
+            )
+        field += f", overlap {result.overlap:g}"
     if result.estimate_s is None:
         estimate = (
             "estimate: unknown, no usable timing: run timing, then scan-plan again"
