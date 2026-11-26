@@ -14,15 +14,45 @@ from typing import Any
 
 import numpy as np
 import numpy.typing as npt
+from pydantic import BaseModel, ConfigDict, StrictFloat, field_validator
 
 __all__ = [
     "DEFAULT_PREPROCESSING",
     "MAX_INPUT_PX",
     "MIN_INPUT_PX",
+    "ModelPreprocessing",
     "Preprocessing",
     "model_input_size_px",
     "normalize_plane",
 ]
+
+#: The largest pixel size, in µm, a card or a parameter may name: the stand's cameras
+#: are under 1 µm per pixel at 10x and above, and a larger number is a typo.
+_MAX_UM_PER_PX = 10.0
+
+
+def pixel_size_or_word(value: object, word: str) -> object:
+    """A card's pixel size: the number, or ``None`` for the word that says there is none.
+
+    TOML has no null (measured, inference.md §1), so a card says *unknown* and
+    *native* in words and reads them here, before the strict float check. Any
+    other string is refused with what to write instead: ``StrictFloat`` alone
+    would only say "not a number".
+    """
+    if isinstance(value, str):
+        if value == word:
+            return None
+        raise ValueError(
+            f"{value!r} is not a pixel size: write a number in um, or the word {word!r}"
+        )
+    return value
+
+
+def check_pixel_size(value: float | None) -> float | None:
+    """A pixel size above 0 and at most 10 um, or ``None``; a nan fails the test, not passes it."""
+    if value is not None and not (0.0 < value <= _MAX_UM_PER_PX):
+        raise ValueError(f"{value:g} um is not above 0 and at most {_MAX_UM_PER_PX:g}")
+    return value
 
 
 def normalize_plane(
@@ -124,3 +154,47 @@ def model_input_size_px(
             f"{MIN_INPUT_PX} and the long side at most {MAX_INPUT_PX}"
         )
     return size
+
+
+class ModelPreprocessing(BaseModel):
+    """What is done to a frame before the model sees it, as a rule (the card's table).
+
+    The rule is what a card names and what a run applies, so that it can be
+    written down, digested into the model's identity and compared; the
+    ``Preprocessing`` of the detector is that rule worked out for one scan's
+    frames. Its bounds are those of ``cells``' ``low_percentile``,
+    ``high_percentile`` and ``model_um_per_px``, so that a parameter that replaces
+    one part of a card's rule always leaves a valid rule. ``model_um_per_px`` is
+    ``None`` for the model's own resize ("native" in a card).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, allow_inf_nan=False, protected_namespaces=()
+    )
+
+    percentiles: tuple[StrictFloat, StrictFloat]
+    model_um_per_px: StrictFloat | None
+
+    @field_validator("percentiles")
+    @classmethod
+    def _percentiles_surround_the_median(
+        cls, value: tuple[float, float]
+    ) -> tuple[float, float]:
+        low, high = value
+        # `not (a < b)`: a nan fails the chain, which `a >= b` would let through.
+        if not (0.0 <= low < 50.0 < high <= 100.0):
+            raise ValueError(
+                f"{list(value)} does not satisfy 0 <= low < 50 < high <= 100, the "
+                f"bounds of cells' low_percentile and high_percentile"
+            )
+        return value
+
+    @field_validator("model_um_per_px", mode="before")
+    @classmethod
+    def _native_is_none(cls, value: object) -> object:
+        return pixel_size_or_word(value, "native")
+
+    @field_validator("model_um_per_px")
+    @classmethod
+    def _model_pixel_size_is_plausible(cls, value: float | None) -> float | None:
+        return check_pixel_size(value)
