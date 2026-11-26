@@ -6,7 +6,6 @@ import _thread
 import logging
 import math
 import pickle
-import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -257,24 +256,35 @@ def _blocking_move(
     return mover, release
 
 
-def _hold_the_lock(executor: Executor) -> tuple[_Thread, threading.Event]:
+def _hold_the_lock(
+    executor: Executor, *, hold_s: float = HOLD_S
+) -> tuple[_Thread, threading.Event]:
     """A hung snap in another thread; set the returned event to end it.
 
     It holds for ``HOLD_S`` unless the test releases it, so that no stall of the
-    runner ends the hold under a test that has not looked yet (#692).
+    runner ends the hold under a test that has not looked yet (#692). A test
+    whose point is that a call never waits for the lock, and whose own thread
+    makes that call under the hold, passes ``hold_s=JOIN_S``: the call that
+    regressed into waiting ends with the hold, and fails in 5 s, not in 60.
     """
     entered, release = threading.Event(), threading.Event()
 
     def hung_snap() -> None:
         entered.set()
-        release.wait(HOLD_S)
+        release.wait(hold_s)
 
     holder = _Thread(lambda: executor.acquire("camera: snap", hung_snap))
     assert entered.wait(JOIN_S)
     return holder, release
 
 
-def _queued(executor: Executor, target: Callable[[], object], what: str) -> _Thread:
+def _queued(
+    executor: Executor,
+    target: Callable[[], object],
+    what: str,
+    *,
+    wait_s: float | None = None,
+) -> _Thread:
     """Run ``target`` in a thread; return once it has polled the held lock and gone on waiting.
 
     "Queued behind the holder" is an event the queued thread sets, never a
@@ -285,7 +295,9 @@ def _queued(executor: Executor, target: Callable[[], object], what: str) -> _Thr
     saw the lock held, looked at its stop generation, its halt and the holder,
     and went on waiting. An action refused at that poll (halted, a motion in
     progress, out of time) raises there and sets nothing, so the assertion says
-    what the thread did instead of timing out blind.
+    what the thread did instead of timing out blind: it is read once the thread
+    has settled (a thread late to start or to end must not read "still
+    running"), however short ``wait_s``, the wait for the poll, is.
     """
     polled = threading.Event()
     contention = executor._contention
@@ -299,49 +311,41 @@ def _queued(executor: Executor, target: Callable[[], object], what: str) -> _Thr
     executor._contention = watched  # type: ignore[method-assign]
     thread = _Thread(target)
     queued.append(thread)
-    assert polled.wait(JOIN_S), (
-        f"{what} did not queue behind the holder: it {thread.said()}"
-    )
+    if not polled.wait(JOIN_S if wait_s is None else wait_s):
+        thread.finished_within(JOIN_S)
+        raise AssertionError(
+            f"{what} did not queue behind the holder: it {thread.said()}"
+        )
     return thread
 
 
 # --- the helper that proves "queued" (#692) ------------------------------------
 
 
-def _proof_that_fails(
-    monkeypatch: pytest.MonkeyPatch, executor: Executor, target: Callable[[], object]
-) -> str:
-    """The message of a ``_queued`` that fails; its wait is shortened for the time of the call."""
-    with monkeypatch.context() as patch:
-        patch.setattr(sys.modules[__name__], "JOIN_S", 0.3)
-        with pytest.raises(AssertionError) as info:
-            _queued(executor, target, "the snap")
+def _proof_that_fails(executor: Executor, target: Callable[[], object]) -> str:
+    """The message of a ``_queued`` that fails, after a wait of 0.3 s for a poll that never comes."""
+    with pytest.raises(AssertionError) as info:
+        _queued(executor, target, "the snap", wait_s=0.3)
     return str(info.value)
 
 
-def test_a_proof_of_queueing_says_what_a_thread_that_never_queued_did(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_proof_of_queueing_says_what_a_thread_that_never_queued_did() -> None:
     # The lock is free: the snap ran and returned, and nothing polled.
     executor = _ex()
     message = _proof_that_fails(
-        monkeypatch, executor, lambda: executor.acquire("camera: snap", lambda: "frame")
+        executor, lambda: executor.acquire("camera: snap", lambda: "frame")
     )
     assert "the snap did not queue behind the holder: it returned 'frame'" in message
 
 
-def test_a_proof_of_queueing_says_what_a_refusal_at_the_first_poll_raised(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_proof_of_queueing_says_what_a_refusal_at_the_first_poll_raised() -> None:
     # Halted behind a holder: refused at its first poll, so it never "went on waiting".
     executor = _ex()
     holder, release = _hold_the_lock(executor)
     try:
         executor.halt()
         message = _proof_that_fails(
-            monkeypatch,
-            executor,
-            lambda: executor.acquire("camera: snap", _never),
+            executor, lambda: executor.acquire("camera: snap", _never)
         )
     finally:
         release.set()
@@ -350,9 +354,7 @@ def test_a_proof_of_queueing_says_what_a_refusal_at_the_first_poll_raised(
     assert "MicroscopeHaltedError" in message
 
 
-def test_the_polls_of_another_queued_thread_are_not_a_proof_of_this_one(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_the_polls_of_another_queued_thread_are_not_a_proof_of_this_one() -> None:
     # The first thread keeps polling every 50 ms through the instance's
     # ``_contention``, which the second proof has replaced: the event is its own
     # thread's, or a thread that never reached the lock would pass.
@@ -364,7 +366,7 @@ def test_the_polls_of_another_queued_thread_are_not_a_proof_of_this_one(
             lambda: executor.acquire("camera: snap", lambda: "frame"),
             "the first snap",
         )
-        message = _proof_that_fails(monkeypatch, executor, lambda: executor.read(int))
+        message = _proof_that_fails(executor, lambda: executor.read(int))
     finally:
         release.set()
         holder.join()
@@ -495,7 +497,9 @@ def _condition(name: str) -> Iterator[Executor]:
     """An executor in one of the columns of §13's "Kinds of call" table."""
     executor = _ex(dry_run=name == "dry-run", lock_timeout_s=0.5)
     if name == "held":  # another thread's action (not a motion) holds the lock
-        holder, release = _hold_the_lock(executor)
+        # The test's own thread calls under the hold, and a lock-free call that
+        # regressed into waiting for it is ended by the hold (the check below).
+        holder, release = _hold_the_lock(executor, hold_s=JOIN_S)
         try:
             yield executor
         finally:
@@ -1194,7 +1198,7 @@ def test_wait_is_a_lock_free_poll_that_never_stops() -> None:
     # 2, 3, 5, 6 and 8).
     executor, xy = _ex(), _Device()
     xy.busy = True  # moved by another caller, or by hand
-    holder, release = _hold_the_lock(executor)
+    holder, release = _hold_the_lock(executor, hold_s=JOIN_S)  # as in `_condition`
     try:
         with pytest.raises(DeviceTimeoutError) as info:
             executor.wait(xy.motion, 0.05)
