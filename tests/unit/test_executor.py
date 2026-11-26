@@ -6,6 +6,7 @@ import _thread
 import logging
 import math
 import pickle
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -32,6 +33,13 @@ LOGGER = logging.getLogger("smc.hardware.test")
 # suite (FM-44). Interrupts are raised from stubs, except in the tests that
 # are about delivering a real pending Ctrl-C.
 JOIN_S = 5.0
+
+# How long a test's holder keeps the lock when the test does not end it: far
+# longer than any stall of a loaded runner, so that "queued behind the holder"
+# stays true until the test releases the holder, always in a ``finally``. A hold
+# of ``JOIN_S`` lapsed on a runner that stalled, and the queued action ran
+# (#692). The thread is a daemon, so a hold nobody released cannot end the run.
+HOLD_S = 60.0
 
 main_thread_only = pytest.mark.skipif(
     threading.current_thread() is not threading.main_thread(),
@@ -97,6 +105,18 @@ class _Thread:
 
     def is_alive(self) -> bool:
         return self._thread.is_alive()
+
+    @property
+    def ident(self) -> int | None:
+        return self._thread.ident
+
+    def said(self) -> str:
+        """What the thread did, for the message of an assertion about it."""
+        if self.is_alive():
+            return "is still running"
+        if self.error is not None:
+            return f"raised {self.error!r}"
+        return f"returned {self.result!r}"
 
     def finished_within(self, seconds: float) -> bool:
         self._thread.join(timeout=seconds)
@@ -238,16 +258,118 @@ def _blocking_move(
 
 
 def _hold_the_lock(executor: Executor) -> tuple[_Thread, threading.Event]:
-    """A hung snap in another thread; set the returned event to end it."""
+    """A hung snap in another thread; set the returned event to end it.
+
+    It holds for ``HOLD_S`` unless the test releases it, so that no stall of the
+    runner ends the hold under a test that has not looked yet (#692).
+    """
     entered, release = threading.Event(), threading.Event()
 
     def hung_snap() -> None:
         entered.set()
-        release.wait(JOIN_S)
+        release.wait(HOLD_S)
 
     holder = _Thread(lambda: executor.acquire("camera: snap", hung_snap))
     assert entered.wait(JOIN_S)
     return holder, release
+
+
+def _queued(executor: Executor, target: Callable[[], object], what: str) -> _Thread:
+    """Run ``target`` in a thread; return once it has polled the held lock and gone on waiting.
+
+    "Queued behind the holder" is an event the queued thread sets, never a
+    window of time: ``not thread.finished_within(0.2)`` also holds for a thread
+    that has not started yet, and fails when the holder's hold or the thread's
+    own ``lock_timeout_s`` lapses during a stall of the runner (#692, FM-44).
+    The event is set when ``Executor._contention`` returns for that thread: it
+    saw the lock held, looked at its stop generation, its halt and the holder,
+    and went on waiting. An action refused at that poll (halted, a motion in
+    progress, out of time) raises there and sets nothing, so the assertion says
+    what the thread did instead of timing out blind.
+    """
+    polled = threading.Event()
+    contention = executor._contention
+    queued: list[_Thread] = []
+
+    def watched(started: float, halt_mark: int | None, *, expired: bool) -> None:
+        contention(started, halt_mark, expired=expired)
+        if queued and queued[0].ident == threading.get_ident():
+            polled.set()
+
+    executor._contention = watched  # type: ignore[method-assign]
+    thread = _Thread(target)
+    queued.append(thread)
+    assert polled.wait(JOIN_S), (
+        f"{what} did not queue behind the holder: it {thread.said()}"
+    )
+    return thread
+
+
+# --- the helper that proves "queued" (#692) ------------------------------------
+
+
+def _proof_that_fails(
+    monkeypatch: pytest.MonkeyPatch, executor: Executor, target: Callable[[], object]
+) -> str:
+    """The message of a ``_queued`` that fails; its wait is shortened for the time of the call."""
+    with monkeypatch.context() as patch:
+        patch.setattr(sys.modules[__name__], "JOIN_S", 0.3)
+        with pytest.raises(AssertionError) as info:
+            _queued(executor, target, "the snap")
+    return str(info.value)
+
+
+def test_a_proof_of_queueing_says_what_a_thread_that_never_queued_did(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The lock is free: the snap ran and returned, and nothing polled.
+    executor = _ex()
+    message = _proof_that_fails(
+        monkeypatch, executor, lambda: executor.acquire("camera: snap", lambda: "frame")
+    )
+    assert "the snap did not queue behind the holder: it returned 'frame'" in message
+
+
+def test_a_proof_of_queueing_says_what_a_refusal_at_the_first_poll_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Halted behind a holder: refused at its first poll, so it never "went on waiting".
+    executor = _ex()
+    holder, release = _hold_the_lock(executor)
+    try:
+        executor.halt()
+        message = _proof_that_fails(
+            monkeypatch,
+            executor,
+            lambda: executor.acquire("camera: snap", _never),
+        )
+    finally:
+        release.set()
+        holder.join()
+    assert "the snap did not queue behind the holder: it raised " in message
+    assert "MicroscopeHaltedError" in message
+
+
+def test_the_polls_of_another_queued_thread_are_not_a_proof_of_this_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The first thread keeps polling every 50 ms through the instance's
+    # ``_contention``, which the second proof has replaced: the event is its own
+    # thread's, or a thread that never reached the lock would pass.
+    executor = _ex()
+    holder, release = _hold_the_lock(executor)
+    try:
+        first = _queued(
+            executor,
+            lambda: executor.acquire("camera: snap", lambda: "frame"),
+            "the first snap",
+        )
+        message = _proof_that_fails(monkeypatch, executor, lambda: executor.read(int))
+    finally:
+        release.set()
+        holder.join()
+    first.join()
+    assert "the snap did not queue behind the holder: it returned 0" in message
 
 
 # --- the basics --------------------------------------------------------------
@@ -627,7 +749,7 @@ def test_snap_right_after_the_move_is_idle_is_not_refused() -> None:
 
     def slow_readback() -> str:
         reading_back.set()
-        release.wait(JOIN_S)
+        release.wait(HOLD_S)
         return "arrived"
 
     mover = _Thread(
@@ -643,12 +765,14 @@ def test_snap_right_after_the_move_is_idle_is_not_refused() -> None:
         xy.busy = False  # the stage arrives, and the mover reads it back
         assert reading_back.wait(JOIN_S)
         executor.wait(xy.motion, JOIN_S)  # the UI waits for the move ...
-        snapper = _Thread(lambda: executor.acquire("camera: snap", lambda: "frame"))
-        done_early = snapper.finished_within(0.3)  # ... then snaps
+        snapper = _queued(  # ... then snaps, behind the readback
+            executor,
+            lambda: executor.acquire("camera: snap", lambda: "frame"),
+            "the snap",
+        )
     finally:
         release.set()
         mover.join()
-    assert not done_early, f"the snap did not wait for the readback: {snapper.error!r}"
     snapper.join()
     assert snapper.error is None
     assert snapper.result == "frame"
@@ -904,8 +1028,7 @@ def test_cancelled_move_is_not_logged_as_sent(
         if why == "stopped while queued":
             holder, release = _hold_the_lock(executor)
             try:
-                mover = _Thread(lambda: _move(executor, xy))
-                assert not mover.finished_within(0.2)  # queued behind the snap
+                mover = _queued(executor, lambda: _move(executor, xy), "the move")
                 executor.stop(xy.motion)
             finally:
                 release.set()
@@ -1298,19 +1421,20 @@ def test_give_up_does_not_cancel_another_threads_queued_move() -> None:
 
     def failing_step() -> Step[str]:
         building.set()
-        assert go.wait(JOIN_S)
+        assert go.wait(HOLD_S)
         return Step("xy_stage: move A", command_that_fails, lambda: "A", "dry")
 
     first = _Thread(
         lambda: executor.do("move A", failing_step, motion=xy.motion, timeout_s=30.0)
     )
     assert building.wait(JOIN_S)  # the first move holds the lock
-    second = _Thread(lambda: _move(executor, xy))  # records the generation, queues
-    queued = not second.finished_within(0.2)
-    go.set()
+    try:
+        # It records the generation, then queues.
+        second = _queued(executor, lambda: _move(executor, xy), "the second move")
+    finally:
+        go.set()
     first.join()
     second.join()
-    assert queued
     assert isinstance(first.error, RuntimeError)
     assert xy.stops == 1  # the give-up stopped the stage
     assert second.error is None
@@ -1540,8 +1664,7 @@ def test_a_stop_while_a_move_waits_for_the_lock_cancels_it() -> None:
     executor, xy = _ex(), _Device()
     holder, release = _hold_the_lock(executor)
     try:
-        mover = _Thread(lambda: _move(executor, xy))
-        assert not mover.finished_within(0.2)  # queued behind the snap
+        mover = _queued(executor, lambda: _move(executor, xy), "the move")
         executor.stop(xy.motion)
     finally:
         release.set()
@@ -2029,15 +2152,18 @@ def test_action_queued_while_halted_does_not_run_after_resume(
     # when the halt landed. resume() starts nothing.
     executor, xy, shutter = _ex(), _Device(arrive_after=0), _Shutter()
     holder, release = _hold_the_lock(executor)
+    action = _actions(executor, xy, shutter)[kind]
     try:
         if when == "called while halted":
             executor.halt()
-        queued = _Thread(_actions(executor, xy, shutter)[kind])
-        if when == "called while halted":
+            queued = _Thread(action)
             # Refused at its first lock poll (#80), so before the resume.
-            assert queued.finished_within(JOIN_S / 2)
+            assert queued.finished_within(JOIN_S / 2), (
+                f"the halted {kind} was not refused at its first poll: "
+                f"it {queued.said()}"
+            )
         else:
-            assert not queued.finished_within(0.2)  # queued behind the snap
+            queued = _queued(executor, action, f"the {kind}")
             executor.halt()
         executor.resume()
     finally:
@@ -2111,23 +2237,26 @@ def test_action_halted_while_queued_behind_a_slow_holder_raises_halted_not_busy(
     # halt while it waited, so it waited the whole lock_timeout_s and raised
     # MicroscopeBusyError, "the device driver may be hung". "called while
     # halted" is the issue's reproduction.
-    executor = _ex(lock_timeout_s=5.0)
+    # Neither the hold nor lock_timeout_s can lapse under a stalled runner, and
+    # the refusal is awaited for JOIN_S, a hundred lock polls (FM-44, #692).
+    executor = _ex(lock_timeout_s=HOLD_S)
     z, shutter = _Device("Z", arrive_after=0), _Shutter()
+    action = _actions(executor, z, shutter)[kind]
     holder, release = _hold_the_lock(executor)
     try:
         if when == "called while halted":
             executor.halt()
-        queued = _Thread(_actions(executor, z, shutter)[kind])
-        if when == "halted while queued":
-            assert not queued.finished_within(0.2)  # queued behind the snap
+            queued = _Thread(action)
+        else:
+            queued = _queued(executor, action, f"the {kind}")
             executor.halt()
-        # One lock poll is 50 ms; 1 s is well short of lock_timeout_s (FM-44).
-        refused = queued.finished_within(1.0)
+        refused = queued.finished_within(JOIN_S)
+        said = queued.said()  # before the release changes what it does
     finally:
         release.set()
         holder.join()
     queued.join()
-    assert refused, f"the halted action kept waiting for the lock: {queued.error!r}"
+    assert refused, f"the halted {kind} kept waiting for the lock: it {said}"
     assert isinstance(queued.error, MicroscopeHaltedError)
     assert (shutter.sent, z.commands) == ([], 0)
 
@@ -2137,20 +2266,20 @@ def test_halt_and_resume_while_queued_still_raise_halted(kind: str) -> None:
     # #80: the check at each lock poll compares the halt epoch, not the flag:
     # a resume() right after the halt does not let the queued action through,
     # nor leave it waiting for the lock, since it was halted after its call.
-    executor = _ex(lock_timeout_s=5.0)
+    executor = _ex(lock_timeout_s=HOLD_S)  # as above: no stall lapses it (#692)
     z, shutter = _Device("Z", arrive_after=0), _Shutter()
     holder, release = _hold_the_lock(executor)
     try:
-        queued = _Thread(_actions(executor, z, shutter)[kind])
-        assert not queued.finished_within(0.2)  # queued behind the snap
+        queued = _queued(executor, _actions(executor, z, shutter)[kind], f"the {kind}")
         executor.halt()
         executor.resume()
-        refused = queued.finished_within(1.0)
+        refused = queued.finished_within(JOIN_S)
+        said = queued.said()  # before the release changes what it does
     finally:
         release.set()
         holder.join()
     queued.join()
-    assert refused, f"the halted action kept waiting for the lock: {queued.error!r}"
+    assert refused, f"the halted {kind} kept waiting for the lock: it {said}"
     assert isinstance(queued.error, MicroscopeHaltedError)
     assert (shutter.sent, z.commands) == ([], 0)
 
@@ -2304,8 +2433,7 @@ def test_a_close_while_an_open_waits_for_the_lock_cancels_it() -> None:
     executor, shutter = _ex(), _Shutter()
     holder, release = _hold_the_lock(executor)
     try:
-        opener = _Thread(lambda: _open(executor, shutter))
-        assert not opener.finished_within(0.2)  # queued behind the snap
+        opener = _queued(executor, lambda: _open(executor, shutter), "the open")
         executor.safe(shutter.close, lambda: shutter.is_open)
     finally:
         release.set()
@@ -2395,8 +2523,7 @@ def test_dry_run_move_stopped_while_queued_is_cancelled_too() -> None:
     executor, xy = _ex(dry_run=True), _Device()
     holder, release = _hold_the_lock(executor)
     try:
-        mover = _Thread(lambda: _move(executor, xy))
-        assert not mover.finished_within(0.2)
+        mover = _queued(executor, lambda: _move(executor, xy), "the dry-run move")
         executor.stop(xy.motion)
     finally:
         release.set()
@@ -2810,8 +2937,7 @@ def test_compound_runs_nested_actions_in_one_lock_section() -> None:
         )
         # Between two nested actions, another thread waits for the lock (a
         # nested motion would refuse it at once, as above).
-        outsiders.append(_Thread(outsider_action))
-        assert not outsiders[0].finished_within(0.3), "it ran inside the compound"
+        outsiders.append(_queued(executor, outsider_action, "the outsider"))
         executor.do("af: engage", _step("af: engage", lambda: events.append("on")))
         return "landed"
 
