@@ -14,7 +14,7 @@ from datetime import datetime
 import numpy as np
 import numpy.typing as npt
 
-__all__ = ["Frame", "display_image"]
+__all__ = ["Box", "Frame", "display_image"]
 
 #: The percentiles of the stretch: a hot pixel or a dead one must not decide the contrast.
 _LOW_PERCENTILE = 0.5
@@ -48,6 +48,27 @@ class Frame:
     summary: str
 
 
+@dataclass(frozen=True, slots=True)
+class Box:
+    """A box over a frame, in the frame's own pixels (m5 §24.2 D6).
+
+    ``(row0, col0)`` and ``(row1, col1)`` are the box's **edges**, in
+    ``Cell.box_px``'s order: a pixel ``(r, c)`` covers ``[c, c + 1) x [r, r + 1)``,
+    so a box that encloses one pixel is ``(r, c, r + 1, c + 1)``. They are floats
+    because a cells file is data and a detector may give a fraction of a pixel; a
+    box that is not finite or encloses no area is not drawn by the view that is
+    given it. ``colour`` is a CSS colour and ``text`` is drawn at the box's top
+    left, as canvas text and never as markup (FM-139).
+    """
+
+    row0: float
+    col0: float
+    row1: float
+    col1: float
+    colour: str
+    text: str = ""
+
+
 def display_image(
     image: npt.NDArray[np.uint8] | npt.NDArray[np.uint16],
     *,
@@ -62,8 +83,9 @@ def display_image(
     **flat** frame has no range to stretch, and stretching it would show noise,
     or a black one white: it is shown against the camera's range (``bit_depth``
     bits, or the dtype's when ``bit_depth`` cannot be that), so a saturated frame
-    is white and a dark one black. The function never flips: the page does,
-    because Bokeh draws an image's first row at the bottom.
+    is white and a dark one black. The function never flips: Bokeh draws an
+    image's first row at its ``y``, and the image view flips its range so that
+    this row is on top (m5 §24.1).
 
     Raises:
         ValueError: The frame is not 2-D ``uint8`` or ``uint16``; the message
