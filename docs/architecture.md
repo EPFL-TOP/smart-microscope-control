@@ -94,6 +94,9 @@ src/smc/
                           the two Nikon stands), mm_stabilizer.py (a one-shot
                           focus stabilizer as an Autofocus), zeiss_mtb/ (the MTB
                           components as unicore devices, over a fake MTB; M4)
+  inference/              models by name: the Detector protocol, the cards in
+                          cards/ (the analysis track's), load_model; imports no
+                          torch and no hardware (ADR-0011, inference design)
   plugins/                api.py, registry.py, params.py, runner.py   (M3)
                           one package per tool: camera_calibration, plate_registration,
                           plate_walls, plate_finding, plate_check, objective_offsets,

@@ -37,6 +37,8 @@ ANALYSIS = {
     "/docs/algorithms/",
     "/tests/**/test_selector_*.py",
     "/tests/analysis/",
+    # The model cards (ADR-0011): a pull request that adds a card is the analysis side's.
+    "/src/smc/inference/cards/",
 }
 
 # Paths that ADR-0010 announces and that do not exist yet: a line for them protects
@@ -103,11 +105,16 @@ def _owners_of(path: str) -> list[str]:
         # The contract between the tracks is given back to the owner.
         ("src/smc/selection/api.py", OWNER),
         ("src/smc/selection/registry.py", OWNER),
+        # What loads a model and says where it ran is the stand's; only the cards are not.
+        ("src/smc/inference/models.py", OWNER),
+        ("src/smc/inference/cards.py", OWNER),
         # The analysis track's paths have no owner: CI alone gates them.
         ("src/smc/selection/builtin.py", []),
         ("src/smc/analysis/review.py", []),
         ("docs/algorithms/README.md", []),
         ("tests/analysis/test_review.py", []),
+        ("src/smc/inference/cards/x.toml", []),
+        ("src/smc/inference/cards/cell-classes-v2.toml", []),
         # ``**/`` is zero or more directories.
         ("tests/test_selector_dense.py", []),
         ("tests/unit/test_selector_dense.py", []),

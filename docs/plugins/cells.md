@@ -27,17 +27,74 @@ install the detect extra`. A torch that is installed and does not load (a DLL, o
 Windows) is told apart: `torch is installed but did not load (...); reinstall the
 detect extra`.
 
-**Put the weights where it looks.** The trained model, `cell_classes_model-cat-v2.pth`
-(166 MB), is **not in git**. It is looked for in `local/models/` of the smc folder
-(ignored by git), or in the folder `SMC_MODELS` names. A run without it says where
-it looked:
+**Put the weights where it looks.** The trained model, `cell-classes-v2`, is the file
+`cell_classes_model-cat-v2.pth` (166 MB), which is **not in git**. It is looked for in
+`local/models/` of the smc folder (ignored by git), or in the folder `SMC_MODELS`
+names. A run without it says where it looked:
 
 ```text
 cells: no model at <path>; put cell_classes_model-cat-v2.pth there, set SMC_MODELS to its folder, or give model_path
 ```
 
 An empty `SMC_MODELS` is no setting. In a worktree, the smc folder is the
-worktree: set `SMC_MODELS` to the main folder's `local/models`.
+worktree: set `SMC_MODELS` to the main folder's `local/models`. A file that is there
+and is not the card's weights (another SHA-256) is refused before torch is imported,
+with both values in the message: `... has the SHA-256 <found>, and the card
+cell-classes-v2 names <wanted>: it is not the model the card describes`.
+
+## Models: names and cards
+
+A model is asked for **by name**, `--param model=<name>` (unset is `cell-classes-v2`),
+and the name stands for a **card**: a TOML file in `src/smc/inference/cards/`, named
+`<name>.toml`, shipped with smc. The card says what the name means, so that two people
+who say `cell-classes-v2` mean one model, and so that a result says which one ran.
+
+```toml
+name = "cell-classes-v2"
+weights = "cell_classes_model-cat-v2.pth"
+weights_sha256 = "b1160edae7dd2e8e1897f959fd55b77481bbfa92d236aaa1202cd94101b2cb7e"
+classes = ["single", "doublet", "debris"]
+trained_um_per_px = "unknown"
+
+[preprocessing]
+percentiles = [0.5, 99.5]
+model_um_per_px = "native"
+```
+
+Every key is required: a card that leaves one out is refused, and nothing is defaulted
+silently. A key that is not in this list is refused too, with its name and the card's.
+
+| Key | Meaning |
+|---|---|
+| `name` | Lower-case letters and digits joined by `-` or `.`, at most 64 characters, and **the file's name** without `.toml`. `blobs` is reserved for the blob detector. |
+| `weights` | The weights' **file name**, never a path: it is looked for in `$SMC_MODELS` (or `local/models/` of the smc folder). |
+| `weights_sha256` | 64 lower-case hexadecimal characters: the weights this card describes. |
+| `classes` | The labels the model gives, in the order of its checkpoint after `__background__`, which the checkpoint is compared with. At least one, all different. |
+| `trained_um_per_px` | The pixel size in µm (above 0, up to 10) of the frames the model was trained on, or the word `unknown` (TOML has no null). It is recorded and **changes nothing in a detection**: for `cell-classes-v2` it is `unknown`, because the checkpoint records none. |
+| `[preprocessing] percentiles` | `[low, high]`, the percentiles of a frame's intensities that are black and white for the model: `0 <= low < 50 < high <= 100`, the bounds of `low_percentile` and `high_percentile`. |
+| `[preprocessing] model_um_per_px` | The pixel size the frame is shown to the model at (above 0, up to 10), or the word `native` for the model's own resize. |
+
+**The weights' SHA-256** is the number a card names and a run checks. On macOS and
+Linux, `shasum -a 256 <file>`. In PowerShell, `(Get-FileHash -Algorithm SHA256 <file>).Hash.ToLower()`:
+`Get-FileHash` prints it in capitals and a card has it in lower case.
+
+**To add a model**, a pull request adds `src/smc/inference/cards/<name>.toml` with the
+weights' file name and SHA-256 (the weights themselves are never in git: they go in
+`SMC_MODELS`, where the stand's PC and the owner's can find them). The folder is the
+**analysis track's** in `.github/CODEOWNERS`: the collaborator adds the cards of their
+own models, and a pull request that touches only a card needs the light set and no
+approval of the owner. Every card is read by a test, so a wrong one fails there. A
+card whose weights are another architecture than torchvision's Faster R-CNN is not
+possible yet: it waits for a card with an `architecture` key (inference design §9).
+
+**The identity of a model** is the SHA-256 of its weights and a digest of its
+pre-processing **as the run applied it** (the card's, with `model_um_per_px`,
+`low_percentile` and `high_percentile` in place when they are set), joined by `+`:
+`<weights sha256>+<pre-processing sha256>`. A change of either is another model, so
+the result records it (`model_identity`) and a resume refuses another one, naming the
+half that changed ([below](#stop-and-resume)). The digest also follows a version
+number in the code, for what the code does that the rule does not say (the float32
+scaling, the plane repeated to three channels).
 
 ## Running it
 
@@ -52,13 +109,14 @@ smc run cells -p <profile> --run-doc run.json --resume
 | Parameter | Default | Meaning |
 |---|---|---|
 | `detector` | `model` | `model` is the trained network. `blobs` counts bright round spots and is for the synthetic plate of the `demo-sample` profile only ([below](#the-blob-detector-for-the-synthetic-plate-only)). |
-| `model_path` | `local/models/cell_classes_model-cat-v2.pth`, or that file in `$SMC_MODELS` | The weights. Refused with `detector=blobs`. |
+| `model` | unset: `cell-classes-v2` | The model, by the name of its card ([above](#models-names-and-cards)): its weights, classes and pre-processing. An unknown name is refused when the stage runs, with the names there are. Refused with `detector=blobs`. |
+| `model_path` | unset: the card's file in `$SMC_MODELS`, or in `local/models/` of the smc folder | The weights, in place of the card's file. Its SHA-256 must still be the card's. Refused with `detector=blobs`. |
 | `device` | `auto` | `auto` is `cuda` when the PC has one and `cpu` otherwise: never `mps` unless asked. `cuda` or `mps` asked for and not there is refused (`device cuda is not available on this PC; use device=auto or cpu`), not replaced by the CPU. With `detector=blobs` only `auto` and `cpu` are accepted. |
 | `score_threshold` | 0.5 | Detections below it are dropped (0.05 to 1). The blob detector scores every detection 1.0, so it has no effect there. |
 | `max_overlap` | 0.7 | Two boxes of one frame sharing more than this fraction of the smaller one are one object; the more confident label stays. |
 | `merge_radius_um` | 5 | Cells of two fields within this distance are one cell. 0 merges nothing. |
-| `model_um_per_px` | unset | The pixel size the model sees, in µm (above 0, up to 10): each frame is resized by the scan's pixel size over this one. Unset keeps the model's own resize to 800 px. A size the model is not given (a short side under 256 px or a long side over 4096 px) is refused before the weights are read, with the size it would have been. Refused with `detector=blobs`. |
-| `low_percentile`, `high_percentile` | 0.5, 99.5 | The percentiles of a frame's intensities that are black and white for the model, as it was trained (`low` under 50, `high` over 50). Refused with `detector=blobs` unless they are the defaults. |
+| `model_um_per_px` | unset: the card's | The pixel size the model sees, in µm (above 0, up to 10): each frame is resized by the scan's pixel size over this one. Unset is the card's, which for `cell-classes-v2` keeps the model's own resize to 800 px. A size the model is not given (a short side under 256 px or a long side over 4096 px) is refused before the weights are read, with the size it would have been. Refused with `detector=blobs`. |
+| `low_percentile`, `high_percentile` | unset: the card's (0.5, 99.5) | The percentiles of a frame's intensities that are black and white for the model (`low` under 50, `high` over 50). Each one that is set replaces **its own part** of the card's pre-processing. Refused with `detector=blobs` unless they are 0.5 and 99.5. |
 | `checked_um_per_px` | unset | The frames' pixel size at which this model and these parameters were measured on annotated frames ([below](#checking-the-model-on-a-stands-frames)). It changes **nothing** in the detection: it is what `assumed` compares the scan's pixel size with. Refused with `detector=blobs`. |
 
 It needs a scan with frames: a dry-run scan, or one whose every field failed, has
@@ -105,8 +163,9 @@ the commands above, do not have such frames.
 
 In the result, `model` is `blobs`, `model_sha256` is the SHA-256 of a string that
 names the detector's version and rules (so a resume after a change of those rules
-is refused, like a change of weights), `classes` are `single` and `doublet` (no
-`debris`) and `device` is `cpu`. The page's Cells tool shows `detector` as a key
+is refused, like a change of weights), `model_identity` is that and the digest of
+no pre-processing, `model_runs_on` is `local:cpu`, `classes` are `single` and
+`doublet` (no `debris`) and `device` is `cpu`. The page's Cells tool shows `detector` as a key
 parameter, next to `score_threshold`. Measured on the synthetic plate, it finds exactly
 the 5 single and 3 paired spots of a frame at 0.1625, 0.25, 0.5, 1 and 2 µm per
 pixel, and nothing on a frame that crosses a well wall.
@@ -117,7 +176,10 @@ The model was trained by `nikon-control` on frames whose camera and pixel size
 nobody recorded: the checkpoint holds none. Before a stand's counts are used, the
 model is **measured on that stand's own frames**, against a reference the owner
 annotated. `scripts/dev/cells_check.py` does the two ends of it; the owner's eye
-is in the middle. Run it with an interpreter that has smc and torch: the stand's
+is in the middle. It takes the model by the name of its card, `--model <name>` on
+`export` and on `measure` (unset is `cell-classes-v2`), and loads it as `cells`
+does, so that a card measured here is the card that is run; the manifest and the
+`--json` numbers record the model's name, its SHA-256 and its identity. Run it with an interpreter that has smc and torch: the stand's
 PC with the `detect` extra, or on a Mac `../nikon-control/.venv/bin/python` with
 `PYTHONPATH=src`. It prints ASCII, reads and writes UTF-8, and moves nothing.
 
@@ -133,7 +195,7 @@ spaced (20 by default; all, when there are fewer), and writes a folder that
 `annotations/val.json` (COCO, every image `reviewed: false`) and `manifest.json` (the
 run document's file name, never its path; the scan's objective, pixel size and frame
 shape; for each image its frame file, well and stage position; the draft's detector
-and the weights' file name and SHA-256). A folder that exists and is not empty is
+and the model's name, the weights' SHA-256 and the identity). A folder that exists and is not empty is
 refused: the owner's annotations are never overwritten. If a frame cannot be copied
 (another program holds it, after five tries), what the export made is removed and the
 message names the frame, so the same command can be run again. The draft is the model's
@@ -168,7 +230,7 @@ configuration that cannot run (no weights, a size the model is not given) says w
 in its own block and the others still run; the exit code is then 1.
 
 **Reading the table.** One block per configuration, headed by what it is (for the
-model, the weights' file name and the first 12 digits of their SHA-256, so that two
+model, its name and the first 12 digits of the weights' SHA-256, so that two
 numbers are never from two files). The numbers below are an illustration, not a
 measurement:
 
@@ -237,11 +299,18 @@ The unit of work is a well. After each well the cells found so far are written t
 keeps the token, keeps the cells of the wells done and detects only the others.
 Three refusals and one repair:
 
-- **Other weights**: the SHA-256 of the weights is in the checkpoint, and a
-  resume with a file that hashes differently is refused (`the weights changed
-  since the run being resumed; run cells without --resume`): cells of two models
-  are not one result. With `detector=blobs` the same check hashes the detector's
-  identity string, so a resume after a release that changed its rules is refused too.
+- **Another model**: the model's identity is in the checkpoint, and a resume
+  with another one is refused, naming the half that changed: `the weights changed
+  since the run being resumed; run cells without --resume` for a file that hashes
+  differently, `the pre-processing changed since the run being resumed; run cells
+  without --resume` when the weights are the same and the rule is not (a card whose
+  percentiles were edited, or a version of the code that changed what the model is
+  shown): cells of two models are not one result. With `detector=blobs` the same
+  check hashes the detector's identity string, so a resume after a release that
+  changed its rules is refused too.
+- **A run started before the models had names** (#684): its checkpoint holds the
+  weights' SHA-256 and no identity, and its parameters were not these, so a
+  resume across this change is refused: run `cells` again without `--resume`.
 - **Other parameters or another profile**: the runner refuses it, as for every
   stage. Another `detector` is a parameter that differs.
 - **A scan produced again**: the runner refuses a resume over inputs that changed.
@@ -264,7 +333,8 @@ The slot `cells` holds a `CellsResult` (`smc.plugins.slots`):
 | Field | Meaning |
 |---|---|
 | `file` | `cells/<token>.json`, relative to the run folder, with forward slashes. |
-| `model`, `model_sha256` | The weights' **file name** (never its path: run documents are attached to issues), or `blobs`, and its SHA-256 (of the blob detector's identity string for `blobs`). The parameter `model_path` is recorded as you typed it, in the stage's `params`, like every parameter: when the path names your account, give the folder through `SMC_MODELS`, which is recorded nowhere. |
+| `model`, `model_sha256` | The model's **name**, the one of its card (`cell-classes-v2`; never a path: run documents are attached to issues), or `blobs`, and the weights' SHA-256 (of the blob detector's identity string for `blobs`). The parameter `model_path` is recorded as you typed it, in the stage's `params`, like every parameter: when the path names your account, give the folder through `SMC_MODELS`, which is recorded nowhere. |
+| `model_identity`, `model_runs_on` | The model as it was run: the weights' SHA-256 and the digest of the pre-processing, joined by `+`, so that the same weights under another rule are told apart; and where it ran, `local:<device>` (`local:cpu`). Both are `null` in a result recorded before #684, which still loads. |
 | `classes`, `device` | The detector's labels (`single`, `doublet`, `debris`) and the device it ran on, never `auto`. |
 | `score_threshold`, `merge_radius_um` | The parameters. |
 | `frames` | The number of frames of the scan. |
