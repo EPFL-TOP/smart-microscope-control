@@ -4107,8 +4107,9 @@ def test_a_flat_well_the_operator_did_not_focus_in_is_not_scanned_and_the_scan_g
     assert (none.anchor_um, len(none.tries)) == (None, 4)
     assert {t.sweep.outcome for t in none.tries if t.sweep is not None} == {"flat"}
     # The four fields of A2 are failed fields, in the plan's order, at their planned
-    # XY, with the text of D23. Four fields, one more than max_failed_in_row (3): if
-    # they counted in a row, the scan would end here instead of going on to B2.
+    # XY, with the text of D23. That they leave the run of failures as it is (neither
+    # counted nor reset) is what the two tests after this one pin: here B2's first
+    # field succeeds, and nothing reads the counter.
     text = (
         "MapNotAnchored: no sweep near the centre of A2 found a peak (4 tried), and "
         "the operator focused in A1: the well was not scanned"
@@ -4136,6 +4137,170 @@ def test_a_flat_well_the_operator_did_not_focus_in_is_not_scanned_and_the_scan_g
         (4 + k, f.name) for k, f in enumerate(a2, start=1)
     ]
     assert progress[-1].done == progress[-1].total == 12
+
+
+#: The XY moves of the rig's map scan with A2 not scanned: A1's 3 tries and 4 fields
+#: are moves 1 to 7, A2's 4 tries 8 to 11, B2's 3 tries 12 to 14, its first field 15.
+_A2_TRIES_FIRST_MOVE = 8
+_B2_FIRST_FIELD_MOVE = 15
+
+
+def test_a_failure_after_a_well_not_scanned_starts_its_own_run_of_failures(
+    rig: _Rig,
+) -> None:
+    # One field of B2 fails: with A2's four fields counted in the run (mutant: an
+    # increment in the not-scanned branch) the run would read 5 and end the scan.
+    _focused_at_a1(rig)
+    path = _seed_map(rig)
+    rig.camera.flat_snaps = set(range(37 + 1, 37 + 44 + 1))
+    rig.stage.fail = {_B2_FIRST_FIELD_MOVE: HardwareError("no answer 15")}
+
+    result = _result(_map_scan(rig, path))
+
+    assert [f.name for f in result.failed] == [
+        "A2_0000",
+        "A2_0001",
+        "A2_0002",
+        "A2_0003",
+        "B2_0000",
+    ]
+    assert [f.well for f in result.frames] == ["A1"] * 4 + ["B2"] * 3
+
+
+def test_a_run_of_failures_is_neither_counted_nor_reset_by_a_well_not_scanned(
+    rig: _Rig,
+) -> None:
+    # The last two fields of A1 fail, A2 is not scanned, and B2's first field fails:
+    # three in a row around the well that is not scanned, which leaves the run as
+    # it is (mutant: a reset to 0 in the not-scanned branch lets the scan go on).
+    _focused_at_a1(rig)
+    path = _seed_map(rig)
+    # A1's two failed fields take no snap: its tries and two frames are 35 snaps.
+    rig.camera.flat_snaps = set(range(35 + 1, 35 + 44 + 1))
+    rig.stage.fail = {
+        6: HardwareError("no answer 6"),
+        7: HardwareError("no answer 7"),
+        _B2_FIRST_FIELD_MOVE: HardwareError("no answer 15"),
+    }
+
+    with pytest.raises(PluginRunError) as raised:
+        _map_scan(rig, path)
+
+    assert raised.value.reason.startswith(
+        "3 fields failed in a row, the last B2_0000: HardwareError: no answer 15; "
+        "the checkpoint keeps 2 wells"
+    )
+
+
+def test_a_well_whose_anchor_tries_all_failed_ends_the_scan_and_is_not_called_not_scanned(
+    rig: _Rig,
+) -> None:
+    # #688's review: a stand that fails in every try of a well is not a well with no
+    # peak. Read as one, a dead stage after A1 would end the scan ``done`` with every
+    # later well "not scanned"; on main it ended after three failed fields.
+    _focused_at_a1(rig)
+    path = _seed_map(rig)
+    rig.stage.fail = {
+        n: HardwareError("stage lost") for n in range(_A2_TRIES_FIRST_MOVE, 100)
+    }
+
+    with pytest.raises(PluginRunError) as raised:
+        _map_scan(rig, path)
+
+    assert raised.value.reason == (
+        "the anchor of A2 could not be measured: none of its 4 tries ran a sweep "
+        "(the first: HardwareError: stage lost): check the stage and the camera, "
+        "then run scan --resume"
+    )
+    assert _stored(rig).status is StageStatus.failed
+    # A1 is kept, and nothing of A2 is recorded as failed: a resume anchors it again.
+    checkpoint = _checkpoint(rig)
+    assert checkpoint.wells_done == ("A1",)
+    assert len(checkpoint.frames) == 4
+    assert checkpoint.failed == ()
+
+
+def test_a_well_where_one_try_failed_and_the_others_swept_flat_is_not_scanned(
+    rig: _Rig,
+) -> None:
+    # The other side of the same rule: one try that swept is a well with no peak.
+    _focused_at_a1(rig)
+    path = _seed_map(rig)
+    rig.stage.fail = {_A2_TRIES_FIRST_MOVE: HardwareError("one lost")}
+    # A2's first try ends before its sweep (no snap); its other three sweep flat.
+    rig.camera.flat_snaps = set(range(37 + 1, 37 + 33 + 1))
+
+    result = _result(_map_scan(rig, path))
+
+    assert result.focus_map is not None
+    none = result.focus_map.anchors[1]
+    assert (none.well, none.source, len(none.tries)) == ("A2", "none", 4)
+    assert [t.error is None for t in none.tries] == [False, True, True, True]
+    assert [f.well for f in result.failed] == ["A2"] * 4
+    assert [f.well for f in result.frames] == ["A1"] * 4 + ["B2"] * 4
+
+
+def test_the_operators_well_is_the_one_check_5_read_and_not_the_first_planned_well(
+    rig: _Rig,
+) -> None:
+    # The operator focused at A2's centre: A2 keeps the start anchor when its sweeps
+    # are flat, and A1, flat too, is not scanned.
+    _focused_at_a1(rig, x_um=9000.0, y_um=0.0)
+    path = _seed_map(rig)
+    rig.camera.flat_snaps = set(range(1, 2 * 44 + 1))
+
+    result = _result(_map_scan(rig, path))
+
+    assert result.focus_map is not None
+    assert result.focus_map.start_well == "A2"
+    assert [(a.well, a.source) for a in result.focus_map.anchors] == [
+        ("A1", "none"),
+        ("A2", "start"),
+        ("B2", "swept"),
+    ]
+    assert result.focus_map.anchors[1].anchor_um == pytest.approx(
+        START_ANCHOR_UM, abs=1e-9
+    )
+    assert [f.well for f in result.failed] == ["A1"] * 4
+    assert [f.well for f in result.frames] == ["A2"] * 4 + ["B2"] * 4
+
+
+def test_the_operators_well_is_kept_when_it_is_not_a_planned_well(rig: _Rig) -> None:
+    # The operator focused in A3, which the plan does not hold (D23: whether or not
+    # it is planned). A1's flat sweeps are then in no operator's well.
+    a3 = [
+        ScanFrame(
+            well="A3",
+            index=k,
+            name=f"A3_{k:04d}",
+            file=f"scan/000000000000/A3/A3_{k:04d}.tif",
+            x_um=18000.0 + 100.0 * k,
+            y_um=0.0,
+            z_um=MAP_BASE_UM,
+            focus="locked",
+            pfs_offset=4242.0,
+            t_s=0.0,
+        )
+        for k in range(4)
+    ]
+    _focused_at_a1(rig, x_um=18000.0)
+    path = _seed_map(rig, frames=[*_map_frames(), *a3])
+    rig.camera.flat_snaps = set(range(1, 44 + 1))
+
+    result = _result(_map_scan(rig, path))
+
+    assert result.focus_map is not None
+    assert result.focus_map.start_well == "A3"
+    assert [(a.well, a.source) for a in result.focus_map.anchors] == [
+        ("A1", "none"),
+        ("A2", "swept"),
+        ("B2", "swept"),
+    ]
+    assert [f.well for f in result.failed] == ["A1"] * 4
+    assert (
+        "A1: no sweep near its centre found a peak (4 tried), and the operator "
+        "focused in A3: the well was not scanned"
+    ) in result.assumed
 
 
 def test_a_flat_well_with_no_well_the_operator_focused_in_says_so(

@@ -416,7 +416,13 @@ the next well. A WARNING and `assumed` say so, for the operator's well too. **Wh
 with such a well**: in a copy of the run document, plan that well alone (`scan-plan` with
 `wells=<well>`), focus by eye on its cells there, and scan it with the same
 `cell_focus=map` command. If every field of the scan fails this way, the scan ends
-`failed` as any scan where every field failed.
+`failed` as any scan where every field failed. **A well whose tries did not sweep at all**
+(every one ended in an error: the stage, the camera or the Z drive failed) is not "no
+peak": the scan ends with `the anchor of <well> could not be measured: none of its <t>
+tries ran a sweep (the first: <error>): check the stage and the camera, then run scan
+--resume`, the checkpoint keeps the wells done, and a resume anchors that well again. In
+the operator's well the start anchor is kept as before, and its fields' own failures end
+the scan after `max_failed_in_row`.
 
 **At each field**, after the stage has landed: the target is the map at the readback plus
 the well's anchor; one Z move there. A target outside the soft limits fails the field with

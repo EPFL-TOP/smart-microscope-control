@@ -603,10 +603,15 @@ def anchor_well(
     ``ANCHOR_PEAKS`` find a peak; the anchor is the median of their offsets
     from the map. When none does, the operator's anchor in the well the operator
     focused in (``source="start"``), and none in any other well
-    (``source="none"``, D23: the well is not scanned). ``ctx.progress`` keeps
-    the fields' count. The tries' frames are neither written nor shown.
+    (``source="none"``, D23: the well is not scanned), unless no try ran a
+    sweep at all: that is a stand that failed, not a well without a peak.
+    ``ctx.progress`` keeps the fields' count. The tries' frames are neither
+    written nor shown.
 
     Raises:
+        PluginRunError: No try ran a sweep in a well the operator did not focus
+            in (every try ended in an error): the scan ends, and a resume anchors
+            the well again.
         MicroscopeHaltedError, MotionStoppedError, StopRequested: Passed (FM-64);
             Z stays where it was read last (FM-88).
     """
@@ -644,6 +649,18 @@ def anchor_well(
         # The operator's focus is a measurement in this well (D23).
         source, anchor_um = "start", state.use.start_anchor_um
     else:
+        if tries and all(t.sweep is None for t in tries):
+            # No sweep ran at all: the stage, the camera or the Z drive failed in
+            # every try, which is not "no peak". Not scanning the well would turn a
+            # dead stage into a scan that ends ``done`` (the backstop of
+            # ``max_failed_in_row`` does not count these fields), so the scan ends
+            # and a resume anchors the well again (#688's review, FM-277).
+            raise PluginRunError(
+                _NAME,
+                f"the anchor of {well} could not be measured: none of its "
+                f"{len(tries)} tries ran a sweep (the first: {tries[0].error}): check "
+                "the stage and the camera, then run scan --resume",
+            )
         # Not in this one: the 10x -> 40x difference is not known here.
         source, anchor_um = "none", None
     anchor = FocusAnchor(

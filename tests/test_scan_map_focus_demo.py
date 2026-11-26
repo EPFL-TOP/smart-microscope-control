@@ -125,12 +125,13 @@ def _ctx() -> RunContext:
     )
 
 
-def _params(step_um: float = 2.0) -> ScanParams:
+def _params(step_um: float = 2.0, check_every: int = 0) -> ScanParams:
     return ScanParams(
         cell_focus="map",
         focus_map=Path("run-10x.json"),
         focus_range_um=10.0,
         focus_step_um=step_um,
+        map_check_every=check_every,
     )
 
 
@@ -140,8 +141,9 @@ def _state(
     z_start_um: float = 0.0,
     jog_um: float = 100.0,
     anchors: tuple[FocusAnchor, ...] = (),
+    map_z_um: float = 0.0,
 ) -> MapFocus:
-    """The attempt's state with the map at Z 0 over A1, the start anchor 0, and ``anchors`` kept."""
+    """The attempt's state with the map at ``map_z_um`` over A1, the start anchor 0, and ``anchors`` kept."""
     use = FocusMapUse(
         run_doc="run-10x.json",
         scan_attempt="m1",
@@ -151,7 +153,9 @@ def _state(
         start_well="A1",
     )
     return MapFocus(
-        focus_map=FocusMap(_POINTS),
+        focus_map=FocusMap(
+            tuple(MapPoint(p.well, p.x_um, p.y_um, map_z_um) for p in _POINTS)
+        ),
         use=use,
         limits=limits,
         z_start_um=z_start_um,
@@ -364,6 +368,102 @@ def test_the_z_jog_limit_is_the_profiles_else_the_layers_default(
         update={"safety": safety.model_copy(update={"max_z_jog_um": None})}
     )
     assert z_jog_limit_um(demo_microscope) == DEFAULT_MAX_Z_JOG_UM
+
+
+def test_the_jog_bound_of_a_field_is_measured_from_the_z_the_scan_started_at(
+    demo_microscope: Microscope,
+) -> None:
+    # A scan that starts at Z 100 µm, on a map at 100: a target 3 µm from the start is
+    # inside a bound of 5, one 6 µm from it is not. Measured from 0 (or from the
+    # command before), 103 would be refused too.
+    camera = demo_microscope.require(Camera)
+    z = _CountingZ(demo_microscope.require(ZStage))
+    near = _state(z_start_um=100.0, jog_um=5.0, map_z_um=100.0, anchors=(_anchor(3.0),))
+
+    stepped = focus_field(z, camera, near, _PLANNED, XY(50.0, 50.0), _params(), _ctx())
+
+    assert isinstance(stepped, MapStep)
+    assert z.moves == 1
+    assert z.position_um() == pytest.approx(103.0, abs=0.01)
+    far = _state(z_start_um=100.0, jog_um=5.0, map_z_um=100.0, anchors=(_anchor(6.0),))
+    z = _CountingZ(demo_microscope.require(ZStage))
+
+    stepped = focus_field(z, camera, far, _PLANNED, XY(50.0, 50.0), _params(), _ctx())
+
+    assert stepped == (
+        "MapBeyondJog: the focus from the map at A1_0000 is 106.00 µm, 6.00 µm from "
+        "the Z the scan starts at, beyond the Z jog limit of 5 µm"
+    )
+    assert z.moves == 0
+
+
+def test_the_jog_bound_of_an_anchor_sweep_is_measured_from_the_z_the_scan_started_at(
+    demo_microscope: Microscope,
+) -> None:
+    # Centred on 100 µm, a sweep of ±10 µm lies within 10 µm of a start at 100: it
+    # runs. Centred on 106 µm its plane at 112 µm is 12 µm from the start: refused.
+    z = _CountingZ(demo_microscope.require(ZStage))
+    tried, _ = _anchor_try(
+        _PLANNED,
+        xy=demo_microscope.require(XYStage),
+        z=z,
+        camera=demo_microscope.require(Camera),
+        state=_state(z_start_um=100.0, jog_um=10.0, map_z_um=100.0),
+        params=_params(),
+        tolerance_um=5.0,
+        ctx=_ctx(),
+    )
+
+    assert tried.error is None
+    assert tried.sweep is not None
+    assert z.moves == 11
+    z = _CountingZ(demo_microscope.require(ZStage))
+
+    tried, offset = _anchor_try(
+        _PLANNED,
+        xy=demo_microscope.require(XYStage),
+        z=z,
+        camera=demo_microscope.require(Camera),
+        state=_state(z_start_um=100.0, jog_um=10.0, map_z_um=106.0),
+        params=_params(),
+        tolerance_um=5.0,
+        ctx=_ctx(),
+    )
+
+    assert tried.error == (
+        "SweepBeyondJog: the anchor sweep around 106.00 µm would reach 112.00 µm, "
+        "12.00 µm from the Z the scan starts at, beyond the Z jog limit of 10 µm"
+    )
+    assert (tried.sweep, offset, z.moves) == (None, None, 0)
+
+
+def test_a_check_sweep_beyond_the_jog_limit_is_skipped_and_says_it_in_its_own_words(
+    demo_microscope: Microscope, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The target is within the bound (it is the start), the sweep around it is not.
+    z = _CountingZ(demo_microscope.require(ZStage))
+    state = _state(jog_um=5.0, anchors=(_anchor(0.0),))
+
+    with caplog.at_level("WARNING", logger="smc.plugins.scan"):
+        stepped = focus_field(
+            z,
+            demo_microscope.require(Camera),
+            state,
+            _PLANNED,
+            XY(50.0, 50.0),
+            _params(check_every=1),
+            _ctx(),
+        )
+
+    assert isinstance(stepped, MapStep)
+    assert stepped.sweep is None
+    assert state.checks_skipped == 1
+    assert z.moves == 1  # the target's move, and no plane
+    assert [r.getMessage() for r in caplog.records] == [
+        "A1_0000: the map's Z was not checked (the check sweep around 0.00 µm would "
+        "reach -10.00 µm, 10.00 µm from the Z the scan starts at, beyond the Z jog "
+        "limit of 5 µm)"
+    ]
 
 
 def test_a_field_target_at_the_jog_limit_moves(demo_microscope: Microscope) -> None:
