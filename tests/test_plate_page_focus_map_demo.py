@@ -295,6 +295,60 @@ def test_a_copy_that_cannot_be_written_leaves_the_scan_done_and_says_so(
     assert rig.view.scan_button.disabled is False
 
 
+def test_a_rename_refused_names_the_kept_file_and_where_the_whole_copy_is(
+    make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = make_rig()
+    rig.autofocus(True)
+    real_replace = os.replace
+
+    def locked(src: Any, dst: Any) -> None:
+        # What CPython raises on Windows for a replace onto a file another program holds open:
+        # its `filename` is the SOURCE, the temporary, which is not what is locked (FM-24).
+        if str(dst).endswith(".focus-map.json"):
+            raise PermissionError(13, "Access is denied", src, None, dst)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", locked)
+
+    outcome = rig.scan()
+
+    # The scan is done; the line names the kept file and says where the whole copy is, so that it
+    # can be renamed by hand, and the temporary is the copy of the run document as it was.
+    assert rig.record().status is StageStatus.done
+    left = sorted(rig.run_doc.parent.glob(".run.focus-map.json.*.smc-tmp"))
+    assert len(left) == 1
+    assert left[0].read_bytes() == rig.run_doc.read_bytes()
+    assert outcome.endswith(
+        "; the focus map was not kept: Access is denied (run.focus-map.json); the whole "
+        f"copy is in {left[0].name}: rename it to run.focus-map.json once nothing holds "
+        "that file open"
+    )
+    assert not rig.kept.exists()
+
+
+def test_the_copy_reads_the_run_document_with_the_retry_a_busy_file_needs(
+    make_rig: Callable[..., Rig], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Antivirus or a sync client may hold the run document for a moment on Windows (FM-24): the
+    # page's own read of it for the copy goes through the retry the run document's reads use.
+    rig = make_rig()
+    rig.autofocus(True)
+    seen: list[str] = []
+    real = controller_module.retry_on_permission_error
+
+    def spying(action: Callable[[], Any]) -> Any:
+        seen.append(getattr(action, "__name__", "?"))
+        return real(action)
+
+    monkeypatch.setattr(controller_module, "retry_on_permission_error", spying)
+
+    rig.scan()
+
+    assert seen == ["read_bytes"]
+    assert rig.kept.read_bytes() == rig.run_doc.read_bytes()
+
+
 def test_map_with_no_typed_focus_map_is_given_the_kept_file_before_the_parse(
     make_rig: Callable[..., Rig],
 ) -> None:
@@ -353,6 +407,10 @@ def test_map_with_no_kept_file_waits_with_the_tools_own_words(
     assert not rig.kept.exists()
 
     # Nothing is added: the command is the call as typed, and the click is the tool's own refusal.
+    # The page does not wait for a map it has not got (`_blocked` reads no pair): the button is
+    # there and says nothing, and it is the click that is refused, in the tool's words.
+    assert rig.view.scan_button.disabled is False
+    assert rig.view.scan_wait_text.visible is False
     assert "focus_map=" not in rig.view.scan_command.object
     assert rig.view.focus_map_text.object.splitlines() == [
         FOCUS_MAP_NONE,

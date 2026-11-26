@@ -132,7 +132,11 @@ from smc.plugins.slots.plate import (
     turned_well,
 )
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
-from smc.run.files import retry_on_permission_error, write_atomically
+from smc.run.files import (
+    AtomicWriteError,
+    retry_on_permission_error,
+    write_atomically,
+)
 from smc.selection import SelectionError, registry
 from smc.ui.frames import Frame
 from smc.ui.guide import (
@@ -1407,7 +1411,14 @@ def _scan_plan_of(record: StageRecord) -> ScanPlanResult | None:
 
 
 def _holds_a_locked_frame(record: StageRecord) -> bool:
-    """Whether the ``scan`` record's result holds a frame whose ``focus`` is the word ``locked``: the only frame that names the plate's bottom (m5 §25 D1).
+    """Whether the ``scan`` record's result holds a frame whose ``focus`` is the word ``locked`` and that took no focus step of its own: the only frame that names the plate's bottom (m5 §25 D1, FM-154).
+
+    A scan locked with ``cell_focus`` ``per-field`` or ``per-well`` also writes ``locked`` frames
+    (the state is read before the sweep), but their Z is the plane the sweep chose, so the frame
+    carries a ``cell_focus`` record and is **not** a point of the map: keeping that run document
+    would replace the 10x map the page holds with swept planes, and the Scan screen would name
+    it as the map (the adversarial review of #634). The tool's own reader keeps such frames; the
+    page does not offer them as the bottom.
 
     Read from the record's JSON as it is and not through ``ScanResult``: the page asks it once at
     the end of a scan of thousands of frames, and a record this smc cannot validate holds no
@@ -1416,7 +1427,10 @@ def _holds_a_locked_frame(record: StageRecord) -> bool:
     """
     frames = None if record.result is None else record.result.get("frames")
     return isinstance(frames, list) and any(
-        isinstance(frame, dict) and frame.get("focus") == "locked" for frame in frames
+        isinstance(frame, dict)
+        and frame.get("focus") == "locked"
+        and frame.get("cell_focus") is None
+        for frame in frames
     )
 
 
@@ -3988,7 +4002,10 @@ class PlatePage:
                 scanned_utc=None,
                 problem=page_words(" ".join(exc.reason.split())),
             )
-        except OSError as exc:
+        except Exception as exc:
+            # A stat that fails, or a hand-copied file whose JSON the parser cannot hold (nested
+            # past the recursion limit, an integer past the digit limit): a line, never an
+            # exception into ``refresh()``, which ends every run (FM-98, FM-125).
             return KeptMap(
                 file=path.name,
                 wells=(),
@@ -4040,12 +4057,32 @@ class PlatePage:
         except Exception as exc:
             # Any error of the copy: a note about the end must never cost the run its outcome.
             log.info("scan: the focus map was not kept: %s", type(exc).__name__)
-            line = _one_line(exc) or type(exc).__name__
+            line = self._not_kept_line(exc)
             return ended._replace(
                 outcome=f"{ended.outcome}; the focus map was not kept: {line}"
             )
         log.info("scan: the run document was kept as the focus map")
         return ended
+
+    def _not_kept_line(self, error: Exception) -> str:
+        """The one line after ``the focus map was not kept:``: why, naming the file that is locked and where the copy is.
+
+        When only the final rename failed (Windows refuses it onto a file another program holds
+        open, FM-24) ``write_atomically`` keeps the whole copy in a temporary beside the file, and
+        its error names that **temporary**, the rename's source, which is not what is locked. The
+        line names the kept file instead, and the temporary as the copy, so that the operator can
+        rename it by hand once nothing holds the file and does not scan the wells again for it.
+        """
+        if isinstance(error, AtomicWriteError):
+            why = (error.cause.strerror or type(error.cause).__name__).strip()
+            line = f"{why} ({self.focus_map_path.name})"
+            if error.kept is not None:
+                line += (
+                    f"; the whole copy is in {error.kept.name}: rename it to "
+                    f"{self.focus_map_path.name} once nothing holds that file open"
+                )
+            return line
+        return _one_line(error) or type(error).__name__
 
     def _with_kept_focus_map(self, plugin: str, params: Sequence[str]) -> list[str]:
         """``params`` with ``focus_map=<the kept file>`` added when a map scan of the page's own document asks for it and has none (m5 §25 D3).
@@ -4068,7 +4105,14 @@ class PlatePage:
         if any(key == "focus_map" and value != "null" for key, _, value in split):
             return pairs
         path = self.focus_map_path
-        if not path.is_file():
+        try:
+            kept = path.is_file()
+        except OSError:
+            # A stat that is refused (an unreadable folder, a share that dropped) is no kept file:
+            # the call goes on as typed and the tool's own refusal says what is missing. Neither
+            # ``run`` nor a redraw raises for it (FM-98).
+            kept = False
+        if not kept:
             return pairs
         return [
             *(pair for pair in pairs if pair != "focus_map=null"),

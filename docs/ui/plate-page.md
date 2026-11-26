@@ -863,9 +863,12 @@ by itself, so no copy is made by hand. Each step names the screen it is on, so t
    anything else can run: the 40× plan of the next step replaces the 10× one in the run
    document, and a copy taken after it would be refused by the tool. If the strip ends
    `; the focus map was not kept: <why>`, the scan is done and the copy is not: fix what it says
-   (a file another program holds open, a read-only folder) and scan again. A scan with no
-   `locked` frame (the autofocus off, a stand with none, the 40× scan itself) leaves the kept
-   file as it is, and so does a dry run. It is **one file**: a 10× scan of other wells replaces
+   (a read-only folder; a file another program holds open: then the strip says where the whole
+   copy is, a `.run.focus-map.json.<hex>.smc-tmp` beside the run document, and you rename it to
+   `run.focus-map.json` once nothing holds the file) and scan again. A scan with no `locked` frame
+   (the autofocus off, a stand with none, the 40× scan itself), one whose `locked` frames took a
+   focus step of their own (`cell_focus` `per-field` or `per-well`: their Z is the plane a sweep
+   chose, not the plate's bottom), and a dry run, leave the kept file as it is. It is **one file**: a 10× scan of other wells replaces
    the map of the first, and the 40× scan's own checks say a well is not in it.
 3. **Turn to the 40×.** *Autofocus off* (under the image: a scan with the map refuses a locked
    autofocus). Check that the stage is clear, choose the 40× in the drive bar's *Objective*,

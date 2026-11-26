@@ -3826,6 +3826,123 @@ def test_the_kept_focus_map_is_what_its_run_document_says_and_never_raises(
         assert (unread.wells, unread.objective, unread.scanned_utc) == ((), None, None)
 
 
+def _scan_record(result: dict[str, Any] | None) -> StageRecord:
+    return StageRecord(
+        plugin="scan",
+        provides="scan",
+        attempt="a2",
+        status=StageStatus.done,
+        started_utc=T0,
+        finished_utc=T0,
+        profile="demo",
+        dry_run=False,
+        smc_version="0",
+        params={},
+        result=result,
+    )
+
+
+def _frames(*foci: str | tuple[str, Any]) -> dict[str, Any]:
+    """A scan result of frames of those ``focus`` states; a pair is a state and the frame's ``cell_focus`` record."""
+    frames = []
+    for item in foci:
+        focus, cell_focus = item if isinstance(item, tuple) else (item, None)
+        frame: dict[str, Any] = {"focus": focus}
+        if cell_focus is not None:
+            frame["cell_focus"] = cell_focus
+        frames.append(frame)
+    return {"frames": frames}
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        # Only the word `locked` names the plate's bottom (FM-154): an `unlocked` frame's Z is
+        # where a search left it, `off` and `none` were never locked.
+        (_frames("locked"), True),
+        (_frames("unlocked", "none", "off"), False),
+        (_frames("unlocked", "locked"), True),
+        (_frames("off", "off", "locked"), True),
+        # A frame locked and then swept (`cell_focus` per-field or per-well) has the sweep's Z:
+        # it is no point of the map, and a scan made of such frames keeps nothing.
+        (_frames(("locked", {"source": "swept", "dz_um": -0.02})), False),
+        (_frames(("locked", {"source": "swept"}), "locked"), True),
+        # What is not the shape of a scan's result is no frame, never an exception (FM-125).
+        (None, False),
+        ({}, False),
+        ({"frames": []}, False),
+        ({"frames": "locked"}, False),
+        ({"frames": None}, False),
+        ({"frames": ["locked", 3, None, ["locked"]]}, False),
+        ({"frames": [{"focus": ["locked"]}, {}, {"focus": "locked"}]}, True),
+    ],
+)
+def test_a_scan_is_kept_as_the_map_only_for_a_frame_the_autofocus_held_and_no_sweep_moved(
+    result: dict[str, Any] | None, expected: bool
+) -> None:
+    holds = controller_module._holds_a_locked_frame
+    assert holds(_scan_record(result)) is expected
+
+
+def test_the_kept_map_names_when_its_scan_ended_and_not_when_it_began(
+    page: PlatePage,
+) -> None:
+    # A scan of several wells lasts tens of minutes: the line says the end (the plan's map is the
+    # scan as it stands then), in another minute than the start.
+    _seed_kept_map(page)
+    record = RunDocument.load(page.focus_map_path).stages["scan"]
+    ended = T0 + timedelta(minutes=17)
+    write_stage(page.focus_map_path, record.model_copy(update={"finished_utc": ended}))
+    kept = page.kept_focus_map()
+    assert kept is not None
+    assert kept.scanned_utc == ended
+    assert record.started_utc != ended
+
+
+def test_a_kept_file_the_page_cannot_hold_is_a_line_and_not_an_exception(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-98, FM-125: a hand-copied file nested past the parser's recursion limit, one with an
+    # integer past its digit limit and a stat that is refused each end in the screen's line, and
+    # never in ``refresh()``, which every run's end calls.
+    page, view = _focus_view(make_page, run_doc)
+    view.tool_fields["scan"]["cell_focus"].value = "map"
+    for text in ("[" * 100_000, '{"schema_version": ' + "9" * 6000 + "}"):
+        page.focus_map_path.write_text(text, encoding="utf-8")
+        kept = page.kept_focus_map()
+        assert kept is not None
+        assert kept.problem
+        assert (kept.wells, kept.objective, kept.scanned_utc) == ((), None, None)
+        view.refresh()
+        assert view.focus_map_text.object.split("\n")[0].startswith(
+            "The kept focus map run.focus-map.json cannot be read ("
+        )
+
+    real_is_file = Path.is_file
+
+    def refused(self: Path) -> bool:
+        if self.name.endswith(".focus-map.json"):
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_is_file(self)
+
+    monkeypatch.setattr(Path, "is_file", refused)
+    # The click and the command read the same stat, and neither raises: the call goes as typed.
+    pairs = ["cell_focus=map", "autofocus=off"]
+    page.run("scan", pairs)
+    assert page.join(BOUND_S)
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("scan: ParamsError: ")
+    assert "set focus_map to a run document" in outcome
+    assert "focus_map=" not in page.command_for("scan", pairs)
+    view.refresh()
+    assert view.focus_map_text.object.split("\n")[0].startswith(
+        "The kept focus map run.focus-map.json cannot be read ("
+    )
+
+
 def test_a_scan_with_no_cell_focus_field_has_no_focus_block(page: PlatePage) -> None:
     # The stub scan of these tests takes no ``cell_focus``: its field is not on the screen, and the
     # lines that are about it are left out with it, as the Wells screen leaves out a tool that did
