@@ -400,7 +400,7 @@ def _snap_and_draw(view: PlatePageView, page: PlatePage) -> None:
     view.tick()
 
 
-def test_a_snap_is_drawn_by_the_next_tick_flipped_and_at_the_frames_size(
+def test_a_snap_is_drawn_by_the_next_tick_with_row_zero_on_top_and_at_the_frames_size(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
     fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10), bit_depth=14))
@@ -411,18 +411,146 @@ def test_a_snap_is_drawn_by_the_next_tick_flipped_and_at_the_frames_size(
     frame = page.frame()
     assert frame is not None
     drawn = view.image_source.data
-    # Bokeh draws the first row at the bottom: the camera's top row is the last.
-    expected = display_image(frame.image, bit_depth=14)[::-1]
+    # The array is the frame's own, row 0 first: the view flips its range, not the rows
+    # (m5 §24.1), so the camera's top row is on top and a box given in pixels falls on it.
+    expected = display_image(frame.image, bit_depth=14)
     assert drawn["image"][0].shape == (6, 10)
     assert (drawn["image"][0] == expected).all()
-    assert (drawn["image"][0][-1] == display_image(frame.image, bit_depth=14)[0]).all()
-    assert list(drawn["dw"]) == [10]
-    assert list(drawn["dh"]) == [6]
+    assert view.image_figure.y_range.flipped is True
+    # The camera says 0.65 µm per pixel, so the view is in micrometres (D4): the frame's own
+    # extent, 10 x 6 pixels, drawn 6.5 x 3.9 µm wide and high.
+    assert list(drawn["dw"]) == pytest.approx([6.5])
+    assert list(drawn["dh"]) == pytest.approx([3.9])
+    assert view.image_view.scale_bar.visible
     assert view.image_figure.title.text == frame.summary
     # The image is always on screen beside the map: a snap changes no screen (m5 §17.2).
     assert (view.step, view.expert) == (step, False)
     # The models with a frame in them still build.
     assert view.layout.get_root() is not None
+
+
+def test_the_page_draws_the_frame_through_its_image_view_with_row_zero_on_top(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    frame = np.zeros((6, 10), dtype=np.uint16)
+    frame[0, :] = 4000
+    fake_microscope.override(Camera, FrameCamera(frame, bit_depth=12))
+    view = PlatePageView(page)
+    # The page's figure and source are the view's own: one object to draw, in a page and in
+    # a notebook (m5 §24.3).
+    assert view.image_source is view.image_view.source
+    assert view.image_figure is view.image_view.figure
+    _snap_and_draw(view, page)
+    shown = view.image_source.data["image"][0]
+    # The frame's row 0 is bright, and it is the array's row 0: the view's range is flipped,
+    # not the array, so the page no longer reverses the rows.
+    assert (shown[0] == 255).all()
+    assert (shown[1:] == 0).all()
+    assert view.image_figure.y_range.flipped is True
+    # The page draws no box in #631 (a snap has no cells), and no axis (D2).
+    assert len(view.image_view.boxes_source.data["left"]) == 0
+    assert not any(axis.visible for axis in view.image_figure.axis)
+
+
+def test_the_image_is_in_the_model_tree_with_its_bar_and_its_drive_bar(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    placed = {id(o) for o in view.layout.select()}
+    # The bar of the image, the enlarge toggle, the figure's pane and the drive bar are one
+    # root: enlarged, the arrows and Z still work (D3).
+    for widget in (
+        view.image_stop_button,
+        view.snap_button,
+        view.live_button,
+        view.snap_note,
+        view.image_view.enlarge_toggle,
+        view.jog_buttons["up"],
+        view.z_buttons["up"],
+        view.drive_toggle,
+    ):
+        assert id(widget) in placed
+    assert any(
+        getattr(o, "object", None) is view.image_figure
+        for o in view.layout.select(pn.pane.Bokeh)
+    )
+    assert view.image_view.enlarge_toggle.visible
+
+
+def test_the_frame_note_wraps_so_that_enlarge_stays_in_the_window(
+    page: PlatePage,
+) -> None:
+    # An unwrapped note of 70 characters ran 560 px from *Live* in a 440 px column and put
+    # *Enlarge*, which sits after it on the bar, at x 1452 of a 1280 px window (measured with
+    # Chromium, #631): the pane wraps and stretches, as the strip's status line does.
+    view = PlatePageView(page)
+    assert view.snap_note.sizing_mode == "stretch_width"
+    assert view.snap_note.styles["white-space"] == "pre-wrap"
+    assert view.snap_note.width is None
+    row = next(
+        o
+        for o in view.layout.select(pn.Row)
+        if view.snap_note in o.objects and view.image_view.enlarge_toggle in o.objects
+    )
+    assert list(row.objects)[-1] is view.image_view.enlarge_toggle
+
+
+def test_the_enlarged_stop_is_the_strips_stop_and_shows_only_when_enlarged(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    # The strip is under the enlarged image, so the enlarged bar's STOP shows then only.
+    assert view.image_stop_button.label == "STOP"
+    assert not view.image_stop_button.visible
+    assert view.stop_button.visible
+    view.image_view.enlarge_toggle.value = True
+    assert view.image_stop_button.visible
+    # A click on it is the strip's STOP: the controller's stop, and Resume shows.
+    assert not page.status().halted
+    view.image_stop_button.clicks += 1
+    assert page.status().halted
+    assert view.resume_button.visible
+    view.resume_button.clicks += 1
+    assert not page.status().halted
+    view.image_view.enlarge_toggle.value = False
+    assert not view.image_stop_button.visible
+
+
+def test_enlarging_belongs_to_the_tab_and_a_snap_does_not_change_it(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The enlarged state is the browser tab's (m5 §17.2 D6, §24.2 D3): a snap, a tick or
+    # another tab's toggle never changes it.
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    first = PlatePageView(page)
+    second = PlatePageView(page)
+    first.image_view.enlarge_toggle.value = True
+    _snap_and_draw(first, page)
+    second.tick()
+    assert first.image_view.enlarge_toggle.value
+    assert list(first.image_view.panel().css_classes) == ["smc-image-enlarged"]
+    assert first.image_stop_button.visible
+    assert not second.image_view.enlarge_toggle.value
+    assert list(second.image_view.panel().css_classes) == []
+    assert not second.image_stop_button.visible
+
+
+def test_a_failing_enlarge_callback_is_a_line_of_the_page_not_a_crash(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(self: PlatePageView, enlarged: bool) -> None:
+        raise _RefusedError("no room")
+
+    # The page registers its callback through `_handler` (FM-171, FM-98): what it raises is
+    # the page's message, and the view's own class and label are already set.
+    monkeypatch.setattr(PlatePageView, "_on_image_enlarged", refuse)
+    monkeypatch.setattr(plate_page.log, "exception", lambda *args, **kwargs: None)
+    view = PlatePageView(page)
+    view.image_view.enlarge_toggle.value = True
+    assert view.message.object.startswith(
+        "that action failed on the page: _RefusedError: no room"
+    )
+    assert list(view.image_view.panel().css_classes) == ["smc-image-enlarged"]
 
 
 def test_a_flat_frame_is_drawn_against_the_cameras_own_bit_depth(
@@ -464,18 +592,70 @@ def test_a_tool_that_ends_between_two_ticks_of_another_tab_is_drawn_there_too(
         controller.close()
 
 
-def test_the_axes_are_the_frames_own_pixels_at_any_stride(
+class _ReadSpy:
+    """Stands for the controller and notes the name of every attribute the view reads."""
+
+    def __init__(self, page: PlatePage) -> None:
+        self._page = page
+        self.read: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.read.append(name)
+        return getattr(self._page, name)
+
+
+class _LiveFlag(_ReadSpy):
+    """The controller, with ``is_live`` set by the test: what a tab reads at the draw, with no Live thread to time."""
+
+    def __init__(self, page: PlatePage, live: bool) -> None:
+        super().__init__(page)
+        self._live = live
+
+    @property
+    def is_live(self) -> bool:
+        self.read.append("is_live")
+        return self._live
+
+
+def _draw_with_live(
+    view: PlatePageView, page: PlatePage, *, live: bool
+) -> PlatePageView:
+    """Snap one frame and draw it as the frame callback does while ``live`` says Live runs."""
+    page.snap()
+    assert page.join(10.0)
+    view.page = cast("PlatePage", _LiveFlag(page, live))
+    view.frame_tick()
+    return view
+
+
+def test_a_live_frame_is_strided_and_a_snap_is_not(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
-    # 2048 rows by 512 columns is shown as 1024 x 256 (a stride of 2): the extent
-    # is the camera's 512 x 2048, or the image would be drawn half its size (FM-136).
+    # Live's frames are strided to 1024 on a side, as they always were (m5 §5.3); a snap is
+    # shown to 2048, so a zoom into it shows the camera's pixels (§24.2 D5). The extent
+    # drawn is the camera's in both (FM-136): 1200 pixels of 0.65 µm, not the strided 600.
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(1200, 1200)))
+    live = _draw_with_live(PlatePageView(page), page, live=True)
+    assert live.image_source.data["image"][0].shape == (600, 600)
+    assert list(live.image_source.data["dw"]) == pytest.approx([780.0])
+    still = _draw_with_live(PlatePageView(page), page, live=False)
+    assert still.image_source.data["image"][0].shape == (1200, 1200)
+    assert list(still.image_source.data["dw"]) == pytest.approx([780.0])
+    assert list(still.image_source.data["dh"]) == pytest.approx([780.0])
+
+
+def test_the_extent_is_the_frames_own_at_any_stride(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # 2048 rows by 512 columns in Live is shown as 1024 x 256 (a stride of 2): the extent
+    # is the camera's 512 x 2048 pixels of 0.65 µm, or the image would be drawn half its
+    # size (FM-136).
     fake_microscope.override(Camera, FrameCamera(_rows_columns(2048, 512)))
-    view = PlatePageView(page)
-    _snap_and_draw(view, page)
+    view = _draw_with_live(PlatePageView(page), page, live=True)
     drawn = view.image_source.data
     assert drawn["image"][0].shape == (1024, 256)
-    assert list(drawn["dw"]) == [512]
-    assert list(drawn["dh"]) == [2048]
+    assert list(drawn["dw"]) == pytest.approx([332.8])
+    assert list(drawn["dh"]) == pytest.approx([1331.2])
 
 
 def test_a_tick_without_a_new_frame_draws_nothing(
@@ -503,13 +683,13 @@ def test_a_frame_snapped_in_another_tab_is_drawn_by_the_next_tick(
     _snap_and_draw(first, page)
     assert list(second.image_source.data["dw"]) == []
     second.tick()
-    assert list(second.image_source.data["dw"]) == [10]
-    assert list(second.image_source.data["dh"]) == [6]
+    assert list(second.image_source.data["dw"]) == pytest.approx([6.5])
+    assert list(second.image_source.data["dh"]) == pytest.approx([3.9])
     # Neither tab changes its screen for a snap, the one that clicked included.
     assert (first.step, second.step) == steps
     # A tab opened after the snap draws it at once.
     third = PlatePageView(page)
-    assert list(third.image_source.data["dw"]) == [10]
+    assert list(third.image_source.data["dw"]) == pytest.approx([6.5])
 
 
 def test_snap_is_disabled_with_the_reason_on_a_stand_without_a_camera(
@@ -690,8 +870,8 @@ def test_frame_tick_draws_a_new_frame_and_reads_nothing_else(
         assert page.join(10.0)
         view.frame_tick()
         drawn = view.image_source.data
-        assert list(drawn["dw"]) == [10]
-        assert list(drawn["dh"]) == [6]
+        assert list(drawn["dw"]) == pytest.approx([6.5])
+        assert list(drawn["dh"]) == pytest.approx([3.9])
         # The same number: nothing is drawn, the very same data stays.
         view.frame_tick()
         view.frame_tick()
@@ -703,25 +883,14 @@ def test_frame_tick_draws_a_new_frame_and_reads_nothing_else(
     assert counts == {"view": 0, "status": 0}
 
 
-class _ReadSpy:
-    """Stands for the controller and notes the name of every attribute the view reads."""
-
-    def __init__(self, page: PlatePage) -> None:
-        self._page = page
-        self.read: list[str] = []
-
-    def __getattr__(self, name: str) -> Any:
-        self.read.append(name)
-        return getattr(self._page, name)
-
-
 def test_frame_tick_reads_nothing_but_the_frame_from_the_controller(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
     # FM-145: it runs ten times a second on the loop that handles STOP. Not the status,
     # not the view, and not the buttons either (`lacks`): `tick` has those. One more is
     # read since #410: whether Live runs, once a new frame has been drawn, to move the
-    # cross from its position only then (m5 §15 D1); a frame already drawn asks nothing.
+    # cross from its position only then (m5 §15 D1), and since #631 to stride the picture
+    # as Live's (read once for both); a frame already drawn asks nothing.
     fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
     view = PlatePageView(page)
     page.snap()
@@ -730,7 +899,7 @@ def test_frame_tick_reads_nothing_but_the_frame_from_the_controller(
     view.page = cast("PlatePage", spy)
     view.frame_tick()  # a new frame: drawn
     view.frame_tick()  # the same one: nothing
-    assert list(view.image_source.data["dw"]) == [10]
+    assert list(view.image_source.data["dw"]) == pytest.approx([6.5])
     assert spy.read == ["frame", "is_live", "frame"]
 
 

@@ -521,6 +521,14 @@ def test_both_figures_stay_in_the_model_tree_whatever_the_screen(
     both_in_tree()
     view.show_step("wells")
     both_in_tree()
+    # *Enlarge* is a class on the image's root: the figure never leaves the tree while the
+    # image covers the window, on any screen (m5 §24.1, FM-174).
+    view.image_view.enlarge_toggle.value = True
+    both_in_tree()
+    view.show_step("scan")
+    both_in_tree()
+    view.image_view.enlarge_toggle.value = False
+    both_in_tree()
     # No tab exists to hide one, in any screen (the accordion's panels included), and
     # no figure is in a screen's list.
     assert not view.layout.select(pn.Tabs)
@@ -531,8 +539,17 @@ def test_both_figures_stay_in_the_model_tree_whatever_the_screen(
     # Both are the same height, side by side in the centre. The design said 460 px, then 400;
     # 360 is the floor (m5 §17.12 D15, measured at 1280 x 800 with the drive bar's toggle in view):
     # a figure lower than that is a plan deviation to report, not a fix, so the number is
-    # pinned and not only the constant against itself.
-    assert view.figure.height == view.image_figure.height == plate_page.FIGURE_HEIGHT_PX
+    # pinned and not only the constant against itself. The image's figure fills its box
+    # (``stretch_both``, so that *Enlarge* can give the box the window's height, m5 §24.1): the
+    # box is the image's height, and the map's figure its own.
+    boxes = [
+        box
+        for box in view.layout.select(pn.Column)
+        if "smc-image-box" in box.css_classes
+    ]
+    assert len(boxes) == 1
+    assert view.image_figure.sizing_mode == "stretch_both"
+    assert view.figure.height == boxes[0].height == plate_page.FIGURE_HEIGHT_PX
     assert plate_page.FIGURE_HEIGHT_PX >= 360
     assert plate_page.STEP_PANEL_WIDTH_PX == 400
 

@@ -430,6 +430,8 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         "empty",
         "wells-selected",
         "snap",
+        # The image's *Enlarge* (m5 §24.6, #631): after the snap, reached on both stands.
+        "enlarged",
         "expert",
         "after-density",
         "with-route",
@@ -452,8 +454,16 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     assert snap.GUIDED_STATES == ("wells-laid-out", "wells-timed", "scanned")
     assert snap.FAILED_STATES == ("stand-failed-620",)
     assert snap.CHAIN_STATES == ("after-density", "with-route", "results-all", "turned")
-    # `expert` is the fourth, so that both stands reach it (m5 §17.8).
-    alone = [True, True, True, True]
+    # `enlarged` and `expert` are among the first five, so that both stands reach them (m5
+    # §17.8, §24.6).
+    assert snap.ALONE_STATES == (
+        "empty",
+        "wells-selected",
+        "snap",
+        "enlarged",
+        "expert",
+    )
+    alone = [True, True, True, True, True]
     chained = [False, False, False, False]
     short = [True, True]
     # The guided states register the plate from the sample themselves and need no chain
@@ -479,15 +489,15 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         *no_sample,
         *failed_seed,
     ]
-    for plan in demo[4:8]:
+    for plan in demo[5:9]:
         assert plan.reason == (
             "the demo camera images no sample: no cells, no density; "
             "use --stand demo-sample"
         )
-    assert [p.reason for p in demo[10:13]] == [
+    assert [p.reason for p in demo[11:14]] == [
         "the demo has no sample to register from"
     ] * 3
-    assert demo[13].reason is None
+    assert demo[14].reason is None
     assert snap.NO_SAMPLE_TO_REGISTER == "the demo has no sample to register from"
 
     # With no chain, or after a chain that failed, the guided states are still reached:
@@ -500,8 +510,8 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         *guided,
         *failed_seed,
     ]
-    assert {p.reason for p in skipped[4:8]} == {"skipped by --no-results"}
-    assert [p.reason for p in skipped[10:]] == [None, None, None, None]
+    assert {p.reason for p in skipped[5:9]} == {"skipped by --no-results"}
+    assert [p.reason for p in skipped[11:]] == [None, None, None, None]
 
     failed = snap.plan_states(
         "demo-sample", results=True, chain_failure="cells exited 1: no detector"
@@ -513,24 +523,24 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         *guided,
         *failed_seed,
     ]
-    assert [p.name for p in failed[4:8]] == [
+    assert [p.name for p in failed[5:9]] == [
         "after-density",
         "with-route",
         "results-all",
         "turned",
     ]
-    assert failed[4].reason == "cells exited 1: no detector"
-    assert failed[5].reason is not None
-    assert "cells exited 1: no detector" in failed[5].reason
-    assert failed[6].reason == failed[5].reason
-    assert failed[7].reason == failed[5].reason
-    # `wells-timed` (D42) is the twelfth state: reached on `demo-sample` with the chain,
+    assert failed[5].reason == "cells exited 1: no detector"
+    assert failed[6].reason is not None
+    assert "cells exited 1: no detector" in failed[6].reason
+    assert failed[7].reason == failed[6].reason
+    assert failed[8].reason == failed[6].reason
+    # `wells-timed` (D42) is the thirteenth state: reached on `demo-sample` with the chain,
     # without it and after a chain that failed (it runs its own `timing`, and reads no
     # result of the chain), and named with the guided states' reason on the plain demo.
     for plans in (full, skipped, failed):
-        assert (plans[11].name, plans[11].reachable) == ("wells-timed", True)
-    assert (demo[11].name, demo[11].reachable) == ("wells-timed", False)
-    assert demo[11].reason == "the demo has no sample to register from"
+        assert (plans[12].name, plans[12].reachable) == ("wells-timed", True)
+    assert (demo[12].name, demo[12].reachable) == ("wells-timed", False)
+    assert demo[12].reason == "the demo has no sample to register from"
     # None is silent: every state that is not reached says why.
     for plans in (demo, skipped, failed):
         assert all(p.reachable or p.reason for p in plans)
@@ -1055,6 +1065,7 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         ("empty", True),
         ("wells-selected", True),
         ("snap", True),
+        ("enlarged", True),
         ("expert", True),
         ("after-density", False),
         ("with-route", False),
@@ -1071,11 +1082,11 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         # The failed calibration is seeded by its own step, which fails on purpose.
         ("stand-failed-620", True),
     ]
-    assert records[4].reason == "cells exited 1: x"
-    assert records[5].reason == "needs the chain: cells exited 1: x"
+    assert records[5].reason == "cells exited 1: x"
     assert records[6].reason == "needs the chain: cells exited 1: x"
     assert records[7].reason == "needs the chain: cells exited 1: x"
-    assert records[11].reason == "cells exited 1: x"
+    assert records[8].reason == "needs the chain: cells exited 1: x"
+    assert records[12].reason == "cells exited 1: x"
     assert (errors, warnings) == ([], 0)
 
 
@@ -1085,12 +1096,13 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
     page = _fake_page(fails_on_button="Snap")
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
     # `after-density` takes a Snap too (the page reads the run document again at its
-    # end, #297), so it fails on the same control; `expert`, `with-route` and `results-all`
-    # run.
+    # end, #297), so it fails on the same control; `enlarged`, `expert`, `with-route` and
+    # `results-all` run.
     assert [r.reached for r in records] == [
         True,
         True,
         False,
+        True,
         True,
         False,
         True,
@@ -1104,7 +1116,7 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
         True,
     ]
     assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
-    assert records[4].reason == records[2].reason
+    assert records[5].reason == records[2].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "snap-FAILED.png"))
     page.screenshot.assert_any_call(path=str(tmp_path / "after-density-FAILED.png"))
 
@@ -1122,14 +1134,14 @@ def test_a_step_button_that_times_out_names_the_state_and_the_next_one_runs(
     assert [r.reached for r in records] == [
         True,
         False,
-        *([True] * 8),
+        *([True] * 9),
         False,
         True,
         True,
         True,
     ]
     assert records[1].reason == "Locator.click: Timeout 10000ms exceeded."
-    assert records[10].reason == records[1].reason
+    assert records[11].reason == records[1].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-laid-out-FAILED.png"))
 
@@ -1144,14 +1156,14 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
     assert [r.reached for r in records] == [
         True,
         False,
-        *([True] * 8),
+        *([True] * 9),
         False,
         False,
         True,
         True,
     ]
     assert records[1].reason == "Locator.fill: Timeout 10000ms exceeded."
-    assert records[10].reason == records[1].reason
+    assert records[11].reason == records[1].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
 
 
@@ -1319,6 +1331,7 @@ def test_expert_waits_for_the_pressed_class_and_the_switch_goes_off_after_the_ph
         state="detached"
     )
     assert {
+        "enlarged": snap._after_enlarged,
         "expert": snap._after_expert,
         "stand-620": snap._after_short,
         "plate-620": snap._after_short,
@@ -1346,6 +1359,221 @@ def test_expert_waits_for_the_pressed_class_and_the_switch_goes_off_after_the_ph
         "expert-full.png",
         "click:Expert view",
     ]
+
+
+# --- `enlarged`: the image over the window and back (m5 §24.6, #631) ---------------------
+
+_BEFORE_BOX = {"x": 840.0, "y": 195.0, "width": 440.0, "height": 360.0}
+_ENLARGED_BOX = {"x": 0.0, "y": 41.0, "width": 1280.0, "height": 433.0}
+
+
+def _boxes_page(*boxes: object, viewport: object = None) -> MagicMock:
+    """A page whose image figure has each of ``boxes`` in turn: before, enlarged, after *Reduce*."""
+    page = MagicMock()
+    page.locator.return_value.last.bounding_box.side_effect = list(boxes)
+    page.viewport_size = (
+        {"width": 1280, "height": 800} if viewport is None else viewport
+    )
+    return page
+
+
+def test_the_enlarged_state_presses_enlarge_waits_for_the_pressed_class_and_gives_the_box_back(
+    snap, tmp_path
+) -> None:
+    stand = _no_chain()
+    page = _boxes_page(_BEFORE_BOX)
+    snap._act_enlarged(page, stand)
+    # The box before is kept for the reading after *Reduce*; the toggle is found by its
+    # exact name, and the state waits for the pressed class on the button that now reads
+    # *Reduce* (never a delay: FM-162).
+    assert stand.image_box == _BEFORE_BOX
+    page.get_by_role.assert_called_once_with("button", name="Enlarge", exact=True)
+    page.get_by_role.return_value.click.assert_called_once_with()
+    page.locator.return_value.filter.assert_called_once_with(has_text="Reduce")
+    page.locator.return_value.filter.return_value.wait_for.assert_called_once_with()
+
+    # In the driver: the photograph is taken while the view is enlarged, then *Reduce*.
+    order: list[str] = []
+    drive_page = _fake_page()
+    drive_page.screenshot.side_effect = lambda **kw: order.append(Path(kw["path"]).name)
+    real_role = drive_page.get_by_role.side_effect
+
+    def role(*args: object, **kwargs: object) -> MagicMock:
+        found = real_role(*args, **kwargs)
+        if kwargs.get("name") in ("Enlarge", "Reduce"):
+            name = kwargs["name"]
+            found.click.side_effect = lambda: order.append(f"click:{name}")
+        return found
+
+    drive_page.get_by_role.side_effect = role
+    _drive(snap, tmp_path, drive_page, lambda steps: None)
+    first = order.index("click:Enlarge")
+    assert order[first : first + 4] == [
+        "click:Enlarge",
+        "enlarged.png",
+        "enlarged-full.png",
+        "click:Reduce",
+    ]
+
+
+def test_the_enlarged_state_says_the_canvas_spans_the_page_and_that_reduce_gave_the_box_back(
+    snap,
+) -> None:
+    stand = _no_chain()
+    page = _boxes_page(_BEFORE_BOX, _ENLARGED_BOX, dict(_BEFORE_BOX))
+    snap._act_enlarged(page, stand)
+    readings = snap._after_enlarged(page, stand)
+    assert readings == [
+        ("canvas before Enlarge", "x 840 to 1280, y 195 to 555 (440 x 360)"),
+        (
+            "canvas enlarged",
+            "x 0 to 1280, y 41 to 474 (1280 x 433); spans the page's width: yes; "
+            "at least 400 px high: yes",
+        ),
+        (
+            "canvas after Reduce",
+            "x 840 to 1280, y 195 to 555 (440 x 360); same box as before: yes",
+        ),
+    ]
+    assert snap.enlarged_facts(readings) == [
+        f"{label}: {text}" for label, text in readings
+    ]
+    # *Reduce* is pressed, the pressed class is awaited gone, and the page settles for a tick
+    # before the box is read again: a canvas read at once would be the enlarged one still.
+    page.get_by_role.assert_called_with("button", name="Reduce", exact=True)
+    page.locator.return_value.filter.return_value.wait_for.assert_called_with(
+        state="detached"
+    )
+    page.wait_for_timeout.assert_called_once_with(snap.SETTLE_MS)
+
+
+@pytest.mark.parametrize(
+    ("enlarged", "viewport_width", "words"),
+    [
+        # Narrower than the page (the overlay did not take the width): said, never asserted.
+        (
+            {**_ENLARGED_BOX, "width": 900.0},
+            1280,
+            "spans the page's width: NO; at least 400 px high: yes",
+        ),
+        # Too low to be worth enlarging.
+        (
+            {**_ENLARGED_BOX, "height": 300.0},
+            1280,
+            "spans the page's width: yes; at least 400 px high: NO",
+        ),
+        # A page at 1600 px (`--width`): 1280 is not its width.
+        (_ENLARGED_BOX, 1600, "spans the page's width: NO; at least 400 px high: yes"),
+        # Ten pixels short of the page still spans it (a scroll bar); eleven do not.
+        (
+            {**_ENLARGED_BOX, "width": 1270.0},
+            1280,
+            "spans the page's width: yes; at least 400 px high: yes",
+        ),
+        (
+            {**_ENLARGED_BOX, "width": 1269.0},
+            1280,
+            "spans the page's width: NO; at least 400 px high: yes",
+        ),
+    ],
+)
+def test_the_enlarged_state_says_no_where_the_canvas_misses(
+    snap, enlarged: dict[str, float], viewport_width: int, words: str
+) -> None:
+    stand = _no_chain()
+    page = _boxes_page(
+        _BEFORE_BOX,
+        enlarged,
+        _BEFORE_BOX,
+        viewport={"width": viewport_width, "height": 800},
+    )
+    snap._act_enlarged(page, stand)
+    readings = dict(snap._after_enlarged(page, stand))
+    assert readings["canvas enlarged"].endswith("; " + words)
+
+
+def test_the_enlarged_state_says_no_when_reduce_did_not_give_the_box_back(
+    snap,
+) -> None:
+    stand = _no_chain()
+    moved = {**_BEFORE_BOX, "height": 380.0}
+    page = _boxes_page(_BEFORE_BOX, _ENLARGED_BOX, moved)
+    snap._act_enlarged(page, stand)
+    readings = dict(snap._after_enlarged(page, stand))
+    assert readings["canvas after Reduce"].endswith("same box as before: NO")
+    # A pixel of difference is the same box.
+    near = {**_BEFORE_BOX, "x": 840.6}
+    page = _boxes_page(_BEFORE_BOX, _ENLARGED_BOX, near)
+    snap._act_enlarged(page, stand)
+    readings = dict(snap._after_enlarged(page, stand))
+    assert readings["canvas after Reduce"].endswith("same box as before: yes")
+
+
+def test_the_enlarged_state_says_a_box_the_browser_did_not_give_as_unknown(
+    snap,
+) -> None:
+    # A browser that refuses the read, or a figure not drawn: `?`, never the enlarged box in
+    # its place and never a yes.
+    stand = _no_chain()
+    page = _boxes_page(None, _ENLARGED_BOX, _BEFORE_BOX)
+    snap._act_enlarged(page, stand)
+    assert stand.image_box is None
+    readings = dict(snap._after_enlarged(page, stand))
+    assert readings["canvas before Enlarge"] == "?"
+    assert readings["canvas after Reduce"].endswith("same box as before: ?")
+    failing = _boxes_page(_BEFORE_BOX)
+    failing.locator.return_value.last.bounding_box.side_effect = RuntimeError("gone")
+    assert snap._image_box(failing) is None
+
+
+def test_a_state_that_failed_while_enlarged_leaves_the_page_reduced(
+    snap, tmp_path
+) -> None:
+    # The pressed class never came: the view may cover the window, and every state after it
+    # would read a page it is not about, so the driver presses *Reduce* (as `_after_short`
+    # puts the 620 px viewport back) and goes on.
+    pressed: list[str] = []
+    page = _fake_page()
+    real_role = page.get_by_role.side_effect
+
+    def role(*args: object, **kwargs: object) -> MagicMock:
+        found = real_role(*args, **kwargs)
+        if kwargs.get("name") == "Reduce":
+            found.count.return_value = 1
+            found.click.side_effect = lambda: pressed.append("click:Reduce")
+        return found
+
+    page.get_by_role.side_effect = role
+    # The wait for the pressed class (the button that reads *Reduce*) times out the first time,
+    # the action's; the driver's own put-back then waits for it to go and gets it.
+    reduce_wait = MagicMock()
+    reduce_wait.wait_for.side_effect = [
+        _FakeError("Locator.wait_for: Timeout 10000ms exceeded."),
+        None,
+    ]
+
+    def filtered(*args: object, **kwargs: object) -> MagicMock:
+        return reduce_wait if kwargs.get("has_text") == "Reduce" else MagicMock()
+
+    page.locator.return_value.filter.side_effect = filtered
+    records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
+    enlarged = next(r for r in records if r.name == "enlarged")
+    assert not enlarged.reached
+    assert enlarged.reason is not None
+    assert "wait_for" in enlarged.reason
+    assert pressed == ["click:Reduce"]
+    assert next(r for r in records if r.name == "expert").reached
+
+
+def test_the_enlarged_labels_are_the_image_views(snap) -> None:
+    # This script imports nothing of smc at import, so its copies are pinned here.
+    if os.environ.get("SMC_REQUIRE_UI"):
+        import panel  # noqa: F401  # CI must fail, not skip, when the extra is missing
+    else:
+        pytest.importorskip("panel")
+    from smc.ui.image_view import ENLARGE_LABEL, REDUCE_LABEL
+
+    assert (snap.ENLARGE_LABEL, snap.REDUCE_LABEL) == (ENLARGE_LABEL, REDUCE_LABEL)
 
 
 def test_the_viewport_defaults_to_1280_by_800_and_the_options_stay(snap) -> None:
@@ -2258,6 +2486,71 @@ def test_on_screen_reads_the_results_parts_of_results_all_and_only_there(
     ]
 
 
+def test_the_enlarged_parts_are_the_bars_own_stop_the_image_and_the_drive_bar(
+    snap,
+) -> None:
+    page = MagicMock()
+    parts = dict(snap._enlarged_parts(page))
+    assert list(parts) == ["second STOP", "image", "drive bar"]
+    # The strip's STOP is in the header and always in the window: the one to look for is the
+    # LAST button of that name (the bar's own, after the header in the DOM), and the image is
+    # the last figure (the map's is the first).
+    assert parts["second STOP"] is page.get_by_role.return_value.last
+    page.get_by_role.assert_any_call("button", name="STOP")
+    assert parts["image"] is page.locator.return_value.last
+    page.locator.assert_any_call(".bk-Figure")
+    page.get_by_role.assert_any_call("button", name=snap._DRIVE_TOGGLE)
+
+
+def test_on_screen_reads_the_enlarged_parts_of_enlarged_and_only_there(
+    snap, monkeypatch
+) -> None:
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 800}
+    page.get_by_role.return_value.count.return_value = 0
+    stop = MagicMock()
+    stop.count.return_value = 1
+    stop.first.bounding_box.return_value = _box(10, 5, 58, 31)
+    # The bar's STOP past the page's top, as an overlay that scrolled would put it: NO.
+    away = MagicMock()
+    away.count.return_value = 1
+    away.first.bounding_box.return_value = _box(0, -40, 1280, 433)
+    monkeypatch.setattr(
+        snap, "_enlarged_parts", lambda page: [("second STOP", stop), ("image", away)]
+    )
+    assert snap._on_screen(page, "enlarged") == [
+        "second STOP: yes (y 5 to 36 of 800, x 10 to 68 of 1280)",
+        "image: NO (y -40 to 393 of 800, x 0 to 1280 of 1280)",
+        "offsets block: not on this screen",
+    ]
+    # Another state reads the frame's parts, as before.
+    monkeypatch.setattr(snap, "_frame_parts", lambda page: [("STOP", stop)])
+    assert snap._on_screen(page, "snap") == [
+        "STOP: yes (y 5 to 36 of 800, x 10 to 68 of 1280)",
+        "offsets block: not on this screen",
+    ]
+
+
+def test_the_enlarged_state_looks_for_the_figure_and_the_pressed_class_by_these_selectors(
+    snap,
+) -> None:
+    # A fake page accepts any selector, so a mistyped one passes every other test: the strings
+    # the real page is read by are pinned (measured on Panel 1.11.1: `bk-Figure` is the figure's
+    # host, a pressed Toggle's button has `bk-active`).
+    page = _boxes_page(_BEFORE_BOX)
+    assert snap._image_box(page) == _BEFORE_BOX
+    page.locator.assert_called_once_with(".bk-Figure")
+    acting = _boxes_page(_BEFORE_BOX)
+    snap._act_enlarged(acting, _no_chain())
+    acting.locator.assert_any_call("button.bk-active")
+    after = _boxes_page(_BEFORE_BOX, _ENLARGED_BOX, _BEFORE_BOX)
+    stand = _no_chain()
+    snap._act_enlarged(after, stand)
+    snap._after_enlarged(after, stand)
+    selectors = {call.args[0] for call in after.locator.call_args_list}
+    assert selectors == {".bk-Figure", "button.bk-active"}
+
+
 def test_results_facts_say_the_rows_the_chain_line_and_the_files_or_that_they_are_not_on_the_page(
     snap,
 ) -> None:
@@ -2494,7 +2787,14 @@ def test_only_the_scanned_wells_timed_and_results_all_states_carry_facts(
     assert by_name["stand-failed-620"].facts == [
         f"failing calibration seed: {FAILING_SEED}"
     ]
+    # `enlarged` says its three boxes; a fake page gives no box, and each says `?`, never a guess.
+    assert by_name["enlarged"].facts == [
+        "canvas before Enlarge: ?",
+        "canvas enlarged: ?",
+        "canvas after Reduce: ?; same box as before: ?",
+    ]
     assert [n for n, r in by_name.items() if r.facts] == [
+        "enlarged",
         "results-all",
         "stand-620",
         "wells-timed",
