@@ -8778,12 +8778,20 @@ side. Before a well's first field, the scan sweeps (§21.4, the scan's
 fields nearest its centre, up to `ANCHOR_TRIES` (8), each centred on the
 map's Z there plus the start anchor, until `ANCHOR_PEAKS` (3) find a peak.
 The well's anchor is the median of `peak - map` over those peaks; with no
-peak, the start anchor, and the result says so. The centre, not the scan's
+peak, D23. The centre, not the scan's
 order: the scan starts at the wall, where the 10× sees dried droplets and
 the meniscus (#636) and the map is least sure (21.12.1).
 - Every anchor is centred on the operator's: never on the previous well's
   nor on a field's best plane, so nothing drifts from well to well (D2's
   point). A well's anchor lies within `focus_range_um` of the start anchor.
+- **A resume keeps the operator's anchor** (accepted by the owner from
+  #623's *Plan deviation*, option 1). The checkpoint is saved once before
+  the first move, with `start_anchor_um` and `start_well`; a `--resume`
+  keeps both and skips check 5 (21.12.5): a stop during an anchor's or a
+  check's sweep leaves Z on a sweep plane, up to `focus_range_um` from the
+  operator's focus, and an anchor read there would centre every later well's
+  sweeps off the cells (FM-141). Refocusing by eye before a resume therefore
+  changes nothing; to anchor again, run the scan again without `--resume`.
 - Not chosen: *the operator's focus alone, in every well*: on 2026-11-24 the
   difference moved by 48 µm between B4 and C4 (21.12.1), and an anchor of
   three peaks costs under a minute a well.
@@ -8794,7 +8802,12 @@ the meniscus (#636) and the map is least sure (21.12.1).
 `map + start anchor ± focus_range_um` (the reach of its anchor's sweeps and
 of its target) lies inside `ZStage.limits_um()` and within the Z jog limit
 of `z_start` (D3: the absolute moves are not jog-guarded by the layer). At a
-field, its target is checked against the soft limits again before the move.
+field, its target is checked against the soft limits **and the Z jog limit
+of `z_start`** again before the move, and an anchor try's planes against
+both before its sweep (#688): a well's anchor comes from a peak, which lies
+up to `focus_range_um` plus a quarter `focus_step_um` from the start anchor,
+and the map is read at the readback, not at the planned XY, so a target can
+pass the bound checked before anything moved by about that much.
 
 **D20. `map_check_every` measures the map in the scan itself.** With
 `n > 0`, a field whose index in its well is a multiple of `n` also sweeps
@@ -8808,6 +8821,56 @@ autofocus (on and locked at the start) is refused with `map`: under a lock,
 `per-field` and `per-well` (§21.6) start from the plane PFS holds. A `map`
 scan never engages, disengages or reads the offset of the autofocus beyond
 §8's checks.
+
+**D22. A field far from every locked frame of its well is scanned, and
+counted (#688).** `z_at` weights the 4 nearest frames by 1/d with no bound
+on d, so a field in a band the 10× could not lock (the wall's, where the
+bottom drops, 21.12.1) gets a Z read from frames millimetres away. Before
+anything moves, dry run included, each planned field left to scan is
+measured: the distance from its planned XY to the nearest locked frame of
+its own well, against the map scan's larger field-of-view side (the bound
+check 5 puts on the operator's start). The fields beyond it are scanned
+as the others; a WARNING and a line of `assumed` give their count, the
+farthest field and its distance, and say the bound is assumed.
+- Measured (2026-11-26, planning #688, on `local/scans/2026-11-24/`): the 10×
+  map's larger field side is 1589 µm (1412 px at 1.125 µm); every one of C3's
+  and C4's 1544 40× fields lies within 980 µm of a locked frame of its well
+  (95th percentile 899 µm), so a complete map counts none. With the frames
+  more than 6.5 mm from the well's centre taken out (a wall band the 10× did
+  not lock), 238 of the 1544 lie beyond, the farthest at 2549 µm.
+- Chosen, not measured: the bound. The stand's check of 21.12.7 says how far
+  from a frame the map's Z still holds; the line stays labelled assumed until
+  then.
+- Not chosen: *refuse the scan*: the band the 10× could not lock is the one
+  PFS cannot lock in, so the operator has no way to fill the map there, and
+  a refusal would leave the whole well unscanned for its border. The 1/d
+  weights make a weighted mean: the Z lies between its frames' Zs and never
+  extrapolates, and D19 bounds it like any other field's.
+- Not chosen: *mark each such frame in its `FieldFocus`*: a slot field for a
+  count that `assumed` already gives; the frames' XY and the map's frames
+  name them for a later reader.
+
+**D23. A well whose anchor sweeps all find no peak is not scanned, unless
+the operator focused in it (#688).** The operator's focus is a measurement
+in one well only, `start_well` (the well of check 5's nearest locked frame):
+there a flat anchor keeps the start anchor (`source="start"`), as before.
+In any other well, the 10× → 40× difference is not known (it moved by 48 µm
+between B4 and C4, 21.12.1): its anchor is `source="none"`, its fields are
+failed fields with nothing moved for them (`MapNotAnchored`), and the scan
+goes on with the next well. An anchor 10 µm off costs, on the rig of #682's
+review, frames 13 µm out of focus in a scan that ends `done` (FM-141's case,
+-37.0 µm against -47.0); in a well the operator never focused in, the error
+is not bounded by anything the scan measured.
+- The failed fields do not count toward `max_failed_in_row`: they are one
+  decision about one well, not a stage that fails field after field.
+- What the operator does: in a copy of the run document, plan that well
+  alone (`scan-plan` with `wells=<well>`), focus by eye on its cells, and
+  scan it there (`docs/plugins/scan.md`).
+- Not chosen: *keep the operator's anchor in every well, with a WARNING*
+  (#682's build): frames tens of µm off at a fixed cost and an end `done`.
+- Not chosen: *end the scan*: a resume keeps the start anchor (D18) and would
+  sweep the same well around the same planes again, and the wells after it
+  would wait for nothing.
 
 #### 21.12.3 Algorithm — `smc/plugins/cell_focus/focus_map.py` (new)
 
@@ -8839,6 +8902,7 @@ class FocusMap:
     def count(self, well: str) -> int: ...
     def z_at(self, well: str, x_um: float, y_um: float) -> float: ...
     def nearest(self, x_um: float, y_um: float) -> tuple[MapPoint, float]: ...
+    def distance_um(self, well: str, x_um: float, y_um: float) -> float: ...
 
 
 def anchor_of(offsets_um: Sequence[float]) -> float | None: ...
@@ -8858,6 +8922,9 @@ def nearest_first(
   `MAP_NEIGHBOURS`.
 - **`nearest`**: the point nearest `(x_um, y_um)` of any well (the first in
   input order on a tie) and its distance; `ValueError` on an empty map.
+- **`distance_um`** (#688, D22): the distance from `(x_um, y_um)` to the
+  nearest point of `well`; `ValueError` when a coordinate is not finite or
+  `well` holds no point (`the focus map holds no locked frame in <well>`).
 - **`anchor_of`**: `statistics.median` of the offsets, `None` when there is
   none; an offset that is not finite is a `ValueError`.
 - **`nearest_first`**: the indices of the `n` points nearest `centre_xy`,
@@ -8897,8 +8964,10 @@ class AnchorTry(SlotValue):
 ```python
 class FocusAnchor(SlotValue):
     well: str
-    source: Literal["swept", "start"]  # three peaks or fewer; or none, the start's
-    anchor_um: float  # added to the map's Z at every field of the well
+    # "swept": three peaks or fewer; "start": none, in the operator's well, the
+    # start's; "none": none in another well, which is not scanned (D23, #688)
+    source: Literal["swept", "start", "none"]
+    anchor_um: float | None  # added to the map's Z at every field; None for "none"
     tries: tuple[AnchorTry, ...]
     duration_s: float = Field(ge=0.0)
 ```
@@ -8908,14 +8977,19 @@ class FocusMapUse(SlotValue):
     run_doc: str  # as typed, forward slashes, never resolved (FM-24, FM-50)
     scan_attempt: str  # the attempt of the map's scan record
     measured: str  # its finished_utc to the second, or "at an unknown time"
-    start_anchor_um: float  # z_start - the map at the start XY, this attempt's
+    start_anchor_um: float  # z_start - the map at the start XY; a resume keeps it (D18)
     anchors: tuple[FocusAnchor, ...]  # in scan order, the resumed attempts' first
+    start_well: str | None = None  # check 5's well (D23); a resume keeps it (#688)
 ```
 
 Validators: `AnchorTry` holds exactly one of `sweep` and `error`, and
 `x_um`, `y_um`, `map_z_um` all set or all `None`; a `FocusAnchor` of
 `source == "swept"` holds at least one try whose sweep is a `peak`, one of
-`"start"` none. The three are exported from `slots/__init__.py`.
+`"start"` or `"none"` none; its `anchor_um` is `None` exactly when `source ==
+"none"` (#688). The three are exported from `slots/__init__.py`.
+`start_well` is `None` when every well was done before the attempt that set
+the start, and in a checkpoint written before #688: no well is then the
+operator's, and a flat well there is not scanned (D23).
 `ScanResult` gains `focus_map: FocusMapUse | None = None` and
 `ScanCheckpoint` (§8) the same field, both last; `ScanResult`'s serializer
 drops it when `None`, as it does `plate_check`, so a scan without `map` is
@@ -8943,22 +9017,17 @@ refuses a `focus_map` that names the document the run writes, whose `scan`
 this run replaces (F15, #626), before anything is written.
 
 `scan/map_focus.py` holds the step's loop, so that `plugin.py` only calls
-it:
-
-```python
-def load_focus_map(
-    path: Path, *, profile: str, dry_run: bool, plate_attempt: str | None
-) -> tuple[FocusMap, FocusMapUse, float]: ...
-```
-
-`load_focus_map` returns the map (the locked frames of the map's scan as
-`MapPoint`s), a `FocusMapUse` with no anchor and a `start_anchor_um` of 0.0
-(the caller sets it), and the larger side of the map scan's `fov_um`.
-`plate_attempt` is the attempt of this run document's `plate` provider. The
-module also holds `anchor_well`, which returns a `FocusAnchor`, and the
-per-field step; they take what §21.6's `_focus_before_snap` takes (the
-stand's capabilities, `params`, `ctx`), and their exact signatures are the
-build's.
+it: `prepare_map` (checks 1 to 6 below, and D22's count; it returns the
+attempt's `MapFocus`), `anchor_well`, which returns a `FocusAnchor`, and
+`focus_field`, the per-field step. They take what §21.6's
+`_focus_before_snap` takes (the stand's capabilities, `params`, `ctx`), and
+their exact signatures are the build's. The map is read (check 2) by a
+private helper of the module, which returns the map (the locked frames of
+the map's scan as `MapPoint`s), a `FocusMapUse` with no anchor and a
+`start_anchor_um` of 0.0 (`prepare_map` sets it), and the larger side of the
+map scan's `fov_um`; `plate_attempt` is the attempt of this run document's
+`plate` provider. (The build of #682 exported it as `load_focus_map`, with
+no caller; the build of #688 drops the export.)
 
 **Before anything moves**, when `cell_focus == "map"`, dry run included,
 after §21.6's checks 1–3 (`check_sweep_bounds`, as for the other modes: the
@@ -8966,7 +9035,7 @@ anchor's sweeps have its range), in this order, each a `PluginRunError`:
 1. the scan uses the autofocus (D21): `cell_focus=map takes each field's Z
    from the map with the autofocus off, and the autofocus is locked: switch
    it off, or use per-field or per-well`;
-2. `load_focus_map`: the document read as `calibration_from` reads one
+2. the map's document, read as `calibration_from` reads one
    (§20.3: `RunDocument.load`, `unusable("scan", profile=..., dry_run=...)`,
    the record's result validated as a `ScanResult`, each refusal its text
    with the path as typed); then `the focus map in <path> was scanned on
@@ -8983,11 +9052,16 @@ anchor's sweeps have its range), in this order, each a `PluginRunError`:
    lies within the map scan's larger `fov_um` side, else `the stage at
    (<x>, <y>) µm is <d> µm from the map's nearest locked frame (<name> in
    <well>): focus by eye on the cells inside a mapped well, then start the
-   scan`; `start_anchor_um = z_start - map.z_at(w0, x0, y0)`;
+   scan`; `start_anchor_um = z_start - map.z_at(w0, x0, y0)` and `start_well
+   = w0`. On a resume, check 5 is skipped: both come from the checkpoint
+   (D18);
 6. D19, field by field in the plan's order: `the focus from the map would
    reach <z> µm at <field>, outside the soft limits [<lo>, <hi>] µm` or `the
    focus from the map would reach <z> µm at <field>, <d> µm from the Z the
    scan starts at, beyond the Z jog limit of <j> µm`.
+
+With check 6, field by field, D22's count: `map.distance_um(well, x, y)` at
+the planned XY against the map scan's larger `fov_um` side. Not a refusal.
 
 **Per well**, not in a dry run, after §8's well checks and the plate check,
 before the first field: a well whose anchor the checkpoint holds keeps it.
@@ -8995,21 +9069,35 @@ Otherwise `anchor_well`: `nearest_first` over the well's planned fields'
 XY, centred on the well's centre (`well_centres_um(plan)`), `ANCHOR_TRIES`;
 for each, `raise_if_stopped`, §8's XY move and landing check, the map at the
 readback, `plan_planes(map + start_anchor, ...)` checked against the soft
-limits, the sweep (§21.4, `wait_s=ctx.wait_s`), `find_peak`; it stops at
-`ANCHOR_PEAKS` peaks. A landing off target, a plane outside the limits,
-`FocusDriveOffTarget` or a `HardwareError` ends that try with its `error`
-and a WARNING, and the next try runs; `MicroscopeHaltedError`,
-`MotionStoppedError` and `StopRequested` pass (FM-64). The anchor is
-`anchor_of(...)`, or the start anchor when it is `None`, with a WARNING
-naming the well. `ctx.progress` keeps the fields' count, with the message
-`anchoring <well> (<k> of 8)`. The anchor's frames are neither written nor
-shown.
+limits and the Z jog limit of `z_start` (D19, #688), the sweep (§21.4,
+`wait_s=ctx.wait_s`), `find_peak`; it stops at
+`ANCHOR_PEAKS` peaks. A landing off target (`StageOffTarget`), a plane
+outside the limits (`SweepOutsideLimits`) or beyond the jog limit
+(`SweepBeyondJog`), `FocusDriveOffTarget` or a `HardwareError` ends that try
+with its `error` and a WARNING, and the next try runs;
+`MicroscopeHaltedError`, `MotionStoppedError` and `StopRequested` pass
+(FM-64). The anchor is `anchor_of(...)`; when it is `None` (D23), the start
+anchor in `start_well` (`source="start"`), and in any other well
+`source="none"`, `anchor_um=None`; a WARNING names the well either way.
+`ctx.progress` keeps the fields' count, with the message `anchoring <well>
+(<k> of 8)`. The anchor's frames are neither written nor shown.
+
+A well anchored `none` (D23) is not scanned: each of its planned fields left
+is a failed field, recorded in the plan's order before any move for it,
+`MapNotAnchored: no sweep near the centre of <well> found a peak (<t>
+tried), and the operator focused in <start_well>: the well was not scanned`
+(`the operator focused in no well of this scan` when `start_well` is
+`None`). They do not count toward `max_failed_in_row`. §8's end-of-well
+check, `wells_done` and the checkpoint follow as for any well.
 
 **Per field**, not in a dry run, after §8's XY move and landing, before
 §8's Z read and snap: `m = map.z_at(well, readback)`, `target = m +
 anchor_um`; a target outside the soft limits fails the field with nothing
 moved for it (`MapOutsideLimits: the focus from the map at <field> is <t>
-µm, outside the soft limits [<lo>, <hi>] µm`). Then `move_checked(z, target,
+µm, outside the soft limits [<lo>, <hi>] µm`), and so does a target beyond
+the Z jog limit of `z_start` (D19, #688: `MapBeyondJog: the focus from the
+map at <field> is <t> µm, <d> µm from the Z the scan starts at, beyond the Z
+jog limit of <j> µm`). Then `move_checked(z, target,
 LANDING_FRACTION * focus_step_um, wait_s=ctx.wait_s)`; on a checked field
 (D20), the sweep around `target`, `find_peak`, and `move_checked` back to
 `target`; then the frame as §21.6's step 6, with `FieldFocus(source="map",
@@ -9019,26 +9107,36 @@ failed field (§8); halt, stop and `StopRequested` pass. The autofocus is not
 touched: there is no `off_by_focus` and nothing to lock again after the last
 field.
 
-**The checkpoint** (§8, saved after each well) carries `focus_map`, its
-`anchors` those of the wells done; the result's `focus_map` holds this
-attempt's `start_anchor_um` and every well's anchor.
+**The checkpoint** (§8, saved once before the first move and after each
+well) carries `focus_map`, its `anchors` those of the wells done; the
+result's `focus_map` holds the scan's `start_anchor_um` and `start_well`
+(the first attempt's, D18) and every well's anchor.
 
 **`assumed`**, for `map`, in place of §21.6's lines on the focus (two
 decimals):
 - `the focus came from the map in <path>, scanned <measured>: each field's Z
   is the map's at its XY, from the 4 nearest locked frames of its well, plus
   its well's anchor`;
+- D22, when a field lies beyond the bound: `<k> of <n> fields lie more than
+  <b> µm from every locked frame of their well, the farthest <field> at <d>
+  µm: their Z is read from frames that far (the bound, the map scan's larger
+  field side, is assumed, not measured)` (one decimal for `<b>` and `<d>`);
 - per well anchored in this attempt: `<well>: anchored <a> µm from the map
   by <p> peaks of <t> sweeps near its centre`, or `<well>: no sweep near its
   centre found a peak (<t> tried): the operator's focus anchors it, <a0> µm
-  from the map`;
+  from the map`, or (D23) `<well>: no sweep near its centre found a peak
+  (<t> tried), and the operator focused in <start_well>: the well was not
+  scanned`;
 - `the focus from the map added <x> s per field (<n> fields), and the
   anchors <y> s (<w> wells)`;
 - `the map's Z was checked on <c> fields: a peak on <p>, within 1 µm of the
   map's Z on <q1> and within 2 µm on <q2>, the median distance <m> µm`, or
-  `the map's Z was not checked against a sweep (map_check_every=0)`;
+  `the map's Z was not checked against a sweep (map_check_every=0)`; and
+  `the map's Z was not checked on <k> fields whose check sweep would have
+  left the soft limits or the Z jog limit` when `k > 0`;
 - in a dry run, instead: `dry run: the focus from the map was planned for
-  <n> fields, Z <lo>…<hi> µm with the operator's anchor <a0> µm, not run`.
+  <n> fields, Z <lo>…<hi> µm with the operator's anchor <a0> µm, not run`,
+  and D22's line when it applies.
 
 **Downstream.** `route` reads a `map` frame as recorded (§26): its `focus`
 is `off` and its `dz_um` 0.0, so a stop carries the frame's own 40× Z, the
@@ -9070,6 +9168,14 @@ Z of a scan that ran at the objective NIS-Elements will use.
   `n`-th field checked with its frame at the map's Z; a resume keeps the
   done wells' anchors and refuses another map; a dry run plans and moves no
   Z; a halt during an anchor's sweep is not a plugin error (FM-64).
+- Added by #688: `distance_um`; D22's count and line (a map with a well's
+  outer frames taken out); D23 from both sides (a flat anchor in
+  `start_well` keeps the start's, in another well its fields fail with
+  nothing moved, not counted in a row, and the scan goes on); a resume keeps
+  `start_well`; the jog bound on a field's target and on an anchor try's
+  planes; each failure row of an anchor try; the `assumed` numbers on a
+  clock the test moves for every timed call (FM-43, FM-157); a relative
+  `focus_map`.
 - The presets' round trip for `scan` with `cell_focus=map` and `focus_map`
   (`tests/unit/test_preset_from_document.py`).
 
