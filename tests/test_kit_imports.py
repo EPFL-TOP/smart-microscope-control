@@ -38,6 +38,8 @@ KIT_MODULES = [
     "smc.inference.cards",
     "smc.inference.local",
     "smc.inference.models",
+    "smc.inference.served",
+    "smc.inference.server",
 ]
 
 #: The packages of ``src/smc/`` the walk covers.
@@ -123,9 +125,13 @@ def test_kit_never_imports_pymmcore_plus(tmp_path: Path) -> None:
         "smc.selection.testing",
         "smc.plugins.route.plugin",
     } <= set(KIT_MODULES)
-    assert {"smc.inference", "smc.inference.blobs", "smc.inference.models"} <= set(
-        KIT_MODULES
-    )
+    assert {
+        "smc.inference",
+        "smc.inference.blobs",
+        "smc.inference.models",
+        "smc.inference.served",
+        "smc.inference.server",
+    } <= set(KIT_MODULES)
     assert _loaded_hardware_modules(KIT_MODULES, tmp_path) == []
 
 
