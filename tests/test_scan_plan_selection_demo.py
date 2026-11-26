@@ -15,13 +15,16 @@ never from the plan it checks.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
+import useq
 
 from plate_check_stand import (
     FORTY,
@@ -43,8 +46,9 @@ from smc.plugins.plate_walls.plugin import PlateWallsParams, PlateWallsPlugin
 from smc.plugins.route.plugin import RouteParams, RoutePlugin
 from smc.plugins.scan.plugin import ScanParams, ScanPlugin
 from smc.plugins.scan_plan.plugin import ScanPlanParams, ScanPlanPlugin
-from smc.plugins.slots import ScanPlanResult, ScanResult, WellRef
+from smc.plugins.slots import ScanPlanResult, ScanResult, TimingsResult, WellRef
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
+from smc.ui.guide import ASSUMED_LINE_CHARS
 
 pytestmark = [pytest.mark.demo, pytest.mark.filterwarnings("error::RuntimeWarning")]
 
@@ -167,6 +171,12 @@ def _stops(path: Path) -> list[dict[str, Any]]:
     return sorted(positions, key=lambda stop: stop["order"])
 
 
+def _measured(path: Path) -> str:
+    """The route record's ``finished_utc`` of the raw JSON, to the second (FM-124)."""
+    raw = _raw(path)["stages"]["route"]["finished_utc"]
+    return datetime.fromisoformat(raw).isoformat(timespec="seconds")
+
+
 def _rewrite_route(path: Path, **record: Any) -> dict[str, Any]:
     """The route's record of ``path`` changed by ``record`` (or its result by ``result=``), validated and written (§20.1)."""
     dumped = RunDocument.load(path).stages["route"].model_dump(mode="json")
@@ -212,18 +222,158 @@ def test_a_selection_at_10x_is_scanned_at_40x_on_its_chosen_fields_in_its_order(
     assert len(selection.wells_without_fields) == 94
     assert (plan.rows, plan.columns, plan.overlap) == (1, 1, 0.0)
     assert plan.objective == FORTY
+    # The chosen wells, one position at each well's centre: B3 is row 1, column 2.
+    assert plan.plate_plan.selected_wells == ((1, 1), (2, 1))
+    assert plan.plate_plan.well_points_plan == useq.RelativePosition(x=0.0, y=0.0)
+    measured = _measured(SELECTION)
+    assert selection.measured == measured
     # The selection's lines come after the frame's (none: the offset is measured)
-    # and before the camera's, which says nothing of a grid's gaps.
-    assert plan.assumed[0] == (
+    # and before the camera's, which says nothing of a grid's gaps (the 40X's own
+    # calibration leaves no line).
+    assert plan.assumed == (
         f"the fields are the 6 that selector 'most-cells' chose in run-10x.json "
-        f"(measured {selection.measured}), each well's in the selection's order"
+        f"(measured {measured}), each well's in the selection's order",
+        "no field was chosen in 94 of the wells named: A1, A2, A3, A4, A5, A6, A7, "
+        "A8, … 86 more",
+        "the stage reports no soft limits: the selection's fields were not checked "
+        "against its travel",
     )
-    assert plan.assumed[1].startswith("no field was chosen in 94 of the wells named:")
-    assert not any("overlap" in line for line in plan.assumed)
     assert scan.assumed[-1] == (
         "the plan's 6 fields in 2 wells were chosen by selector 'most-cells' in "
         "run-10x.json: the rest of each well was not scanned"
     )
+
+
+def _with_limits(the_profile: Profile) -> Profile:
+    """``the_profile`` with the Ti2-E's XY soft limits, wide enough for every stop."""
+    return the_profile.model_copy(
+        update={
+            "safety": the_profile.safety.model_copy(
+                update={
+                    "xy_soft_limits_um": ((-49_000.0, 49_000.0), (-29_000.0, 29_000.0))
+                }
+            )
+        }
+    )
+
+
+@pytest.mark.parametrize(("fov_scale", "fov_line"), [(1.02, True), (1.005, False)])
+def test_a_selection_plans_assumed_lines_come_in_their_order_with_timings(
+    fov_scale: float,
+    fov_line: bool,
+    stands: list[Microscope],
+    here: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # m3 §28.5: the frame's lines, the selection's, the basis's, the timings', the
+    # estimate's. The 40X's offset is not measured (#548: the Ti2-E today), the
+    # wells named are A1 to A12 and B2 (B3's stops are left out), the stand has soft
+    # limits, the calibration is the profile's size, and the document holds timings.
+    (here / "runs").mkdir()
+    selection_doc = Path("runs") / "run-10x.json"
+    shutil.move(SELECTION, selection_doc)
+    then = datetime(2026, 11, 26, 8, 0, tzinfo=timezone.utc)
+    write_stage(
+        Path("run.json"),
+        StageRecord(
+            plugin="timing",
+            provides="timings",
+            attempt="t1",
+            status=StageStatus.done,
+            started_utc=then,
+            finished_utc=then,
+            profile=profile().microscope.name,
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=TimingsResult(
+                move_overhead_ms=100.0,
+                move_ms_per_mm=50.0,
+                refocus_ms=None,
+                snap_ms=20.0,
+                samples=5,
+                assumed=("the demo's own timings",),
+            ).model_dump(mode="json"),
+        ),
+    )
+    stand = _stand(stands, _with_limits(profile(forty=False)))
+    params: dict[str, Any] = {
+        "wells": "A1:A12,B2",
+        "fields_from": selection_doc,
+        "calibration": None,
+    }
+    # The route's field, sized from the plan's own (the camera's size at the 40X)
+    # by `fov_scale`: 2 % is beyond FOV_TOLERANCE, 0.5 % within it.
+    first = _planned(_plan(stand, **params))
+    result = _raw(selection_doc)["stages"]["route"]["result"]
+    result["fov_um"] = [side * fov_scale for side in first.fov_um]
+    _rewrite_route(selection_doc, result=result)
+
+    with caplog.at_level(logging.INFO, logger="smc"):
+        plan = _planned(_plan(stand, **params))
+
+    stops = _stops(selection_doc)
+    b2 = [stop["name"] for stop in stops if stop["well"] == "B2"]
+    assert plan.wells == ("B2",)
+    assert [field.stop for field in plan.fields] == b2
+    selection = plan.selection
+    assert selection is not None
+    assert selection.run_doc == "runs/run-10x.json"
+    assert selection.fields_left_out == 3
+    assert selection.shift_um is None
+    assert plan.estimate_s is not None
+    measured = _measured(selection_doc)
+    fov = result["fov_um"]
+    expected_selection = [
+        f"the fields are the 3 that selector 'most-cells' chose in runs/run-10x.json "
+        f"(measured {measured}), each well's in the selection's order",
+        f"the offset between {TEN} and {FORTY} is not measured (the profile's "
+        f"[objectives]): the selection's positions are {TEN}'s, not corrected",
+        "no field was chosen in 12 of the wells named: A1, A2, A3, A4, A5, A6, A7, "
+        "A8, … 4 more",
+        "3 fields of the selection lie in wells not named and were left out: B3",
+    ]
+    if fov_line:
+        expected_selection.append(
+            f"the selection sized its fields {fov[0]:.1f} × {fov[1]:.1f} µm, the "  # noqa: RUF001
+            f"plan's are {plan.fov_um[0]:.1f} × {plan.fov_um[1]:.1f} µm: "  # noqa: RUF001
+            "neighbouring fields may overlap or leave a gap"
+        )
+    frame_line = (
+        f"the offset between {TEN} and {FORTY} is not measured (the profile's "
+        f"[objectives]): the positions are {TEN}'s, not corrected"
+    )
+    count = len(expected_selection)
+    assert list(plan.assumed[: 1 + count]) == [frame_line, *expected_selection]
+    rest = plan.assumed[1 + count :]
+    # The basis's lines (the profile's size of the 40X), then the timings', then the
+    # estimate's: no soft-limit line, the stand has limits.
+    first_timing = next(i for i, line in enumerate(rest) if line.startswith("timings:"))
+    assert list(rest[:first_timing]) == [
+        f"camera calibration not used: it is of {TEN}, the plan is for {FORTY}; give "
+        f"calibration, a run document whose camera-calibration was made with {FORTY} "
+        "in place",
+        f"no camera calibration for {FORTY}: rotation 0 and no mirror assumed",
+    ]
+    assert rest[first_timing] == "timings: the demo's own timings"
+    assert all(line.startswith("estimate") for line in rest[first_timing + 1 :])
+    assert rest[first_timing + 1 :]
+    assert not any("soft limits" in line for line in plan.assumed)
+    # FM-205: the lines that hold no path stay within what the page shows.
+    for line in expected_selection[2:]:
+        assert len(line) <= ASSUMED_LINE_CHARS, line
+    assert (
+        f"3 fields in 1 wells chosen by most-cells, from runs/run-10x.json measured "
+        f"{measured}; shift not applied"
+    ) in caplog.messages
+
+
+def test_a_selection_document_that_is_not_there_is_refused_by_its_name(
+    stands: list[Microscope], here: Path
+) -> None:
+    stand = _stand(stands)
+    reason = _refused(stand, fields_from=Path("runs") / "missing.json")
+    assert reason.startswith("runs/missing.json: ")
 
 
 # ------------------------------------------------------------------ refused

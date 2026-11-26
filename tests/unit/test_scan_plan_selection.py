@@ -76,12 +76,14 @@ def _chosen(
     )
 
 
-#: B3 and B2 interleaved by the route's order, given out of that order.
+#: B3 and B2 interleaved by the route's order, given out of that order, and each
+#: well's names running against it: `route` names a stop by the selector's rank
+#: and orders it by the orderer's place, which differ once an orderer reorders.
 INTERLEAVED = [
-    _stop(3, "B2", 1, 400.0, -300.0),
-    _stop(0, "B3", 0, -200.0, 100.0),
-    _stop(2, "B3", 1, 500.0, 600.0),
-    _stop(1, "B2", 0, 0.0, 0.0),
+    _stop(3, "B2", 0, 400.0, -300.0),
+    _stop(0, "B3", 1, -200.0, 100.0),
+    _stop(2, "B3", 0, 500.0, 600.0),
+    _stop(1, "B2", 1, 0.0, 0.0),
 ]
 
 
@@ -92,19 +94,19 @@ def test_a_wells_fields_are_its_stops_in_the_routes_order_and_the_wells_the_plan
     assert chosen.wells == ("B2", "B3")
     # B2 whole, then B3, each in the route's order (B2: orders 1, 3; B3: 0, 2).
     assert [field.stop for field in chosen.fields] == [
-        "B2_r000",
         "B2_r001",
-        "B3_r000",
+        "B2_r000",
         "B3_r001",
+        "B3_r000",
     ]
     # And the wells in the order given, not the route's first well.
     reversed_ = _chosen(INTERLEAVED, ("B3", "B2"))
     assert reversed_.wells == ("B3", "B2")
     assert [field.stop for field in reversed_.fields] == [
-        "B3_r000",
         "B3_r001",
-        "B2_r000",
+        "B3_r000",
         "B2_r001",
+        "B2_r000",
     ]
 
 
@@ -121,7 +123,7 @@ def test_stops_of_a_well_not_named_are_counted_and_their_wells_listed() -> None:
     positions = [*INTERLEAVED, _stop(4, "D5", 0), _stop(5, "C4", 0), _stop(6, "D5", 1)]
     chosen = _chosen(positions, ("B3",))
     assert chosen.wells == ("B3",)
-    assert [field.stop for field in chosen.fields] == ["B3_r000", "B3_r001"]
+    assert [field.stop for field in chosen.fields] == ["B3_r001", "B3_r000"]
     # Two of B2, two of D5, one of C4; their wells in the order first met (route order).
     assert chosen.fields_left_out == 5
     assert chosen.wells_left_out == ("B2", "D5", "C4")
@@ -233,10 +235,10 @@ def test_more_than_ten_thousand_fields_in_a_well_are_refused() -> None:
 def test_fields_are_named_by_well_and_index_and_keep_their_stop() -> None:
     chosen = _chosen(INTERLEAVED, ("B3", "B2"))
     assert [(f.well, f.index, f.name, f.stop) for f in chosen.fields] == [
-        ("B3", 0, "B3_0000", "B3_r000"),
-        ("B3", 1, "B3_0001", "B3_r001"),
-        ("B2", 0, "B2_0000", "B2_r000"),
-        ("B2", 1, "B2_0001", "B2_r001"),
+        ("B3", 0, "B3_0000", "B3_r001"),
+        ("B3", 1, "B3_0001", "B3_r000"),
+        ("B2", 0, "B2_0000", "B2_r001"),
+        ("B2", 1, "B2_0001", "B2_r000"),
     ]
     assert all(isinstance(f, PlannedField) for f in chosen.fields)
 
