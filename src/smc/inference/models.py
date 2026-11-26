@@ -22,6 +22,7 @@ from smc.inference.errors import ModelError
 from smc.inference.local import load_local
 from smc.inference.preprocessing import (
     ModelPreprocessing,
+    Preprocessing,
     preprocessing_for,
     preprocessing_sha256,
 )
@@ -29,6 +30,7 @@ from smc.inference.preprocessing import (
 __all__ = [
     "ResolvedModel",
     "file_sha256",
+    "load_local_model",
     "load_model",
     "model_identity",
     "weights_folder",
@@ -86,7 +88,59 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _shown_to_the_model(
+    preprocessing: ModelPreprocessing,
+    *,
+    frame_shape_px: tuple[int, int],
+    frame_um_per_px: float,
+) -> Preprocessing:
+    """The rule worked out for this scan's frames, or a ``ModelError`` that names the pixel size.
+
+    Both places a model can run need it first: a pixel size the model is never
+    given is refused before 166 MB of weights are looked for, and before a server
+    is asked.
+    """
+    try:
+        return preprocessing_for(
+            preprocessing,
+            frame_shape_px=frame_shape_px,
+            frame_um_per_px=frame_um_per_px,
+        )
+    except ValueError as exc:
+        raise ModelError(
+            f"model_um_per_px={preprocessing.model_um_per_px:g} cannot be used: {exc}"
+            if preprocessing.model_um_per_px is not None
+            else f"the frame cannot be shown to the model: {exc}"
+        ) from exc
+
+
 def load_model(
+    card: ModelCard,
+    *,
+    preprocessing: ModelPreprocessing,
+    frame_shape_px: tuple[int, int],
+    frame_um_per_px: float,
+    device: str,
+    score_threshold: float,
+    weights: Path | None = None,
+) -> ResolvedModel:
+    """The model a card names: on the model server, or on this PC (it dispatches).
+
+    The one place a card becomes a ``Detector``. ``load_local_model`` is the body
+    this function had; it runs the model here. Nothing else changes for a caller.
+    """
+    return load_local_model(
+        card,
+        preprocessing=preprocessing,
+        frame_shape_px=frame_shape_px,
+        frame_um_per_px=frame_um_per_px,
+        device=device,
+        score_threshold=score_threshold,
+        weights=weights,
+    )
+
+
+def load_local_model(
     card: ModelCard,
     *,
     preprocessing: ModelPreprocessing,
@@ -123,18 +177,9 @@ def load_model(
             checkpoint is refused; or the checkpoint's classes are not the
             card's.
     """
-    try:
-        shown = preprocessing_for(
-            preprocessing,
-            frame_shape_px=frame_shape_px,
-            frame_um_per_px=frame_um_per_px,
-        )
-    except ValueError as exc:
-        raise ModelError(
-            f"model_um_per_px={preprocessing.model_um_per_px:g} cannot be used: {exc}"
-            if preprocessing.model_um_per_px is not None
-            else f"the frame cannot be shown to the model: {exc}"
-        ) from exc
+    shown = _shown_to_the_model(
+        preprocessing, frame_shape_px=frame_shape_px, frame_um_per_px=frame_um_per_px
+    )
 
     path = weights
     try:
