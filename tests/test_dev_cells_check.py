@@ -1067,18 +1067,24 @@ def test_measure_refuses_an_image_that_is_not_the_size_its_annotation_file_says(
     assert "A1_0000.tif" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "option",
+    [["--model", "cell-classes-v2"], ["--model-um-per-px", "0.25"]],
+    ids=["model", "model-um-per-px"],
+)
 def test_measure_refuses_a_model_option_without_the_model(
-    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    check: ModuleType,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    option: list[str],
 ) -> None:
     dataset = _reviewed_dataset(tmp_path, check)
     capsys.readouterr()
 
-    code = check.main(
-        ["measure", str(dataset), "--detector", "blobs", "--model-um-per-px", "0.25"]
-    )
+    code = check.main(["measure", str(dataset), "--detector", "blobs", *option])
 
     assert code == 1
-    assert "--detector model" in capsys.readouterr().err
+    assert f"{option[0]} is for --detector model" in capsys.readouterr().err
 
 
 def test_measure_refuses_an_input_size_without_the_manifest(
@@ -1520,7 +1526,12 @@ def test_export_refuses_a_frame_path_that_leaves_the_run_folder(
 @pytest.mark.parametrize("prefill", ["blobs", "none"])
 @pytest.mark.parametrize(
     "option",
-    [["--model-path", "w.pth"], ["--device", "cpu"], ["--model-um-per-px", "0.25"]],
+    [
+        ["--model", "cell-classes-v2"],
+        ["--model-path", "w.pth"],
+        ["--device", "cpu"],
+        ["--model-um-per-px", "0.25"],
+    ],
 )
 def test_export_refuses_a_model_option_next_to_another_prefill(
     check: ModuleType,

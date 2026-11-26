@@ -136,14 +136,18 @@ def load_model(
             else f"the frame cannot be shown to the model: {exc}"
         ) from exc
 
-    path = weights if weights is not None else weights_folder() / card.weights
+    path = weights
     try:
+        if path is None:
+            path = weights_folder() / card.weights
         is_file = path.is_file()
     except OSError as exc:
         # A folder the user cannot enter, a share that dropped: `is_file` raises
-        # for what it cannot tell (FM-116), and the operator needs the same line.
+        # for what it cannot tell, and so does `resolve` on a checkout that sits on
+        # one (FM-116); the operator needs the same line.
+        where = path if path is not None else "the models folder"
         raise ModelError(
-            f"cannot look for the model at {path} ({exc.strerror or exc}); set "
+            f"cannot look for the model at {where} ({exc.strerror or exc}); set "
             f"SMC_MODELS to the folder that holds {card.weights}, or give model_path"
         ) from exc
     if not is_file:

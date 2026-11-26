@@ -179,6 +179,31 @@ def test_an_int_in_a_card_is_a_float() -> None:
 
 
 @pytest.mark.parametrize(
+    ("percentiles", "native", "trained"),
+    [
+        ("[0, 99.5]", '"native"', '"unknown"'),
+        ("[0.5, 100]", '"native"', '"unknown"'),
+        ("[49.9, 50.1]", '"native"', '"unknown"'),
+        ("[0.5, 99.5]", "10", "10"),
+        ("[0.5, 99.5]", "0.001", "0.001"),
+    ],
+)
+def test_the_edges_the_bounds_include_are_accepted(
+    percentiles: str, native: str, trained: str
+) -> None:
+    """``0 <= low``, ``high <= 100`` and 10 um are inside, as in ``cells``' parameters.
+
+    A card that names one must read, or a parameter at the same edge would be
+    a valid ``cells`` run and a raw validation error out of the plugin.
+    """
+    card = parse_card(
+        _card(percentiles=percentiles, native=native, trained=trained), source=SOURCE
+    )
+
+    assert card.name == "x"
+
+
+@pytest.mark.parametrize(
     "percentiles",
     ["[50, 99.5]", "[0.5, 50]", "[-1, 99]", "[0.5, 101]", "[0.5]", "[1, 2, 3]", "true"],
 )
@@ -228,6 +253,35 @@ def test_a_name_with_dots_and_hyphens_is_a_model_name() -> None:
     card = parse_card(_card(name="cells-v1.5-a"), source="cards/cells-v1.5-a.toml")
 
     assert card.name == "cells-v1.5-a"
+
+
+@pytest.mark.parametrize(
+    "name", ["con", "nul", "aux", "prn", "com1", "lpt9", "com0", "con.v2", "nul.1"]
+)
+def test_a_name_windows_keeps_for_a_device_is_refused(name: str) -> None:
+    """``cards/nul.toml`` cannot be checked out on Windows: a Mac must not be able to add it (FM-24)."""
+    reason = _refusal(_card(name=name), source=f"cards/{name}.toml")
+
+    assert "name" in reason
+    assert "Windows" in reason
+
+
+@pytest.mark.parametrize("name", ["console", "com10", "lpt", "conv2", "nulls", "a.con"])
+def test_only_the_whole_device_part_of_a_name_counts(name: str) -> None:
+    """``COM10`` and ``CONSOLE`` are files on Windows: only the part before the first dot is read."""
+    card = parse_card(_card(name=name), source=f"cards/{name}.toml")
+
+    assert card.name == name
+
+
+@pytest.mark.parametrize("weights", ["NUL", "con.pth", "Aux.pth", "COM3.bin"])
+def test_a_weights_file_name_windows_keeps_for_a_device_is_refused(
+    weights: str,
+) -> None:
+    reason = _refusal(_card(weights=weights))
+
+    assert "weights" in reason
+    assert "Windows" in reason
 
 
 @pytest.mark.parametrize(
@@ -285,6 +339,18 @@ def test_a_card_in_utf16_is_refused_with_its_name() -> None:
     reason = _refusal(data)
 
     assert reason.startswith(SOURCE)
+    assert "UTF-8" in reason
+
+
+def test_a_card_that_is_not_utf8_names_the_line_an_editor_shows() -> None:
+    """A comment saved as ANSI after a byte-order mark: the line, not a byte offset (FM-80)."""
+    text = _card(extra="# café")  # the comment is on the sixth line of the card
+    data = b"\xef\xbb\xbf" + text.replace("café".encode(), "café".encode("cp1252"))
+
+    reason = _refusal(data)
+
+    assert reason.startswith(SOURCE)
+    assert "on line 6" in reason
     assert "UTF-8" in reason
 
 

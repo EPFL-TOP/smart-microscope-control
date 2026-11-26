@@ -79,6 +79,7 @@ def _load(
     weights: Path | None = None,
     rule: ModelPreprocessing = NATIVE,
     device: str = "cpu",
+    score_threshold: float = 0.5,
     shape: tuple[int, int] = (1412, 1412),
     um: float = 0.2756,
 ) -> ResolvedModel:
@@ -88,7 +89,7 @@ def _load(
         frame_shape_px=shape,
         frame_um_per_px=um,
         device=device,
-        score_threshold=0.5,
+        score_threshold=score_threshold,
         weights=weights,
     )
 
@@ -313,6 +314,24 @@ def test_a_folder_the_os_refuses_to_stat_is_a_model_error(
     assert "w.pth" in reason
 
 
+def test_a_checkout_the_os_cannot_resolve_is_a_model_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The checkout on a mapped drive that dropped: ``resolve`` raises, and it is the same line as ``is_file``'s (FM-116)."""
+    monkeypatch.delenv("SMC_MODELS", raising=False)
+
+    def dropped(self: Path, *args: object, **kwargs: object) -> Path:
+        raise OSError(64, "The specified network name is no longer available")
+
+    monkeypatch.setattr(Path, "resolve", dropped)
+
+    reason = _reason(_card("0" * 64))
+
+    assert "no longer available" in reason
+    assert "SMC_MODELS" in reason
+    assert "w.pth" in reason
+
+
 def test_a_weights_file_that_cannot_be_read_says_who_may_hold_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -509,7 +528,11 @@ def test_load_model_runs_locally_and_says_so(
     rule = ModelPreprocessing(percentiles=(1.0, 99.0), model_um_per_px=0.49)
     built = _standin(monkeypatch, device="cuda")
 
-    resolved = _load(_card(sha), weights=path, rule=rule, device="auto")
+    # Not the defaults of `_load` (cpu, 0.5): a device or a threshold that was
+    # replaced by a constant would still pass with those.
+    resolved = _load(
+        _card(sha), weights=path, rule=rule, device="mps", score_threshold=0.8
+    )
 
     assert resolved.name == "m"
     assert resolved.runs_on == "local:cuda"
@@ -518,8 +541,8 @@ def test_load_model_runs_locally_and_says_so(
     assert isinstance(resolved.detector, Detector)
     (call,) = built
     assert call["weights"] == path
-    assert call["device"] == "auto"
-    assert call["score_threshold"] == 0.5
+    assert call["device"] == "mps"
+    assert call["score_threshold"] == 0.8
     assert call["preprocessing"].percentiles == (1.0, 99.0)
     assert call["preprocessing"].input_size_px == (794, 795)
 
@@ -609,6 +632,28 @@ def test_every_module_of_smc_inference_imports_without_torch() -> None:
         "smc.inference.models",
         "smc.inference.preprocessing",
     } <= modules
+
+
+def test_smc_inference_imports_nothing_of_the_plugins_the_stand_or_the_page() -> None:
+    """``cells`` depends on ``smc.inference`` and not the reverse (ADR-0011): it is part of the collaborator's kit.
+
+    The kit's import guard cannot say it for ``smc.plugins`` (the kit includes a
+    plugin that imports the selection package), so it is said here, on what a
+    fresh interpreter has loaded after every module of the package.
+    """
+    run = _run(
+        """
+        import importlib, pkgutil, sys
+        import smc.inference
+        for m in pkgutil.walk_packages(smc.inference.__path__, "smc.inference."):
+            importlib.import_module(m.name)
+        outside = ("smc.plugins", "smc.hardware", "smc.testing", "smc.ui")
+        print(sorted(k for k in sys.modules if k.startswith(outside)))
+        """
+    )
+
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.strip() == "[]"
 
 
 def test_importing_smc_inference_loads_neither_torch_nor_skimage() -> None:

@@ -391,7 +391,15 @@ def test_cells_asks_for_the_model_by_name_with_the_cards_preprocessing_and_the_s
     weights = _weights(tmp_path)
     calls = _install(monkeypatch, StubDetector({}))
 
-    _run(demo_microscope, tmp_path, model="cell-classes-v2")
+    # A device and a threshold that are not the helper's defaults (cpu, 0.5): a
+    # parameter replaced by a constant would still pass with those.
+    _run(
+        demo_microscope,
+        tmp_path,
+        model="cell-classes-v2",
+        device="cuda",
+        score_threshold=0.8,
+    )
 
     (call,) = calls
     assert call["card"] == model_card("cell-classes-v2")
@@ -401,6 +409,8 @@ def test_cells_asks_for_the_model_by_name_with_the_cards_preprocessing_and_the_s
     assert call["frame_shape_px"] == (60, 80)
     assert call["frame_um_per_px"] == 0.5
     assert call["weights"] == weights
+    assert call["device"] == "cuda"
+    assert call["threshold"] == 0.8
 
 
 def test_a_parameter_replaces_only_its_part_of_the_cards_preprocessing(
@@ -414,6 +424,27 @@ def test_a_parameter_replaces_only_its_part_of_the_cards_preprocessing(
 
     assert _rule_of(calls) == ModelPreprocessing(
         percentiles=(1.0, 99.5), model_um_per_px=None
+    )
+
+
+def test_the_parameters_edges_are_valid_rules_not_a_raw_validation_error(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``low_percentile=0``, ``high_percentile=100`` and ``model_um_per_px=10`` are inside ``CellsParams``' bounds, so they must be inside the rule's."""
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    calls = _install(monkeypatch, StubDetector({}))
+
+    _run(
+        demo_microscope,
+        tmp_path,
+        low_percentile=0,
+        high_percentile=100,
+        model_um_per_px=10,
+    )
+
+    assert _rule_of(calls) == ModelPreprocessing(
+        percentiles=(0.0, 100.0), model_um_per_px=10.0
     )
 
 

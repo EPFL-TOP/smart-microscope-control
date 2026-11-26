@@ -13,6 +13,7 @@ is said as unknown, never guessed (CLAUDE.md, *Measured beats assumed*).
 
 from __future__ import annotations
 
+import codecs
 import re
 import sys
 from importlib.resources import files
@@ -58,11 +59,26 @@ _MAX_NAME_LENGTH = 64
 #: not a card (a test pins the two equal; ``blobs.py`` imports scikit-image).
 _RESERVED_NAME = "blobs"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+#: The names Windows keeps for devices, in upper case: a file named ``NUL.pth`` or
+#: ``con.toml`` is a device there, and Git for Windows cannot check it out, so a card
+#: made on a Mac with one passes every test but the Windows job's checkout (FM-24).
+#: The list is its own, as ``smc.plugins.scan`` has: ``smc.inference`` imports nothing
+#: of ``smc.plugins``, and ``PurePath.is_reserved`` is deprecated in Python 3.13.
+_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{n}" for n in range(10)}
+    | {f"LPT{n}" for n in range(10)}
+)
 _BACKGROUND = "__background__"
 _CARDS_FOLDER = "cards"
 _SUFFIX = ".toml"
 #: Where the cards are, for a message: the repository's path, never an absolute one (FM-50).
 _WHERE = "src/smc/inference/cards/"
+
+
+def _is_device_name(file_name: str) -> bool:
+    """Whether Windows reads this file name as a device: the part before the first dot, in any case."""
+    return file_name.split(".", 1)[0].upper() in _DEVICE_NAMES
 
 
 class ModelCard(BaseModel):
@@ -84,11 +100,13 @@ class ModelCard(BaseModel):
             not _NAME.fullmatch(value)
             or len(value) > _MAX_NAME_LENGTH
             or value == _RESERVED_NAME
+            or _is_device_name(value)
         ):
             raise ValueError(
                 f"{value!r} is not a model name: lower case letters and digits "
                 f"joined by '-' or '.', at most {_MAX_NAME_LENGTH} characters, "
-                f"and not {_RESERVED_NAME!r} (the blob detector's)"
+                f"not {_RESERVED_NAME!r} (the blob detector's) and not a name "
+                f"Windows keeps for a device (con, nul, com1, ...)"
             )
         return value
 
@@ -99,6 +117,11 @@ class ModelCard(BaseModel):
             raise ValueError(
                 f"{value!r} is a path, not a file name: the weights are looked "
                 f"for in the models folder (SMC_MODELS)"
+            )
+        if _is_device_name(value):
+            raise ValueError(
+                f"{value!r} is a name Windows keeps for a device (con, nul, "
+                f"com1, ...): it cannot be a file there"
             )
         return value
 
@@ -214,11 +237,15 @@ def parse_card(data: bytes, *, source: str) -> ModelCard:
             The message starts with ``source`` and gives the first problem as
             ``<key>: <message>``.
     """
+    # The byte-order mark is taken off first, so that the line a message names is the
+    # one an editor shows (`utf-8-sig` strips it too, but counts bytes after it).
+    body = data.removeprefix(codecs.BOM_UTF8)
     try:
-        text = data.decode("utf-8-sig")
+        text = body.decode("utf-8")
     except UnicodeDecodeError as exc:
+        line = body.count(b"\n", 0, exc.start) + 1
         raise ModelError(
-            f"{source} is not UTF-8 text ({exc.reason} at byte {exc.start}); "
+            f"{source} is not UTF-8 text ({exc.reason} on line {line}); "
             f"save it as UTF-8, not ANSI or UTF-16"
         ) from exc
     try:
