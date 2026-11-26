@@ -55,6 +55,7 @@ __all__ = [
     "outside_limits",
     "sweep",
     "switch_off_for_sweep",
+    "z_jog_limit_um",
 ]
 
 
@@ -77,6 +78,18 @@ def outside_limits(
         f"the focus sweep around {centre_um:g} µm would reach {plane:g} µm, "
         f"outside the soft limits [{limits.low_um:g}, {limits.high_um:g}] µm"
     )
+
+
+def z_jog_limit_um(microscope: Microscope) -> float:
+    """The Z jog limit the plugins bound an absolute move by: the profile's ``max_z_jog_um``, else the layer's default.
+
+    The sweep's moves, and the map's targets, are absolute, so the layer's own
+    jog guard does not reach them (M1 §7, m3 §21.12.2 D3): a plugin bounds their
+    distance from the Z it started at by the same number the layer bounds a jog
+    by. One place, so that the sweep's check and the map's cannot read two.
+    """
+    configured = microscope.profile.safety.max_z_jog_um
+    return DEFAULT_MAX_Z_JOG_UM if configured is None else float(configured)
 
 
 def check_sweep_bounds(
@@ -107,8 +120,7 @@ def check_sweep_bounds(
             stage,
             f"{subject} moves Z: the profile must set [safety] z_soft_limits_um",
         )
-    configured = microscope.profile.safety.max_z_jog_um
-    jog_um = DEFAULT_MAX_Z_JOG_UM if configured is None else float(configured)
+    jog_um = z_jog_limit_um(microscope)
     if range_um > jog_um:
         raise PluginRunError(
             stage,
