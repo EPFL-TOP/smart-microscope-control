@@ -4237,6 +4237,12 @@ def test_a_well_where_one_try_failed_and_the_others_swept_flat_is_not_scanned(
     assert (none.well, none.source, len(none.tries)) == ("A2", "none", 4)
     assert [t.error is None for t in none.tries] == [False, True, True, True]
     assert [f.well for f in result.failed] == ["A2"] * 4
+    # Three sweeps ran and found nothing: the text says a sweep found no peak, not
+    # that none could run (#712).
+    assert {f.error for f in result.failed} == {
+        "MapNotAnchored: no sweep near the centre of A2 found a peak (4 tried), and "
+        "the operator focused in A1: the well was not scanned"
+    }
     assert [f.well for f in result.frames] == ["A1"] * 4 + ["B2"] * 4
 
 
@@ -4403,6 +4409,61 @@ def test_a_scan_with_a_well_not_anchored_and_the_others_failed_by_the_stage_keep
         "check the stage and the camera, then run scan again without --resume (a "
         "resume skips the wells already walked)"
     )
+
+
+def test_a_scan_whose_last_well_is_not_anchored_and_the_stage_failed_before_keeps_the_stages_text(
+    rig: _Rig,
+) -> None:
+    # The reverse mix: the stage failed every field of A1 and A2, and B2, the last
+    # well, is flat. The sample's text would send the operator to focus by eye in
+    # a well when it is the stage that failed first (#712).
+    _focused_at_a1(rig, x_um=18000.0)
+    path = _seed_map(rig, frames=[*_map_frames(), *_frames_of_a3()])
+    # A1's and A2's tries (3 sweeps of 11 planes each) are sharp: 66 snaps; B2's
+    # four tries sweep flat.
+    rig.camera.flat_snaps = set(range(66 + 1, 66 + 4 * 11 + 1))
+    # XY moves: A1's 3 tries (1-3) and 4 fields (4-7), A2's 3 tries (8-10) and 4
+    # fields (11-14), then B2's 4 tries.
+    rig.stage.fail = {
+        n: HardwareError("no answer") for n in (*range(4, 8), *range(11, 15))
+    }
+
+    with pytest.raises(PluginRunError) as raised:
+        _map_scan(rig, path, max_failed_in_row=100)
+
+    assert raised.value.reason.startswith(
+        "every field failed (12), the first A1_0000: HardwareError: no answer: "
+    )
+
+
+def test_a_resume_lists_a_well_an_earlier_attempt_did_not_scan_with_the_operators_well(
+    rig: _Rig,
+) -> None:
+    # A2 was anchored ``none`` by the first attempt, which the operator stopped at
+    # B2: the resumed line says it as the first attempt did, with A1 as the
+    # operator's well, and that it is an earlier attempt's.
+    _focused_at_a1(rig)
+    path = _seed_map(rig)
+    # A1: three sweeps and four frames (37 snaps); A2's four tries sweep flat.
+    rig.camera.flat_snaps = set(range(37 + 1, 37 + 4 * 11 + 1))
+    stop = threading.Event()
+    stopped = _map_scan(rig, path, stop=stop, on_progress=_at(8, stop.set))
+    assert stopped.status is StageStatus.stopped
+    assert _checkpoint(rig).wells_done == ("A1", "A2")
+
+    result = _result(_map_scan(rig, path, resume=True))
+
+    assert result.focus_map is not None
+    assert [(a.well, a.source) for a in result.focus_map.anchors] == [
+        ("A1", "swept"),
+        ("A2", "none"),
+        ("B2", "swept"),
+    ]
+    assert (
+        "A2: no sweep near its centre found a peak (4 tried), and the operator "
+        "focused in A1: the well was not scanned (an earlier attempt)"
+    ) in result.assumed
+    assert [f.well for f in result.failed] == ["A2"] * 4
 
 
 def test_a_resume_with_every_well_done_reads_no_start_and_names_no_operators_well(
