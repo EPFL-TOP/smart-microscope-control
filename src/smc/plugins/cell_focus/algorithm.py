@@ -28,6 +28,9 @@ import numpy as np
 import numpy.typing as npt
 
 __all__ = [
+    "CELLS_RANGE_MEASURED",
+    "CELLS_RANGE_UM",
+    "CELLS_STEP_UM",
     "DEFAULT_SCORE",
     "LANDING_FRACTION",
     "MAX_PLANES",
@@ -84,6 +87,16 @@ SECOND_PEAK_FRACTION = 0.5
 #: A Z readback farther from its command than this fraction of the step
 #: fails the sweep (FM-167). Chosen.
 LANDING_FRACTION = 0.25
+#: The sweep the rule is used with on cells, one source for the scan and the
+#: tool (m3 §21.11.6 D11): the half-range and the step. The text says where the
+#: range was measured, and is the tail of both parameters' descriptions.
+CELLS_RANGE_UM = 10.0
+CELLS_STEP_UM = 1.0
+CELLS_RANGE_MEASURED = (
+    "Measured at the Ti2-E's 40x (session 6, m3 §21.11.6): the cells' focus curve "
+    "is 9-11 µm wide at half its rise, and ±10 µm at 1 µm finds 17 of 24 cell "
+    "peaks where ±5 µm finds 3."
+)
 
 #: Absorbs the decimal error of ``range / step`` (0.3 / 0.1 is 2.9999...), so
 #: that a range of a whole number of steps keeps its ends.

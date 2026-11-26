@@ -10,6 +10,9 @@ import numpy as np
 import pytest
 
 from smc.plugins.cell_focus.algorithm import (
+    CELLS_RANGE_MEASURED,
+    CELLS_RANGE_UM,
+    CELLS_STEP_UM,
     MAX_PLANES,
     MIN_PLANES,
     NOISE_FACTOR,
@@ -266,6 +269,16 @@ def test_the_default_sweep_finds_the_weakest_recorded_cell_peak() -> None:
     tool = FocusOnCellsParams()
     scan = ScanParams()
     assert (tool.range_um, tool.step_um) == (scan.focus_range_um, scan.focus_step_um)
+    # One source (#688): the two parameters take their defaults and the measured
+    # sentence from the algorithm's constants, not from a copy each.
+    assert (scan.focus_range_um, scan.focus_step_um) == (CELLS_RANGE_UM, CELLS_STEP_UM)
+    for model, field in (
+        (ScanParams, "focus_range_um"),
+        (FocusOnCellsParams, "range_um"),
+    ):
+        description = model.model_fields[field].description
+        assert description is not None
+        assert description.endswith(CELLS_RANGE_MEASURED)
     planes = plan_planes(0.0, tool.range_um, tool.step_um)
     assert len(planes) == 21
     assert all(b - a == pytest.approx(1.0) for a, b in itertools.pairwise(planes))
