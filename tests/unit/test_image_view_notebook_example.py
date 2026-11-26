@@ -14,7 +14,7 @@ import ast
 import json
 import os
 import re
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 from typing import Any
 
 import pytest
@@ -37,15 +37,21 @@ _BLOCK = re.compile(r"^```python\n(.*?)^```$", re.DOTALL | re.MULTILINE)
 _RUN_DOC_LINE = re.compile(r"^RUN_DOC = Path\(.*$", re.MULTILINE)
 
 
-def _example(run_doc: Path) -> str:
-    """The page's code, as one script whose ``RUN_DOC`` is ``run_doc``."""
+def _example(run_doc: PurePath) -> str:
+    """The page's code, as one script whose ``RUN_DOC`` is ``run_doc``.
+
+    The replacement is a function, not a string: ``re`` reads the backslashes of a replacement
+    string, and a Windows path (``C:\\Users``, with ``\\U`` an unicode escape) came out as a
+    SyntaxError on the Windows runner only.
+    """
     text = PAGE.read_text(encoding="utf-8")
     blocks = _BLOCK.findall(text)
     assert len(blocks) == 2, (
         "the page's example is two blocks: the document, then the view"
     )
     code = "\n".join(blocks)
-    replaced, count = _RUN_DOC_LINE.subn(f"RUN_DOC = Path({str(run_doc)!r})", code)
+    line = f"RUN_DOC = Path({str(run_doc)!r})"
+    replaced, count = _RUN_DOC_LINE.subn(lambda _match: line, code)
     assert count == 1, "the first block has one `RUN_DOC = Path(...)` line to replace"
     return replaced
 
@@ -122,3 +128,21 @@ def test_the_pages_first_block_is_the_two_lines_the_test_replaces() -> None:
     first = _BLOCK.findall(text)[0]
     assert first.splitlines()[0] == "from pathlib import Path"
     assert sum(1 for line in first.splitlines() if line.startswith("RUN_DOC = ")) == 1
+
+
+def test_the_replaced_line_keeps_a_windows_path_as_it_is() -> None:
+    # `re.subn` reads the backslashes of its replacement: `C:\\Users` came out as `C:\Users`,
+    # and `\U` begins a unicode escape, so the Windows runner alone failed with a SyntaxError
+    # (#695). The check is on the parsed value, so it fails on every platform, not on one.
+    run_doc = PureWindowsPath("C:\\Users\\runneradmin\\Temp\\pytest-0\\t0\\run.json")
+    tree = ast.parse(_example(run_doc))
+    (assign,) = (
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and [t.id for t in node.targets if isinstance(t, ast.Name)] == ["RUN_DOC"]
+    )
+    assert isinstance(assign.value, ast.Call)
+    (argument,) = assign.value.args
+    assert isinstance(argument, ast.Constant)
+    assert argument.value == str(run_doc)
