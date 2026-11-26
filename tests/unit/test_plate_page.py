@@ -477,6 +477,24 @@ def test_the_image_is_in_the_model_tree_with_its_bar_and_its_drive_bar(
     assert view.image_view.enlarge_toggle.visible
 
 
+def test_the_frame_note_wraps_so_that_enlarge_stays_in_the_window(
+    page: PlatePage,
+) -> None:
+    # An unwrapped note of 70 characters ran 560 px from *Live* in a 440 px column and put
+    # *Enlarge*, which sits after it on the bar, at x 1452 of a 1280 px window (measured with
+    # Chromium, #631): the pane wraps and stretches, as the strip's status line does.
+    view = PlatePageView(page)
+    assert view.snap_note.sizing_mode == "stretch_width"
+    assert view.snap_note.styles["white-space"] == "pre-wrap"
+    assert view.snap_note.width is None
+    row = next(
+        o
+        for o in view.layout.select(pn.Row)
+        if view.snap_note in o.objects and view.image_view.enlarge_toggle in o.objects
+    )
+    assert list(row.objects)[-1] is view.image_view.enlarge_toggle
+
+
 def test_the_enlarged_stop_is_the_strips_stop_and_shows_only_when_enlarged(
     page: PlatePage,
 ) -> None:

@@ -1244,7 +1244,13 @@ class PlatePageView:
         self.walls_touches_note = _wrapped_text()
         self.snap_button = pn.widgets.Button(label="Snap")
         self.live_button = pn.widgets.Button(label=_LIVE_LABEL)
-        self.snap_note = TextPane("", styles={"color": _WARNING})
+        # A note on the frame (the dark and saturated hints are 43 to 70 characters) shares the
+        # image's bar with *Enlarge*, which sits after it: unwrapped, the note ran 560 px from the
+        # *Live* button at the image column's 440 and put *Enlarge* at x 1452 of a 1280 px window,
+        # out of reach exactly when the light is off (measured, #631). Wrapped and stretched, as
+        # the strip's status line shares its row with the buttons, it takes what the bar leaves.
+        self.snap_note = _wrapped_text(extra={"color": _WARNING}, width=None)
+        self.snap_note.sizing_mode = "stretch_width"
         # ADR-0006's *Connect* (m5 §7.3): the one line that says why every control
         # that needs the stand is disabled while it is closed.
         self.connect_button = pn.widgets.Button(label="Connect")
