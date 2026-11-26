@@ -475,9 +475,17 @@ def _parse_address(address: str) -> tuple[str, int, bool]:
     (ADR-0011). Every refusal is one fixed message, **without the value**: a
     mistyped address with a password in it must not reach a run folder (FM-50).
 
+    A space or a control character anywhere is refused too. ``urlsplit`` accepts it
+    in a host (``http://10.0.0.5 :8000``) and ``http.client`` then raises
+    ``InvalidURL``, with the host in its text, when the connection is built: outside
+    every ``try`` of the wire, so it would be neither a ``ModelError`` nor a
+    ``ServedError`` and would reach the run folder's diagnosis (FM-277).
+
     Raises:
         ModelError: ``address`` is not of that shape.
     """
+    if any(char <= " " or char == "\x7f" for char in address):
+        raise ModelError(_BAD_ADDRESS)
     try:
         parts = urlsplit(address)
         host = parts.hostname

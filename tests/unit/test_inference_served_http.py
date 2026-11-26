@@ -282,6 +282,19 @@ def test_a_proxy_in_the_environment_does_not_divert_the_call(
     assert len(server.requests) == 1
 
 
+# A space or a control character in the host: `urlsplit` accepts it and `http.client`
+# raises `InvalidURL` (a text that holds the host) when it builds the connection,
+# outside every `try` of the wire; so it is refused with the others, by the one fixed
+# message (FM-50, FM-277).
+HOST_WITH_A_SPACE_OR_A_CONTROL_CHARACTER = [
+    "http://10.0.0.5 :8000",
+    "http://my host:8000",
+    "http://lab-gpu\x07:8000",
+    "http://lab-gpu\x7f:8000",
+    "http://lab gpu\t:8000",
+]
+
+
 @pytest.mark.parametrize(
     "address",
     [
@@ -295,6 +308,7 @@ def test_a_proxy_in_the_environment_does_not_divert_the_call(
         "http://h:0",
         "http://h:1?q=1",
         "http://[::1:1",
+        *HOST_WITH_A_SPACE_OR_A_CONTROL_CHARACTER,
     ],
 )
 def test_an_address_that_is_not_http_host_port_is_refused_without_echoing_it(
@@ -306,7 +320,41 @@ def test_an_address_that_is_not_http_host_port_is_refused_without_echoing_it(
     assert str(caught.value) == NO_ADDRESS
     # Neither the value nor, on a port that is out of range, the exception it hid.
     shown = "".join(traceback.format_exception(caught.value))
-    for part in ("99999", "u:p", "localhost:8000", "ftp"):
+    for part in ("99999", "u:p", "localhost:8000", "ftp", "10.0.0.5", "my host", "gpu"):
+        assert part not in shown
+
+
+@pytest.mark.parametrize("address", HOST_WITH_A_SPACE_OR_A_CONTROL_CHARACTER)
+def test_a_host_with_a_space_in_the_variable_is_a_model_error_and_not_the_clients_exception(
+    address: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The address of the variable `load_model` reads: a `ModelError` with the fixed
+    # message, which `cells` ends the stage with, and not an `InvalidURL` that holds the
+    # lab's host and goes past every `except ModelError` into a diagnosis the run
+    # folder keeps.
+    monkeypatch.setenv(served.SERVER_ENV, address)
+    card = ModelCard(
+        name="stub",
+        weights="w.pth",
+        weights_sha256="a" * 64,
+        classes=("single",),
+        trained_um_per_px=None,
+        preprocessing=ModelPreprocessing(percentiles=(0.5, 99.5), model_um_per_px=None),
+    )
+
+    with pytest.raises(ModelError) as caught:
+        load_model(
+            card,
+            preprocessing=card.preprocessing,
+            frame_shape_px=(64, 64),
+            frame_um_per_px=0.0,
+            device="auto",
+            score_threshold=0.5,
+        )
+
+    assert str(caught.value) == NO_ADDRESS
+    shown = "".join(traceback.format_exception(caught.value))
+    for part in ("10.0.0.5", "my host", "gpu"):
         assert part not in shown
 
 
