@@ -9208,7 +9208,7 @@ The public names above are fixed; a private helper's name is the executor's.
 ### 25.4 Tests and failure modes
 
 `tests/unit/test_ui_guide.py` (D3's lines in each case, D4's note, D5 on every form of the time line,
-`focus_map_file`); a new `tests/unit/test_plate_page_focus_map.py` (the copy kept, replaced, not kept
+`focus_map_file`); a new `tests/test_plate_page_focus_map_demo.py` (the copy kept, replaced, not kept
 without a `locked` frame, for a dry run or for another document; a copy that cannot be written leaves
 the scan `done` with the tail; the pairs added and not added); `tests/test_plate_page_forty_walk_demo.py`
 (D7). Failure modes: FM-38 and FM-24 (the copy), FM-98 (a note of the end never costs the run its
