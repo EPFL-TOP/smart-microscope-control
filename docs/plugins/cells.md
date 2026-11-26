@@ -96,6 +96,113 @@ half that changed ([below](#stop-and-resume)). The digest also follows a version
 number in the code, for what the code does that the rule does not say (the float32
 scaling, the plane repeated to three channels).
 
+## Running the model on a server
+
+The model can run on **another machine** (a GPU PC of the lab) while the acquisition
+PC keeps the frames, the run folder and the stand. Set one variable on the acquisition
+PC and `cells` asks the server instead of loading the weights:
+
+```text
+SMC_MODEL_SERVER=http://<host>:<port>
+```
+
+(`http://` or `https://`, a host and an explicit port, no user, no path; anything else
+is refused with `SMC_MODEL_SERVER is not an address like http://host:8000`, **without
+repeating what you typed**. A blank value is no setting.) Nothing else changes in the
+command: the model is still asked for by name, and the name stands for the same card.
+The design is [`inference.md`](../design/inference.md) §8 and ADR-0011.
+
+**On the GPU machine**, install the `serve` extra and start the server:
+
+```text
+pip install -e ".[serve]"
+smc serve-models --host <the machine's address> --port 8000
+```
+
+`serve` is torch and torchvision (as `detect`) and `imaging-server-kit`, pinned to the
+exact version the wire was read from. The acquisition PC installs **nothing** for a
+served model: its client is the standard library, numpy and tifffile. The server loads
+every card whose weights are in `$SMC_MODELS` (or `local/models/`) with **its own**
+card's pre-processing (`--model <name>`, repeated, serves only those, and a card it
+cannot serve is then an error and not a skipped line; `--device` is `auto`, `cpu`,
+`cuda` or `mps`), then prints what it skipped and each model it serves with its
+**identity**, and listens:
+
+```text
+serving cell-classes-v2  on cuda  identity b1160edae7dd2e8e1897f959fd55b77481bbfa92d236aaa1202cd94101b2cb7e+2df8feb4070d6d7b527502090c9f1be7003a1b50b7ee09390b81b8413a6cfff1
+```
+
+A port that is held is refused before any model is loaded (`port 8000 is in use;
+choose another with --port`, exit 2), and so is a host that is not an address of the
+machine. The default host is `127.0.0.1`: serving the lab's network is a choice of the
+deployment, and a host that is not a loopback address says `listening on <host>: anyone
+who reaches this port can run the models; it has no login`. There is no token and no
+TLS: the server is for the lab's network only. Ctrl-C ends it. It serves **native
+pre-processing only**: a card whose `model_um_per_px` is a number is skipped (an error
+when named), because a sized rule would need a model per input size.
+
+**What leaves the acquisition PC, and what never does.** One call sends the model's
+name, the frame's pixels as an uncompressed TIFF (5.3 MB for 1412 x 1412 `uint16`) and
+the frame's pixel size. Never a path, a run document, a host name, an account or the
+score threshold, which stays on the acquisition PC: the server returns every detection
+and `cells` keeps the ones at or above `score_threshold`, so a served run and a local
+one on the same weights give the same cells. Nothing the run records holds the server's
+address, done or failed: the result says `served`, and a failed stage's diagnosis names
+no host and no port.
+
+**What a server set refuses**, before any call, each with the words that say what to
+remove: `model_path` (`model_path names a file on this PC, and the model runs on the
+server`), a `device` other than `auto` (`device=cuda is for a model that runs on this
+PC; the server chooses its own`), and a `low_percentile`, `high_percentile` or
+`model_um_per_px` that changes the card's pre-processing (`the server runs the card's
+pre-processing`). There is **no fallback**: a variable that is set means the server, and
+a value that is not an address is refused, never read as "run it here".
+
+**The check.** At the start of the stage `cells` asks the server what it serves and
+compares the identity it lists for the model with the one worked out from the card. What
+it found is the stage's first progress line and a log line (a WARNING when it is not
+well), and it **does not refuse the stage**:
+
+```text
+model server: cell-classes-v2 is served on cuda, identity b1160edae7dd+2df8feb4070d
+model server: the model server does not answer (connection refused); is smc serve-models running there, and is SMC_MODEL_SERVER its address?
+model server: the server does not serve cell-classes-v2 (it serves: a, b)
+model server: cell-classes-v2 is served with another identity than the card's: the weights differ
+```
+
+The identity comes back with every answer, and `cells` refuses an answer for another
+model or with another identity (`the server answered with another model identity: the
+pre-processing differs; ...`), naming the half that differs: a server started on another
+checkout, or on other weights, is told at the first frame, never believed.
+
+**A call that fails ends the stage `failed`**, with the diagnosis, at the first frame
+that asked: the server is not there, did not answer in time, answered an error (`HTTP
+500 from the model server; the server said: <its first line>`) or something that is not
+its wire. It is never a frame with no cell, nothing is retried, and the model is never
+loaded here instead. `--resume` goes on from the wells done, **on either place**: if the
+server is gone, unset `SMC_MODEL_SERVER` and resume here, and the result says so (`2 of 4
+frames were detected by an earlier attempt that ran on served; the others ran on
+local:cpu`).
+
+**Timeouts.** Every call has one: 3 s to connect, 10 s for the check, 60 s for a detect
+call (a CPU takes 0.5 to 0.8 s a frame, and a cold first call loads kernels).
+`SMC_MODEL_TIMEOUT_S` sets the last, in seconds above 0 and at most a day (blank is
+unset; anything else is refused). A proxy in the environment is never used. The 60 s is
+an assumption: the cost of a call on the lab's network is measured by the deployment note
+(#686), which sets it for good. Each timeout bounds **one wait on the socket**, not the
+whole call, and the connect's does not cover looking the name up: **write the address with
+an IP** (`http://192.0.2.10:8000`), not a short host name (a Windows PC may take seconds to
+fail to resolve it) and not `localhost` for a server on the same PC (it resolves to `::1`
+first, the server listens on `127.0.0.1`, and a refused connection on Windows takes about
+2 s, paid at every call). Do not put quotes in the variable (`set SMC_MODEL_SERVER=http://...`
+in cmd.exe, `$env:SMC_MODEL_SERVER = "http://..."` in PowerShell, which keeps no quotes in
+the value): cmd.exe keeps them, and the address is then refused. While a call waits,
+Ctrl-C and STOP wait for it, up to the timeout (a hung server holds the stage for 60 s).
+
+**What the result records.** `model_runs_on` is `served` (and `model_identity` the
+card's), `device` is the server's, as it said it (`unknown` for a run that never got an
+answer), and `assumed` says how long the calls took, network included ([below](#what-it-leaves)).
+
 ## Running it
 
 ```text
@@ -111,7 +218,7 @@ smc run cells -p <profile> --run-doc run.json --resume
 | `detector` | `model` | `model` is the trained network. `blobs` counts bright round spots and is for the synthetic plate of the `demo-sample` profile only ([below](#the-blob-detector-for-the-synthetic-plate-only)). |
 | `model` | unset: `cell-classes-v2` | The model, by the name of its card ([above](#models-names-and-cards)): its weights, classes and pre-processing. An unknown name is refused when the stage runs, with the names there are. Refused with `detector=blobs`. |
 | `model_path` | unset: the card's file in `$SMC_MODELS`, or in `local/models/` of the smc folder | The weights, in place of the card's file. Its SHA-256 must still be the card's. Refused with `detector=blobs`. |
-| `device` | `auto` | `auto` is `cuda` when the PC has one and `cpu` otherwise: never `mps` unless asked. `cuda` or `mps` asked for and not there is refused (`device cuda is not available on this PC; use device=auto or cpu`), not replaced by the CPU. With `detector=blobs` only `auto` and `cpu` are accepted. |
+| `device` | `auto` | `auto` is `cuda` when the PC has one and `cpu` otherwise: never `mps` unless asked. `cuda` or `mps` asked for and not there is refused (`device cuda is not available on this PC; use device=auto or cpu`), not replaced by the CPU. With `detector=blobs` only `auto` and `cpu` are accepted. With `SMC_MODEL_SERVER` set the model runs on the server, which chooses its own device: only `auto` is accepted ([above](#running-the-model-on-a-server)). |
 | `score_threshold` | 0.5 | Detections below it are dropped (0.05 to 1). The blob detector scores every detection 1.0, so it has no effect there. |
 | `max_overlap` | 0.7 | Two boxes of one frame sharing more than this fraction of the smaller one are one object; the more confident label stays. |
 | `merge_radius_um` | 5 | Cells of two fields within this distance are one cell. 0 merges nothing. |
@@ -311,6 +418,15 @@ Three refusals and one repair:
 - **A run started before the models had names** (#684): its checkpoint holds the
   weights' SHA-256 and no identity, and its parameters were not these, so a
   resume across this change is refused: run `cells` again without `--resume`.
+- **Another place is not refused** (#685): the checkpoint records where the wells
+  done were detected (`served`, `local:cuda`), and a resume on the other place goes
+  on and says so in `assumed`, because a server that died and an operator who goes
+  local is the case a resume is for. The identity is what makes it safe: the same
+  weights under the same rule are the same model wherever they run. When the places
+  of several attempts differ the checkpoint lists them all (`served+local:cpu`), so
+  that a later attempt does not take a well detected elsewhere for one detected here.
+  A call that fails ends the stage `failed` with the wells done kept
+  ([above](#running-the-model-on-a-server)).
 - **Other parameters or another profile**: the runner refuses it, as for every
   stage. Another `detector` is a parameter that differs.
 - **A scan produced again**: the runner refuses a resume over inputs that changed.
@@ -334,14 +450,14 @@ The slot `cells` holds a `CellsResult` (`smc.plugins.slots`):
 |---|---|
 | `file` | `cells/<token>.json`, relative to the run folder, with forward slashes. |
 | `model`, `model_sha256` | The model's **name**, the one of its card (`cell-classes-v2`; never a path: run documents are attached to issues), or `blobs`, and the weights' SHA-256 (of the blob detector's identity string for `blobs`). The parameter `model_path` is recorded as you typed it, in the stage's `params`, like every parameter: when the path names your account, give the folder through `SMC_MODELS`, which is recorded nowhere. |
-| `model_identity`, `model_runs_on` | The model as it was run: the weights' SHA-256 and the digest of the pre-processing, joined by `+`, so that the same weights under another rule are told apart; and where it ran, `local:<device>` (`local:cpu`). Both are `null` in a result recorded before #684, which still loads. |
-| `classes`, `device` | The detector's labels (`single`, `doublet`, `debris`) and the device it ran on, never `auto`. |
+| `model_identity`, `model_runs_on` | The model as it was run: the weights' SHA-256 and the digest of the pre-processing, joined by `+`, so that the same weights under another rule are told apart; and where it ran, `local:<device>` (`local:cpu`), or `served` for a model that ran on the model server ([above](#running-the-model-on-a-server); the address is never recorded). Both are `null` in a result recorded before #684, which still loads. |
+| `classes`, `device` | The detector's labels (`single`, `doublet`, `debris`) and the device it ran on, never `auto`: for a served model the server's, as it said it (`unknown` when it never answered). |
 | `score_threshold`, `merge_radius_um` | The parameters. |
 | `frames` | The number of frames of the scan. |
 | `counts` | Well to label to count, every well of the scan and every label, **zeros included**. A well whose every field failed is absent, as in the scan. |
 | `merged` | How many views were removed as the second sight of a cell, over every well, a resumed run's included. |
 | `seconds_per_frame` | The mean time of `detect` in this attempt; `null` when it detected no frame. |
-| `assumed` | What the counts rest on without a measurement, one line each, in this order. With `detector=model`, first a line when the model was not measured at this scan's pixel size: `the model's detections were not measured on frames of this stand: checked_um_per_px is not set (docs/plugins/cells.md)` when it is unset, or `the frames are at 0.2756 µm per pixel and the model was checked at 0.49 µm per pixel: its counts at this pixel size are not measured` when the scan's pixel size is more than 5 % from it (relative to the checked one, on either side); within 5 % there is no such line. With `detector=blobs`, instead, the line that says its counts are of bright round spots and not cells. Then `cells within 5 µm seen by two fields are counted once: a chosen radius, not measured`, absent when `merge_radius_um` is 0. |
+| `assumed` | What the counts rest on without a measurement, one line each, in this order. With `detector=model`, first a line when the model was not measured at this scan's pixel size: `the model's detections were not measured on frames of this stand: checked_um_per_px is not set (docs/plugins/cells.md)` when it is unset, or `the frames are at 0.2756 µm per pixel and the model was checked at 0.49 µm per pixel: its counts at this pixel size are not measured` when the scan's pixel size is more than 5 % from it (relative to the checked one, on either side); within 5 % there is no such line. With `detector=blobs`, instead, the line that says its counts are of bright round spots and not cells. Then `cells within 5 µm seen by two fields are counted once: a chosen radius, not measured`, absent when `merge_radius_um` is 0. For a served run with a frame timed in this attempt: `the model ran on the server: the first frame took 2.31 s and the next 11 frames 0.12 s on average, network included (the first can carry the server's start-up work); the server's device was cuda` (only the first part for one frame). For a resume that found some frames detected on another place than the rest: `2 of 4 frames were detected by an earlier attempt that ran on served; the others ran on local:cpu`. Neither line is there for a run that stayed on this PC. |
 
 The cells are in the file, not in the run document: a 96-well plate at 40× is
 about 300 frames per well and thousands of cells per well. `load_cells` reads the
@@ -409,6 +525,12 @@ are skipped without them.
 - **`cuda`**: no GPU was available to the tests, and a card that cannot run the
   model (`no kernel image`) is only simulated: the message says to use
   `device=cpu`.
+- **The model server** ([above](#running-the-model-on-a-server)) on a GPU, on
+  Windows (Ctrl-C included) and on Python 3.10 and 3.14: its test ran with
+  `imaging-server-kit==0.0.12` on Python 3.13 on a Mac, against stub models, and is
+  in no CI job. A real `cells` through a real server with the real weights, and the
+  cost of a call on the lab's network (a 5.3 MB frame, uncompressed), are the owner's
+  to measure at the first visit (#686).
 - **torch next to the stand's DLLs.** `smc run` opens the stand around the stage,
   although this stage needs none, so torch may be imported in a process that already
   holds the Micro-Manager and vendor DLLs, and Windows resolves a module that is

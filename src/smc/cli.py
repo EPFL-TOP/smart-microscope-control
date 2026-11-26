@@ -12,6 +12,7 @@ import contextlib
 import errno
 import gc
 import importlib
+import ipaddress
 import json
 import logging
 import math
@@ -3031,6 +3032,153 @@ def ui_command(
             raise typer.Exit(code=_EXIT_ERROR)
 
 
+#: What the operator types to get the model server's dependencies (FM-36).
+_SERVE_EXTRA_FIX = 'install the serve extra: pip install -e ".[serve]"'
+#: The devices ``TorchDetector`` takes, for ``smc serve-models --device``.
+_SERVE_DEVICES = ("auto", "cpu", "cuda", "mps")
+
+
+def _is_loopback(host: str) -> bool:
+    """Whether ``host`` can only be reached from this PC: ``localhost`` or a loopback address."""
+    name = host.strip().strip("[]")
+    if name.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def _log_at_info(name: str) -> Callable[[], None]:
+    """Put the logger ``name`` at INFO, unless it is lower already; return the call that puts its level back.
+
+    The model server's per-call line (``cell-classes-v2: a 1412x1412 frame in 0.6 s``)
+    is an INFO record, and a service has no ``-v``: at the default WARNING its log would
+    show no call at all. Only this logger, and put back when the command ends, as
+    ``_log_ui_at_info`` does.
+    """
+    logger = logging.getLogger(name)
+    previous_level = logger.level
+    if logger.getEffectiveLevel() > logging.INFO:
+        logger.setLevel(logging.INFO)
+
+    def undo() -> None:
+        logger.setLevel(previous_level)
+
+    return undo
+
+
+@app.command("serve-models")
+def serve_models_command(
+    ctx: typer.Context,
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host",
+            help="The interface to listen on. The default is this PC only: serving "
+            "the lab's network is a choice of the deployment. The server has no "
+            "login, so whoever reaches the port can run the models.",
+        ),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", min=1, max=65535, help="The port to serve on."),
+    ] = 8000,
+    device: Annotated[
+        str,
+        typer.Option(
+            "--device", help="The device the models run on: auto, cpu, cuda or mps."
+        ),
+    ] = "auto",
+    model: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--model",
+            help="A card to serve, by name; repeat it for several. None serves every "
+            "card whose weights are on this PC.",
+        ),
+    ] = None,
+) -> None:
+    """Serve the models of the cards to the acquisition PCs (needs the serve extra): load them, list them, listen.
+
+    Run it on the machine that has the GPU. An acquisition PC with `SMC_MODEL_SERVER`
+    set to this server's address (`http://<host>:<port>`) asks it for the cells of
+    each frame instead of loading the weights. Each model is loaded with its own
+    card's pre-processing and answers with its identity, which the client compares
+    with the one it works out from the card. Ctrl-C ends it.
+    """
+    if device not in _SERVE_DEVICES:
+        _fail(f"unknown device {device}: it is one of auto, cpu, cuda or mps")
+        raise typer.Exit(code=_EXIT_REFUSED)
+    if not host.strip():
+        _fail("--host is empty; name the interface to listen on")
+        raise typer.Exit(code=_EXIT_REFUSED)
+    with _Reported(ctx):
+        # Imported here: the module is light, but `smc` starts without it, and the
+        # kit and uvicorn are imported by its functions only.
+        from smc.inference import server as serving
+        from smc.inference.cards import model_card
+        from smc.inference.errors import ModelError
+        from smc.inference.served import decode_listing
+
+        # The names first: from the cards alone, before a library or a weight file.
+        for name in model or ():
+            try:
+                model_card(name)
+            except ModelError as exc:
+                _fail(str(exc))
+                raise typer.Exit(code=_EXIT_REFUSED) from None
+        # Text, never the error: nothing here keeps it (FM-98).
+        missing: str | None = None
+        try:
+            serving.check_serve_extra()
+        except ImportError as exc:
+            missing = str(exc)
+        if missing is not None:
+            _fail(_SERVE_EXTRA_FIX)
+            _say(missing)
+            raise typer.Exit(code=_EXIT_ERROR)
+        try:
+            socket.getaddrinfo(
+                host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+            )
+        except socket.gaierror:
+            _fail(f"{host} is not an address this PC knows; choose another with --host")
+            raise typer.Exit(code=_EXIT_REFUSED) from None
+        # Before a model is loaded: a model is seconds of torch and 166 MB, and a
+        # server that cannot bind is found out after all of it (FM-144, FM-150).
+        taken, bindable = _probe_port(host, port)
+        if taken:
+            _fail(f"port {port} is in use; choose another with --port")
+            raise typer.Exit(code=_EXIT_REFUSED)
+        if bindable == 0:
+            # The host resolves, and no address of it is this PC's: another machine's
+            # address, or a typo. uvicorn would find out after the models were loaded.
+            _fail(f"{host} is not an address of this PC; choose another with --host")
+            raise typer.Exit(code=_EXIT_REFUSED)
+        try:
+            server, notes = serving.prepare(model or None, device=device)
+        except ModelError as exc:
+            _fail(str(exc))
+            raise typer.Exit(code=_EXIT_ERROR) from None
+        for note in notes:
+            _say(note)
+        for served in decode_listing(server.listing()):
+            _say(
+                f"serving {served.name}  on {served.device}  identity {served.identity}"
+            )
+        if not _is_loopback(host):
+            _say(
+                f"listening on {host}: anyone who reaches this port can run the "
+                "models; it has no login"
+            )
+        restore_log_level = _log_at_info("smc.inference.server")
+        try:
+            serving.serve(server, host=host, port=port)
+        finally:
+            restore_log_level()
+
+
 def _port_is_taken(port: int) -> bool:
     """Whether ``localhost:<port>`` is held, on any address the page's server will bind.
 
@@ -3040,12 +3188,39 @@ def _port_is_taken(port: int) -> bool:
     dies (measured). An address this host cannot bind at all (no IPv6) is not a
     taken port.
     """
+    return _port_is_taken_on("localhost", port)
+
+
+def _port_is_taken_on(host: str, port: int) -> bool:
+    """Whether ``<host>:<port>`` is held, on every address ``host`` resolves to: the rules of ``_port_is_taken``.
+
+    The model server's host is the operator's (``127.0.0.1``, a LAN address, ``localhost``
+    that is two addresses), and a probe of one address of several passes a port that the
+    other holds. A host that does not resolve holds nothing (the command says so before
+    it asks); ``localhost`` that does not resolve is the IPv4 loopback.
+    """
+    return _probe_port(host, port)[0]
+
+
+def _probe_port(host: str, port: int) -> tuple[bool, int]:
+    """Whether ``<host>:<port>`` is held, and how many of its addresses this PC could bind.
+
+    The second number tells a host that is not an address of this PC (every address of it
+    cannot be bound here: ``EADDRNOTAVAIL``, or ``EAFNOSUPPORT`` for IPv6 on a PC with
+    none) from a free port: the first is skipped as no taken port (FM-150), and a server
+    that cannot bind any address would load its models and then fail (FM-144).
+    """
+    bindable = 0
     try:
         found = socket.getaddrinfo(
-            "localhost", port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+            host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
         )
     except socket.gaierror:
-        found = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port))]
+        found = (
+            [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port))]
+            if host == "localhost"
+            else []
+        )
     for family, kind, proto, _name, address in found:
         try:
             with socket.socket(family, kind, proto) as probe:
@@ -3053,8 +3228,9 @@ def _port_is_taken(port: int) -> bool:
         except OSError as exc:
             if exc.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
                 continue
-            return True
-    return False
+            return True, bindable
+        bindable += 1
+    return False, bindable
 
 
 def main() -> None:

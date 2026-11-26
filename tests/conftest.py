@@ -63,6 +63,19 @@ def no_cyclic_gc() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
+def no_model_server_in_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``SMC_MODEL_SERVER`` and ``SMC_MODEL_TIMEOUT_S`` are unset in every test (inference.md §8.9).
+
+    A developer's PC that has them set, as the acquisition PC does, must not send a
+    local test of ``cells`` over the network or wait on a timeout that is not the
+    test's (FM-40). A test of the served path sets them itself, or has
+    ``FakeModelServer.install`` do it.
+    """
+    monkeypatch.delenv("SMC_MODEL_SERVER", raising=False)
+    monkeypatch.delenv("SMC_MODEL_TIMEOUT_S", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def no_stand_read_outlives_its_test() -> Iterator[None]:
     """A background stand read ends before the next test starts (m3 §15.4, #333).
 

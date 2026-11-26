@@ -20,6 +20,12 @@ or faking its work:
   anywhere. ``detector=blobs`` (#260) has no file: the SHA-256 of its identity
   string stands for it, and the result says that its counts are spots, not
   cells.
+* **The model may run on a server** (``SMC_MODEL_SERVER``, inference.md §8): the
+  name resolves through ``load_model`` either way, and a call that fails ends the
+  stage ``failed`` with the server's diagnosis, never a frame with no cell and never
+  a model quietly loaded here. The check of the server is reported at the start, the
+  wells done stay in the checkpoint, and a resume goes on from them on either place
+  and says so. Nothing recorded holds the server's address (FM-50).
 * **A frame is checked before it is detected on.** The matrix of the scan is
   only right on the scan's own frame shape (FM-73), and a missing, corrupt or
   foreign frame is told by its file name with what to do.
@@ -33,6 +39,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
@@ -52,6 +59,7 @@ from smc.inference import (
 )
 from smc.inference.blobs import blob_model
 from smc.inference.preprocessing import DEFAULT_PREPROCESSING
+from smc.inference.served import ServedDetector
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.cells.algorithm import (
     merge_across_fields,
@@ -126,7 +134,11 @@ class CellsParams(PluginParams):
     )
     device: Literal["auto", "cpu", "cuda", "mps"] = Field(
         "auto",
-        description="auto is cuda when there is one, else cpu; mps only when asked.",
+        description=(
+            "auto is cuda when there is one, else cpu; mps only when asked. With "
+            "SMC_MODEL_SERVER set the model runs on the server, which chooses its "
+            "own device: only auto is accepted."
+        ),
     )
     score_threshold: float = Field(
         0.5, ge=0.05, le=1.0, description="Detections below this score are dropped."
@@ -258,13 +270,19 @@ class CellsCheckpoint(BaseModel):
     which half changed. ``merged`` is the number of cells removed so far, so the
     result of a resumed run counts the wells it did not redo. A checkpoint saved
     before #684 has ``model_sha256`` and no ``identity``: it is refused as one
-    that is not what ``cells`` expects.
+    that is not what ``cells`` expects. ``runs_on`` is where the model ran, as
+    ``ResolvedModel.runs_on`` says it (``served``, ``local:cuda``), and has a default
+    so that a checkpoint saved before #685 still loads: a resume does not refuse
+    another place (a server that died, and the operator going local, is the case a
+    resume is kept for), it says so in the result. When the places of two attempts
+    differ the value lists both, joined by ``+``: the wells done are of both.
     """
 
     token: str
     wells_done: tuple[str, ...]
     identity: str
     merged: int = Field(ge=0)
+    runs_on: str | None = None
 
 
 class CellsPlugin:
@@ -312,13 +330,17 @@ class CellsPlugin:
 
         resolved = _resolve(params, scan)
         detector = resolved.detector
+        if isinstance(detector, ServedDetector):
+            _report_check(ctx, detector, len(scan.frames))
 
         index = scan.frame_index()
-        token, cells, wells_done, merged = _resume(
-            ctx, scan, resolved.identity, detector.classes
+        token, cells, wells_done, merged, earlier = _resume(
+            ctx, scan, resolved, detector.classes
         )
         partial = ctx.run_dir / "cells" / f"{token}.partial.json"
         done = sum(len(index[well]) for well in wells_done)
+        resumed = done
+        places = _places(earlier, resolved.runs_on)
 
         seconds: list[float] = []
         for well, positions in index.items():
@@ -330,7 +352,14 @@ class CellsPlugin:
                 frame = scan.frames[position]
                 pixels = _read_frame(ctx.run_dir, frame, scan.image_shape_px)
                 started = time.perf_counter()
-                detections = detector.detect(pixels)
+                try:
+                    detections = detector.detect(pixels)
+                except ModelError as exc:
+                    # A call that fails is a finding, never a frame with no cell: the
+                    # stage ends `failed`, the checkpoint keeps the wells done, and
+                    # `--resume` goes on from them (inference.md §8.7). The text is
+                    # the server's diagnosis, which holds no address.
+                    raise PluginRunError(_NAME, str(exc)) from exc
                 seconds.append(time.perf_counter() - started)
                 unknown = {d.label for d in detections} - set(detector.classes)
                 if unknown:
@@ -366,6 +395,7 @@ class CellsPlugin:
                     wells_done=tuple(wells_done),
                     identity=resolved.identity,
                     merged=merged,
+                    runs_on=places,
                 )
             )
 
@@ -405,6 +435,8 @@ class CellsPlugin:
                     if radius > 0.0
                     else ()
                 ),
+                *_served_timings(resolved, seconds),
+                *_other_place(earlier, resolved.runs_on, resumed, len(scan.frames)),
             ),
         )
 
@@ -506,13 +538,19 @@ def _identity_changed(was: str, now: str) -> str:
 
 
 def _resume(
-    ctx: RunContext, scan: ScanResult, identity: str, classes: tuple[str, ...]
-) -> tuple[str, list[Cell], list[str], int]:
-    """The token, the cells of the wells done, those wells and their ``merged``; or a fresh start.
+    ctx: RunContext,
+    scan: ScanResult,
+    resolved: ResolvedModel,
+    classes: tuple[str, ...],
+) -> tuple[str, list[Cell], list[str], int, str | None]:
+    """The token, the cells of the wells done, those wells, their ``merged`` and where they were detected; or a fresh start.
 
     Without a checkpoint the token is new and nothing is done. With one, the
     model's identity must be the one that made it, and its token is kept so that the
-    final file is the one the partial file leads to. A missing or invalid
+    final file is the one the partial file leads to. The place is **not** compared:
+    a server that died and an operator who goes local is the case a resume is for,
+    so the place the checkpoint names is returned (``None`` for none, or when no
+    well is kept) and the result says so. A missing or invalid
     partial file means no well is done: every well is detected again under the
     same token, which is slower and never wrong (``_redo_every_well`` resets the
     stored checkpoint first). A cell of the partial file whose well is not in
@@ -522,9 +560,10 @@ def _resume(
     checkpoint, would be taken at its word (a count of cells in the checkpoint
     would tell; it is a follow-up, the checkpoint's fields being fixed).
     """
+    identity = resolved.identity
     checkpoint = ctx.checkpoint(CellsCheckpoint)
     if checkpoint is None:
-        return new_token(), [], [], 0
+        return new_token(), [], [], 0, None
     if checkpoint.identity != identity:
         raise PluginRunError(_NAME, _identity_changed(checkpoint.identity, identity))
     partial = ctx.run_dir / "cells" / f"{checkpoint.token}.partial.json"
@@ -539,7 +578,7 @@ def _resume(
             where,
             _why(exc),
         )
-        return _redo_every_well(ctx, checkpoint.token, identity)
+        return _redo_every_well(ctx, checkpoint.token, resolved)
     index = scan.frame_index()
     done = [well for well in checkpoint.wells_done if well in index]
     kept = [cell for cell in loaded.cells if cell.well in done]
@@ -551,25 +590,97 @@ def _resume(
                 where,
                 cell.label,
             )
-            return _redo_every_well(ctx, checkpoint.token, identity)
-    return checkpoint.token, kept, done, checkpoint.merged
+            return _redo_every_well(ctx, checkpoint.token, resolved)
+    return checkpoint.token, kept, done, checkpoint.merged, checkpoint.runs_on
 
 
 def _redo_every_well(
-    ctx: RunContext, token: str, identity: str
-) -> tuple[str, list[Cell], list[str], int]:
+    ctx: RunContext, token: str, resolved: ResolvedModel
+) -> tuple[str, list[Cell], list[str], int, str | None]:
     """Nothing is done, and the stored checkpoint says so before the first well is redone.
 
     The redo rewrites the partial file well by well. A stored checkpoint that
     still named the wells of the lost file would, if the run ended before its
     first new checkpoint, make the next resume trust a partial file that holds
     fewer wells than that, skip the rest, and record a ``done`` result whose
-    counts for them are zero (FM-111).
+    counts for them are zero (FM-111). No well is kept, so no earlier place is
+    reported.
     """
     ctx.save_checkpoint(
-        CellsCheckpoint(token=token, wells_done=(), identity=identity, merged=0)
+        CellsCheckpoint(
+            token=token,
+            wells_done=(),
+            identity=resolved.identity,
+            merged=0,
+            runs_on=resolved.runs_on,
+        )
     )
-    return token, [], [], 0
+    return token, [], [], 0, None
+
+
+def _report_check(ctx: RunContext, detector: ServedDetector, frames: int) -> None:
+    """Say at the start of the stage what the check of the model server found.
+
+    On the progress line and on the plugin's logger (WARNING when the check is not
+    ok). It does not refuse the stage: a server that is not there ends it ``failed``
+    at the first frame with the call's own diagnosis, and the operator has the
+    reason from the first second, not after a frame that was read for nothing.
+    """
+    check = detector.check
+    ctx.progress(0, frames, check.message)
+    (ctx.logger.info if check.ok else ctx.logger.warning)("%s", check.message)
+
+
+def _places(earlier: str | None, now: str) -> str:
+    """Where the wells in the checkpoint were detected: the earlier places and this one.
+
+    Equal places are one; places that differ are listed (``served+local:cpu``), so that
+    a third attempt on the second place still knows that the first well was not detected
+    there: a checkpoint that said only ``local:cpu`` would let it say nothing of it.
+    """
+    if earlier is None or earlier == now:
+        return now
+    if now in earlier.split("+"):
+        return earlier
+    return f"{earlier}+{now}"
+
+
+def _other_place(
+    earlier: str | None, now: str, resumed: int, frames: int
+) -> tuple[str, ...]:
+    """The line that says a resume detected some frames elsewhere than the rest, or none."""
+    if earlier is None or earlier == now or resumed == 0:
+        return ()
+    return (
+        f"{resumed} of {frames} frames were detected by an earlier attempt that ran "
+        f"on {earlier}; the others ran on {now}",
+    )
+
+
+def _served_timings(
+    resolved: ResolvedModel, seconds: Sequence[float]
+) -> tuple[str, ...]:
+    """What a served run took, with the network in it, or nothing for a local run.
+
+    The first call carries the server's start-up work (kernels, the first allocation),
+    so it is told apart from the mean of the next; neither is a measurement of the
+    server alone, since the network is in both. Only the frames timed in *this*
+    attempt count.
+    """
+    if resolved.runs_on != "served" or not seconds:
+        return ()
+    first, rest = seconds[0], seconds[1:]
+    then = (
+        f" and the next {len(rest)} frame{'s' if len(rest) > 1 else ''} "
+        f"{sum(rest) / len(rest):.2f} s on average"
+        if rest
+        else ""
+    )
+    return (
+        f"the model ran on the server: the first frame took {first:.2f} s{then}, "
+        f"network included (the first can carry the server's start-up work); the "
+        f"server's device was {resolved.detector.device}",
+    )
 
 
 def _why(exc: Exception) -> str:

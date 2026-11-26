@@ -61,7 +61,7 @@ from smc.plugins.slots import (
 )
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.run.files import AtomicWriteError
-from smc.testing import StubDetector, stub_model
+from smc.testing import FakeModelServer, ServedCall, StubDetector, stub_model
 
 pytestmark = pytest.mark.demo
 
@@ -1706,3 +1706,462 @@ def test_a_detector_that_is_neither_the_model_nor_blobs_is_refused() -> None:
         parse_params(CellsParams, ["detector=yolo"])
 
     assert "detector" in str(caught.value)
+
+
+# --------------------------------------------- the model on a server (#685, inference.md §8)
+
+#: A host and a port nothing else in a run folder says: the search for them is the test.
+SERVER_HOST = "gpu-box.lab.test"
+SERVER_PORT = "48151"
+SERVER_ADDRESS = f"http://{SERVER_HOST}:{SERVER_PORT}"
+CHECK_OK = "model server: cell-classes-v2 is served on cuda, identity b1160edae7dd+2df8feb4070d"
+
+
+def _server(stub: StubDetector | None = None) -> FakeModelServer:
+    """A model server for ``cell-classes-v2``: the real card's identity, a stub that says cuda."""
+    card = model_card(DEFAULT_MODEL_NAME)
+    model = stub_model(
+        stub or StubDetector(SCRIPT, device="cuda"),
+        name=card.name,
+        weights_sha256=card.weights_sha256,
+        preprocessing=card.preprocessing,
+    )
+    return FakeModelServer({card.name: model}, address=SERVER_ADDRESS)
+
+
+def _run_served(
+    microscope: Microscope,
+    tmp_path: Path,
+    fake: FakeModelServer,
+    monkeypatch: pytest.MonkeyPatch,
+    **kwargs: Any,
+) -> StageRecord:
+    """``cells`` through the real ``load_model`` with the variable set: no model path, no device."""
+    fake.install(monkeypatch)
+    return _run(microscope, tmp_path, model_path=None, device="auto", **kwargs)
+
+
+def _detect_calls(fake: FakeModelServer) -> list[ServedCall]:
+    return [c for c in fake.calls if c.path == "/detect/process"]
+
+
+def _local_standin(monkeypatch: pytest.MonkeyPatch, stub: StubDetector) -> None:
+    """A stand-in for the local ``load_model`` whose identity is the card's, as a real local load's is."""
+
+    def load(card: ModelCard, **kwargs: Any) -> ResolvedModel:
+        return stub_model(
+            stub,
+            name=card.name,
+            weights_sha256=card.weights_sha256,
+            preprocessing=kwargs["preprocessing"],
+        )
+
+    monkeypatch.setattr(plugin_mod, "load_model", load)
+
+
+def test_cells_with_a_server_set_records_the_served_model_and_finds_what_the_local_stub_finds(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    card = model_card(DEFAULT_MODEL_NAME)
+    served_dir, local_dir = tmp_path / "served", tmp_path / "local"
+    _seed_scan(served_dir)
+    _seed_scan(local_dir)
+    fake = _server()
+
+    record = _run_served(demo_microscope, served_dir, fake, monkeypatch)
+
+    result = _result(record)
+    assert result.model == "cell-classes-v2"
+    assert result.model_runs_on == "served"
+    assert result.model_identity == model_identity(
+        card.weights_sha256, card.preprocessing
+    )
+    assert result.model_sha256 == card.weights_sha256
+    # The server's device, as it said it, and never `auto`.
+    assert result.device == "cuda"
+    assert len(_detect_calls(fake)) == 4
+    assert all(
+        set(c.body) == {"model", "image", "pixel_size_um"} for c in fake.calls[1:]
+    )
+    assert [int(c.frame[0, 0]) for c in _detect_calls(fake)] == [0, 1, 2, 3]  # type: ignore[index]
+
+    # The same counts and the same cells as the local stub finds on the same scan.
+    _local_standin(monkeypatch, StubDetector(SCRIPT))
+    local = _run(demo_microscope, local_dir, model_path=None, device="auto")
+    assert _result(local).counts == result.counts
+    assert {
+        (c.well, c.label, c.frame, c.x_um, c.y_um) for c in _cells(local_dir, local)
+    } == {
+        (c.well, c.label, c.frame, c.x_um, c.y_um) for c in _cells(served_dir, record)
+    }
+
+
+def _everything_in(folder: Path) -> list[tuple[Path, bytes]]:
+    files = [(p, p.read_bytes()) for p in sorted(folder.rglob("*")) if p.is_file()]
+    assert len(files) > 3, "the run folder holds nothing to search"
+    return files
+
+
+@pytest.mark.parametrize(
+    "scenario", ["done", "absent", "timeout", "fail_next", "identity"]
+)
+def test_the_address_is_nowhere_in_the_run_folder(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    # A failed stage keeps its diagnosis in the run folder, and run documents are
+    # attached to issues: the host and the port must not be in any byte of it (FM-50).
+    _seed_scan(tmp_path)
+    fake = _server()
+    if scenario == "absent":
+        fake.absent = True
+    elif scenario == "timeout":
+        fake.latency_s = 5.0
+        monkeypatch.setenv("SMC_MODEL_TIMEOUT_S", "1")
+    elif scenario == "fail_next":
+        # The check's own call would use it up (and the stage would go on, the
+        # check not refusing): it is the first frame's call that fails.
+        armed = [True]
+
+        def fail_the_first_frame(call: ServedCall) -> None:
+            if call.path == "/detect/process" and armed:
+                armed.clear()
+                fake.fail_next = 1
+
+        fake.on_call = fail_the_first_frame
+    elif scenario == "identity":
+        fake.identity_override = f"{'f' * 64}+{'e' * 64}"
+
+    if scenario == "done":
+        record = _run_served(demo_microscope, tmp_path, fake, monkeypatch)
+        assert record.status is StageStatus.done
+    else:
+        with pytest.raises(PluginRunError):
+            _run_served(demo_microscope, tmp_path, fake, monkeypatch)
+        assert _stored(tmp_path).status is StageStatus.failed
+
+    for path, data in _everything_in(tmp_path):
+        assert SERVER_HOST.encode() not in data, path
+        assert SERVER_PORT.encode() not in data, path
+    # The failed ones did say what failed.
+    if scenario != "done":
+        assert _stored(tmp_path).error
+
+
+def test_cells_with_the_server_absent_ends_failed_with_its_diagnosis_at_the_first_frame(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    fake = _server()
+    fake.absent = True
+    shown: list[Progress] = []
+
+    with pytest.raises(PluginRunError) as caught:
+        _run_served(
+            demo_microscope, tmp_path, fake, monkeypatch, on_progress=shown.append
+        )
+
+    assert "does not answer" in caught.value.reason
+    assert isinstance(caught.value.__cause__, ModelError)
+    assert _stored(tmp_path).status is StageStatus.failed
+    # The reason was on the screen before the first frame was read.
+    assert shown[0].done == 0
+    assert "does not answer" in shown[0].message
+    assert [p.done for p in shown] == [0]
+    # The server never saw a frame, and no cell was invented for the failure.
+    assert fake.calls == []
+    assert not (tmp_path / "cells").exists() or not list(
+        (tmp_path / "cells").glob("*.json")
+    )
+
+
+def test_a_server_that_dies_in_the_second_well_fails_the_stage_and_a_resume_goes_on_from_the_first(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    fake = _server()
+
+    def die_on_the_third_frame(call: ServedCall) -> None:
+        if call.path == "/detect/process" and len(_detect_calls(fake)) == 3:
+            fake.absent = True
+
+    fake.on_call = die_on_the_third_frame
+    with pytest.raises(PluginRunError) as caught:
+        _run_served(demo_microscope, tmp_path, fake, monkeypatch)
+
+    assert "does not answer" in caught.value.reason
+    failed = _stored(tmp_path)
+    assert failed.status is StageStatus.failed
+    assert failed.checkpoint is not None
+    assert failed.checkpoint["wells_done"] == ["A1"]
+    assert failed.checkpoint["runs_on"] == "served"
+    before = len(fake.calls)
+
+    fake.absent = False
+    fake.on_call = None
+    record = _run(
+        demo_microscope, tmp_path, model_path=None, device="auto", resume=True
+    )
+
+    # Only A2's frames were sent again, and the cells are those of an uninterrupted run.
+    resent = [int(c.frame[0, 0]) for c in _detect_calls_after(fake, before)]  # type: ignore[index]
+    assert resent == [2, 3]
+    assert {(c.well, c.label, c.frame) for c in _cells(tmp_path, record)} == {
+        ("A1", "doublet", 0),
+        ("A1", "single", 1),
+        ("A2", "doublet", 2),
+        ("A2", "single", 3),
+    }
+    result = _result(record)
+    assert result.model_runs_on == "served"
+    assert result.merged == 2
+    # One place for the whole run: no line about two.
+    assert not [line for line in result.assumed if "earlier attempt" in line]
+
+
+def _detect_calls_after(fake: FakeModelServer, count: int) -> list[ServedCall]:
+    return [c for c in fake.calls[count:] if c.path == "/detect/process"]
+
+
+def test_the_start_of_the_stage_reports_the_check(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed_scan(tmp_path)
+    shown: list[Progress] = []
+    caplog.set_level(logging.INFO, logger=LOGGER)
+
+    _run_served(
+        demo_microscope, tmp_path, _server(), monkeypatch, on_progress=shown.append
+    )
+
+    assert (shown[0].done, shown[0].total, shown[0].message) == (0, 4, CHECK_OK)
+    assert [p.done for p in shown] == [0, 1, 2, 3, 4]
+    ours = [
+        r for r in caplog.records if r.name == LOGGER and r.getMessage() == CHECK_OK
+    ]
+    assert [r.levelno for r in ours] == [logging.INFO]
+
+
+def test_the_start_of_the_stage_warns_when_the_check_is_not_ok(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed_scan(tmp_path)
+    fake = _server()
+    fake.hidden = {DEFAULT_MODEL_NAME}
+    caplog.set_level(logging.INFO, logger=LOGGER)
+
+    with pytest.raises(PluginRunError):
+        _run_served(demo_microscope, tmp_path, fake, monkeypatch)
+
+    warned = [r for r in caplog.records if r.name == LOGGER]
+    assert [r.levelno for r in warned] == [logging.WARNING]
+    assert "does not serve cell-classes-v2" in warned[0].getMessage()
+
+
+def test_a_served_run_says_its_timings_in_assumed(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    # Four detects: the first lasts 2.31 s, the next three 0.10, 0.20 and 0.30 s: their
+    # mean is 0.20, which the maximum (0.30), the minimum (0.10) and the last (0.30) are not.
+    ticks = iter([0.0, 2.31, 10.0, 10.10, 20.0, 20.20, 30.0, 30.30])
+    monkeypatch.setattr(
+        plugin_mod, "time", SimpleNamespace(perf_counter=lambda: next(ticks))
+    )
+
+    record = _run_served(demo_microscope, tmp_path, _server(), monkeypatch)
+
+    assert (
+        "the model ran on the server: the first frame took 2.31 s and the next 3 "
+        "frames 0.20 s on average, network included (the first can carry the "
+        "server's start-up work); the server's device was cuda"
+    ) in _result(record).assumed
+
+
+def test_a_served_run_of_one_frame_says_only_its_first(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path, frames=[("A1", 0.0)])
+    ticks = iter([0.0, 2.31])
+    monkeypatch.setattr(
+        plugin_mod, "time", SimpleNamespace(perf_counter=lambda: next(ticks))
+    )
+
+    record = _run_served(demo_microscope, tmp_path, _server(), monkeypatch)
+
+    assert (
+        "the model ran on the server: the first frame took 2.31 s, network included "
+        "(the first can carry the server's start-up work); the server's device was cuda"
+    ) in _result(record).assumed
+
+
+def test_a_local_run_says_nothing_of_a_server(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _install(monkeypatch, StubDetector(SCRIPT))
+
+    record = _run(demo_microscope, tmp_path)
+
+    assert not [
+        line
+        for line in _result(record).assumed
+        if "server" in line or "earlier attempt" in line
+    ]
+
+
+def _stopped_served_in_the_second_well(
+    microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> StageRecord:
+    """The first attempt of ``TWO_WELLS`` on a server: A1 done, stopped on the first frame of A2."""
+    stop = threading.Event()
+    fake = _server(StubDetector(SCRIPT, device="cuda", on_frame=_stopping_at(2, stop)))
+    return _run_served(microscope, tmp_path, fake, monkeypatch, stop=stop)
+
+
+def test_a_resume_on_another_place_says_so_in_assumed(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    stopped = _stopped_served_in_the_second_well(demo_microscope, tmp_path, monkeypatch)
+    assert stopped.checkpoint is not None
+    assert stopped.checkpoint["runs_on"] == "served"
+    # The operator goes local (the server is gone): a resume is not refused for it.
+    monkeypatch.delenv("SMC_MODEL_SERVER")
+    local = StubDetector(SCRIPT)
+    _local_standin(monkeypatch, local)
+
+    record = _run(
+        demo_microscope, tmp_path, model_path=None, device="auto", resume=True
+    )
+
+    result = _result(record)
+    assert local.seen == [2, 3]
+    assert result.model_runs_on == "local:cpu"
+    assert (
+        "2 of 4 frames were detected by an earlier attempt that ran on served; "
+        "the others ran on local:cpu"
+    ) in result.assumed
+    assert {(c.well, c.label) for c in _cells(tmp_path, record)} == {
+        ("A1", "doublet"),
+        ("A1", "single"),
+        ("A2", "doublet"),
+        ("A2", "single"),
+    }
+
+
+def test_a_third_attempt_still_knows_the_first_wells_were_not_detected_where_it_runs(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Served for A1, local for A2, then local again: a checkpoint that kept only the
+    # last place would say the first well was detected here.
+    frames = [("A1", 0.0), ("A2", 0.0), ("A3", 0.0)]
+    script = {0: [OWN], 1: [OWN], 2: [OWN]}
+    _seed_scan(tmp_path, frames)
+    stop = threading.Event()
+    fake = _server(StubDetector(script, device="cuda", on_frame=_stopping_at(0, stop)))
+    _run_served(demo_microscope, tmp_path, fake, monkeypatch, stop=stop)
+    assert _stored(tmp_path).checkpoint["wells_done"] == ["A1"]  # type: ignore[index]
+
+    monkeypatch.delenv("SMC_MODEL_SERVER")
+    stop = threading.Event()
+    _local_standin(monkeypatch, StubDetector(script, on_frame=_stopping_at(1, stop)))
+    second = _run(
+        demo_microscope,
+        tmp_path,
+        model_path=None,
+        device="auto",
+        resume=True,
+        stop=stop,
+    )
+    assert second.checkpoint is not None
+    assert second.checkpoint["wells_done"] == ["A1", "A2"]
+    assert second.checkpoint["runs_on"] == "served+local:cpu"
+
+    _local_standin(monkeypatch, StubDetector(script))
+    third = _run(demo_microscope, tmp_path, model_path=None, device="auto", resume=True)
+
+    assert (
+        "2 of 3 frames were detected by an earlier attempt that ran on "
+        "served+local:cpu; the others ran on local:cpu"
+    ) in _result(third).assumed
+
+
+def test_a_checkpoint_without_runs_on_still_resumes(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A checkpoint saved before #685 has no ``runs_on``: it loads, and a resume says nothing of places."""
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    stopped = _stop_in_the_second_well(demo_microscope, tmp_path, monkeypatch)
+    assert stopped.checkpoint is not None
+    older = {k: v for k, v in stopped.checkpoint.items() if k != "runs_on"}
+    assert "runs_on" in stopped.checkpoint
+    write_stage(tmp_path / "run.json", stopped.model_copy(update={"checkpoint": older}))
+    counting = StubDetector(SCRIPT)
+    _install(monkeypatch, counting)
+
+    record = _run(demo_microscope, tmp_path, resume=True)
+
+    assert counting.seen == [2, 3]
+    assert not [line for line in _result(record).assumed if "earlier attempt" in line]
+
+
+def test_model_path_and_a_device_with_a_server_set_are_plugin_run_errors_with_the_servers_words(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    fake = _server()
+    fake.install(monkeypatch)
+
+    with pytest.raises(PluginRunError) as with_path:
+        _run(demo_microscope, tmp_path, model_path=tmp_path / "w.pth", device="auto")
+    with pytest.raises(PluginRunError) as with_device:
+        _run(demo_microscope, tmp_path, model_path=None, device="cuda")
+    with pytest.raises(PluginRunError) as with_rule:
+        _run(
+            demo_microscope,
+            tmp_path,
+            model_path=None,
+            device="auto",
+            low_percentile=1.0,
+        )
+
+    assert "model_path names a file on this PC" in with_path.value.reason
+    assert "device=cuda is for a model that runs on this PC" in with_device.value.reason
+    assert "the server runs the card's pre-processing" in with_rule.value.reason
+    assert isinstance(with_path.value.__cause__, ModelError)
+    assert fake.calls == []
+
+
+def test_a_model_error_during_detect_is_a_plugin_run_error_with_its_text(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+
+    def fall_over(position: int) -> None:
+        if position == 2:
+            raise ModelError("the model fell over on this frame")
+
+    _install(monkeypatch, StubDetector(SCRIPT, on_frame=fall_over))
+
+    with pytest.raises(PluginRunError) as caught:
+        _run(demo_microscope, tmp_path)
+
+    assert caught.value.reason == "the model fell over on this frame"
+    assert isinstance(caught.value.__cause__, ModelError)
+    failed = _stored(tmp_path)
+    assert failed.status is StageStatus.failed
+    # The wells done before it are kept.
+    assert failed.checkpoint is not None
+    assert failed.checkpoint["wells_done"] == ["A1"]

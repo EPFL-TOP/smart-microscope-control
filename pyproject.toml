@@ -72,6 +72,11 @@ dev = [
 ]
 # Cell detection (m3 §9): the trained Faster R-CNN; imported only inside TorchDetector.
 detect = ["torch>=2.2", "torchvision>=0.17"]
+# The model server (inference.md §8, ADR-0011): `smc serve-models` on the GPU machine. It is the
+# server's extra, not the acquisition PC's: the client of a served model is the standard library,
+# numpy and tifffile. The `detect` lines written out (a test compares them), and the kit pinned
+# exactly: the lab runs 0.0.12 and its wire was read from that version.
+serve = ["torch>=2.2", "torchvision>=0.17", "imaging-server-kit==0.0.12"]
 # Zeiss stands reached through Zeiss MTB 2011 (.NET) — Windows only.
 zeiss = ["pythonnet>=3.0; sys_platform == 'win32'"]
 # The plate page (m3 §15, ADR-0006): Panel on Bokeh; imported only by `smc.ui.plate_page`.
@@ -209,6 +214,14 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["torch", "torch.*", "torchvision", "torchvision.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+# The model server's libraries are the `serve` extra, untyped or absent in `lint & types`
+# (`.[dev]` only): without the skip, the kit's untyped calls are errors with it installed and
+# an import-not-found without it, as torch's (inference.md §8.2).
+[[tool.mypy.overrides]]
+module = ["imaging_server_kit", "imaging_server_kit.*", "uvicorn", "uvicorn.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
