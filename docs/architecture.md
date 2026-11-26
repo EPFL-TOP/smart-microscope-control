@@ -125,5 +125,7 @@ Not on `main` when this was written: `src/smc/selection/`, the rest of the
 collaborator's kit (selectors chosen by name, the contract of a selector, the
 offline runs, the dataset's export; designed in
 [`docs/design/algorithms.md`](design/algorithms.md), built by the issues #565
-to #568; its loader, `src/smc/data/`, is built), and a Viventis backend (M6,
-not started).
+to #568; its loader, `src/smc/data/`, is built), `src/smc/analysis/` (the
+analysis track's package, ADR-0010; its first module, the review of fields,
+is designed in [`docs/design/analysis.md`](design/analysis.md)), and a
+Viventis backend (M6, not started).
