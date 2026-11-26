@@ -3782,6 +3782,12 @@ FM-98, FM-129, FM-130, FM-165, FM-215.
 and the in-frame suppression a port of `overlap.py`; the de-duplication
 across fields is new.
 
+**Amended by [inference.md](inference.md) (#684, ADR-0011)**: `detector.py`
+moves to the package `smc.inference` (§9.1's names, unchanged, in its
+modules), and `cells` takes a model by name from a card, records its
+identity and where it ran, and checkpoints that identity (§9.3's step 2,
+checkpoint and result). Where the two documents differ, inference.md holds.
+
 ### 9.0 What was measured (2026-10-27, planning #23)
 
 On `local/models/cell_classes_model-cat-v2.pth` with torch 2.13 and
