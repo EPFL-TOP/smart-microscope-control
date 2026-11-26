@@ -130,6 +130,28 @@ class FocusMap:
         best = min(self._points, key=lambda p: math.hypot(p.x_um - x_um, p.y_um - y_um))
         return best, math.hypot(best.x_um - x_um, best.y_um - y_um)
 
+    def distance_um(self, well: str, x_um: float, y_um: float) -> float:
+        """The distance from ``(x_um, y_um)`` to the nearest locked frame of ``well``, in µm.
+
+        ``z_at`` weights its 4 nearest frames with no bound on how far they
+        lie, so a field in a band the 10x could not lock gets a Z read from
+        frames millimetres away; this is the number that says how far (m3
+        §21.12.2 D22, #688). Only ``well``'s frames are read, as ``z_at``
+        reads them, and no neighbour count is asked: the distance is a fact
+        about the nearest frame.
+
+        Raises:
+            ValueError: A coordinate is not finite, or ``well`` holds no frame.
+        """
+        if not _finite(x_um, y_um):
+            raise ValueError(
+                f"the focus map is read at a point that is not finite: ({x_um!r}, {y_um!r})"
+            )
+        points = self._by_well.get(well, ())
+        if not points:
+            raise ValueError(f"the focus map holds no locked frame in {well}")
+        return min(math.hypot(p.x_um - x_um, p.y_um - y_um) for p in points)
+
 
 def anchor_of(offsets_um: Sequence[float]) -> float | None:
     """A well's anchor: the median of its peaks' offsets from the map; ``None`` without one.

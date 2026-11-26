@@ -120,6 +120,39 @@ def test_nearest_names_the_well_and_the_distance_and_takes_the_first_on_a_tie() 
     assert swapped.nearest(5.0, 0.0) == (_CORNERS[1], 5.0)
 
 
+def test_distance_um_is_to_the_nearest_frame_of_the_well_only() -> None:
+    # C2's frame lies 1 µm from the point, nearer than any of B2's: it is not read
+    # (a wall lies between the wells), so the distance is B2's nearest corner's.
+    other = MapPoint("C2", 6.0, 10.0, 100.0)
+    focus_map = FocusMap((*_CORNERS, other))
+    # (5, 10) is sqrt(5**2 + 10**2) from every corner of the rectangle.
+    assert focus_map.distance_um("B2", 5.0, 10.0) == pytest.approx(
+        math.hypot(5.0, 10.0), abs=1e-12
+    )
+    assert focus_map.distance_um("C2", 5.0, 10.0) == pytest.approx(1.0, abs=1e-12)
+    # On a frame, the distance is 0; x and y are not swapped (FM-73): (0, 20) is
+    # a corner, (20, 0) is 10 µm from (10, 0).
+    assert focus_map.distance_um("B2", 0.0, 20.0) == 0.0
+    assert focus_map.distance_um("B2", 20.0, 0.0) == pytest.approx(10.0, abs=1e-12)
+    # No neighbour count: a well of one frame has a distance, though z_at refuses it.
+    assert FocusMap((other,)).distance_um("C2", 6.0, 13.0) == 3.0
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_distance_um_refuses_a_well_with_no_frame_and_a_point_that_is_not_finite(
+    bad: float,
+) -> None:
+    focus_map = FocusMap(_CORNERS)
+    with pytest.raises(
+        ValueError, match=r"\Athe focus map holds no locked frame in C3\Z"
+    ):
+        focus_map.distance_um("C3", 5.0, 10.0)
+    with pytest.raises(ValueError, match=r"not finite"):
+        focus_map.distance_um("B2", bad, 0.0)
+    with pytest.raises(ValueError, match=r"not finite"):
+        focus_map.distance_um("B2", 0.0, bad)
+
+
 def test_an_empty_map_is_allowed_and_refuses_to_answer() -> None:
     empty = FocusMap(())
     assert empty.count("B2") == 0

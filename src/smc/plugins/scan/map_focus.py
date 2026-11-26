@@ -16,8 +16,14 @@ offset per well, measured at the 40x by a few sweeps near the well's centre.
   jog guard does not reach them).
 * **Nothing drifts from well to well** (D2's point, D18). Every anchor's sweeps
   are centred on the map plus the operator's anchor, never on the previous
-  well's nor on a field's best plane; a well where no sweep finds a peak keeps
-  the operator's anchor, and the result says so.
+  well's nor on a field's best plane.
+* **A flat well keeps the operator's anchor only where the operator focused**
+  (D23). The operator's focus is a measurement in one well, ``start_well``; in
+  any other well the 10x -> 40x difference is not known (it moved by 48 µm
+  between two wells), so the well is not scanned and the scan goes on.
+* **A field far from every locked frame is scanned, and counted** (D22). The
+  map's Z is a weighted mean of frames that may lie millimetres away; the count
+  and the farthest field are said, against a bound that is assumed.
 * **The map is read at the readback** (FM-142), never at the target, and only
   from locked frames (FM-154): the others name no bottom.
 * **A check measures, it does not correct** (D20): a checked field sweeps
@@ -26,17 +32,22 @@ offset per well, measured at the 40x by a few sweeps near the well's centre.
 * **A failed anchor try is not a failed field**: it is recorded with its error,
   a WARNING names it, and the next try runs. A halt, a motion stop and a stop
   pass (FM-64); nothing moves to put something back (FM-88).
+* **Every target is bounded by the Z jog limit from the Z the scan started at**
+  (D19): the moves are absolute, and a peak found at a field lies up to
+  ``focus_range_um`` from the start anchor, so the bound checked before anything
+  moved does not hold for a target, and is checked again at each one.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import statistics
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import ValidationError
 
@@ -46,7 +57,6 @@ from smc.hardware.errors import (
     MicroscopeHaltedError,
     MotionStoppedError,
 )
-from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM
 from smc.plugins.api import RunContext
 from smc.plugins.cell_focus.algorithm import (
     LANDING_FRACTION,
@@ -68,6 +78,7 @@ from smc.plugins.cell_focus.loop import (
     move_checked,
     outside_limits,
     sweep,
+    z_jog_limit_um,
 )
 from smc.plugins.errors import PluginRunError
 from smc.plugins.geometry import fov_of
@@ -92,7 +103,6 @@ __all__ = [
     "MapStep",
     "anchor_well",
     "focus_field",
-    "load_focus_map",
     "prepare_map",
 ]
 
@@ -113,6 +123,8 @@ class MapFocus:
     limits: Limits
     z_start_um: float
     jog_um: float
+    #: The map scan's larger field-of-view side: the bound of D22 (assumed, not measured).
+    fov_side_um: float
     #: The anchors a resumed checkpoint holds, kept as they are (D18).
     resumed: tuple[FocusAnchor, ...] = ()
     #: This attempt's anchors, in scan order.
@@ -121,20 +133,53 @@ class MapFocus:
     planned: int = 0
     planned_lo_um: float | None = None
     planned_hi_um: float | None = None
+    #: D22: the fields left whose nearest locked frame of their well lies beyond
+    #: ``fov_side_um``, the farthest of them (the first in the plan's order on a tie).
+    beyond: int = 0
+    farthest_name: str | None = None
+    farthest_um: float = 0.0
     #: Checked fields whose frame was written, and the distances of their peaks.
     checks: int = 0
     distances_um: list[float] = field(default_factory=list)
     #: Fields whose check sweep would have left the soft limits or the jog limit.
     checks_skipped: int = 0
 
-    def anchor_um(self, well: str) -> float | None:
+    def anchored(self, well: str) -> FocusAnchor | None:
         """The anchor of ``well``, this attempt's or a resumed one; ``None`` before it is measured."""
         if well in self.anchors:
-            return self.anchors[well].anchor_um
+            return self.anchors[well]
         for kept in self.resumed:
             if kept.well == well:
-                return kept.anchor_um
+                return kept
         return None
+
+    def anchor_um(self, well: str) -> float | None:
+        """The offset added to the map in ``well``; ``None`` before it is measured and in a well not scanned (D23)."""
+        found = self.anchored(well)
+        return None if found is None else found.anchor_um
+
+    def not_scanned(self, well: str) -> str | None:
+        """A field's error when ``well`` was anchored ``none`` (D23): it is not scanned; else ``None``."""
+        found = self.anchored(well)
+        if found is None or found.source != "none":
+            return None
+        return (
+            f"MapNotAnchored: no sweep near the centre of {well} found a peak "
+            f"({len(found.tries)} tried), and {_operator_focus(self.use.start_well)}: "
+            "the well was not scanned"
+        )
+
+    def beyond_line(self) -> str | None:
+        """D22's line, for ``assumed`` and the WARNING; ``None`` when no field lies beyond the bound."""
+        if not self.beyond or self.farthest_name is None:
+            return None
+        return (
+            f"{self.beyond} of {self.planned} fields lie more than "
+            f"{self.fov_side_um:.1f} µm from every locked frame of their well, the "
+            f"farthest {self.farthest_name} at {self.farthest_um:.1f} µm: their Z is "
+            "read from frames that far (the bound, the map scan's larger field side, "
+            "is assumed, not measured)"
+        )
 
     def record(self) -> FocusMapUse:
         """The ``focus_map`` of the result and the checkpoint: the resumed anchors first."""
@@ -156,23 +201,27 @@ class MapFocus:
     ) -> list[str]:
         """``assumed``'s lines for the map (m3 §21.12.5), two decimals."""
         start = self.use.start_anchor_um
+        beyond = self.beyond_line()
         if dry_run:
             reach = (
                 f", Z {self.planned_lo_um:.2f}…{self.planned_hi_um:.2f} µm"
                 if self.planned_lo_um is not None and self.planned_hi_um is not None
                 else ""
             )
-            return [
+            planned = [
                 f"dry run: the focus from the map was planned for {self.planned} "
                 f"fields{reach} with the operator's anchor {start:.2f} µm, not run"
             ]
+            return planned if beyond is None else [*planned, beyond]
         lines = [
             f"the focus came from the map in {self.use.run_doc}, scanned "
             f"{self.use.measured}: each field's Z is the map's at its XY, from the "
             f"{MAP_NEIGHBOURS} nearest locked frames of its well, plus its well's anchor"
         ]
+        if beyond is not None:
+            lines.append(beyond)
         for anchor in self.anchors.values():
-            lines.append(_anchor_line(anchor))
+            lines.append(_anchor_line(anchor, self.use.start_well))
         anchor_s = sum(a.duration_s for a in self.anchors.values())
         if fields or self.anchors:
             per_field = step_s / fields if fields else 0.0
@@ -195,7 +244,7 @@ class MapFocus:
         within_1 = sum(d <= 1.0 for d in self.distances_um)
         within_2 = sum(d <= 2.0 for d in self.distances_um)
         median = (
-            f", the median distance {_median(self.distances_um):.2f} µm"
+            f", the median distance {statistics.median(self.distances_um):.2f} µm"
             if self.distances_um
             else ""
         )
@@ -206,34 +255,40 @@ class MapFocus:
         )
 
 
-def _median(values: Sequence[float]) -> float:
-    ordered = sorted(values)
-    middle = len(ordered) // 2
-    if len(ordered) % 2:
-        return ordered[middle]
-    return (ordered[middle - 1] + ordered[middle]) / 2.0
+def _operator_focus(start_well: str | None) -> str:
+    """Where the operator focused by eye, for the lines of a well that is not scanned (D23)."""
+    if start_well is None:
+        return "the operator focused in no well of this scan"
+    return f"the operator focused in {start_well}"
 
 
-def _anchor_line(anchor: FocusAnchor) -> str:
+def _anchor_line(anchor: FocusAnchor, start_well: str | None) -> str:
     """A well's line in ``assumed``, the same text as its WARNING when no peak came."""
     tried = len(anchor.tries)
+    offset = anchor.anchor_um
+    if offset is None:
+        # D23: no peak in a well the operator did not focus in.
+        return (
+            f"{anchor.well}: no sweep near its centre found a peak ({tried} tried), "
+            f"and {_operator_focus(start_well)}: the well was not scanned"
+        )
     if anchor.source == "swept":
         peaks = sum(
             t.sweep is not None and t.sweep.outcome == "peak" for t in anchor.tries
         )
         return (
-            f"{anchor.well}: anchored {anchor.anchor_um:.2f} µm from the map by "
+            f"{anchor.well}: anchored {offset:.2f} µm from the map by "
             f"{peaks} peaks of {tried} sweeps near its centre"
         )
     return (
         f"{anchor.well}: no sweep near its centre found a peak ({tried} tried): the "
-        f"operator's focus anchors it, {anchor.anchor_um:.2f} µm from the map"
+        f"operator's focus anchors it, {offset:.2f} µm from the map"
     )
 
 
 @dataclass(frozen=True)
 class _Loaded:
-    """What ``load_focus_map`` reads, with the names of the frames for the start's refusal."""
+    """What ``_read_map`` reads, with the names of the frames for the start's refusal."""
 
     focus_map: FocusMap
     use: FocusMapUse
@@ -244,7 +299,23 @@ class _Loaded:
 def _read_map(
     path: Path, *, profile: str, dry_run: bool, plate_attempt: str | None
 ) -> _Loaded:
-    """``load_focus_map``'s body; the names of the locked frames too, for check 5's text."""
+    """The map in another run document, its record with no anchor, and the larger side of its field.
+
+    Read as ``calibration_from`` reads a calibration (m3 §20.3): the runner's
+    own ``unusable`` decides whether the document's ``scan`` can be used (not
+    ``done``, another profile, a dry run read by a real one, stale), and its
+    result is validated, never trusted. ``path`` is named as typed, with
+    forward slashes (FM-24), and never resolved (FM-50): a relative path is
+    read from the working folder and recorded as typed. ``plate_attempt`` is
+    the attempt of this run document's ``plate`` provider: a map scanned on
+    another registration of the plate is refused, and so is one when either
+    side has none. The record's ``start_anchor_um`` is 0.0: the caller sets it.
+    The names of the locked frames come with it, for check 5's text.
+
+    Raises:
+        PluginRunError: The document cannot be read, holds no usable ``scan``,
+            a result this smc does not read, or a scan of another registration.
+    """
     where = path.as_posix()
     problem: str | None = None
     try:
@@ -306,30 +377,6 @@ def _read_map(
     )
     fov = fov_of(found.matrix_um_per_px, found.image_shape_px)
     return _Loaded(FocusMap(points), use, max(fov), names)
-
-
-def load_focus_map(
-    path: Path, *, profile: str, dry_run: bool, plate_attempt: str | None
-) -> tuple[FocusMap, FocusMapUse, float]:
-    """The map in another run document, its record with no anchor, and the larger side of its field.
-
-    Read as ``calibration_from`` reads a calibration (m3 §20.3): the runner's
-    own ``unusable`` decides whether the document's ``scan`` can be used (not
-    ``done``, another profile, a dry run read by a real one, stale), and its
-    result is validated, never trusted. ``path`` is named as typed, with
-    forward slashes (FM-24), and never resolved (FM-50). ``plate_attempt`` is
-    the attempt of this run document's ``plate`` provider: a map scanned on
-    another registration of the plate is refused, and so is one when either
-    side has none. The record's ``start_anchor_um`` is 0.0: the caller sets it.
-
-    Raises:
-        PluginRunError: The document cannot be read, holds no usable ``scan``,
-            a result this smc does not read, or a scan of another registration.
-    """
-    loaded = _read_map(
-        path, profile=profile, dry_run=dry_run, plate_attempt=plate_attempt
-    )
-    return loaded.focus_map, loaded.use, loaded.fov_side_um
 
 
 def prepare_map(
@@ -398,23 +445,30 @@ def prepare_map(
         # focus_range_um from the operator's focus, and an anchor read from it
         # would centre every later well's sweeps there (#623's review).
         start_anchor = resumed.start_anchor_um
+        start_well = resumed.start_well
     elif groups:
-        start_anchor = _start_anchor(xy, loaded, z_start, where)
+        start_anchor, start_well = _start_anchor(xy, loaded, z_start, where)
     else:
-        # Every well was done by an earlier attempt: nothing is read, nothing moves.
-        start_anchor = 0.0
-    configured = microscope.profile.safety.max_z_jog_um
-    jog_um = DEFAULT_MAX_Z_JOG_UM if configured is None else float(configured)
+        # Every well was done by an earlier attempt: nothing is read, nothing
+        # moves, and no well is the operator's.
+        start_anchor, start_well = 0.0, None
     state = MapFocus(
         focus_map=focus_map,
-        use=loaded.use.model_copy(update={"start_anchor_um": start_anchor}),
+        use=loaded.use.model_copy(
+            update={"start_anchor_um": start_anchor, "start_well": start_well}
+        ),
         limits=bounds.limits,
         z_start_um=z_start,
-        jog_um=jog_um,
+        jog_um=z_jog_limit_um(microscope),
+        fov_side_um=loaded.fov_side_um,
         resumed=kept,
     )
-    # 6. D19: every field's reach, its anchor's sweeps and its target.
+    # 6. D19: every field's reach, its anchor's sweeps and its target; and D22's
+    # count of the fields far from every locked frame of their well.
     _check_reach(state, groups, params.focus_range_um)
+    line = state.beyond_line()
+    if line is not None:
+        _LOG.warning("%s", line)
     return state
 
 
@@ -424,8 +478,14 @@ def _um(value: float) -> str:
     return "0.0" if text == "-0.0" else text
 
 
-def _start_anchor(xy: XYStage, loaded: _Loaded, z_start: float, where: str) -> float:
-    """Check 5: the operator focused inside a mapped well; ``z_start`` minus the map there.
+def _start_anchor(
+    xy: XYStage, loaded: _Loaded, z_start: float, where: str
+) -> tuple[float, str]:
+    """Check 5: the operator focused inside a mapped well; ``z_start`` minus the map there, and that well.
+
+    The well is the one of the map's locked frame nearest the stage, whether or
+    not the plan holds it: it is the only well where a flat anchor keeps the
+    operator's anchor (D23).
 
     Raises:
         PluginRunError: The XY read is not finite, the map's nearest locked frame
@@ -456,7 +516,7 @@ def _start_anchor(xy: XYStage, loaded: _Loaded, z_start: float, where: str) -> f
             f"{name} in {point.well}, and the focus map in {where} holds {count} "
             f"locked frames there, fewer than {MAP_NEIGHBOURS}: {_FOCUS_INSIDE}",
         )
-    return z_start - loaded.focus_map.z_at(point.well, x0, y0)
+    return z_start - loaded.focus_map.z_at(point.well, x0, y0), point.well
 
 
 def _check_reach(
@@ -470,6 +530,10 @@ def _check_reach(
     absolute, so the layer's Z jog guard does not reach them (D3): the plugin
     bounds them by the same number, from the Z the scan starts at. The targets'
     span is kept for the dry run's line.
+
+    Each field's distance to the nearest locked frame of its well is counted
+    against the map scan's larger field side (D22): a field beyond it is
+    scanned, and the count and the farthest are said, not refused.
 
     Raises:
         PluginRunError: A field's reach leaves the soft limits or the jog bound.
@@ -496,6 +560,14 @@ def _check_reach(
                     f"{planned.name}, {distance:.2f} µm from the Z the scan starts "
                     f"at, beyond the Z jog limit of {state.jog_um:g} µm",
                 )
+            # At the planned XY, not the readback: it is a count made before
+            # anything moves, and the difference is a landing tolerance against a
+            # bound of a field side.
+            gap = state.focus_map.distance_um(well, planned.x_um, planned.y_um)
+            if gap > state.fov_side_um:
+                state.beyond += 1
+                if state.farthest_name is None or gap > state.farthest_um:
+                    state.farthest_name, state.farthest_um = planned.name, gap
             state.planned += 1
             state.planned_lo_um = (
                 centre
@@ -529,10 +601,17 @@ def anchor_well(
     Up to ``ANCHOR_TRIES`` of the well's planned fields nearest its centre, each
     swept around the map there plus the operator's anchor, until
     ``ANCHOR_PEAKS`` find a peak; the anchor is the median of their offsets
-    from the map, or the operator's when none does. ``ctx.progress`` keeps the
-    fields' count. The tries' frames are neither written nor shown.
+    from the map. When none does, the operator's anchor in the well the operator
+    focused in (``source="start"``), and none in any other well
+    (``source="none"``, D23: the well is not scanned), unless no try ran a
+    sweep at all: that is a stand that failed, not a well without a peak.
+    ``ctx.progress`` keeps the fields' count. The tries' frames are neither
+    written nor shown.
 
     Raises:
+        PluginRunError: No try ran a sweep in a well the operator did not focus
+            in (every try ended in an error): the scan ends, and a resume anchors
+            the well again.
         MicroscopeHaltedError, MotionStoppedError, StopRequested: Passed (FM-64);
             Z stays where it was read last (FM-88).
     """
@@ -563,15 +642,36 @@ def anchor_well(
             if len(offsets) >= ANCHOR_PEAKS:
                 break
     found = anchor_of(offsets)
+    source: Literal["swept", "start", "none"]
+    if found is not None:
+        source, anchor_um = "swept", found
+    elif well == state.use.start_well:
+        # The operator's focus is a measurement in this well (D23).
+        source, anchor_um = "start", state.use.start_anchor_um
+    else:
+        if tries and all(t.sweep is None for t in tries):
+            # No sweep ran at all: the stage, the camera or the Z drive failed in
+            # every try, which is not "no peak". Not scanning the well would turn a
+            # dead stage into a scan that ends ``done`` (the backstop of
+            # ``max_failed_in_row`` does not count these fields), so the scan ends
+            # and a resume anchors the well again (#688's review, FM-277).
+            raise PluginRunError(
+                _NAME,
+                f"the anchor of {well} could not be measured: none of its "
+                f"{len(tries)} tries ran a sweep (the first: {tries[0].error}): check "
+                "the stage and the camera, then run scan --resume",
+            )
+        # Not in this one: the 10x -> 40x difference is not known here.
+        source, anchor_um = "none", None
     anchor = FocusAnchor(
         well=well,
-        source="start" if found is None else "swept",
-        anchor_um=state.use.start_anchor_um if found is None else found,
+        source=source,
+        anchor_um=anchor_um,
         tries=tuple(tries),
         duration_s=time.perf_counter() - started,
     )
     if found is None:
-        _LOG.warning("%s", _anchor_line(anchor))
+        _LOG.warning("%s", _anchor_line(anchor, state.use.start_well))
     state.anchors[well] = anchor
     return anchor
 
@@ -589,9 +689,10 @@ def _anchor_try(
 ) -> tuple[AnchorTry, float | None]:
     """One try: §8's move and landing, the map at the readback, the sweep; its record and offset.
 
-    A landing off target, a plane outside the limits, ``FocusDriveOffTarget``
-    or a ``HardwareError`` end the try with its error; the offset is ``None``
-    unless the sweep found a peak.
+    A landing off target, a plane outside the soft limits or beyond the Z jog
+    limit, ``FocusDriveOffTarget`` or a ``HardwareError`` end the try with its
+    error, and Z makes no move for a try that ends before its sweep; the offset
+    is ``None`` unless the sweep found a peak.
     """
     readback: XY | None = None
     map_z: float | None = None
@@ -616,8 +717,14 @@ def _anchor_try(
             centre = map_z + state.use.start_anchor_um
             planes = plan_planes(centre, params.focus_range_um, params.focus_step_um)
             refusal = outside_limits(centre, planes, state.limits)
+            # D19 (#688): the plane's distance from the Z the scan started at, as
+            # the field's target is bounded; the moves are absolute, and this
+            # centre is the map at the readback, not at the planned XY check 6 read.
+            beyond = _beyond_jog(state, "the anchor sweep", centre, planes)
             if refusal is not None:
                 error = f"SweepOutsideLimits: {refusal}"
+            elif beyond is not None:
+                error = f"SweepBeyondJog: {beyond}"
             else:
                 readbacks, scores = sweep(
                     z,
@@ -700,6 +807,16 @@ def focus_field(
             f"MapOutsideLimits: the focus from the map at {planned.name} is "
             f"{target:.2f} µm, outside the soft limits [{low:g}, {high:g}] µm"
         )
+    # D19 (#688): the peak an anchor found lies up to focus_range_um from the
+    # start anchor, and the map is read at the readback, not at the planned XY
+    # check 6 read: a target can pass that bound and fail this one.
+    distance = abs(target - state.z_start_um)
+    if not distance <= state.jog_um:
+        return (
+            f"MapBeyondJog: the focus from the map at {planned.name} is "
+            f"{target:.2f} µm, {distance:.2f} µm from the Z the scan starts at, "
+            f"beyond the Z jog limit of {state.jog_um:g} µm"
+        )
     started = time.perf_counter()
     tolerance_um = LANDING_FRACTION * params.focus_step_um
     move_checked(z, target, tolerance_um, wait_s=ctx.wait_s)
@@ -708,7 +825,7 @@ def focus_field(
     if every > 0 and planned.index % every == 0:
         planes = plan_planes(target, params.focus_range_um, params.focus_step_um)
         refusal = outside_limits(target, planes, state.limits) or _beyond_jog(
-            state, target, planes
+            state, "the check sweep", target, planes
         )
         if refusal is not None:
             # The frame is still the map's: a check that cannot be made is said.
@@ -738,13 +855,19 @@ def focus_field(
     return MapStep(started, check, map_z, anchor)
 
 
-def _beyond_jog(state: MapFocus, target: float, planes: Sequence[float]) -> str | None:
-    """The refusal of a check sweep with a plane beyond the jog bound from ``z_start`` (D3), or ``None``."""
+def _beyond_jog(
+    state: MapFocus, subject: str, centre: float, planes: Sequence[float]
+) -> str | None:
+    """The refusal of a sweep with a plane beyond the jog bound from ``z_start`` (D3), or ``None``.
+
+    ``subject`` names the sweep in the text (``the check sweep``, ``the anchor
+    sweep``); ``centre`` is the Z it is centred on.
+    """
     for plane in planes:
         distance = abs(plane - state.z_start_um)
         if not distance <= state.jog_um:
             return (
-                f"the check sweep around {target:.2f} µm would reach {plane:.2f} µm, "
+                f"{subject} around {centre:.2f} µm would reach {plane:.2f} µm, "
                 f"{distance:.2f} µm from the Z the scan starts at, beyond the Z jog "
                 f"limit of {state.jog_um:g} µm"
             )

@@ -271,11 +271,21 @@ _FOCUS_ANCHOR: dict[str, Any] = {
     "tries": [_ANCHOR_TRY, _ANCHOR_TRY_FAILED],
     "duration_s": 17.5,
 }
+#: A well the operator did not focus in, whose sweeps found no peak (m3 §21.12.2
+#: D23, #688): not scanned, so it has no anchor.
+_FOCUS_ANCHOR_NONE: dict[str, Any] = {
+    "well": "C3",
+    "source": "none",
+    "anchor_um": None,
+    "tries": [_ANCHOR_TRY_FAILED, _ANCHOR_TRY_UNMOVED],
+    "duration_s": 3.5,
+}
 _FOCUS_MAP_USE: dict[str, Any] = {
     "run_doc": "C:/runs/2026-11-24/run-10x.json",
     "scan_attempt": "b50d0123abcd",
     "measured": "2026-11-24T13:40:05+00:00",
     "start_anchor_um": -81.75,
+    "start_well": "B4",
     "anchors": [
         _FOCUS_ANCHOR,
         {
@@ -592,11 +602,12 @@ SAMPLES: dict[type[BaseModel], Sample] = {
         {**_FIELD_FOCUS, "source": "well", "sweep": None},
     ),
     AnchorTry: (_ANCHOR_TRY, _ANCHOR_TRY_UNMOVED),
-    FocusAnchor: (
-        _FOCUS_ANCHOR,
-        {**_FOCUS_ANCHOR, "source": "start", "tries": [], "duration_s": 0.0},
+    FocusAnchor: (_FOCUS_ANCHOR, _FOCUS_ANCHOR_NONE),
+    FocusMapUse: (
+        _FOCUS_MAP_USE,
+        # A checkpoint written before #688 holds no start_well.
+        {**_FOCUS_MAP_USE, "anchors": [_FOCUS_ANCHOR_NONE], "start_well": None},
     ),
-    FocusMapUse: (_FOCUS_MAP_USE, {**_FOCUS_MAP_USE, "anchors": []}),
     CellFocusResult: (
         _CELL_FOCUS,
         {
@@ -1492,6 +1503,51 @@ def test_a_swept_anchor_needs_a_peak_and_a_start_anchor_none() -> None:
     assert _error_types(FocusAnchor, {**_FOCUS_ANCHOR, "source": "start"}) == [
         "value_error"
     ]
+    # A well that is not scanned holds no peak either (D23, #688).
+    assert _error_types(
+        FocusAnchor, {**_FOCUS_ANCHOR, "source": "none", "anchor_um": None}
+    ) == ["value_error"]
+
+
+def test_an_anchor_is_none_exactly_when_its_well_is_not_scanned() -> None:
+    # m3 §21.12.4 (#688): source "none" is the well no sweep anchored and the
+    # operator did not focus in; it has no anchor, and the other two always do.
+    none = FocusAnchor.model_validate(_FOCUS_ANCHOR_NONE)
+    assert (none.source, none.anchor_um) == ("none", None)
+    assert FocusAnchor.model_validate(none.model_dump(mode="json")) == none
+    # "none" with a float anchor is refused, and so are "start" and "swept" with None.
+    assert _error_types(FocusAnchor, {**_FOCUS_ANCHOR_NONE, "anchor_um": -81.75}) == [
+        "value_error"
+    ]
+    for source, tries in (
+        ("start", _FOCUS_ANCHOR_NONE["tries"]),
+        ("swept", _FOCUS_ANCHOR["tries"]),
+    ):
+        refused = {
+            **_FOCUS_ANCHOR_NONE,
+            "source": source,
+            "tries": tries,
+            "anchor_um": None,
+        }
+        assert _error_types(FocusAnchor, refused) == ["value_error"]
+    # A "none" anchor with a try that found a peak is a contradiction: it would
+    # have been "swept".
+    peak = {**_FOCUS_ANCHOR_NONE, "tries": _FOCUS_ANCHOR["tries"]}
+    assert _error_types(FocusAnchor, peak) == ["value_error"]
+
+
+def test_a_focus_map_use_without_a_start_well_is_an_older_checkpoint() -> None:
+    # m3 §21.12.4 (#688): a checkpoint written before start_well existed validates,
+    # and holds None: no well is the operator's, and a flat well there is not scanned.
+    older = {k: v for k, v in _FOCUS_MAP_USE.items() if k != "start_well"}
+    assert FocusMapUse.model_validate(older).start_well is None
+    assert FocusMapUse.model_validate(_FOCUS_MAP_USE).start_well == "B4"
+    assert (
+        FocusMapUse.model_validate(
+            FocusMapUse.model_validate(older).model_dump()
+        ).model_dump(mode="json")["start_well"]
+        is None
+    )
 
 
 def test_a_cell_focus_result_names_one_file_per_plane_or_none() -> None:

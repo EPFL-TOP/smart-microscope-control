@@ -160,25 +160,34 @@ class FocusAnchor(SlotValue):
     """A well's anchor: the offset added to the map's Z at every field of the well.
 
     ``swept``: the median of the peaks' offsets from the map, over the tries
-    near the well's centre; ``start``: no try found a peak, and the operator's
-    focus at the start anchors the well.
+    near the well's centre; ``start``: no try found a peak, in the well the
+    operator focused in (``FocusMapUse.start_well``), so the operator's focus at
+    the start anchors it; ``none``: no try found a peak in any other well,
+    where the 10x -> 40x difference is not known (it moved by 48 µm between
+    two wells, m3 §21.12.1): the well is not scanned (D23, #688), and
+    ``anchor_um`` is ``None``.
     """
 
     well: str
-    source: Literal["swept", "start"]
-    anchor_um: float
+    source: Literal["swept", "start", "none"]
+    anchor_um: float | None
     tries: tuple[AnchorTry, ...]
     duration_s: float = Field(ge=0.0)
 
     @model_validator(mode="after")
-    def _swept_has_a_peak(self) -> FocusAnchor:
+    def _each_source_has_its_peaks_and_its_anchor(self) -> FocusAnchor:
         peaks = sum(
             t.sweep is not None and t.sweep.outcome == "peak" for t in self.tries
         )
         if (peaks > 0) != (self.source == "swept"):
             raise ValueError(
                 f"an anchor of source 'swept' holds a try with a peak and one of "
-                f"'start' none, got source={self.source!r} with {peaks} peaks"
+                f"'start' or 'none' none, got source={self.source!r} with {peaks} peaks"
+            )
+        if (self.anchor_um is None) != (self.source == "none"):
+            raise ValueError(
+                f"anchor_um is None exactly when source is 'none' (the well is not "
+                f"scanned), got source={self.source!r} and anchor_um={self.anchor_um!r}"
             )
         return self
 
@@ -191,7 +200,11 @@ class FocusMapUse(SlotValue):
     unknown time``; ``start_anchor_um`` is ``z_start`` minus the map at the
     start XY, of the attempt that started the scan (a resume keeps it: a stop
     leaves Z on a sweep plane, not at the operator's focus); ``anchors`` are in
-    scan order, a resumed attempt's first.
+    scan order, a resumed attempt's first. ``start_well`` is the well of the map's
+    locked frame nearest the operator's focus (D23, #688): the one well where a
+    flat anchor keeps the start anchor. It is ``None`` when every well was done
+    before the attempt that set the start, and in a checkpoint written before
+    #688: no well is then the operator's, and a flat well there is not scanned.
     """
 
     run_doc: str
@@ -199,6 +212,7 @@ class FocusMapUse(SlotValue):
     measured: str
     start_anchor_um: float
     anchors: tuple[FocusAnchor, ...]
+    start_well: str | None = None
 
 
 class CellFocusResult(PluginResult):
