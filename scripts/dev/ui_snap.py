@@ -85,8 +85,9 @@ STOP_GRACE_S = 25.0
 TERMINATE_GRACE_S = 10.0
 KILL_GRACE_S = 5.0
 
-#: The first four need no chain and are reached on both stands (``expert`` is fourth for
-#: that: m5 §17.8); the next four need the results of a real run of the workflow
+#: The first five need no chain and are reached on both stands (``enlarged`` presses the image's
+#: *Enlarge* after the snap, m5 §24.6, and ``expert`` stays before the chain's states for the
+#: same reason, m5 §17.8); the next four need the results of a real run of the workflow
 #: (``results-all`` presses *Run all that are left* over them, m5 §17.11.4); the next
 #: two are the short-page shots of D12 (m5 §17.2, §17.8), reached alone again, after them; the
 #: last three walk the Wells and Scan screens by their own buttons (m5 §17.10.4, #445), the
@@ -96,7 +97,7 @@ KILL_GRACE_S = 5.0
 #: calibration that failed (m5 §22.2, #625), at the short height, reached alone on both stands;
 #: its failed record replaces the calibration ``stand-620`` seeded, so nothing may come after it
 #: (#658).
-ALONE_STATES = ("empty", "wells-selected", "snap", "expert")
+ALONE_STATES = ("empty", "wells-selected", "snap", "enlarged", "expert")
 CHAIN_STATES = ("after-density", "with-route", "results-all", "turned")
 SHORT_STATES = ("stand-620", "plate-620")
 GUIDED_STATES = ("wells-laid-out", "wells-timed", "scanned")
@@ -178,6 +179,18 @@ RUN_ALL = "Run all that are left"
 OFFSETS_MEASURE = "Measure the offsets"
 FILES_HEADING = "Where the files are"
 DONE_ROW = re.compile(r"^Done \d{4}-\d\d-\d\d")
+#: The image's toggle and its two labels (``smc.ui.image_view.ENLARGE_LABEL`` and ``REDUCE_LABEL``,
+#: which a test pins this to: this script imports nothing of smc at import). The button reads
+#: *Reduce* while the view is enlarged, and its ``bk-active`` class is what ``enlarged`` waits for.
+ENLARGE_LABEL = "Enlarge"
+REDUCE_LABEL = "Reduce"
+#: How close to the viewport's width the enlarged canvas must be to be said to span it, in pixels
+#: (m5 §24.6: 1270 of 1280), the least height it is said to be tall enough at, and how far the
+#: canvas after *Reduce* may be from the one before and still be called the same box. They decide
+#: a word in ``summary.txt``, never an exit code.
+ENLARGED_WIDTH_SLACK_PX = 10.0
+ENLARGED_MIN_HEIGHT_PX = 400.0
+SAME_BOX_TOLERANCE_PX = 1.0
 #: The last control of the drive bar (m5 §17.12 D15): the *Drive* toggle, the lowest of the bar's
 #: controls (the notes under it may be below the fold). Its name starts ``Drive``; nothing else
 #: button-shaped does.
@@ -753,6 +766,9 @@ class Stand:
     #: Whether the stand's camera images a sample: the calibration ``stand-620`` seeds can be
     #: measured only on ``demo-sample`` (the plain demo's frames hold no texture, #658).
     images_sample: bool = True
+    #: The image figure's box before *Enlarge*, which ``enlarged`` gives back after *Reduce*
+    #: (m5 §24.6); ``None`` when the browser gave none.
+    image_box: dict[str, float] | None = None
 
     def _run(self, step: Step) -> StepOutcome:
         return run_step(
@@ -839,6 +855,98 @@ def _act_snap(page: Any, stand: Stand) -> None:
     # The image is beside the map: Snap is always in view, and no screen changes.
     page.get_by_role("button", name="Snap").click()
     page.locator("pre").filter(has_text="snap: ").first.wait_for()
+
+
+def _as_box(value: Any) -> dict[str, float] | None:
+    """A browser's bounding box as four floats, or ``None`` for anything else (a fake page, a part not drawn): never a guess."""
+    keys = ("x", "y", "width", "height")
+    if not isinstance(value, dict) or not all(
+        isinstance(value.get(k), int | float) and not isinstance(value.get(k), bool)
+        for k in keys
+    ):
+        return None
+    return {k: float(value[k]) for k in keys}
+
+
+def _image_box(page: Any) -> dict[str, float] | None:
+    """The box of the image's figure (the last ``.bk-Figure``: the map's is the first), or ``None`` when the browser gives none."""
+    try:
+        return _as_box(page.locator(".bk-Figure").last.bounding_box())
+    except Exception:
+        return None
+
+
+def _box_text(box: dict[str, float] | None) -> str:
+    """A box as ``x 0 to 1280, y 45 to 585 (1280 x 540)``; ``?`` when it is not known."""
+    if box is None:
+        return "?"
+    return (
+        f"x {box['x']:.0f} to {box['x'] + box['width']:.0f}, "
+        f"y {box['y']:.0f} to {box['y'] + box['height']:.0f} "
+        f"({box['width']:.0f} x {box['height']:.0f})"
+    )
+
+
+def _act_enlarged(page: Any, stand: Stand) -> None:
+    """The image's *Enlarge*, and the wait for it: the pressed toggle's button reads *Reduce* and has ``bk-active``.
+
+    The figure's box before is kept on ``stand`` for ``_after_enlarged``, which gives the
+    numbers once the photograph is taken (m5 §24.6): the canvas takes the page's width, a
+    second STOP is in the window, and *Reduce* gives back the box it had.
+    """
+    stand.image_box = _image_box(page)
+    page.get_by_role("button", name=ENLARGE_LABEL, exact=True).click()
+    page.locator("button.bk-active").filter(has_text=REDUCE_LABEL).wait_for()
+
+
+def _after_enlarged(page: Any, stand: Stand) -> list[tuple[str, str]]:
+    """What the enlarged canvas measured, then *Reduce* and what that gave back (m5 §24.6).
+
+    Read while the view is still enlarged (the photograph is taken), then the same toggle
+    puts the page back and the page settles for one tick before the box is read again: the
+    summary says the box after *Reduce* against the one before, so that a canvas that did not
+    come back shows. Words only, never an assertion: a session reads them.
+    """
+    enlarged = _image_box(page)
+    viewport = page.viewport_size
+    words = _box_text(enlarged)
+    if enlarged is not None and isinstance(viewport, dict):
+        spans = enlarged["width"] >= float(viewport["width"]) - ENLARGED_WIDTH_SLACK_PX
+        tall = enlarged["height"] >= ENLARGED_MIN_HEIGHT_PX
+        words += (
+            f"; spans the page's width: {'yes' if spans else 'NO'}"
+            f"; at least {ENLARGED_MIN_HEIGHT_PX:.0f} px high: {'yes' if tall else 'NO'}"
+        )
+    page.get_by_role("button", name=REDUCE_LABEL, exact=True).click()
+    page.locator("button.bk-active").filter(has_text=REDUCE_LABEL).wait_for(
+        state="detached"
+    )
+    page.wait_for_timeout(SETTLE_MS)
+    after = _image_box(page)
+    before = stand.image_box
+    if before is None or after is None:
+        same = "?"
+    else:
+        same = (
+            "yes"
+            if all(abs(before[k] - after[k]) <= SAME_BOX_TOLERANCE_PX for k in before)
+            else "NO"
+        )
+    return [
+        ("canvas before Enlarge", _box_text(before)),
+        ("canvas enlarged", words),
+        ("canvas after Reduce", f"{_box_text(after)}; same box as before: {same}"),
+    ]
+
+
+def _reduce_if_enlarged(page: Any) -> None:
+    """Press *Reduce* when the view is enlarged, so that a state that failed leaves the next ones the page they expect (as ``_after_short`` does for the 620 px page)."""
+    toggle = page.get_by_role("button", name=REDUCE_LABEL, exact=True)
+    if toggle.count():
+        toggle.click()
+        page.locator("button.bk-active").filter(has_text=REDUCE_LABEL).wait_for(
+            state="detached"
+        )
 
 
 def _expert_switch(page: Any) -> Any:
@@ -1121,6 +1229,7 @@ ACTIONS = {
     "empty": _act_empty,
     "wells-selected": _act_wells_selected,
     "snap": _act_snap,
+    "enlarged": _act_enlarged,
     "expert": _act_expert,
     "after-density": _act_after_density,
     "with-route": _act_with_route,
@@ -1134,9 +1243,11 @@ ACTIONS = {
     "stand-failed-620": _act_stand_failed_620,
 }
 
-#: What a state does after its photograph: ``expert`` puts its switch off, and the short-page
+#: What a state does after its photograph: ``enlarged`` reads the enlarged canvas and presses
+#: *Reduce* (it hands back what it read), ``expert`` puts its switch off, and the short-page
 #: states put the viewport back.
 AFTER_ACTIONS = {
+    "enlarged": _after_enlarged,
     "expert": _after_expert,
     "stand-620": _after_short,
     "plate-620": _after_short,
@@ -1204,6 +1315,22 @@ def _guided_parts(page: Any, state: str) -> list[tuple[str, Any]]:
         *_frame_parts(page),
         ("title", page.locator("pre").filter(has_text=SCREEN_TITLE_OF[state])),
         ("first action", page.get_by_role("button", name=action)),
+    ]
+
+
+def _enlarged_parts(page: Any) -> list[tuple[str, Any]]:
+    """The parts of the enlarged view that must be in the window (m5 §24.6), by name.
+
+    The strip's STOP is under the overlay and is not the one to look for: the bar's own
+    STOP is the **last** button of that name in the DOM (the strip is in the header, the
+    overlay's bar after it), and while the view is not enlarged it is hidden and not counted.
+    The image is the figure's box, and the last control of the drive bar must still be in
+    reach: the arrows and Z work while enlarged.
+    """
+    return [
+        ("second STOP", page.get_by_role("button", name="STOP").last),
+        ("image", page.locator(".bk-Figure").last),
+        ("drive bar", page.get_by_role("button", name=_DRIVE_TOGGLE)),
     ]
 
 
@@ -1340,6 +1467,8 @@ def _on_screen(page: Any, state: str | None = None) -> list[str]:
         parts = _guided_parts(page, state)
     elif state == "results-all":
         parts = _results_parts(page)
+    elif state == "enlarged":
+        parts = _enlarged_parts(page)
     else:
         parts = _frame_parts(page)
     for name, locator in parts:
@@ -1460,12 +1589,17 @@ def seed_facts(readings: Sequence[tuple[str, str]]) -> list[str]:
     return [f"{label}: {text}" for label, text in readings]
 
 
+def enlarged_facts(readings: Sequence[tuple[str, str]]) -> list[str]:
+    """What ``enlarged`` is about, as ``<label>: <what>``: the image's canvas before *Enlarge*, enlarged (and whether it spans the page and is tall enough) and after *Reduce* against the first (m5 §24.6)."""
+    return [f"{label}: {text}" for label, text in readings]
+
+
 def state_facts(
     name: str,
     texts: Sequence[str],
     readings: Sequence[tuple[str, str]] = (),
 ) -> list[str]:
-    """The facts a state is about, by name: ``scanned`` the scan's, ``results-all`` the chain's, ``wells-timed`` the three ``Time`` lines its action read (``readings``), the two Stand states their seed (``readings``); none for the others."""
+    """The facts a state is about, by name: ``scanned`` the scan's, ``results-all`` the chain's, ``wells-timed`` the three ``Time`` lines its action read (``readings``), the two Stand states their seed (``readings``), ``enlarged`` its canvas's three boxes (``readings``); none for the others."""
     if name in ("stand-620", "stand-failed-620"):
         return seed_facts(readings)
     if name == "scanned":
@@ -1474,6 +1608,8 @@ def state_facts(
         return results_facts(texts)
     if name == "wells-timed":
         return time_facts(readings)
+    if name == "enlarged":
+        return enlarged_facts(readings)
     return []
 
 
@@ -1550,7 +1686,9 @@ def drive(
             step, wells, texts, on_screen = _read_page(page, plan.name)
             after = AFTER_ACTIONS.get(plan.name)
             if after is not None:
-                after(page, stand)
+                # An after-action may hand back what it read once the page is put back
+                # (``enlarged``: the canvas after *Reduce* against the one before).
+                readings = [*readings, *(after(page, stand) or [])]
         except (pw.Error, ChainFailedError) as exc:
             reason = (
                 exc.args[0]
@@ -1567,6 +1705,11 @@ def drive(
             if plan.name in SHORT_PAGE_STATES:
                 with contextlib.suppress(pw.Error):
                     _after_short(page, stand)
+            # The same for a view left enlarged: it covers the window, and every state after
+            # it would read a page it is not about.
+            if plan.name == "enlarged":
+                with contextlib.suppress(pw.Error):
+                    _reduce_if_enlarged(page)
             records.append(StateRecord(plan.name, False, reason))
             if isinstance(exc, ChainFailedError) and plan.name == "after-density":
                 later = plan_states(stand_name, results=results, chain_failure=reason)

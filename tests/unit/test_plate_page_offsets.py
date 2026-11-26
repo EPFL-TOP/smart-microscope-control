@@ -1141,6 +1141,7 @@ def test_nothing_else_in_the_page_writes_confirm_turns() -> None:
         "controller.py": 1,
         "frames.py": 0,
         "guide.py": 0,
+        "image_view.py": 0,
         "plate_page.py": 0,
         "selection.py": 0,
     }

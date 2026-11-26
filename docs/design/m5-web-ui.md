@@ -28,7 +28,9 @@
   cap on assumed lines, a `/ui-check` state for the time line) fixed by #592's plan
   (§17.12.12, 2026-11-23); the image and the plate at working size (the image view as a
   component, enlarged over the page, smoothing in Live, the plate map as a component that
-  zooms to a well) fixed by #631's plan with the owner (§24, 2026-11-25).
+  zooms to a well) fixed by #631's plan with the owner (§24, 2026-11-25); a 40× scan from the
+  page, end to end (the focus map the page keeps, the Scan screen's focus on the cells) fixed by
+  #634's plan (§25, 2026-11-26).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -9042,3 +9044,190 @@ reaches what a tool reads* (#679).
 **Not verified (for the owner)**: the enlarged view and the smoothing on the stand PC's screen and over
 RDP, Live at full frame on the Ti2-E with smoothing at 8 frames, and the notebook example opened in
 Jupyter by the collaborator.
+
+## 25. A 40× scan from the page, end to end (#634)
+
+Fixed by #634's plan (design session, 2026-11-26, run in a lane: the decisions below are proposed, and
+the owner's merge of this section accepts them). The owner, after the Ti2-E session 6: "La prochaine
+étape pour nous est de pouvoir faire un scan en 40× depuis l'UI, de faire la détection on the fly, et
+de pouvoir configurer et lancer l'algorithme qui va choisir les positions" (2026-11-24). In session 6
+the 40× half was done from the console: two whole wells of 1544 fields, PFS off, then `cells`,
+`select_fields.py` and `nis-export`. This section says what the page still lacks for that walk and
+fixes the small build that closes it. Detection on the fly is #635's (after #685), the plate map at
+working size #680's, the channel #633's: none of them is here.
+
+### 25.1 What was measured (2026-11-26, planning #634)
+
+Two throwaway scripts on `demo-sample`, not committed, at `2f2fab4`, driving `PlatePage` and
+`PlatePageView` through the view's own handlers (a click is `button.clicks += 1`, as the demo tests
+do), on a stand that is **not** in dry run, the demo stage's `Velocity` raised to 100 mm/s.
+
+- **The walk without the map, from the page alone: nothing refuses.** *Calibrate the camera* at the
+  10× (0.2 s); *Register the plate* from the sample's references; the drive bar's objective select,
+  its button and its confirmation turn the turret to `Nikon 40X Plan Fluor ELWD`; *Calibrate the
+  camera* at the 40× (0.2 s, into `calibrations/position-1.json`, §18.6); *Wells* `B2`, `coverage`
+  1.0, *Lay out the fields*: **2544 fields in 1 well** at the 40× (the plan's `objective` the 40×,
+  its `plate_objective` the 10×, the 40×'s calibration used, one `assumed` line: the offset between
+  the two objectives is not measured, the profile's `[objectives]`), `Time: not known (no timing
+  measured yet)`; *Start the scan*: `done` in **80.5 s** (2544 frames written); *Run all that are
+  left*: `cells` (`blobs`, 2544 frames, 4.5 ms a frame), `density`, `route` (10 stops at the 40×),
+  `report` and `nis-export` all `done` in 13.6 s. The route row's selector list holds one name,
+  `most-cells`: it is the only selector installed (`pyproject.toml`'s `smc.selectors`).
+- **The walk with the map works on the demo only through the expert view and a copy made by hand.**
+  The page's *Autofocus on* locks the demo's autofocus; a 10× scan of B2 (coverage 0.4, 36 fields)
+  records `focus: locked` on all 36 frames; the run document was then copied by the script (the
+  console's step 1 of `docs/plugins/scan.md`); *Autofocus off*, the turn to the 40×, its
+  calibration, a plan; then `cell_focus=map`, `focus_map=<the copy>`, `autofocus=off` and
+  `map_check_every=25` typed in the expert view's `scan` fields, and *Start the scan*: `done` in
+  3.9 s, `B2: anchored 0.08 µm from the map by 3 peaks of 3 sweeps near its centre`. The guided
+  screens show none of `cell_focus`, `focus_map` or `map_check_every`, and the page makes no copy.
+- **What the page can know and does not say.** A stopped or failed scan's record holds its `params`
+  from the start of the run (`runner.py` writes them in the `running` record), so the page can tell a
+  map scan's checkpoint from another. What a map scan costs is in no estimate: `scan-plan` reads no
+  `cell_focus` (none in `scan_plan/` or `guide.py`).
+- **Not measured**: the page in a browser at the 40× (a `/ui-check` page is served in dry run, and a
+  dry-run facade does not turn the turret: #667 decides how `/ui-check` reaches the 40×); 2544 field
+  rectangles on the map in a browser; anything at the Ti2-E.
+
+### 25.2 Decisions
+
+- **D1 The page keeps the focus map by itself.** When a run of `scan` into the page's own document
+  ends `done` (not a dry run) and at least one of its frames was taken `locked`, the page copies the
+  run document, as it is at that moment, to **`<run document's stem>.focus-map.json`** beside it
+  (`run.json` gives `run.focus-map.json`), through `smc.run.files.write_atomically` (FM-38, FM-24).
+  One file: the next such scan replaces it. The copy is taken before anything else can run on the
+  page, so it is never one whose plan a 40× `scan-plan` has replaced (#682's review; `scan.md`'s step
+  1). A copy that cannot be written never fails the scan: the scan's outcome gains `; the focus map
+  was not kept: <one line>` and the log names the error's type. A scan with no `locked` frame (the
+  40× with the map, a dry run, a stand with no autofocus) leaves the kept file as it is. *Why
+  automatic*: an operator who forgets the copy finds out at the 40×, with the 10× plan gone; and the
+  scan's own checks (the registration, 4 locked frames a well, the stage near a mapped frame) decide,
+  at the click, whether the copy can be used.
+- **D2 The Scan screen says how the scan focuses.** Above *Start the scan*, new, in this order: the
+  words `How the scan focuses on the cells` (`CELL_FOCUS_WORDS`), `scan`'s own `cell_focus` field (the
+  one instance, §17.2 D5) and its *from …* line (§17.2 D7, the page's `_field_line`); then, only while
+  the field reads `map`, the **focus map line** and the **anchor line** (D3). `focus_map` and
+  `map_check_every` stay under *Advanced* in the expert view: the page fills the first (D3), and the
+  second keeps the tool's default, 0 (a profile suggestion would reach the 10× scan too, which the
+  tool refuses: `map_check_every is read only with cell_focus=map`).
+- **D3 What the page gives a map scan.** When the typed `cell_focus` is `map` and the `focus_map` field
+  is empty, the page adds `focus_map=<the kept file, absolute>` to the pairs **before they are
+  parsed** (the tool's validator refuses `map` without `focus_map`), in the one place every run of the
+  page's own `scan` goes through, beside `scan-plan`'s `calibration=` (§18.6 D24): the click, the
+  wait under *Start the scan* and the command under its *Command* read the same decision (FM-169,
+  FM-247). With no kept file nothing is added, and the tool's own refusal is the wait. The lines:
+  - kept: `Focus map: the scan of <wells> at <objective>, <YYYY-MM-DD HH:MM> UTC, kept by the page in
+    <file name>.` (`<objective>` reads `objective not recorded` when the copy's plan has none);
+  - typed in `focus_map`: `Focus map: <the typed text>, typed on this page.`;
+  - none: `FOCUS_MAP_NONE`;
+  - a kept file that cannot be read: `The kept focus map <file name> cannot be read (<one line>).`;
+  - the anchor line: `Before you start: with Live, focus by eye on the cells near the centre of
+    <well>. That focus is the scan's starting point; each well is then anchored near its centre.`,
+    `<well>` the first well of the plan's visiting order (`the first well` with no plan).
+
+  The file is read on a redraw, never on a tick (FM-145); its date and wells come from its `scan`
+  record and its plan, and every word of it is plain text (FM-139).
+- **D4 Continue or start again, for a map scan** (#682's review; the owner's option 1 of #623). When
+  the scan record that *Continue the scan* and *Start again* are offered for has `params.cell_focus`
+  `map`, one line under them: `SCAN_MAP_RESUME_NOTE`. The expert view's reason for the scan
+  (`SCAN_CHECKPOINT_KEPT`) is unchanged.
+- **D5 The time line says what it does not count.** `time_line(plan, autofocus, cell_focus="")`: when
+  the stripped `cell_focus` is neither empty nor `off`, the line gains `; the focus on the cells
+  (cell_focus=<mode>) is not counted`, after every form of today's line, `Time: not known` included.
+  The figures stay the plan's; a map scan's cost is measured at the next visit (`scan.md`), and no
+  number is guessed (FM-170).
+- **D6 `fields_from` stays in the expert view.** #637 (PR #697) lists `scan-plan`'s `fields_from` under
+  *Advanced*, as it lists `calibration`. The guided Wells screen does not offer it here: a selection
+  worth planning the 40× from is #636's work, and the Wells screen's choice between the whole wells
+  and a selection's fields is #699, filed with this plan.
+- **D7 The walk is a test, and a page at the stand.** `tests/test_plate_page_forty_walk_demo.py` walks
+  §25.1's first item through the view's handlers, not in dry run, with a throwaway selector registered
+  in place of the installed ones (as `test_plate_page_algorithms_demo.py` does) and one of its
+  parameters changed, to the exported list; and §25.1's second item with D1 to D3 instead of the hand
+  copy. A whole well at the 40× is 2544 fields and 80 s on the demo, so the test lays out the whole
+  well once (its count is the claim) and scans a plan of `coverage` 0.2. `docs/ui/plate-page.md` gains
+  *A 40× scan, end to end*: the walk as the operator does it, which a `/hardware-session` checklist
+  takes as a step at the Ti2-E.
+
+### 25.3 Interface
+
+`smc/ui/guide.py` (pure):
+
+```python
+CELL_FOCUS_WORDS = "How the scan focuses on the cells"
+FOCUS_MAP_NONE = (
+    "No focus map kept yet: scan the wells with the autofocus locked first; "
+    "the page keeps that scan as the map."
+)
+SCAN_MAP_RESUME_NOTE = (
+    "Continue the scan keeps the focus this scan started with: focusing again now "
+    "changes nothing. Start again takes the focus as it is now."
+)
+
+
+def focus_map_file(run_doc: Path) -> Path:
+    """``<stem>.focus-map.json`` beside the run document (D1)."""
+
+
+def focus_map_lines(
+    *, cell_focus: str, typed_map: str, kept: KeptMap | None, first_well: str | None
+) -> tuple[str, ...]:
+    """D3's focus map line and anchor line, or ``()`` when ``cell_focus`` is not ``map``."""
+
+
+def time_line(plan: PlanLayer, autofocus: str, cell_focus: str = "") -> str:
+    """Today's line, and D5's tail."""
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class KeptMap:
+    """What the Scan screen says of the kept focus map (guide.py): read on a redraw, never on a tick."""
+
+    file: str  # the file's name, not its path
+    wells: tuple[str, ...]
+    objective: str | None
+    scanned_utc: datetime | None
+    problem: str | None  # one line when the file cannot be read; then the rest is empty
+```
+
+```python
+class PlatePage:  # smc/ui/controller.py
+    @property
+    def focus_map_path(self) -> Path:
+        """``focus_map_file(self.run_doc)``."""
+
+    def kept_focus_map(self) -> KeptMap | None:
+        """The kept file, read once; ``None`` when there is none (D3)."""
+```
+
+The copy (D1) is made in `PlatePage._run_plugin`, after `_run_plugin_once` and for `doc_path is
+None` only; the pairs (D3) are added where `scan-plan`'s `calibration=` is added, before the parse.
+The public names above are fixed; a private helper's name is the executor's.
+
+### 25.4 Tests and failure modes
+
+`tests/unit/test_ui_guide.py` (D3's lines in each case, D4's note, D5 on every form of the time line,
+`focus_map_file`); a new `tests/test_plate_page_focus_map_demo.py` (the copy kept, replaced, not kept
+without a `locked` frame, for a dry run or for another document; a copy that cannot be written leaves
+the scan `done` with the tail; the pairs added and not added); `tests/test_plate_page_forty_walk_demo.py`
+(D7). Failure modes: FM-38 and FM-24 (the copy), FM-98 (a note of the end never costs the run its
+outcome), FM-139 (the copy's words are data), FM-145 (no read on the tick), FM-161 (the handlers
+through the view; the browser is #667's), FM-169 and FM-247 (one decision for the click, the wait and
+the command), FM-170 (no guessed time), FM-182 (a dry-run page keeps nothing), FM-216 (one kept file
+whatever the objective: the tool's checks decide).
+
+### 25.5 What this does not do
+
+- It does not run detection while the scan goes (#635), draw 2544 fields at working size (#680),
+  choose the channel (#633) or a condenser (#628), or measure the offset between the objectives (#548).
+- It does not lay out the 40× from a selection on the guided screens (D6, #699), nor time a map scan
+  (D5).
+- It does not decide #667: until then `/ui-check` photographs the new Scan-screen lines at the 10×
+  (`cell_focus` typed `map` on a dry-run page: `FOCUS_MAP_NONE`), not the 40×.
+- It keeps one focus map: a 10× scan of other wells replaces the map of the first, and the scan's
+  check 3 says so at the 40×.
+
+**Not verified (for the owner)**: the walk at the Ti2-E (a `/hardware-session` step: PFS locked at the
+10×, the page's kept map, the 40× with PFS off, focus by eye, a whole well, then the Results screen and
+the list loaded in NIS-Elements); the Scan screen at the 40× in a browser (#667).

@@ -221,7 +221,7 @@ the outcome line (always its height); the connection, message and problems lines
 [1. Stand ✓][2. Plate ✓][3. Wells][4. Scan][5. Results]                       [Expert view]   the step bar
  demo-sample   96-well, registered   next                                                    its summaries
 ┌ step panel (400 px) ┬ map ──────────────────────┬ image ─────────────────────────────┐
-│ title: a question   │ [Refresh] (Density of ▾)  │ [Snap] [Live] a note on the frame  │
+│ title: a question   │ [Refresh] (Density of ▾)  │ [Snap] [Live] [Enlarge] a note     │
 │ a sentence          │ the map's title, wrapped  │ the frame                          │
 │ the step's regions  │ the plate map             │ the drive bar: two columns (the    │
 │ [Continue to …]     │                           │ pad and its step | Z, autofocus,   │
@@ -1122,9 +1122,20 @@ gave it, **never rescaled**, and a snap writes nothing: not a file, not the run
 document (`smc snap --out` writes a TIFF). What is drawn is a copy for the screen: 8-bit
 grey, stretched between the 0.5 and 99.5 percentiles of the frame, so a hot pixel does
 not decide the contrast; a **flat** frame is shown against the camera's range instead, so
-a saturated frame is white and a dark one black and not a stretched grey. A frame larger
-than 1024 px on a side is shown at every n-th pixel (n = 2 for a 1412 px camera), and the
-axes are still the **camera's pixels**. The frame is the same for every tab of the server: a
+a saturated frame is white and a dark one black and not a stretched grey. The image has
+**no axes**: it takes the whole of its box, with the toolbar's pan, wheel zoom, box zoom, reset
+and save, and **a scale bar** at the bottom right that follows the zoom. The view is drawn in
+**micrometres** when the camera knows its pixel size, so the bar reads a length; when it does
+not (the demo's camera, a plugin's frame) the view is in the camera's pixels, there is **no
+scale bar**, and the title ends with `; no scale bar: pixel size unknown`. A frame of **Live**
+larger than 1024 px on a side is shown at every n-th pixel (n = 2 for a 1412 px camera); a
+**snap** is shown up to 2048 px, so a zoom into it shows the camera's own pixels. The extent
+drawn is the camera's in both. **Enlarge**, on the image's bar, puts the image and the drive bar
+over the whole window, so the arrows, Z and the light work while you look; the strip is under
+it, so the bar has a **STOP of its own**, the same as the strip's. **Reduce** (the same button)
+gives the page back as it was; the choice is the tab's, and a snap or a tick never changes it.
+No key closes it. The image view is a component of its own, which a notebook shows too
+([views in a notebook](views-in-a-notebook.md)). The frame is the same for every tab of the server: a
 frame snapped in one tab is drawn by the others the next time they look for a new
 frame, every 0.1 s. Snap is disabled with
 `this stand has no Camera` when the stand has none, and, as every Run button, while

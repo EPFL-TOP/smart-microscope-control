@@ -42,7 +42,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-import numpy as np
 import panel as pn
 import useq
 from bokeh.events import Tap
@@ -54,7 +53,7 @@ from bokeh.models import (
     LabelSet,
     LinearColorMapper,
 )
-from bokeh.palettes import Greys256, Viridis256
+from bokeh.palettes import Viridis256
 from bokeh.plotting import figure
 from pydantic import BaseModel
 from tornado.web import HTTPError, RequestHandler
@@ -87,7 +86,7 @@ from smc.ui.controller import (
     plan_calibration,
     stand_calibration,
 )
-from smc.ui.frames import Frame, display_image
+from smc.ui.frames import Frame
 from smc.ui.guide import (
     AUTOFOCUS_WORDS,
     CALIBRATE_LEAD,
@@ -205,6 +204,7 @@ from smc.ui.guide import (
     wells_from_line,
     wells_known_lines,
 )
+from smc.ui.image_view import LIVE_MAX_SIDE_PX, STILL_MAX_SIDE_PX, ImageView
 from smc.ui.selection import (
     NOT_A_JSON_OBJECT,
     ORDER_LABEL,
@@ -815,6 +815,8 @@ class PlatePageView:
         # The number of the frame this session last drew, and the stand's name the
         # tick last read (a result card names a profile only when it is another).
         self._seen_frame: int | None = None
+        # Whether Live ran when that frame was drawn: the view's stride and the cross follow it.
+        self._frame_live = False
         # What the frame last drawn says of its light (``frame_hint``): dark, saturated or
         # nothing, computed when the frame's number changes and drawn beside *Snap* and *Live*.
         self._frame_hint = ""
@@ -1102,28 +1104,16 @@ class PlatePageView:
         )
         self.map_title_text.sizing_mode = "stretch_width"
 
-        # The camera's frame: 8-bit grey from 0 to 255 (``display_image``), whatever
-        # the camera's bit depth is.
-        self.image_source = ColumnDataSource({"image": [], "dw": [], "dh": []})
-        self.image_figure = figure(
-            match_aspect=True,
-            height=FIGURE_HEIGHT_PX,
-            sizing_mode="stretch_width",
-            title=NO_FRAME_TEXT,
-            x_axis_label="camera x (px)",
-            y_axis_label="camera y (px, from the bottom)",
-            tools="pan,wheel_zoom,box_zoom,reset,save",
-            active_scroll="wheel_zoom",
+        # The camera's frame is the image view's (m5 §24.3): a component of its own, which a
+        # notebook builds too. ``image_figure`` and ``image_source`` stay as its figure and its
+        # source: the tests and ``/ui-check`` read them, and the figure is in the model tree for
+        # as long as the page is (FM-174). *Enlarge* is offered here, where there is a window
+        # to cover.
+        self.image_view = ImageView(
+            height_px=FIGURE_HEIGHT_PX, enlargeable=True, title=NO_FRAME_TEXT
         )
-        self.image_figure.image(
-            image="image",
-            x=0,
-            y=0,
-            dw="dw",
-            dh="dh",
-            source=self.image_source,
-            color_mapper=LinearColorMapper(palette=Greys256, low=0, high=255),
-        )
+        self.image_figure = self.image_view.figure
+        self.image_source = self.image_view.source
 
         # The outcome lines under the strip take no height while their text is empty
         # (m5 §17.3): ``_hide_when_empty`` is registered for each below, so the rule is
@@ -1225,6 +1215,12 @@ class PlatePageView:
         )
         self.refresh_button = pn.widgets.Button(label="Refresh", align="end")
         self.stop_button = pn.widgets.Button(label="STOP", color="danger")
+        # The strip is under the enlarged image (m5 §24.2 D3), so the enlarged bar has a STOP
+        # of its own: the same call through the same guard, shown only while the view is
+        # enlarged. Two instances of one button are allowed (§17.2 D5).
+        self.image_stop_button = pn.widgets.Button(
+            label="STOP", color="danger", visible=False
+        )
         self.resume_button = pn.widgets.Button(label="Resume", visible=False)
         self.capture_centre_button = pn.widgets.Button(label="Capture centre")
         self.capture_wall_button = pn.widgets.Button(label="Capture wall")
@@ -1248,7 +1244,13 @@ class PlatePageView:
         self.walls_touches_note = _wrapped_text()
         self.snap_button = pn.widgets.Button(label="Snap")
         self.live_button = pn.widgets.Button(label=_LIVE_LABEL)
-        self.snap_note = TextPane("", styles={"color": _WARNING})
+        # A note on the frame (the dark and saturated hints are 43 to 70 characters) shares the
+        # image's bar with *Enlarge*, which sits after it: unwrapped, the note ran 560 px from the
+        # *Live* button at the image column's 440 and put *Enlarge* at x 1452 of a 1280 px window,
+        # out of reach exactly when the light is off (measured, #631). Wrapped and stretched, as
+        # the strip's status line shares its row with the buttons, it takes what the bar leaves.
+        self.snap_note = _wrapped_text(extra={"color": _WARNING}, width=None)
+        self.snap_note.sizing_mode = "stretch_width"
         # ADR-0006's *Connect* (m5 §7.3): the one line that says why every control
         # that needs the stand is disabled while it is closed.
         self.connect_button = pn.widgets.Button(label="Connect")
@@ -1306,6 +1308,8 @@ class PlatePageView:
         self.refresh_button.on_click(self._handler(lambda event: self.on_refresh()))
         self.next_button.on_click(self._handler(lambda event: self.on_next()))
         self.stop_button.on_click(self._handler(lambda event: self.on_stop()))
+        self.image_stop_button.on_click(self._handler(lambda event: self.on_stop()))
+        self.image_view.on_enlarge(self._handler(self._on_image_enlarged))
         self.resume_button.on_click(self._handler(lambda event: self.on_resume()))
         self.capture_centre_button.on_click(
             self._handler(lambda event: self.on_capture("centre"))
@@ -2338,11 +2342,17 @@ class PlatePageView:
             pn.pane.Bokeh(self.figure, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
         )
-        image_column = pn.Column(
-            pn.Row(self.snap_button, self.live_button, self.snap_note),
-            pn.pane.Bokeh(self.image_figure, sizing_mode="stretch_width"),
-            self._drive_bar(),
-            sizing_mode="stretch_width",
+        # The image view's own root: its bar (the second STOP, *Snap*, *Live*, then *Enlarge*),
+        # the figure, and the drive bar under it, so that the arrows, Z and the light work
+        # while the view is enlarged over the window (m5 §24.2 D3). One root, built once.
+        image_column = self.image_view.panel(
+            toolbar=[
+                self.image_stop_button,
+                self.snap_button,
+                self.live_button,
+                self.snap_note,
+            ],
+            below=[self._drive_bar()],
         )
         centre = pn.Row(map_column, image_column, sizing_mode="stretch_width")
         # One sticky header (m5 §17.2 D12): the strip, the outcome lines and the step bar
@@ -3789,7 +3799,7 @@ class PlatePageView:
         is no new frame; a frame with no position, or one drawn when Live is not running (a
         snap's), moves nothing and leaves the flag as it was.
         """
-        if frame is None or frame.xy_um is None or not self.page.is_live:
+        if frame is None or frame.xy_um is None or not self._frame_live:
             return
         self._cross_from_frames = True
         self._draw_cross(frame.xy_um)
@@ -4053,15 +4063,19 @@ class PlatePageView:
     def _draw_frame(self) -> Frame | None:
         """Draw the controller's frame when it is one this session has not drawn, and return it; else ``None``.
 
-        The axes are the frame's own pixels: ``dw`` and ``dh`` are its width and
-        height, not those of the strided picture (FM-136). Bokeh draws an image's
-        first row at the bottom, so the rows are flipped to put the camera's top
-        row on top.
+        The extent drawn is the frame's own, whatever the picture is strided to:
+        the view's ``dw`` and ``dh`` are its width and height (in micrometres when the
+        camera knows its pixel size), not those of the strided picture (FM-136). The
+        view flips its range, not the array, to put the camera's top row on top.
         """
         frame = self.page.frame()
         if frame is None or frame.number == self._seen_frame:
             return None
         self._seen_frame = frame.number
+        # Read once for the frame, and kept for ``_follow_frame``: the view's stride and the
+        # cross both depend on it, and the frame callback asks the controller for as little
+        # as it can (FM-145).
+        self._frame_live = self.page.is_live
         self._draw_image(frame)
         # Once for each new frame, never at a tick: 4.5 ms at 512 x 512 and 16.5 ms at the Prime
         # 95B's 1200 x 1200, on every other row and column past 1600 x 1600 (m5 §17.12 D22, FM-145).
@@ -4072,14 +4086,23 @@ class PlatePageView:
         return frame
 
     def _draw_image(self, frame: Frame) -> None:
-        shown = display_image(frame.image, bit_depth=frame.bit_depth)
-        height, width = frame.image.shape
-        self.image_source.data = {
-            "image": [np.ascontiguousarray(shown[::-1])],
-            "dw": [width],
-            "dh": [height],
-        }
-        self.image_figure.title.text = frame.summary
+        """Show ``frame`` through the image view: strided to Live's size while Live runs, as a snap is not.
+
+        Whether Live runs is read at the draw (``_draw_frame``): a frame drawn just after
+        Live ends may still be strided, which the next snap redraws (m5 §24.3). The page
+        draws no box: a snap has no cells.
+        """
+        self.image_view.show(
+            frame.image,
+            bit_depth=frame.bit_depth,
+            pixel_size_um=frame.pixel_size_um,
+            title=frame.summary,
+            max_side_px=LIVE_MAX_SIDE_PX if self._frame_live else STILL_MAX_SIDE_PX,
+        )
+
+    def _on_image_enlarged(self, enlarged: bool) -> None:
+        """Show the enlarged bar's STOP while the view covers the window, where the strip's is not in view (m5 §24.2 D3)."""
+        self.image_stop_button.visible = enlarged
 
     def _draw_wells(self) -> None:
         view = self._view
