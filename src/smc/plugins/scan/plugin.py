@@ -1168,6 +1168,14 @@ class ScanPlugin:
                     kept_without_offsets=kept_without_offsets,
                 )
             )
+        if plan.selection is not None:
+            # The plan's fields are a selection's (m3 §28.8): the frames are not the
+            # wells, and `cells`, `density` and a later selector read them as they are.
+            assumed.append(
+                f"the plan's {len(plan.fields)} fields in {len(plan.wells)} wells were "
+                f"chosen by selector '{plan.selection.selector}' in "
+                f"{plan.selection.run_doc}: the rest of each well was not scanned"
+            )
         return ScanResult(
             folder=f"scan/{token}",
             objective=plan.objective,
