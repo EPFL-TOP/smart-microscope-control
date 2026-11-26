@@ -153,6 +153,14 @@ class ScanPlanParams(PluginParams):
             "is used, rotation and mirror included."
         ),
     )
+    fields_from: Path | None = Field(
+        None,
+        description=(
+            "A run document holding a route: plan the fields it chose instead of "
+            "a grid (relative to the working directory, as from_run_doc). Copy "
+            "the document after the survey scan and give the copy."
+        ),
+    )
 
     @model_validator(mode="after")
     def _rows_and_columns_come_together(self) -> ScanPlanParams:
@@ -166,6 +174,28 @@ class ScanPlanParams(PluginParams):
         """A bare size says rotation 0 and no mirror, a calibration says what was measured: asked for both, one would be dropped without a word."""
         if self.pixel_size_um is not None and self.calibration is not None:
             raise ValueError("give pixel_size_um or calibration, not both")
+        return self
+
+    @model_validator(mode="after")
+    def _a_selection_lays_no_grid(self) -> ScanPlanParams:
+        """The grid's parameters given with a selection would be dropped without a word (m3 §28.5).
+
+        A value equal to its default is not refused: it says nothing a plan from a
+        selection would ignore, and the page or a preset may send it.
+        """
+        if self.fields_from is None:
+            return self
+        defaults = type(self).model_fields
+        names = [
+            name
+            for name in ("rows", "columns", "coverage", "overlap", "clip_to_well")
+            if getattr(self, name) != defaults[name].default
+        ]
+        if names:
+            raise ValueError(
+                f"fields_from plans the fields a selection chose: {', '.join(names)} "
+                "are not read with it; leave them unset"
+            )
         return self
 
 
