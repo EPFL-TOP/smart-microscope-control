@@ -171,7 +171,7 @@ def test_at_least_one_label_is_needed() -> None:
     ("field", "bad"),
     [
         ("fields_per_well", 0),
-        ("fields_per_well", 501),
+        ("fields_per_well", 2001),
         ("min_cells", 0),
         ("exclude_centre_um", -1.0),
         ("wall_margin_um", -1.0),
@@ -191,7 +191,7 @@ def test_a_value_out_of_its_bound_is_refused(field: str, bad: float) -> None:
     ("field", "edge"),
     [
         ("fields_per_well", 1),
-        ("fields_per_well", 500),
+        ("fields_per_well", 2000),
         ("min_cells", 1),
         ("exclude_centre_um", 0.0),
         ("wall_margin_um", 0.0),
@@ -235,7 +235,7 @@ def test_every_parameter_is_described_with_its_bound() -> None:
         "orderer",
         "orderer_params",
     ]
-    assert "le=500" in rows["fields_per_well"][1]
+    assert "le=2000" in rows["fields_per_well"][1]
     assert "gt=0.0 le=1.0" in rows["candidate_step_fraction"][1]
     assert all(notes.strip() for _, notes in rows.values())
     assert rows["selector"][0] == "'most-cells'"

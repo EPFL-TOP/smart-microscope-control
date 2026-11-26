@@ -160,7 +160,7 @@ class RouteParams(PluginParams):
         ),
     )
     fields_per_well: int = Field(
-        10, ge=1, le=500, description="The most fields to choose in a well."
+        10, ge=1, le=2000, description="The most fields to choose in a well."
     )
     min_cells: int = Field(
         1,

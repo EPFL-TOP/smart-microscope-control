@@ -26,7 +26,7 @@ smc run route -p <profile> --run-doc run.json --param objective="Nikon 40X Plan 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `labels` | `["single"]` | The cell classes that count; JSON for more than one. Each must be one of the cells stage's classes, and none may repeat. |
-| `fields_per_well` | 10 | The most fields to choose in a well (1 to 500). |
+| `fields_per_well` | 10 | The most fields to choose in a well (1 to 2000: a whole well at the 40×, for `scan-plan`'s `fields_from`). |
 | `min_cells` | 1 | A field must hold at least this many cells that no earlier field holds. |
 | `exclude_centre_um` | 0 | The **radius** of the disc at each well's centre that no field may touch. |
 | `wall_margin_um` | 0 | The distance from the wall that every corner of a field keeps. |
@@ -359,7 +359,8 @@ do, and never gives a route that is empty or that rests on a number that is not 
   once.
 - **The run document's size.** The stops are in the run document, and the document is
   rewritten at every stage write. At the default of 10 fields per well, 96 wells are
-  about 0.24 MB; at the largest `fields_per_well` (500) they are about 12 MB.
+  about 0.24 MB; at the largest `fields_per_well` (2000) they would be about 48 MB, scaled
+  from that figure (not measured): a selection of a whole 40× well is one or a few wells.
 
 ## Selection prototype
 
