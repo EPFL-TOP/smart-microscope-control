@@ -20,9 +20,17 @@ import pytest
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XY, Camera, Limits, XYStage, ZStage
+from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM
 from smc.plugins.api import RunContext
 from smc.plugins.cell_focus.focus_map import FocusMap, MapPoint
-from smc.plugins.scan.map_focus import MapFocus, MapStep, _anchor_try, focus_field
+from smc.plugins.cell_focus.loop import z_jog_limit_um
+from smc.plugins.scan.map_focus import (
+    MapFocus,
+    MapStep,
+    _anchor_try,
+    _check_reach,
+    focus_field,
+)
 from smc.plugins.scan.plugin import ScanParams
 from smc.plugins.slots import FocusAnchor, FocusMapUse, PlannedField
 
@@ -297,6 +305,65 @@ def test_a_field_target_beyond_the_jog_limit_fails_with_nothing_moved(
         "the Z the scan starts at, beyond the Z jog limit of 5 µm"
     )
     assert z.moves == 0
+
+
+#: The corners of a 1 mm square of A1, all at Z 0.
+_CORNERS = tuple(
+    MapPoint("A1", x, y, 0.0) for x in (0.0, 1000.0) for y in (0.0, 1000.0)
+)
+
+
+def _planned(index: int, x_um: float, y_um: float) -> PlannedField:
+    return PlannedField(
+        well="A1", index=index, name=f"A1_{index:04d}", x_um=x_um, y_um=y_um
+    )
+
+
+def test_a_field_at_the_bound_is_not_beyond_it_and_the_first_farthest_wins_a_tie() -> (
+    None
+):
+    # D22: strictly greater is beyond. (60, 80) is 100 µm from the corner at the
+    # origin, exactly the bound of this map; (60, 80.1) is just past it.
+    state = MapFocus(
+        focus_map=FocusMap(_CORNERS),
+        use=_state().use,
+        limits=_WIDE,
+        z_start_um=0.0,
+        jog_um=100.0,
+        fov_side_um=100.0,
+    )
+    fields = [
+        _planned(0, 60.0, 80.0),
+        _planned(1, 60.0, 80.1),
+        _planned(2, 0.0, 120.0),
+        _planned(3, 120.0, 0.0),
+        _planned(4, 0.0, 110.0),
+    ]
+
+    _check_reach(state, [("A1", fields)], 10.0)
+
+    # Beyond: A1_0001 (100.08), A1_0002 and A1_0003 (120 each), A1_0004 (110); the
+    # farthest is the first of the two at 120.
+    assert (state.planned, state.beyond) == (5, 4)
+    assert (state.farthest_name, state.farthest_um) == ("A1_0002", 120.0)
+    line = state.beyond_line()
+    assert line is not None
+    assert line.startswith("4 of 5 fields lie more than 100.0 µm from every locked")
+    assert "the farthest A1_0002 at 120.0 µm" in line
+
+
+def test_the_z_jog_limit_is_the_profiles_else_the_layers_default(
+    demo_microscope: Microscope,
+) -> None:
+    safety = demo_microscope.profile.safety
+    demo_microscope.profile = demo_microscope.profile.model_copy(
+        update={"safety": safety.model_copy(update={"max_z_jog_um": 4.0})}
+    )
+    assert z_jog_limit_um(demo_microscope) == 4.0
+    demo_microscope.profile = demo_microscope.profile.model_copy(
+        update={"safety": safety.model_copy(update={"max_z_jog_um": None})}
+    )
+    assert z_jog_limit_um(demo_microscope) == DEFAULT_MAX_Z_JOG_UM
 
 
 def test_a_field_target_at_the_jog_limit_moves(demo_microscope: Microscope) -> None:
