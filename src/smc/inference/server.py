@@ -18,11 +18,12 @@ module imports on every PC and the fake of the tests can use ``ModelServer``.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -33,7 +34,14 @@ from smc.inference.errors import ModelError
 from smc.inference.models import ResolvedModel, load_local_model
 from smc.inference.served import ServedModel, encode_answer, encode_listing
 
-__all__ = ["SERVER_SCORE_FLOOR", "ModelServer", "prepare"]
+__all__ = [
+    "SERVER_SCORE_FLOOR",
+    "ModelServer",
+    "build_app",
+    "check_serve_extra",
+    "prepare",
+    "serve",
+]
 
 #: The server's detectors keep every detection (torchvision's own floor of 0.05
 #: still applies); the **client** keeps ``score >= threshold``, the predicate of
@@ -176,6 +184,103 @@ def prepare(
         reason = "; ".join(notes) if notes else "there is no model card"
         raise ModelError(f"no model can be served here: {reason}")
     return ModelServer(models), notes
+
+
+def check_serve_extra() -> None:
+    """Import what serving needs, so that a PC without the ``serve`` extra says so before a model is loaded.
+
+    The command asks before it reads 166 MB of weights, not after. The kit's import
+    takes seconds and loads ``cv2``, ``scipy`` and ``fastapi``: it is made here and in
+    ``build_app``, never at module level, so that the acquisition PC and the fake model
+    server import this module without any of it.
+
+    Raises:
+        ImportError: The kit or uvicorn is not installed, or does not import.
+    """
+    import imaging_server_kit  # noqa: F401
+    import uvicorn  # noqa: F401
+
+
+@contextlib.asynccontextmanager
+async def _no_lifespan(app: object) -> AsyncIterator[None]:
+    """A lifespan that does nothing: what the kit's own would do is talk to a hub we do not have."""
+    yield
+
+
+def build_app(server: ModelServer) -> object:
+    """The kit's ASGI app for ``server``: two algorithms, ``models`` and ``detect``, as the wire says (§8.3).
+
+    The kit's ``MultiAlgorithmServer`` registers with an "algorithm hub" at start-up
+    (``requests.get("http://algorithm_hub:8000/")`` with no timeout) and deregisters,
+    unguarded, at shutdown, so a server with no hub logs ``Application shutdown failed``
+    (measured, 0.0.12). Its lifespan is replaced by one that does nothing.
+
+    The decorator is called as a function, not written as ``@algorithm_server``: the kit
+    is untyped, and a decorator that mypy cannot see makes the function untyped with the
+    kit installed and an import error without it.
+
+    Raises:
+        ImportError: The kit is not installed (``check_serve_extra`` says so first).
+    """
+    from imaging_server_kit import (
+        FloatSpinBoxUI,
+        ImageUI,
+        MultiAlgorithmServer,
+        StringUI,
+        algorithm_server,
+    )
+
+    def list_models() -> list[tuple[str, dict[str, str], str]]:
+        return [(server.listing(), {"name": "models"}, "text")]
+
+    def detect(
+        model: str, image: npt.NDArray[Any], pixel_size_um: float
+    ) -> list[tuple[str, dict[str, str], str]]:
+        return [
+            (server.detect(model, image, pixel_size_um), {"name": "detections"}, "text")
+        ]
+
+    models_algorithm = algorithm_server(
+        parameters={},
+        algorithm_name="models",
+        title="Models",
+        description="The models this server serves, with their identities.",
+    )(list_models)
+    detect_algorithm = algorithm_server(
+        parameters={
+            "model": StringUI(title="Model", description="A name of the listing."),
+            "image": ImageUI(dimensionality=[2]),
+            "pixel_size_um": FloatSpinBoxUI(
+                title="Pixel size (um)",
+                description="The frame's pixel size; 0 is unknown.",
+                min=0.0,
+                max=1000.0,
+                default=0.0,
+            ),
+        },
+        algorithm_name="detect",
+        title="Detect",
+        description="The detections of one 2-D frame by a model of the listing.",
+    )(detect)
+    multi = MultiAlgorithmServer("smc-models", [models_algorithm, detect_algorithm])
+    multi.app.router.lifespan_context = _no_lifespan
+    return multi.app
+
+
+def serve(server: ModelServer, *, host: str, port: int) -> None:
+    """Serve ``server`` over HTTP until it is interrupted: uvicorn's own graceful shutdown ends it.
+
+    A first Ctrl-C ends uvicorn and this function returns, which is the server's normal
+    end. Each call is logged by ``ModelServer`` at INFO (the model, the frame's shape
+    and the seconds, never pixels); uvicorn prints a traceback on stderr for every 500
+    (measured), which is the server's console and not a client's.
+
+    Raises:
+        ImportError: The kit or uvicorn is not installed.
+    """
+    import uvicorn
+
+    uvicorn.run(build_app(server), host=host, port=port, log_level="info")
 
 
 def _load_native(

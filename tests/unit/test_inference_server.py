@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -33,7 +34,13 @@ from smc.inference.served import decode_answer, decode_listing
 from smc.inference.server import SERVER_SCORE_FLOOR, ModelServer, prepare
 from smc.testing import StubDetector, stub_model
 
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover - exercised on the 3.10 CI job
+    import tomli as tomllib
+
 SRC = Path(smc.__file__).resolve().parent
+REPOSITORY = SRC.parents[1]
 NATIVE = ModelPreprocessing(percentiles=(0.5, 99.5), model_um_per_px=None)
 SIZED = ModelPreprocessing(percentiles=(0.5, 99.5), model_um_per_px=0.5)
 SHA_A, SHA_B = "a" * 64, "b" * 64
@@ -461,6 +468,29 @@ def test_the_kit_is_imported_only_in_server_py_inside_a_function() -> None:
                 outside.append(f"{path.relative_to(SRC)}:{line}")
     assert walked > 50
     assert outside == []
+
+
+def test_the_serve_extra_is_detect_plus_the_kit_pinned_exactly() -> None:
+    # The server's extra: torch and torchvision as `detect` has them, written out
+    # (an extra cannot include another), and the kit at the version whose wire was read
+    # (inference.md §8.2). A looser pin is a design change and a run of the real-server
+    # test, so a range, a bare name or an extra pinned to anything else fails here.
+    data = tomllib.loads((REPOSITORY / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = data["project"]["optional-dependencies"]
+    detect, serve = extras["detect"], extras["serve"]
+
+    assert detect
+    assert all(line in serve for line in detect)
+    kit = [line for line in serve if line not in detect]
+    assert len(kit) == 1
+    assert re.fullmatch(r"imaging-server-kit==\d+(\.\d+)*", kit[0]), kit[0]
+    assert len(serve) == len(detect) + 1
+    # Not in the base dependencies, nor in `detect`: the acquisition PC installs none of it.
+    assert not [
+        line
+        for line in data["project"]["dependencies"] + detect
+        if "imaging-server-kit" in line or "uvicorn" in line or "fastapi" in line
+    ]
 
 
 def test_served_and_server_import_without_the_kit_torch_uvicorn_and_fastapi(
