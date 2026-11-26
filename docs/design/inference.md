@@ -997,8 +997,9 @@ class LiveRecord(BaseModel):
   was computed (a frame that failed its call), never for `full`, which the scan's thread does
   not hash.
 - **A store** is `<run folder>/cells/live/<new_token()>.jsonl`, one per `LiveCells`, written
-  only by it (§10.5): one JSON object a line, `json.dumps(record.model_dump(mode="json"),
-  ensure_ascii=True, allow_nan=False, separators=(",", ":"))` and `"\n"`, appended and flushed
+  only by it (§10.5): one JSON object a line, **`encode_record(record: LiveRecord) -> str`**,
+  which is `json.dumps(record.model_dump(mode="json"), ensure_ascii=True, allow_nan=False,
+  separators=(",", ":"))` and `"\n"` (the worker and the tests share it), appended and flushed
   line by line (opened `"a"`, `encoding="ascii"`, `newline="\n"`). No `fsync`: a line lost in
   a crash is a frame `cells` detects again. smc never removes a store; a new scan in the same
   run folder leaves the old ones, whose digests no new frame has.
