@@ -1,9 +1,9 @@
 # Inference design — models by name, one detector interface
 
 - **Status**: design for issue #684 (2026-11-26), the first step of
-  [ADR-0011](../adr/0011-where-the-models-run.md). #685 (the served detector)
-  builds on §2 to §5; #635 (cells on the fly) and #600 (several models by
-  name) are planned on top of it.
+  [ADR-0011](../adr/0011-where-the-models-run.md), and for #685 (the served
+  detector, §8). #635 (cells on the fly) and #600 (several models by name) are
+  planned on top of both.
 - **Owner**: the design session. **Executors**: `/develop` sessions.
 - **Rule**: as in M1 to M5, names, module paths and signatures below are
   fixed; an executor who needs to change one stops and comments on its issue
@@ -20,8 +20,8 @@ cards' folder the analysis track's).
 implementation (`TorchDetector`), the blob detector, the pre-processing, and
 names models by **cards** in the repository. `cells` asks for a model by name,
 and its result records the model's name, its **identity** and **where it
-ran**. There is no server here: #685 adds the served implementation behind
-the same `load_model` (§8).
+ran**. There is no server in §2 to §7: #685 adds the served implementation
+behind the same `load_model` (§8).
 
 Out of scope: the served client, the `serve` extra, `SMC_MODEL_SERVER`
 (#685); detection during a scan (#635); several models' detections side by
@@ -298,7 +298,8 @@ def blob_model() -> ResolvedModel: ...
   native rule, else with
   `model_input_size_px(frame_shape_px, frame_um_per_px, rule.model_um_per_px)`
   (its `ValueError` propagates).
-- `load_model`, in this order, each failure a `ModelError`:
+- `load_model`, in this order, each failure a `ModelError` (#685 renames this
+  body `load_local_model` and makes `load_model` the dispatcher of §8.5):
   1. `preprocessing_for(...)`; a `ValueError` is `model_um_per_px={x:g}
      cannot be used: {exc}`, before any file is looked for (a refused size
      does not wait for 166 MB).
@@ -461,15 +462,371 @@ the identity from the rule it is given (FM-260).
   without them, and are run by hand with the torch venv and `SMC_MODELS`
   (§1).
 
-## 8. What #685 adds, for the record
+## 8. The served detector (#685)
 
-`load_model` resolves to the served implementation when `SMC_MODEL_SERVER`
-is set (ADR-0011), with `runs_on` `served`; the server process reads the same
-cards (`model_cards()`) and runs `load_model` locally, so the pre-processing
-is the same by construction, and answers with `model_identity`, which the
-client compares with `model_identity(card.weights_sha256, rule)`. The fake
-model server joins `smc.testing` and the contract suite. Nothing of §2 to §6
-changes for it but `load_model`'s first branch.
+`load_model` resolves to the served implementation when `SMC_MODEL_SERVER` is
+set (ADR-0011), with `runs_on` `served`. The server runs this repository's own
+code: it reads the same cards and runs the same `TorchDetector`, so the
+pre-processing is the same by construction, and it answers with the model's
+identity, which the client compares with `model_identity(card.weights_sha256,
+rule)`. Nothing of §2 to §6 changes but `load_model`'s first branch (§8.5), the
+checkpoint's one new field and what `cells` says of a served run (§8.7).
+
+### 8.1 Measured (2026-11-26, planning #685)
+
+On the main checkout's `.venv` (Python 3.13.0, macOS arm64) and a scratch venv
+with `imaging-server-kit==0.0.12` (fastapi 0.165.0, starlette 1.10.0, uvicorn
+0.54.0, tifffile 2026.11.16, numpy 2.5.5, pydantic 2.14.4); the client part also
+on Python 3.10.10:
+
+- **Versions.** PyPI has 0.0.1 to 0.0.16, 0.1.0 to 0.1.3, 0.2.0 and 0.3.x.
+  0.0.12 (`Requires-Python >=3.9`) is what the lab runs
+  (`lightsheet-live-tracking-tool/requirements.txt`). 0.0.13 to 0.0.16 are `>=3.9`,
+  and the `client/client.py` of each has no `timeout`. 0.1.3 (`>=3.9`) is another
+  API (`AlgorithmRunner`, msgpack on the wire) whose client has one timeout, fixed at
+  3600 s (`TIMEOUT_SEC`); 0.3.2 needs Python 3.11 and is yet another API
+  (`core/algorithm.py`, `remote/client.py`), so not installable on smc's minimum, 3.10.
+  None is a drop-in for the lab's server.
+- **The kit's `Client` has no timeout.** Its constructor calls
+  `requests.get(f"{url}/services")` and `run_algorithm` calls `requests.post(...)`,
+  neither with `timeout=`, and the class takes no such argument (source of
+  0.0.12): a host that drops packets holds the caller until the OS gives up.
+- **`/services` lists algorithm names only**, no identity:
+  `{"services": ["models", "detect"]}`.
+- **The wire** (real server): `POST /<algorithm>/process` with a JSON body of the
+  parameters, an image as the base64 of a TIFF (`tifffile`); the answer is 201
+  and a JSON list of `{"type", "data", "data_params"}`; a result of type `text`
+  carries a string. A 1412 × 1412 `uint16` frame is a 3 987 744-byte TIFF and a
+  5 316 992-byte JSON field, encoded in 4 to 8 ms, and the function receives it as
+  the same `uint16` array (first pixel included). A 4096 × 4096 frame (a 44.7 MB
+  body) went through the default server in 0.09 s on loopback: no body limit.
+  An algorithm declared with `parameters={}` takes `{}`.
+- **The errors**: a function that raises is 500
+  `{"error_type": "internal_server_error", "message": str(exc)}`; a parameter
+  that fails validation (`ge`, `extra="forbid"`, missing) is 422 `{"detail": [...]}`;
+  an unknown algorithm is 404 `{"detail": ...}`; an image that is not a TIFF is a
+  500 (the kit's 422 handler fails to serialise the exception). Every body is JSON.
+- **`MultiAlgorithmServer.lifespan` talks to an "algorithm hub"**:
+  `requests.get("http://algorithm_hub:8000/")` at start, with no timeout, and
+  `requests.post(.../deregister)` at shutdown, unguarded: with no hub, shutdown
+  logs `Application shutdown failed`. Setting `server.app.router.lifespan_context`
+  to a no-op async context manager after construction removes both.
+- **Importing the kit is heavy**: `import imaging_server_kit` takes 6.4 s cold and
+  0.30 s warm and loads `cv2`, `scipy`, `skimage`, `fastapi`, `starlette`,
+  `imantics` and `requests` (1041 modules); its metadata installs
+  `opencv-python` and `opencv-contrib-python-headless` together. That is not
+  for the acquisition PC, which holds the stand's DLLs (FM-95).
+- **`http.client`** (Python 3.13 and 3.10.10), a connect timeout and then
+  `sock.settimeout` for the rest: a server that does not answer raises
+  `TimeoutError` (3.10: the alias of `socket.timeout`), a closed port
+  `ConnectionRefusedError`, a server that closes the connection
+  `RemoteDisconnected`, an unroutable address `TimeoutError` from `connect`. It
+  never uses a proxy (FM-152).
+- **Not measured**: the server on Python 3.10 and 3.14 (the only 3.10 of this Mac
+  fails to load scipy's own binary, a `dlopen` error unrelated to the kit), on
+  Windows, and on a GPU.
+
+### 8.2 The version, the extra and the modules
+
+- **`imaging-server-kit==0.0.12`**, exactly: the lab's, `>=3.9`, its wire read
+  here. Moving the pin is a design change and a run of the real-server test (§8.9).
+- **`serve = ["torch>=2.2", "torchvision>=0.17", "imaging-server-kit==0.0.12"]`**:
+  the `detect` extra and the kit, written out, with a test that its torch lines
+  are `detect`'s. It is the **server's** extra; the acquisition PC installs
+  nothing for a served model (the client is the standard library, numpy and
+  tifffile).
+- **The client does not import the kit** (§8.1: no timeout, and the import cost).
+  It speaks the kit's `/process` wire itself, in `served.py`; the kit is imported
+  **only in `server.py`, inside functions**, and a test walks the source for it.
+  This departs from ADR-0011's "one module" and #685's "a client of
+  `imaging-server-kit`": the transport is the kit's, in two modules and the fake
+  that share the wire's constants and codecs; changing the transport changes those.
+
+```text
+src/smc/inference/
+  served.py     the wire and the client: constants, ServedError, ServedModel, ServedAnswer,
+                encode_frame, encode_listing/decode_listing, encode_answer/decode_answer,
+                ModelWire, HttpWire, open_wire, ServedCheck, check_served,
+                ServedDetector, load_served        (stdlib, numpy, tifffile; no kit, no torch)
+  server.py     ModelServer, prepare, build_app, serve                     (the kit, inside functions)
+  models.py     load_local_model (what load_model was) and load_model (the dispatcher, §8.5)
+src/smc/testing/fake_model_server.py   FakeModelServer, ServedCall      (exported by smc.testing)
+```
+
+`smc.inference.__init__` does not change (`served` and `server` are imported from
+their modules, as `local` is). Neither module imports torch, scikit-image, the kit,
+uvicorn or fastapi at module level.
+
+### 8.3 The wire
+
+Two algorithms, as the kit names them, on one `MultiAlgorithmServer`
+(`server_name="smc-models"`):
+
+```text
+POST /models/process   {}                                                    -> 201 [text: LISTING]
+POST /detect/process   {"model": str, "image": <base64 TIFF>, "pixel_size_um": float}  -> 201 [text: ANSWER]
+```
+
+```json
+{"schema": 1, "models": [{"name": "cell-classes-v2", "identity": "<sha>+<sha>",
+                          "classes": ["single", "doublet", "debris"], "device": "cuda"}]}
+{"schema": 1, "model": "cell-classes-v2", "identity": "<sha>+<sha>", "device": "cuda",
+ "detections": [[row0, col0, row1, col1, "single", 0.93], ...]}
+```
+
+- A result is `{"type": "text", "data": <the JSON above as a string>, "data_params":
+  {"name": "models" | "detections"}}` (`data_params` must be a dict). The client
+  reads the first result of type `text` whose `data` is a `str`.
+- The JSON is `json.dumps(..., allow_nan=False)`; a float is Python's `repr`, so a
+  detection crosses the wire exactly. A box is `(row0, col0, row1, col1)` in the
+  frame's pixels, as `Detection`. `pixel_size_um` has `ge=0`.
+- **What is sent: these three keys and nothing else** (the kit's parameter model is
+  `extra="forbid"`). The frame is `tifffile.imwrite` of the array as it is (dtype
+  and values kept), base64. Never a path, a run document, a host, an account, or
+  the score threshold.
+- **The score threshold stays on the client.** The server runs its detectors with
+  `SERVER_SCORE_FLOOR = 0.0` (torchvision keeps the scores above 0.05, which is no
+  higher than any `cells` threshold, `ge=0.05`), and the client keeps `score >= threshold`, the
+  predicate of `detections_from_output`: a served run and a local one on the same
+  weights give the same detections.
+- **A pixel size of 0 is sent as 0.0 and means unknown**, never defaulted; a
+  negative or non-finite one is refused by the client before anything is sent. A
+  native rule (the only kind the server serves, §8.6) does not read it; it is
+  carried so that a sized rule can be served without changing the wire.
+
+### 8.4 The error
+
+```python
+class ServedError(ModelError):
+    """A call to the model server that did not give a usable answer; `kind` says which."""
+
+    kind: Literal["unreachable", "timeout", "error", "identity", "malformed"]
+```
+
+- `unreachable`: no connection (refused, unroutable, no name, no answer within
+  `CONNECT_TIMEOUT_S`), or the connection broke mid-call (`RemoteDisconnected`).
+  `timeout`: connected, and no answer within the call's read timeout. `error`: the
+  server answered a status other than 201. `identity`: the answer is for another
+  model than the one asked for, or carries another identity. `malformed`: not
+  JSON, another `schema`, a field of the wrong type, a number that is not
+  finite, more than `MAX_ANSWER_BYTES`.
+- **No message holds the address, the host, the port or the URL**: a failed
+  stage's diagnosis is kept in the run folder (FM-50). A message is built from the
+  kind, the status, `strerror` and the server's own text, never from `str(exc)` of a
+  library that puts the URL in it, and **never from the address**. The server's text
+  (`message` or `detail`) is cut to its first line and 200 characters, and says
+  `the server said: ...`.
+- `ServedError` is a `ModelError`, so `cells` and `cells_check` already turn it into
+  a diagnosis. #635 reads `kind` to count a failure in a row.
+
+### 8.5 The client
+
+```python
+#: http://host:port; blank is unset (FM-78).
+SERVER_ENV = "SMC_MODEL_SERVER"
+#: The read timeout of a detect call, in seconds; blank is unset.
+TIMEOUT_ENV = "SMC_MODEL_TIMEOUT_S"
+#: Assumed: a LAN host that is up answers at once.
+CONNECT_TIMEOUT_S = 3.0
+#: Assumed: the listing is a few hundred bytes.
+CHECK_TIMEOUT_S = 10.0
+#: Assumed: 0.5 to 0.8 s a frame on a CPU, and a cold first call loads kernels.
+DETECT_TIMEOUT_S = 60.0
+MAX_ANSWER_BYTES = 4 * 1024 * 1024
+```
+
+```python
+class ModelWire(Protocol):
+    def post(
+        self, path: str, body: Mapping[str, object], *, read_timeout_s: float
+    ) -> object:
+        """The parsed JSON of a 201 answer; a ServedError for anything else."""
+
+
+def open_wire(address: str) -> ModelWire:
+    """HttpWire(address): the seam a test replaces."""
+```
+
+- **`HttpWire(address)`** is `http.client` and nothing else: `address` is `http://host:port` or
+  `https://host:port`, no user, no path, an explicit port (otherwise `ModelError`:
+  `SMC_MODEL_SERVER is not an address like http://host:8000`, **without the value**). One
+  connection per call: `HTTPConnection(host, port, timeout=CONNECT_TIMEOUT_S)`, `connect()`,
+  then `sock.settimeout(read_timeout_s)`, `request("POST", ...)` with `Content-Type` and
+  `Accept` of `application/json`, `getresponse()`, `read(MAX_ANSWER_BYTES + 1)`, `close()`
+  in a `finally`. The read timeout is per socket operation: it bounds the call because the
+  server writes its answer, a few kB, in one piece after it has computed it. **No proxy,
+  ever** (FM-152): the server is reached on the lab's network only (ADR-0011). Its
+  `__repr__` does not show the address.
+- `ServedModel(name, identity, classes, device)` and `ServedAnswer(model, identity, device,
+  detections)` are frozen dataclasses; `decode_listing(text)` and `decode_answer(text)` raise
+  `ServedError("malformed", ...)` and validate: `schema == 1`, the types, every number finite
+  (a `bool` is not a number), a detection a list of six with a `str` label.
+- **`check_served(wire, card, *, timeout_s=CHECK_TIMEOUT_S) -> ServedCheck`** never raises:
+
+```python
+@dataclass(frozen=True, slots=True)
+class ServedCheck:
+    """What the check found; `ok` says whether a call can be expected to work."""
+
+    ok: bool
+    kind: str | None
+    message: str
+    device: str | None
+```
+
+  `kind` is `None` when `ok`, else a `ServedError` kind or `"not_served"` (the server answered
+  and does not serve the card's name); `device` is what the server said, when it answered.
+  It posts `/models/process`, finds `card.name` and compares the listed identity with
+  `model_identity(card.weights_sha256, card.preprocessing)`. The messages (the tests assert
+  the words in italics): ok: `model server: cell-classes-v2 is served on cuda, identity
+  b1160edae7dd+2df8feb4070d` (the first 12 characters of each half); *does not answer* /
+  *did not answer in N s* for `unreachable` / `timeout`; `does not serve cell-classes-v2 (it
+  serves: a, b)` for `not_served`, `(it serves no model)` for an empty list; *another identity*
+  naming which half differs (`the weights differ`, `the pre-processing differs`, or both)
+  for `identity`.
+
+- **`ServedDetector`** (`classes` is the card's; `device` is the last answer's, else the
+  check's, else `"unknown"`, never `auto`; `check` is the `ServedCheck` of its construction):
+
+  `detect(frame)` refuses a frame that is not 2-D with `ValueError` (`detect takes one 2-D
+  frame, got an array of shape ...`) before anything is sent; posts `/detect/process` with
+  the three keys, `read_timeout_s=` its own; decodes; refuses an answer whose `model` is not
+  the one asked for or whose `identity` is not the expected one (`ServedError("identity")`:
+  `the server answered with another model identity: ...`, the halves told apart); keeps
+  `score >= score_threshold`; sets `device`; returns a new list. It retries nothing and
+  never answers an empty list for a failure ("failures are findings").
+- **`load_model` dispatches** (the first branch): `load_local_model(...)` is the body that
+  `load_model` had; `load_model` first does what both places need (§5 step 1,
+  `preprocessing_for`, in a helper both call), then `load_served(...)` when `SERVER_ENV` is
+  set and not blank, else `load_local_model(...)`. There is **no fallback in either
+  direction**. `load_served(card, *, preprocessing, frame_um_per_px, device, score_threshold,
+  weights, address)` refuses, each a `ModelError` and before any call, what a served model
+  cannot honour:
+  - `weights` set: `model_path names a file on this PC, and the model runs on the server:
+    remove model_path, or unset SMC_MODEL_SERVER to run it here`;
+  - `device` other than `auto`: `device=cuda is for a model that runs on this PC; the server
+    chooses its own: remove device, or unset SMC_MODEL_SERVER`;
+  - `preprocessing` other than `card.preprocessing`: `the server runs the card's
+    pre-processing, and low_percentile, high_percentile or model_um_per_px change it: remove
+    them, or unset SMC_MODEL_SERVER to run the model here`;
+  - a pixel size that is negative or not finite; an address that is not one; a
+    `SMC_MODEL_TIMEOUT_S` that is not a number above 0 (`SMC_MODEL_TIMEOUT_S must be a number
+    of seconds above 0`).
+
+  Then `open_wire(address)`, `check_served(...)`, `log.info` (ok) or `log.warning` (not) with
+  its message, and `ResolvedModel(name=card.name, identity=model_identity(card.weights_sha256,
+  card.preprocessing), weights_sha256=card.weights_sha256, runs_on="served",
+  detector=ServedDetector(...))`. **A failed check does not refuse**: it is reported
+  (§8.7) and every call checks again; `cells` ends `failed` at its first frame, and a scan
+  (#635) goes on.
+
+### 8.6 The server
+
+- **`ModelServer(models: Mapping[str, ResolvedModel])`** is the server without HTTP:
+  `listing() -> str` (LISTING) and `detect(model, frame, pixel_size_um) -> str` (ANSWER). One
+  `threading.Lock` makes the forward passes one at a time (the kit runs a function on a
+  thread of the loop's pool, and two calls would share the GPU). Its errors are `ValueError`s
+  that name no path: `model is required`, `the server does not serve {model!r}; it serves: ...`,
+  `detect takes one 2-D frame, got an array of shape ...`, `pixel_size_um must be a number
+  of at least 0`. The fake model server **is** this class behind `ModelWire` (§8.8), so the
+  two cannot drift.
+- **`prepare(names, *, device, load=load_local_model) -> tuple[ModelServer, list[str]]`**:
+  `names` is the cards to serve, or `None` for every card. Each is loaded with `load` (never
+  `load_model`: a `SMC_MODEL_SERVER` in the server's own environment must not make it a client
+  of itself) with `preprocessing=card.preprocessing`, `score_threshold=SERVER_SCORE_FLOOR`
+  and a native rule's placeholders for the frame (`frame_shape_px=(1, 1)`,
+  `frame_um_per_px=1.0`, which `preprocessing_for` never reads for a native rule). A card
+  whose rule names a size is **not served**: the server serves native rules only (a sized
+  rule needs a model per input size, and an unbounded cache; a design change when a card
+  needs it, §9). With `names=None` a card that cannot be served (no weights here, a wrong
+  SHA-256, a sized rule) is skipped and its reason goes to the returned notes; with names
+  given, any failure is a `ModelError`; no model at all is a `ModelError`. The notes may
+  name paths: they go to the server's own console.
+- **`build_app(server) -> object`** imports the kit (inside), declares the two algorithms
+  with `@algorithm_server`: `models` with `parameters={}`, and `detect` with
+  `{"model": StringUI(), "image": ImageUI(dimensionality=[2]), "pixel_size_um":
+  FloatSpinBoxUI(min=0.0, max=1000.0, default=0.0)}`, each returning
+  `[(text, {"name": ...}, "text")]`; builds `MultiAlgorithmServer("smc-models", [...])`;
+  sets `app.router.lifespan_context` to a no-op (§8.1); returns `server.app`.
+- **`serve(server, *, host, port) -> None`**: `uvicorn.run(app, host=host, port=port,
+  log_level="info")`; logs each call at INFO (the model, the frame's shape, the seconds;
+  never pixels).
+- **`smc serve-models [--host 127.0.0.1] [--port 8000] [--device auto] [--model NAME ...]`**
+  (`smc.cli`, imports `smc.inference.server` inside the command): a port that is held is
+  `port N is in use; choose another with --port`, exit 2, **before** any model is loaded
+  (FM-144, FM-150: every address of `host`, an address this host cannot bind is not a taken
+  port); a missing kit or uvicorn is `install the serve extra: pip install -e ".[serve]"`,
+  exit 1; the notes of `prepare`, then **the models it serves with their identities**, one per
+  line, then (for a `host` that is not a loopback address) `listening on <host>: anyone who
+  reaches this port can run the models; it has no login`. Ctrl-C ends it by uvicorn's own
+  graceful shutdown, exit 0. The default host is loopback: the lab's interface is the
+  deployment note's (#686).
+
+### 8.7 `cells` (amends §6)
+
+- **A call that fails ends the stage `failed`.** `cells` wraps `detector.detect(pixels)`:
+  a `ModelError` is `PluginRunError("cells", str(exc))`. The checkpoint (per well, as before)
+  keeps the wells done, and `--resume` goes on from them.
+- **Reported at the start**: after `_resolve`, for a `ServedDetector`: `ctx.progress(0,
+  len(scan.frames), detector.check.message)` and the same text on the plugin's logger
+  (INFO, WARNING when the check is not ok). The check does not refuse the stage.
+- **`assumed`** gains one line for a served run with at least one frame timed in this
+  attempt: `the model ran on the server: the first frame took 2.31 s and the next 11
+  frames 0.12 s on average, network included (the first can carry the server's start-up
+  work); the server's device was cuda` (only the first part with one frame).
+- **`CellsCheckpoint.runs_on: str | None = None`** (a default, so that a checkpoint saved
+  before this change loads) is saved with every checkpoint. A resume whose `runs_on` differs
+  from the earlier attempt's is **not refused** (a server that died, and the operator
+  going local, is the case ADR-0011 keeps a resume for) and `assumed` says so: `n of m
+  frames were detected by an earlier attempt that ran on served; the others ran on
+  local:cpu`. A checkpoint with no `runs_on` says nothing.
+- `CellsParams.device`'s description says: with `SMC_MODEL_SERVER` set the server chooses and
+  only `auto` is accepted. `cells_check.py` is unchanged: it calls `load_model`, so with a
+  server set it measures the served model and records no place (§9).
+
+### 8.8 The fake model server
+
+`FakeModelServer(models: Mapping[str, ResolvedModel], *, address="http://models.test:8000")`
+(`smc.testing`, `fake_model_server.py`) is a `ModelWire` with no socket, as `FakeMTB` is the
+MTB's components: it wraps a `ModelServer` and speaks the wire as the kit's server does
+(404 for another path, 422 for a body with another key than the three or a pixel size below 0,
+500 `{"message"}` for a `ValueError` or an image that is not a TIFF, 201 with the result list),
+so the real `ServedDetector` runs against it. Knobs, as attributes: `absent` (every call is
+`ServedError("unreachable")`, and the server never saw it), `latency_s` (a call whose
+`read_timeout_s` is below it is `ServedError("timeout")`; nothing sleeps), `fail_next: int`
+(the next n calls are `ServedError("error")` with `HTTP 500`), `identity_override: str | None`
+(the listing and the answers carry it), `hidden: set[str]` (names the server does not serve),
+`on_call: Callable[[ServedCall], None] | None` (called as a call arrives, before it is answered:
+where a test sets `absent` after n frames). `calls: list[ServedCall]` records, in order,
+`path`, `body` (the exact dict the client built), `frame` (decoded from it) and
+`read_timeout_s`. `install(monkeypatch)` sets `SERVER_ENV` to `address` and replaces
+`served.open_wire` by a function that returns the fake for its address and raises `ServedError(
+"unreachable")` for any other: a test that forgot the environment variable sees `load_model`
+go local, and one that set another address sees a refusal, never a network call. The identity
+it answers with is the one its models carry (`stub_model` computes it from the rule, FM-260).
+
+### 8.9 Tests
+
+- **The default suite never needs the kit, a socket to anywhere but loopback, torch or a
+  weights file.** An autouse fixture of `tests/conftest.py` deletes `SMC_MODEL_SERVER` and
+  `SMC_MODEL_TIMEOUT_S` for every test: a developer's PC that has them set must not send a
+  local test over the network (FM-40).
+- **The contract** (§7) gains the case `served`: a `ServedDetector` on a `FakeModelServer`
+  around the stub's detector. It passes the same cases (the frame goes through TIFF and JSON
+  and comes back identical).
+- **`HttpWire` is tested on a real socket in the light set**, against a standard-library
+  `ThreadingHTTPServer` in a thread that answers as the kit does (201 and the list, 500 and
+  `{"message"}`, 404, 422, a body that is not JSON, one over `MAX_ANSWER_BYTES`, a connection it
+  closes), with a handler that waits on a `threading.Event` for the timeout (FM-44) and a port
+  that is closed for the refusal; the request body's keys are asserted to be the three; a
+  `HTTP_PROXY` pointing nowhere does not divert it.
+- **A real server test** (`tests/test_model_server_kit.py`) runs where `imaging_server_kit` is
+  installed (`pytest.importorskip`, never in the light set: no CI job installs the kit): a
+  `ModelServer` of stub models behind `build_app`, `uvicorn` in a thread on a free loopback
+  port, `HttpWire` and `ServedDetector` against it, errors included.
+- **The address is nowhere in a run folder**: a `cells` run through `load_model` with
+  `SMC_MODEL_SERVER` set, done and failed (each kind), then every byte of the folder is searched
+  for the host and the port. The failed one is the case that matters: its diagnosis is kept.
 
 ## 9. Not decided here
 
@@ -483,3 +840,18 @@ changes for it but `load_model`'s first branch.
 - **Cards outside the repository** (a lab share, `$SMC_MODELS`): ADR-0011 puts
   them in the repository; a model is added by a pull request.
 - The page's choice of a model (#600).
+- **A sized rule on the server** (a card with `model_um_per_px`): the input size depends
+  on the frame, so it needs a detector per size and a bound on how many (§8.6). The first
+  such card brings its design change.
+- **What #635 does with the check and the kinds** (how many failures in a row stop the
+  detection of a scan, what is named as missed): `ServedCheck` and `ServedError.kind` are
+  what it reads (§8.4, §8.5).
+- **A token or TLS** for the server: a machine setting too, when the lab needs one; the
+  address already accepts `https://`.
+- **What a frame costs on the lab's network**: the frame goes as an uncompressed TIFF
+  (5.3 MB for 1412 x 1412 `uint16`), and the time of a call, cold and warm, is measured on
+  the lab's machine by #686, which also sets `DETECT_TIMEOUT_S` for good.
+- **A CI leg that installs the kit** for the real-server test: no leg does today, and the
+  kit's wheels on Windows with Python 3.14 are not measured.
+- **`cells_check.py` and the place**: it records name, SHA-256 and identity, and not where
+  the model ran; with a server set it measures the served model.
