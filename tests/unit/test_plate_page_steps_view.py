@@ -531,8 +531,17 @@ def test_both_figures_stay_in_the_model_tree_whatever_the_screen(
     # Both are the same height, side by side in the centre. The design said 460 px, then 400;
     # 360 is the floor (m5 §17.12 D15, measured at 1280 x 800 with the drive bar's toggle in view):
     # a figure lower than that is a plan deviation to report, not a fix, so the number is
-    # pinned and not only the constant against itself.
-    assert view.figure.height == view.image_figure.height == plate_page.FIGURE_HEIGHT_PX
+    # pinned and not only the constant against itself. The image's figure fills its box
+    # (``stretch_both``, so that *Enlarge* can give the box the window's height, m5 §24.1): the
+    # box is the image's height, and the map's figure its own.
+    boxes = [
+        box
+        for box in view.layout.select(pn.Column)
+        if "smc-image-box" in box.css_classes
+    ]
+    assert len(boxes) == 1
+    assert view.image_figure.sizing_mode == "stretch_both"
+    assert view.figure.height == boxes[0].height == plate_page.FIGURE_HEIGHT_PX
     assert plate_page.FIGURE_HEIGHT_PX >= 360
     assert plate_page.STEP_PANEL_WIDTH_PX == 400
 
