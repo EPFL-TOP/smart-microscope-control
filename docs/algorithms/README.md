@@ -491,8 +491,14 @@ change, and opens the pull request. `/feature <issue>` does the same for a small
 Without Claude Code: branch from `main` as `feat/<issue>-<slug>`, make the checks above
 pass, and open a pull request titled in the Conventional Commits form
 (`feat(algorithms): a selector by density`), with `Closes #<issue>` in its body and the
-template filled honestly, including what you did not verify. **Never merge**: the owner
-merges.
+template filled honestly, including what you did not verify. **Agents never merge.**
+Under ADR-0010 the lead of the analysis track merges a pull request whose paths are all
+the analysis track's, once `/review` says `ready to merge` and the light set is green;
+`.github/CODEOWNERS` is the map of the paths, and `python scripts/dev/tracks.py <path> ...`
+tells the track of one. A pull request that touches a stand path (a shared file, the
+selection contract `smc.selection.api`, `registry.py`) needs the owner's approval on
+GitHub first, and that need is an issue for the stand track before it is an edit: a need
+across the border is never an edit.
 
 ## What comes next
 
