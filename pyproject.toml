@@ -111,6 +111,7 @@ timing = "smc.plugins.timing.plugin:TimingPlugin"
 
 [project.entry-points."smc.selectors"]
 most-cells = "smc.selection.builtin:MostCells"
+low-mag-survey = "smc.selection.low_mag_survey:LowMagSurvey"
 
 [project.entry-points."smc.orderers"]
 nearest = "smc.selection.builtin:Nearest"
